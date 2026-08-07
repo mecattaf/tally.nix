@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
@@ -158,6 +159,10 @@ pub struct LifecycleStore {
     file: File,
     records: Vec<LifecycleRecord>,
     retention: RetentionState,
+    /// Cached [`shared_snapshot`](Self::shared_snapshot) value, dropped by the
+    /// two mutators (`append_at`, `compact_if_over_limit`) so a snapshot is
+    /// deep-built at most once per mutation instead of once per reader.
+    shared: Option<Arc<LifecycleSnapshot>>,
 }
 
 impl LifecycleStore {
@@ -218,6 +223,7 @@ impl LifecycleStore {
             file,
             records,
             retention,
+            shared: None,
         })
     }
 
@@ -251,6 +257,7 @@ impl LifecycleStore {
                 .sync_all()
                 .map_err(|source| io_error(&self.path, source))?;
             self.records.push(record.clone());
+            self.shared = None;
             Ok(record)
         })();
         let unlock = FileExt::unlock(&self.file).map_err(|source| io_error(&self.path, source));
@@ -283,6 +290,18 @@ impl LifecycleStore {
                 reason: self.retention.reason.clone(),
             },
         }
+    }
+
+    /// The same snapshot behind an `Arc`, deep-built at most once per
+    /// mutation. [`snapshot`](Self::snapshot) clones every record per call,
+    /// which on the daemon put O(all lifecycle records) of copying on the
+    /// dispatch thread for every fresh query (#431); readers that only need a
+    /// frozen view share this one instead.
+    pub fn shared_snapshot(&mut self) -> Arc<LifecycleSnapshot> {
+        if self.shared.is_none() {
+            self.shared = Some(Arc::new(self.snapshot()));
+        }
+        Arc::clone(self.shared.as_ref().expect("populated above"))
     }
 
     pub fn path(&self) -> &Path {
@@ -384,6 +403,7 @@ impl LifecycleStore {
         // unreachable inode.
         self.file = replacement;
         self.records = kept_records;
+        self.shared = None;
         unlock?;
         File::open(
             self.path

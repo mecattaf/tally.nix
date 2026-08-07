@@ -9315,7 +9315,10 @@ mod tests {
                 format!("EXTEND_TIMEOUT_USEC=90000000\nSTATUS=starting: {phase}"),
             );
         }
-        // Nothing else is sent: the extension is per phase, not per operation.
+        // Nothing else is sent by the timeline: its extension is per phase.
+        // (The unit-facts loop additionally renews on its own time-throttled
+        // cadence while it is visiting rows — #428 — but that is driven by
+        // row progress, not by these phase boundaries.)
         let mut buffer = [0_u8; 256];
         assert!(socket.recv(&mut buffer).is_err());
 
@@ -9330,6 +9333,62 @@ mod tests {
                 "{report} omits {phase}"
             );
         }
+    }
+
+    /// #428: the unit-facts phase renews the start timeout from inside its
+    /// per-row loop, so the 90 s budget bounds progress stalls rather than
+    /// the phase's total O(corpus) cost. The throttle is time-based; driving
+    /// it with a zero interval makes every visited row renew, which is the
+    /// seam that proves the notification actually flows from inside
+    /// `collect_local_unit_facts` — remove the in-loop extension and this
+    /// observes no datagrams.
+    #[tokio::test]
+    async fn unit_facts_progress_renews_the_start_timeout_from_inside_the_loop() {
+        let temp = tempdir().unwrap();
+        let (paths, _) = seed_scale_corpus(temp.path(), 0, 3);
+        let durable = crate::recovery::collect_durable_recovery_facts(
+            &paths.events_dir(),
+            &paths.witness_path(),
+        )
+        .unwrap();
+        let executor = direct_executor(&paths.state_dir)
+            .with_systemd_run(temp.path().join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+
+        let notify_path = temp.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&notify_path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let notifier = SystemdNotifier::with_socket(notify_path, None);
+        let mut extension =
+            startup::UnitFactsExtension::new(notifier, Duration::ZERO, durable.events().len());
+        collect_local_unit_facts(&executor, &durable, || extension.row_visited())
+            .await
+            .unwrap();
+
+        for visited in 1..=3 {
+            let mut buffer = [0_u8; 256];
+            let read = socket.recv(&mut buffer).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&buffer[..read]).unwrap(),
+                format!("EXTEND_TIMEOUT_USEC=90000000\nSTATUS=starting: unit-facts ({visited}/3 rows)"),
+            );
+        }
+        let mut buffer = [0_u8; 256];
+        assert!(
+            socket.recv(&mut buffer).is_err(),
+            "one renewal per visited row, nothing more"
+        );
+    }
+
+    /// The shipped in-loop renewal interval, pinned: a small fraction of the
+    /// phase budget, so a slow-but-moving unit-facts loop renews several
+    /// times per budget and never rides the 90 s deadline.
+    #[test]
+    fn unit_facts_extend_interval_is_a_small_fraction_of_the_phase_budget() {
+        assert_eq!(startup::UNIT_FACTS_EXTEND_INTERVAL, Duration::from_secs(10));
+        assert!(startup::UNIT_FACTS_EXTEND_INTERVAL * 3 < startup::STARTUP_PHASE_BUDGET);
     }
 
     /// The full phase list, pinned through the line `run_loop` actually emits.
@@ -14201,6 +14260,763 @@ mod tests {
                     "{}",
                     error.message
                 );
+            })
+            .await;
+    }
+
+    /// Seed a durable corpus at estate scale: `terminal` completed rows (event
+    /// file + lifecycle trail + witness Pass) and `queued` rows with no
+    /// witness, which recovery re-presents as live jobs. Event files and
+    /// lifecycle lines are written directly in their durable formats — the
+    /// fixture needs the bytes on disk, not the writers' per-line fsyncs.
+    fn seed_scale_corpus(root: &Path, terminal: usize, queued: usize) -> (DaemonPaths, Vec<Uuid>) {
+        let paths = DaemonPaths {
+            socket: root.join("run/tally.sock"),
+            state_dir: root.join("state"),
+            data_dir: root.join("data"),
+        };
+        prepare_paths(&paths).unwrap();
+        assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
+        let events_dir = paths.events_dir();
+        fs::create_dir_all(&events_dir).unwrap();
+
+        let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+        let mut lifecycle = Vec::new();
+        let mut sequence = 0_u64;
+        let mut realtime = 1_786_000_000_000_000_u64;
+        let mut uuids = Vec::with_capacity(terminal + queued);
+        let mut append_lifecycle = |row: &RowSeed, event: TallyEvent, sequence: &mut u64, realtime: &mut u64| {
+            let terminal_event = matches!(event, TallyEvent::Completed | TallyEvent::Failed);
+            let fields = EmitEvent {
+                event,
+                task_uuid: row.uuid.to_string(),
+                task_ref: None,
+                class: row.priority,
+                source: row.source,
+                message: Some(format!("scale fixture {event}")),
+                agent: Some(row.adapter.clone()),
+                session_ref: None,
+                unit: Some(format!("tally-job-{}.service", row.uuid)),
+                exit_code: terminal_event.then_some(0),
+                stderr_tail: None,
+                stderr_truncated: None,
+                gpu_seconds: terminal_event.then_some(0.0),
+                context_tokens: None,
+                context_window: None,
+                artifact_hash: (event == TallyEvent::Completed)
+                    .then(|| format!("sha256:{}", "a".repeat(64))),
+                evidence: event.is_evidence().then(|| "exit:0".to_owned()),
+                attempt: Some(1),
+                lease_epoch: Some(1),
+                labor_class: Some(LaborClass::Fresh),
+                job_id: Some(row.uuid.to_string()),
+                parent: None,
+                pools: Some(row.pools.clone()),
+                executor: None,
+            }
+            .into_fields()
+            .unwrap();
+            *sequence += 1;
+            *realtime += 1;
+            let cursor = crate::history::lifecycle_cursor(*sequence);
+            let record = crate::history::LifecycleRecord {
+                schema_version: crate::history::LIFECYCLE_SCHEMA_VERSION,
+                sequence: *sequence,
+                event_id: cursor.clone(),
+                cursor,
+                observed_at: chrono::DateTime::<Utc>::from_timestamp_micros(
+                    i64::try_from(*realtime).unwrap(),
+                )
+                .unwrap()
+                .to_rfc3339_opts(SecondsFormat::Micros, true),
+                realtime_us: *realtime,
+                fields,
+            };
+            lifecycle.extend_from_slice(&serde_json::to_vec(&record).unwrap());
+            lifecycle.push(b'\n');
+        };
+
+        for index in 0..(terminal + queued) {
+            let uuid = Uuid::new_v4();
+            uuids.push(uuid);
+            let row = durable_row(uuid, &format!("scale-{index}"), 1);
+            let event = DurableEnqueueEvent::new(row.clone()).unwrap();
+            fs::write(
+                events_dir.join(format!("{}.enqueue.json", event.event_id)),
+                serde_json::to_vec(&event).unwrap(),
+            )
+            .unwrap();
+            if index < terminal {
+                for lifecycle_event in [
+                    TallyEvent::Enqueued,
+                    TallyEvent::Dispatched,
+                    TallyEvent::Started,
+                    TallyEvent::EvidencePass,
+                    TallyEvent::Completed,
+                ] {
+                    append_lifecycle(&row, lifecycle_event, &mut sequence, &mut realtime);
+                }
+                append_fixture_witness(
+                    &mut ledger,
+                    &row,
+                    "2026-08-05T12:00:00.000Z",
+                    Verdict::Pass,
+                    0,
+                    1,
+                    1,
+                );
+            } else {
+                append_lifecycle(&row, TallyEvent::Enqueued, &mut sequence, &mut realtime);
+            }
+        }
+        drop(ledger);
+        fs::write(paths.data_dir.join(crate::history::LIFECYCLE_FILE), lifecycle).unwrap();
+        (paths, uuids)
+    }
+
+    /// #431 acceptance: with a ~30k-row durable corpus, the dispatch loop's
+    /// maximum absence over a sustained scheduling period stays under a
+    /// single-digit-second bound, and RPCs issued during that period answer
+    /// within the 10 s client deadline the estate's readers use.
+    ///
+    /// Shape of the proof:
+    /// - The corpus is 30,000 terminal rows plus 40 queued rows that recovery
+    ///   re-presents; the queued cohort dispatches, runs, and completes through
+    ///   the live loop, and twelve more admissions land mid-storm, so
+    ///   admission, scheduling, and completion are all exercised while the
+    ///   query storm runs.
+    /// - Clients run on their own OS threads with their own runtimes, the way
+    ///   estate clients are their own processes, so client-side JSON decoding
+    ///   cannot pollute the loop measurement.
+    /// - Loop absence is measured at tick boundaries with the loop's own lease
+    ///   tick (100 ms cadence when live): the hook stamps an instant per tick,
+    ///   and the maximum inter-tick gap is the loop's maximum absence as its
+    ///   own watchdog witness would see it.
+    /// - The bound is 5 s. That is deliberately far above the healthy ~100 ms
+    ///   cadence (this suite shares hosts with compiling siblings and the
+    ///   corpus makes some O(live)+fsync arm bodies real) and far below the
+    ///   60–183 s absences measured live on 2026-08-07 — which one inline
+    ///   corpus-scale query reproduces, so the unfixed loop fails this test by
+    ///   minutes, not by margin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_loop_stays_live_under_query_storm_at_estate_scale() {
+        const STORM: Duration = Duration::from_secs(6);
+        const ABSENCE_BOUND: Duration = Duration::from_secs(5);
+        const CLIENT_DEADLINE: Duration = Duration::from_secs(10);
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let (paths, uuids) = seed_scale_corpus(temp.path(), 30_000, 40);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let (tick_tx, mut tick_rx) = mpsc::unbounded_channel();
+                let (_release_tx, release_rx) = watch::channel(true);
+                daemon.lease_tick_hook = Some(LeaseTickHook {
+                    started: tick_tx,
+                    release: release_rx,
+                });
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+
+                let ticks = Rc::new(RefCell::new(Vec::<Instant>::new()));
+                let collected = ticks.clone();
+                let collector = tokio::task::spawn_local(async move {
+                    while tick_rx.recv().await.is_some() {
+                        collected.borrow_mut().push(Instant::now());
+                    }
+                });
+
+                // Query storm: corpus-scale reads back to back for the whole
+                // period, from a dedicated OS thread.
+                let storm_socket = paths.socket.clone();
+                let probe_uuid = uuids[0].to_string();
+                let storm_uuid = probe_uuid.clone();
+                let storm = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let client = RpcClient::connect(&storm_socket).await.unwrap();
+                            let started = Instant::now();
+                            let mut completed = 0_usize;
+                            while started.elapsed() < STORM {
+                                client
+                                    .call("query.jobs", Some(json!({"limit": 100})))
+                                    .await
+                                    .unwrap();
+                                client
+                                    .call("query.job", Some(json!({"id": storm_uuid})))
+                                    .await
+                                    .unwrap();
+                                client.call("query.status", Some(json!({}))).await.unwrap();
+                                completed += 3;
+                            }
+                            completed
+                        })
+                });
+                // Scheduling activity: admissions landing mid-storm, each of
+                // which must not wait behind a corpus-scale query.
+                let sched_socket = paths.socket.clone();
+                let scheduler = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let client = RpcClient::connect(&sched_socket).await.unwrap();
+                            let mut worst = Duration::ZERO;
+                            for round in 0..12 {
+                                let started = Instant::now();
+                                client
+                                    .call(
+                                        "queue.enqueue",
+                                        Some(json!({
+                                            "argv": ["true"],
+                                            "pool": "slot",
+                                            "adapter": "shell",
+                                            "source": "manual",
+                                            "evidence": ["exit:0"],
+                                            "dedupKey": format!("storm-{round}"),
+                                        })),
+                                    )
+                                    .await
+                                    .unwrap();
+                                worst = worst.max(started.elapsed());
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                            }
+                            worst
+                        })
+                });
+                // The acceptance probe: a `query.job` read issued in the middle
+                // of the storm, with the client deadline the estate's readers
+                // use. On the unfixed loop this is the read that timed out.
+                let probe_socket = paths.socket.clone();
+                let probe = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let client = RpcClient::connect(&probe_socket).await.unwrap();
+                            tokio::time::sleep(STORM / 3).await;
+                            let mut elapsed = Vec::new();
+                            for _ in 0..2 {
+                                let started = Instant::now();
+                                client
+                                    .call_with_deadline(
+                                        "query.job",
+                                        Some(json!({"id": probe_uuid})),
+                                        CLIENT_DEADLINE,
+                                    )
+                                    .await
+                                    .unwrap();
+                                elapsed.push(started.elapsed());
+                                tokio::time::sleep(STORM / 3).await;
+                            }
+                            elapsed
+                        })
+                });
+
+                let queries = tokio::task::spawn_blocking(move || storm.join().unwrap())
+                    .await
+                    .unwrap();
+                let worst_enqueue = tokio::task::spawn_blocking(move || scheduler.join().unwrap())
+                    .await
+                    .unwrap();
+                let probe_elapsed = tokio::task::spawn_blocking(move || probe.join().unwrap())
+                    .await
+                    .unwrap();
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+                collector.abort();
+
+                assert!(queries >= 3, "the storm must actually run corpus-scale queries");
+                for elapsed in &probe_elapsed {
+                    assert!(
+                        *elapsed < CLIENT_DEADLINE,
+                        "a query.job issued during the storm took {elapsed:?}, past the \
+                         {CLIENT_DEADLINE:?} client deadline"
+                    );
+                }
+                assert!(
+                    worst_enqueue < CLIENT_DEADLINE,
+                    "an admission waited {worst_enqueue:?} behind corpus-scale query work"
+                );
+                let ticks = ticks.borrow();
+                // The instrument must have measured across the storm window;
+                // how many samples that took is the host's business. A fixed
+                // sample count flaked on a loaded gate host (19 live ticks in
+                // ~10 s under a full parallel suite), while a deaf loop is
+                // caught by the max-gap bound below regardless of how many
+                // ticks it eventually produced.
+                assert!(
+                    ticks.len() >= 2,
+                    "the tick instrument produced too few samples to measure absence ({} ticks)",
+                    ticks.len()
+                );
+                let span = *ticks.last().unwrap() - *ticks.first().unwrap();
+                assert!(
+                    span >= STORM,
+                    "tick samples span {span:?}, less than the {STORM:?} storm window"
+                );
+                let mut max_gap = Duration::ZERO;
+                for pair in ticks.windows(2) {
+                    max_gap = max_gap.max(pair[1] - pair[0]);
+                }
+                assert!(
+                    max_gap < ABSENCE_BOUND,
+                    "the dispatch loop was absent for {max_gap:?} during the storm \
+                     (bound {ABSENCE_BOUND:?}, {} ticks observed)",
+                    ticks.len()
+                );
+            })
+            .await;
+    }
+
+    /// #431: an RPC read that races a scheduling mutation answers from the
+    /// frozen snapshot its projection took — the mutation is either entirely
+    /// invisible to that answer or entirely visible to a later one, never
+    /// partially visible. This is the torn-read discipline that moving query
+    /// construction off the dispatch thread must keep.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_projection_is_frozen_against_racing_mutations() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+
+                let before = daemon.handler.query_projection().await.unwrap();
+                let rows_before = before.rows.len();
+
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let new_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+
+                // The projection taken before the admission is immutable: the
+                // mutation cannot appear in any of its facts, so a query built
+                // from it cannot observe the admission half-applied.
+                assert_eq!(before.rows.len(), rows_before);
+                assert!(!before.rows.iter().any(|row| row.task_uuid == new_uuid));
+                assert!(!before
+                    .live
+                    .iter()
+                    .any(|fact| fact.anchor == new_uuid));
+                let frozen = query_jobs_v2(
+                    &before.details,
+                    &before.live,
+                    &before.history,
+                    &before.witness,
+                    &BTreeMap::new(),
+                    &JobsFilter::default(),
+                    &before.membership,
+                )
+                .unwrap();
+                assert!(!frozen.items.iter().any(|item| item.anchor == new_uuid));
+
+                // A projection taken after the admission sees it whole.
+                let after = daemon.handler.query_projection().await.unwrap();
+                assert_eq!(after.rows.len(), rows_before + 1);
+                assert!(after.rows.iter().any(|row| row.task_uuid == new_uuid));
+                assert!(after.live.iter().any(|fact| fact.anchor == new_uuid));
+            })
+            .await;
+    }
+
+    /// #431 repair (eval finding D1-1): the trace decoration on job envelopes
+    /// is pinned. `query.jobs` decorates every item through the per-anchor
+    /// lane index and `query.job` decorates its single summary; both surfaces
+    /// were rewritten by #431 and neither was asserted anywhere, so emptying
+    /// the index — or deleting `query.job`'s assignment outright — shipped
+    /// every job as "no trace metadata" with the whole suite green.
+    ///
+    /// Positive shape: a completed job under a trace-declaring adapter with
+    /// retained captures reports `trace.available == true` on both verbs.
+    /// Negative shape: a job under an adapter with no declared trace reports
+    /// exactly `adapter-does-not-declare-a-provider-trace` — the reason that
+    /// proves its lanes were found and consulted, where a broken index would
+    /// report `no-attempt-trace-metadata` instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_envelopes_report_trace_availability_from_the_lane_index() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let program = temp.path().join("traced-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    concat!(
+                        "#!/bin/sh\n",
+                        "printf '%s\\n' '{\"event\":{\"session_id\":\"trace-session\"}}'\n"
+                    ),
+                );
+                let mut config = one_pool_config();
+                let mut adapter = structured_adapter(&program);
+                adapter.trace = Some(AdapterTrace {
+                    stream: ScrapeStream::Stdout,
+                    framing: TraceFraming::JsonLines,
+                });
+                config.adapters.insert("traced".to_owned(), adapter);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+
+                let mut finished_uuids = Vec::new();
+                for adapter in ["traced", "shell"] {
+                    let admitted = daemon
+                        .handler
+                        .enqueue_as_client(Some(json!({
+                            "argv": if adapter == "traced" {
+                                json!(["ignored-by-template"])
+                            } else {
+                                json!(["true"])
+                            },
+                            "pool": "slot",
+                            "adapter": adapter,
+                            "source": "manual",
+                            "evidence": ["exit:0"]
+                        })))
+                        .await
+                        .unwrap();
+                    let finished = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        daemon.completion_rx.recv(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    daemon.finish_job(finished).await.unwrap();
+                    let terminal = daemon
+                        .handler
+                        .await_job(Some(json!({"task_uuid": admitted["task_uuid"]})))
+                        .await
+                        .unwrap();
+                    assert_eq!(terminal["verdict"], "pass");
+                    finished_uuids.push(admitted["task_uuid"].as_str().unwrap().to_owned());
+                }
+                let (traced_uuid, plain_uuid) = (&finished_uuids[0], &finished_uuids[1]);
+
+                let job = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": traced_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    job["job"]["trace"]["available"], true,
+                    "query.job must report the retained trace: {}",
+                    job["job"]["trace"]
+                );
+
+                let jobs = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({})))
+                    .await
+                    .unwrap();
+                let item = |uuid: &str| {
+                    jobs["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|item| item["taskUuid"] == uuid)
+                        .unwrap()
+                        .clone()
+                };
+                assert_eq!(
+                    item(traced_uuid)["trace"]["available"],
+                    true,
+                    "query.jobs must decorate items from the lane index: {}",
+                    item(traced_uuid)["trace"]
+                );
+                assert_eq!(
+                    item(plain_uuid)["trace"]["reason"],
+                    "adapter-does-not-declare-a-provider-trace",
+                    "an adapter without a trace still has its lanes consulted: {}",
+                    item(plain_uuid)["trace"]
+                );
+            })
+            .await;
+    }
+
+    /// #420 (1): `unreachable_paused_jobs` reclaims uuids whose job was
+    /// retired out of `context.jobs`. Before this fix the set's GC walked only
+    /// the live map, which no longer retains terminal jobs (#395), so a
+    /// pool-loss-paused job that was then cancelled pinned its uuid in the
+    /// set for the daemon's lifetime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_return_reclaims_unreachable_paused_uuids_whose_job_was_retired() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    two_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+
+                // Hold zeta so the admission queues instead of running.
+                daemon
+                    .handler
+                    .acquire(Some(json!({"pool": "zeta"})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "zeta",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(admitted["state"], "queued");
+                let task_uuid = Uuid::parse_str(admitted["task_uuid"].as_str().unwrap()).unwrap();
+
+                daemon.handler.apply_pool_loss("zeta").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert!(context.unreachable_paused_jobs.contains(&task_uuid));
+                }
+
+                // The paused job reaches a terminal disposition and is retired
+                // out of the live map — the exact membership the old GC could
+                // never reclaim.
+                let cancelled = daemon
+                    .handler
+                    .cancel(Some(json!({"task_uuid": task_uuid.to_string(), "force": true})))
+                    .await
+                    .unwrap();
+                assert_eq!(cancelled["affected"], 1);
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(!context.jobs.contains_key(&task_uuid));
+                    assert!(
+                        context.unreachable_paused_jobs.contains(&task_uuid),
+                        "precondition: the uuid is still held when the pool returns"
+                    );
+                }
+
+                daemon.handler.apply_pool_return("zeta").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(
+                        !context.unreachable_paused_jobs.contains(&task_uuid),
+                        "a retired job's uuid must not survive a sweep of the set"
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// #420 (2): `cancel`'s already-terminal answer derives `was` from the
+    /// query fact that admitted the retired job, instead of asserting
+    /// `completed`. A row recovered as `Deleted` — latest witness verdict
+    /// `cancelled` — answers with the same `deleted-cache` label its query
+    /// projection uses; reporting it `completed` claimed a verdict the daemon
+    /// does not hold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_reports_deleted_cache_for_a_row_recovered_as_deleted() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                prepare_paths(&paths).unwrap();
+                assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
+                let row = durable_row(Uuid::new_v4(), "deleted-cache-answer", 1);
+                write_enqueue_event_atomic(
+                    &paths.events_dir(),
+                    &DurableEnqueueEvent::new(row.clone()).unwrap(),
+                )
+                .unwrap();
+                let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+                append_fixture_witness(
+                    &mut ledger,
+                    &row,
+                    "2026-08-06T12:00:00.000Z",
+                    Verdict::Cancelled,
+                    1,
+                    1,
+                    1,
+                );
+                drop(ledger);
+
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(!context.jobs.contains_key(&row.uuid));
+                    assert_eq!(context.query_rows[&row.uuid].status, RowStatus::Deleted);
+                }
+
+                let already = daemon
+                    .handler
+                    .cancel(Some(json!({"task_uuid": row.uuid.to_string(), "force": true})))
+                    .await
+                    .unwrap();
+                assert_eq!(already["already_terminal"], true);
+                assert_eq!(already["affected"], 0);
+                assert_eq!(
+                    already["was"], "deleted-cache",
+                    "the label is the query fact's status, not a constant"
+                );
+            })
+            .await;
+    }
+
+    /// Timing probe for #431: what does each dispatch-loop-resident operation
+    /// cost against a corpus at estate scale? Run with
+    /// `TALLY_EXP_CORPUS=30000 cargo test -p tally-core exp_corpus -- --ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn exp_corpus_scale_timing() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let terminal = std::env::var("TALLY_EXP_CORPUS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(30_000);
+                let queued = 60;
+                let temp = tempdir().unwrap();
+                let started = Instant::now();
+                let (paths, uuids) = seed_scale_corpus(temp.path(), terminal, queued);
+                eprintln!("seed: {terminal} terminal + {queued} queued rows in {:?}", started.elapsed());
+
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let started = Instant::now();
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                eprintln!("open: {:?}", started.elapsed());
+                eprintln!(
+                    "phases: {:?}",
+                    daemon.startup.as_ref().map(|timeline| timeline.phase_names())
+                );
+
+                for method in ["query.status", "query.standup", "query.render"] {
+                    let started = Instant::now();
+                    let result = daemon.handler.query(method, Some(json!({}))).await;
+                    eprintln!("{method}: {:?} ok={}", started.elapsed(), result.is_ok());
+                }
+                let started = Instant::now();
+                let result = daemon.handler.query("query.jobs", Some(json!({}))).await;
+                eprintln!("query.jobs: {:?} ok={}", started.elapsed(), result.is_ok());
+                let started = Instant::now();
+                let result = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": uuids[0].to_string()})))
+                    .await;
+                eprintln!("query.job: {:?} ok={}", started.elapsed(), result.is_ok());
+                let started = Instant::now();
+                let result = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": uuids[0].to_string()})))
+                    .await;
+                eprintln!("query.run(unknown): {:?} ok={}", started.elapsed(), result.is_ok());
+
+                // Repeat, now warm.
+                for method in ["query.status", "query.standup"] {
+                    let started = Instant::now();
+                    let result = daemon.handler.query(method, Some(json!({}))).await;
+                    eprintln!("warm {method}: {:?} ok={}", started.elapsed(), result.is_ok());
+                }
+
+                // Admission with the corpus resident.
+                let started = Instant::now();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await;
+                eprintln!("enqueue: {:?} ok={}", started.elapsed(), admitted.is_ok());
+
+                // A query right after the mutation (cold snapshot rebuild).
+                let started = Instant::now();
+                let result = daemon.handler.query("query.status", Some(json!({}))).await;
+                eprintln!("post-mutation query.status: {:?} ok={}", started.elapsed(), result.is_ok());
+
+                // One lease tick with the queued cohort resident.
+                let started = Instant::now();
+                Daemon::tick_leases_at(daemon.handler.clone(), Utc::now())
+                    .await
+                    .unwrap();
+                eprintln!("tick_leases: {:?}", started.elapsed());
+                let started = Instant::now();
+                Daemon::tick_leases_at(daemon.handler.clone(), Utc::now())
+                    .await
+                    .unwrap();
+                eprintln!("tick_leases again: {:?}", started.elapsed());
             })
             .await;
     }

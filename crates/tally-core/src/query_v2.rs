@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -635,26 +635,43 @@ pub fn query_jobs(
         .iter()
         .map(|fact| (fact.anchor.as_str(), fact))
         .collect::<BTreeMap<_, _>>();
+    // Grouped in one pass each. Filtering the whole history and ledger once
+    // per anchor made this collection O(anchors x (records + witnesses)) --
+    // at estate scale (~30k rows, ~150k lifecycle records) that is minutes of
+    // CPU for one call, and it used to run on the daemon's dispatch thread
+    // (#431). Iteration order within a group is preserved, so per-anchor
+    // consumers still see records in ledger order.
+    let mut events_by_task = HashMap::<&str, Vec<&LifecycleRecord>>::new();
+    for record in &history.records {
+        events_by_task
+            .entry(record.fields.task_uuid.as_str())
+            .or_default()
+            .push(record);
+    }
+    let mut witness_by_anchor = HashMap::<String, Vec<&WitnessRecord>>::new();
+    for record in witness {
+        let anchor = record
+            .task_uuid
+            .clone()
+            .unwrap_or_else(|| format!("witness:{}", record.seq));
+        witness_by_anchor.entry(anchor).or_default().push(record);
+    }
     let mut items = Vec::new();
     for anchor in anchors {
-        let events = history
-            .records
-            .iter()
-            .filter(|record| record.fields.task_uuid == anchor)
-            .collect::<Vec<_>>();
-        let witnesses = witness
-            .iter()
-            .filter(|record| {
-                record.task_uuid.as_deref() == Some(anchor.as_str())
-                    || (record.task_uuid.is_none() && anchor == format!("witness:{}", record.seq))
-            })
-            .collect::<Vec<_>>();
+        let events = events_by_task
+            .get(anchor.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let witnesses = witness_by_anchor
+            .get(anchor.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let summary = build_summary(
             &anchor,
             detail_by_task.get(anchor.as_str()).copied(),
             live_by_task.get(anchor.as_str()).copied(),
-            &events,
-            &witnesses,
+            events,
+            witnesses,
             children.get(&anchor).cloned().unwrap_or_default(),
             pool_signals,
         );

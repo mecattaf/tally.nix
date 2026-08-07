@@ -6,6 +6,93 @@ authorized.
 
 ## [Unreleased]
 
+### Daemon under load (#431, #428, #420)
+
+One mechanism, three surfaces: work that scales with the durable corpus,
+executed where it can starve everything else. Measured live on the
+coordinator on 2026-08-06/07 at ~25–30k durable rows.
+
+#### #431 — dispatch loop stays live at estate scale; query service moves off the dispatch thread
+
+The daemon's runtime is a single thread: the dispatch `select!`, every RPC
+connection, and every fresh query shared it. Two query builders were also
+quadratic in the corpus — `query.jobs`/`query.job` re-scanned the whole
+lifecycle history and witness ledger once per task anchor, and decorating a
+collection resolved trace lanes with a whole-table scan per item. At ~30k
+durable rows one such call held the select loop for minutes; a synthetic
+30k-row corpus reproduced the estate's 60–183 s deaf windows as a
+never-returning `query.jobs` (did not finish in 9.5 minutes, debug build)
+while `tick_leases` stayed at microseconds.
+
+- `query_jobs`/`query_job` now group history and witness records by task in
+  one pass instead of filtering the whole corpus per anchor; trace-lane
+  decoration in `query.jobs` resolves lanes through a per-anchor index
+  (`anchor_trace_availability`) instead of the per-item whole-table scan.
+- Fresh-query construction, response serialization, and page-snapshot
+  splitting/sizing (`pagination::prepare_snapshot`) run on the blocking pool
+  via `spawn_blocking`, over immutable snapshots taken under the context
+  lock. What remains on the dispatch thread is amortized O(live jobs) per
+  query, plus one O(corpus) snapshot-cache rebuild per mutation on the first
+  query that follows it. The lifecycle store hands out a
+  cached `Arc` snapshot (`LifecycleStore::shared_snapshot`), rebuilt at most
+  once per mutation instead of deep-cloned per query; the flow lineage and
+  membership caches moved from `Rc` to `Arc` so the blocking pool can read
+  them.
+- Reads that race a scheduling mutation answer from their frozen snapshot:
+  the mutation is entirely invisible to that answer or entirely visible to a
+  later one, never partially visible (tested). Admission keeps making
+  progress while corpus-scale queries are in flight (tested). The
+  self-reported dispatch-loop absence line and the watchdog
+  keepalive/withhold behaviour are untouched — the instrument that found
+  this defect still tells the truth.
+- Acceptance is estate-scale and in-tree: a generated 30,000-row durable
+  corpus (plus 40 live rows recovery re-presents and runs) under a
+  continuous `query.jobs`/`query.job`/`query.status` storm with admissions
+  landing mid-storm. The dispatch loop's maximum absence, measured at its
+  own lease-tick boundaries, stays under a 5 s bound (healthy cadence is
+  100 ms; the unfixed loop fails by minutes), and a `query.job` issued
+  mid-storm answers inside the estate's 10 s client deadline.
+
+#### #428 — the unit-facts startup phase renews its budget from inside the loop
+
+`collect_local_unit_facts` probes the executor once per durable event row
+that is not canonically terminal (and every local row unconditionally), so
+the unit-facts phase is O(event corpus) — ~90–95 s at the coordinator's
+~25k rows, exactly astride its single 90 s `EXTEND_TIMEOUT_USEC=` budget,
+which put the 2026-08-06 switch into a restart loop.
+
+- The loop now reports progress once per visited row, and the daemon turns
+  those callbacks into time-throttled `EXTEND_TIMEOUT_USEC=` renewals (every
+  10 s of progress, `STATUS=starting: unit-facts (k/N rows)`), so the 90 s
+  budget bounds progress stalls rather than the phase's total cost: a daemon
+  still visiting rows keeps starting; one wedged on a single probe dies on
+  the same clock. A fast startup sends nothing extra.
+- Tested at both ends and mutation-proved: the loop reports exactly one
+  progress callback per durable event row (skipped canonically-terminal
+  remote rows included, still unprobed), and the renewal datagrams flow
+  through the notify socket from inside the loop — deleting the in-loop
+  callback turns both tests red.
+- The coordinator's interim dotfiles override
+  (`TimeoutStartSec = mkForce "10min"`) becomes revertible once this lands;
+  that revert is the operator's, not this change's.
+
+#### #420 — two residues of the context.jobs prune
+
+Both arrived with #395, which retires terminal jobs out of `context.jobs`;
+neither changed behaviour today, both were unbounded-or-untrue surfaces.
+
+- `unreachable_paused_jobs` reclaims uuids whose job is absent from the
+  live map: a pool-loss-paused job that then completed or was cancelled used
+  to pin its uuid in the set for the daemon's lifetime, because the GC read
+  only the map that no longer retains terminal jobs. A retired job can never
+  be resumed, so any pool-return sweep of the set now drops such uuids.
+  Mutation-proved: reverting the reclaim arm turns the test red.
+- `cancel`'s already-terminal answer derives `"was"` from the query
+  fact that admitted the retired job instead of asserting `"completed"`:
+  a row recovered as `Deleted` (latest witness verdict `cancelled`)
+  answers `"deleted-cache"`, the same label its query projection uses.
+  Mutation-proved: fabricating the constant back turns the test red.
+
 ### Campaign mechanism (#429, #432, #433, #424)
 
 The spec-build campaign path surfaced by the first real ad-hoc campaign

@@ -64,6 +64,47 @@ impl Default for PageCache {
     }
 }
 
+/// A collection envelope split into its retained-snapshot parts, with the
+/// per-item size accounting already paid.
+///
+/// [`prepare_snapshot`] is deliberately a free function: splitting and sizing
+/// an envelope touches every item, which at estate scale is corpus-sized work,
+/// and the daemon runs it on the blocking pool next to the query construction
+/// that built the envelope (#431). Inserting the prepared snapshot into the
+/// cache ([`PageCache::page_prepared`]) is what needs the cache borrow, and
+/// that is O(evictions), not O(items).
+#[derive(Debug)]
+pub struct PreparedSnapshot {
+    template: Value,
+    items: Vec<Value>,
+    bytes: usize,
+}
+
+pub fn prepare_snapshot(mut envelope: Value) -> Result<PreparedSnapshot, PaginationError> {
+    let object = envelope
+        .as_object_mut()
+        .ok_or(PaginationError::InvalidEnvelope)?;
+    let items = match object.remove("items") {
+        Some(Value::Array(items)) => items,
+        _ => return Err(PaginationError::InvalidEnvelope),
+    };
+    object.insert("items".to_owned(), Value::Array(Vec::new()));
+    object.insert("nextCursor".to_owned(), Value::Null);
+    let bytes = approximate_size(&envelope)?.saturating_add(
+        items
+            .iter()
+            .map(approximate_size)
+            .try_fold(0_usize, |total, size| {
+                size.map(|size| total.saturating_add(size))
+            })?,
+    );
+    Ok(PreparedSnapshot {
+        template: envelope,
+        items,
+        bytes,
+    })
+}
+
 impl PageCache {
     pub fn page(
         &mut self,
@@ -73,6 +114,35 @@ impl PageCache {
         cursor: Option<&str>,
         envelope: Option<Value>,
     ) -> Result<Value, PaginationError> {
+        match cursor {
+            Some(cursor) => self.page_at(method, fingerprint, limit, Some(cursor), None),
+            None => {
+                let envelope = envelope.ok_or(PaginationError::InvalidEnvelope)?;
+                self.page_prepared(method, fingerprint, limit, prepare_snapshot(envelope)?)
+            }
+        }
+    }
+
+    /// Serve the first page of an envelope whose snapshot split was already
+    /// paid by [`prepare_snapshot`].
+    pub fn page_prepared(
+        &mut self,
+        method: &str,
+        fingerprint: &str,
+        limit: Option<usize>,
+        prepared: PreparedSnapshot,
+    ) -> Result<Value, PaginationError> {
+        self.page_at(method, fingerprint, limit, None, Some(prepared))
+    }
+
+    fn page_at(
+        &mut self,
+        method: &str,
+        fingerprint: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        prepared: Option<PreparedSnapshot>,
+    ) -> Result<Value, PaginationError> {
         let limit = limit.unwrap_or(DEFAULT_PAGE_ITEMS);
         if !(1..=MAX_PAGE_ITEMS).contains(&limit) {
             return Err(PaginationError::InvalidLimit);
@@ -80,26 +150,13 @@ impl PageCache {
         let (snapshot_id, offset) = if let Some(cursor) = cursor {
             parse_cursor(cursor)?
         } else {
-            let mut template = envelope.ok_or(PaginationError::InvalidEnvelope)?;
-            let object = template
-                .as_object_mut()
-                .ok_or(PaginationError::InvalidEnvelope)?;
-            let items = object
-                .remove("items")
-                .and_then(|items| items.as_array().cloned())
-                .ok_or(PaginationError::InvalidEnvelope)?;
-            object.insert("items".to_owned(), Value::Array(Vec::new()));
-            object.insert("nextCursor".to_owned(), Value::Null);
+            let PreparedSnapshot {
+                template,
+                items,
+                bytes,
+            } = prepared.ok_or(PaginationError::InvalidEnvelope)?;
             let id = self.next_id;
             self.next_id = self.next_id.checked_add(1).unwrap_or(1);
-            let bytes = approximate_size(&template)?.saturating_add(
-                items
-                    .iter()
-                    .map(approximate_size)
-                    .try_fold(0_usize, |total, size| {
-                        size.map(|size| total.saturating_add(size))
-                    })?,
-            );
             while !self.snapshots.is_empty()
                 && (self.snapshots.len() == MAX_SNAPSHOTS
                     || self.used_bytes.saturating_add(bytes) > self.budget_bytes)
