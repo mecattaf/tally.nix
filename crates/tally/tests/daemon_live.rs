@@ -473,6 +473,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                 "live-json".to_owned(),
                 AdapterConfig {
                     argv: vec![harness.to_string_lossy().into_owned()],
+                    resume_requires_launch_cwd: false,
                     resume: Some(vec![
                         "/run/current-system/sw/bin/echo".to_owned(),
                         "%<sessionRef>%".to_owned(),

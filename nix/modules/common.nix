@@ -313,6 +313,20 @@ let
           ];
           description = "Optional direct argv template for recovery resume.";
         };
+        resumeRequiresLaunchCwd = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = ''
+            Declare that this adapter's harness resolves a session by the
+            directory the session was launched in, so a resume run anywhere
+            else reaches no session. tally then refuses a continuation whose
+            working directory differs from the recorded launch directory,
+            naming both. Leave false to declare nothing: tally enforces
+            nothing, which is not a claim that cross-directory resume is safe
+            for that harness.
+          '';
+        };
         scrape = mkOption {
           type = types.attrsOf mkScrapeCaptureType;
           default = { };
@@ -408,6 +422,10 @@ let
         {
           assertion = config.argv == [ ] || builtins.head config.argv != "";
           message = "tally adapter ${name} argv must start with a non-empty executable";
+        }
+        {
+          assertion = !config.resumeRequiresLaunchCwd || config.resume != null;
+          message = "tally adapter ${name} resumeRequiresLaunchCwd requires a resume template to constrain";
         }
         {
           assertion = config.resume == null || config.resume != [ ];

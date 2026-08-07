@@ -4,8 +4,22 @@ use super::text::sanitize_line;
 use super::*;
 
 const SMOKE_RUNTIME_MAX_SEC: u64 = 5 * 60;
+/// How long the smoke keeps asking for a capture the daemon has answered about
+/// but not yet projected. This is the *projection* window, not an RPC deadline:
+/// it bounds "the daemon replied and the capture is not there yet", which ends
+/// in a missing-capture FAIL. The deadline for the reply itself is
+/// `--rpc-timeout-sec` (see [`run_adapter_smoke`]), and a reply that never
+/// arrives is a different outcome with a different exit code.
 const CAPTURE_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPTURE_PROJECTION_POLL: Duration = Duration::from_millis(100);
+/// The smoke could not read its verdict. Distinct from 1 ("the adapter, or
+/// something the smoke asserts about it, failed") because the two demand
+/// opposite next actions, and conflating them cost real diagnosis time on
+/// 2026-08-07: two smokes whose daemon-side verdicts were exit 0 and
+/// witness-emitted PASS were reported as failures because a `query.job` read
+/// timed out during a daemon stall (#431). A timed-out read is never rendered
+/// as adapter failure.
+const VERDICT_UNAVAILABLE_EXIT: i32 = 5;
 const DEFAULT_SMOKE_PROMPT: &str = "Reply with the single word ok.";
 pub(super) const COMMIT_PROBE_FILE: &str = "tally-commit-probe.txt";
 pub(super) const COMMIT_PROBE_MESSAGE: &str = "tally commit probe";
@@ -17,6 +31,50 @@ const COMMIT_PROBE_PROMPT: &str = concat!(
     "message \"tally commit probe\". Change nothing else and leave the worktree ",
     "clean. Reply with the single word done.",
 );
+
+/// What the smoke is able to say about the run it just asked for.
+///
+/// Three-valued on purpose. `Pass` and `Fail` are claims about the adapter;
+/// `Unavailable` is a claim about the smoke's own reach, and it is never a
+/// claim about the adapter. The rendered label is what the operator reads and
+/// what a wrapper greps for, so it is pinned here rather than spelled at each
+/// print site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmokeVerdict {
+    Pass,
+    Fail,
+    /// The result read did not return within its deadline. The adapter may
+    /// have passed, failed, or still be running; this states only that the
+    /// daemon did not answer.
+    Unavailable,
+}
+
+impl SmokeVerdict {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Unavailable => "VERDICT-UNAVAILABLE",
+        }
+    }
+}
+
+/// Whether this failure is "the daemon did not answer in time" as opposed to
+/// "the daemon answered, and the answer was an error".
+///
+/// Both deadline variants count: a per-call deadline and the reconnect window
+/// used while re-arming a wait describe the same fact from the client's side —
+/// no reply arrived — and a stalled daemon can produce either.
+fn is_rpc_timeout(error: &WireIoError) -> bool {
+    matches!(
+        error,
+        WireIoError::DeadlineExceeded { .. } | WireIoError::RearmDeadlineExceeded { .. }
+    )
+}
+
+fn verdict_unavailable(detail: String) -> anyhow::Error {
+    exit_failure(VERDICT_UNAVAILABLE_EXIT, detail)
+}
 
 pub(super) async fn run_adapter(
     socket: &Path,
@@ -207,10 +265,38 @@ async fn run_adapter_smoke(
                 retained(invalid(
                     "queue.enqueue returned no task_uuid for adapter smoke",
                 ))
-            })?;
-        await_job_with_rearm(client, socket, task_uuid, rpc_timeout)
-            .await
-            .map_err(|error| retained(error.into()))?
+            })?
+            .to_owned();
+        match await_job_with_rearm(client, socket, &task_uuid, rpc_timeout).await {
+            Ok(terminal) => terminal,
+            Err(error) if is_rpc_timeout(&error) => {
+                // The job was admitted and the wait did not return. Nothing
+                // here is a statement about the adapter, so the receipt names
+                // the task and says so, and the probe repository is retained
+                // rather than judged.
+                print_smoke_result(
+                    &args.name,
+                    &label,
+                    &pool,
+                    &cwd,
+                    &json!({"task_uuid": task_uuid}),
+                    &required_captures,
+                    &BTreeMap::new(),
+                    "not-read",
+                    probe.as_ref().map(CommitProbe::not_checked),
+                    SmokeVerdict::Unavailable,
+                    rpc_timeout,
+                )
+                .map_err(&retained)?;
+                return Err(retained(verdict_unavailable(format!(
+                    "adapter smoke {:?} could not read its verdict: {} did not return within {} s; the daemon may be stalled (see #431). Task {task_uuid} was admitted and its verdict, if any, is on the daemon side",
+                    args.name,
+                    "queue.await_job",
+                    rpc_timeout.as_secs(),
+                ))));
+            }
+            Err(error) => return Err(retained(error.into())),
+        }
     };
 
     let exit_code = waited_exit_code(&terminal);
@@ -225,6 +311,8 @@ async fn run_adapter_smoke(
             &BTreeMap::new(),
             "not-checked",
             probe.as_ref().map(CommitProbe::not_checked),
+            SmokeVerdict::Fail,
+            rpc_timeout,
         )
         .map_err(&retained)?;
         print_captured_stderr(&args.name, &terminal).map_err(&retained)?;
@@ -241,22 +329,46 @@ async fn run_adapter_smoke(
         )));
     }
 
-    let (captures, missing) =
-        await_declared_captures(socket, config_path, &terminal, &required_captures)
-            .await
-            .map_err(&retained)?;
-    let capture_status = if required_captures.is_empty() {
-        "not-declared"
-    } else if missing.is_empty() {
-        "verified"
-    } else {
-        "missing"
+    let read = await_declared_captures(
+        socket,
+        config_path,
+        &terminal,
+        &required_captures,
+        rpc_timeout,
+    )
+    .await
+    .map_err(&retained)?;
+    let (captures, missing) = match &read {
+        CaptureRead::Read { captures, missing } => (captures.clone(), missing.clone()),
+        CaptureRead::Unavailable => (BTreeMap::new(), Vec::new()),
     };
+    let capture_status = match &read {
+        CaptureRead::Unavailable => "unavailable",
+        CaptureRead::Read { .. } if required_captures.is_empty() => "not-declared",
+        CaptureRead::Read { missing, .. } if missing.is_empty() => "verified",
+        CaptureRead::Read { .. } => "missing",
+    };
+    // Evaluated in every outcome because it is a filesystem fact and needs no
+    // daemon, but it is only *judged* below when a verdict exists: a probe
+    // status cannot complete a verdict whose other half never arrived.
     let outcome = probe
         .as_ref()
         .map(CommitProbe::evaluate)
         .transpose()
         .map_err(&retained)?;
+    let verdict = match &read {
+        CaptureRead::Unavailable => SmokeVerdict::Unavailable,
+        CaptureRead::Read { missing, .. } => {
+            let probe_verified = outcome.as_ref().is_none_or(|outcome| {
+                outcome.get("status").and_then(Value::as_str) == Some("verified")
+            });
+            if missing.is_empty() && probe_verified {
+                SmokeVerdict::Pass
+            } else {
+                SmokeVerdict::Fail
+            }
+        }
+    };
     print_smoke_result(
         &args.name,
         &label,
@@ -267,8 +379,25 @@ async fn run_adapter_smoke(
         &captures,
         capture_status,
         outcome.clone(),
+        verdict,
+        rpc_timeout,
     )
     .map_err(&retained)?;
+    if verdict == SmokeVerdict::Unavailable {
+        // The execution verdict was read and the capture projection was not,
+        // so the smoke's own verdict is incomplete. A probe repository, if
+        // any, is retained rather than discarded: nothing here established
+        // that it may go.
+        return Err(retained(verdict_unavailable(format!(
+            "adapter smoke {:?} could not read its verdict: query.job did not return within {} s; the daemon may be stalled (see #431). The adapter's execution verdict was {}",
+            args.name,
+            rpc_timeout.as_secs(),
+            terminal
+                .get("verdict")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        ))));
+    }
     let mut discarded = false;
     if let (Some(probe), Some(outcome)) = (&probe, &outcome) {
         let status = outcome["status"].as_str().unwrap_or("unknown");
@@ -529,14 +658,41 @@ fn configured_names<'a>(names: impl Iterator<Item = &'a String>) -> String {
     }
 }
 
+/// The outcome of the smoke's result read, kept apart from its contents.
+///
+/// A read that returned and found nothing is a different fact from a read that
+/// never returned, and collapsing the two is the defect this type exists to
+/// make unrepresentable.
+enum CaptureRead {
+    Read {
+        captures: BTreeMap<String, Value>,
+        missing: Vec<String>,
+    },
+    /// `query.job` exceeded its deadline. Says nothing about the captures.
+    Unavailable,
+}
+
+/// Poll the daemon until every declared capture is projected, the projection
+/// window closes, or the read itself stops returning.
+///
+/// `rpc_timeout` is the operator's `--rpc-timeout-sec` / `TALLY_RPC_TIMEOUT_SEC`
+/// and it is the deadline for each `query.job` reply. It used to be
+/// [`CAPTURE_PROJECTION_TIMEOUT`], a private 10 s constant no flag could
+/// reach, so the one knob an operator had did not govern the one read that
+/// timed out under a stall. The projection window stays its own bound: it
+/// answers "not projected yet", the deadline answers "not answered at all".
 async fn await_declared_captures(
     socket: &Path,
     config_path: Option<&Path>,
     terminal: &Value,
     required: &[String],
-) -> Result<(BTreeMap<String, Value>, Vec<String>)> {
+    rpc_timeout: Duration,
+) -> Result<CaptureRead> {
     if required.is_empty() {
-        return Ok((BTreeMap::new(), Vec::new()));
+        return Ok(CaptureRead::Read {
+            captures: BTreeMap::new(),
+            missing: Vec::new(),
+        });
     }
     let task_uuid = terminal
         .get("task_uuid")
@@ -547,13 +703,14 @@ async fn await_declared_captures(
     let deadline = tokio::time::Instant::now() + CAPTURE_PROJECTION_TIMEOUT;
     let client = connect_rpc(socket, config_path).await?;
     loop {
-        let result = client
-            .call_with_deadline(
-                "query.job",
-                Some(json!({"id": task_uuid})),
-                CAPTURE_PROJECTION_TIMEOUT,
-            )
-            .await?;
+        let result = match client
+            .call_with_deadline("query.job", Some(json!({"id": task_uuid})), rpc_timeout)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if is_rpc_timeout(&error) => return Ok(CaptureRead::Unavailable),
+            Err(error) => return Err(error.into()),
+        };
         let job = result
             .get("job")
             .and_then(Value::as_object)
@@ -572,7 +729,7 @@ async fn await_declared_captures(
             .cloned()
             .collect::<Vec<_>>();
         if missing.is_empty() || tokio::time::Instant::now() >= deadline {
-            return Ok((captures, missing));
+            return Ok(CaptureRead::Read { captures, missing });
         }
         tokio::time::sleep(CAPTURE_PROJECTION_POLL).await;
     }
@@ -589,6 +746,8 @@ fn print_smoke_result(
     captures: &BTreeMap<String, Value>,
     capture_status: &str,
     commit_probe: Option<Value>,
+    verdict_state: SmokeVerdict,
+    rpc_timeout: Duration,
 ) -> Result<()> {
     let field = |snake: &str, camel: &str| {
         terminal
@@ -616,6 +775,14 @@ fn print_smoke_result(
             "captures": captures,
             "captureStatus": capture_status,
             "commitProbe": commit_probe,
+            // The smoke's own three-valued verdict, beside the daemon's
+            // `verdict` for the job. They answer different questions: the
+            // daemon's is what the run did, this one is what the smoke can
+            // state about it, and only this one can be VERDICT-UNAVAILABLE.
+            "verdictState": verdict_state.label(),
+            // The deadline this run actually used, so the receipt states the
+            // knob rather than leaving an operator to infer it.
+            "rpcTimeoutSec": rpc_timeout.as_secs(),
         }))?
     );
     Ok(())

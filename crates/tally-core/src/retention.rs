@@ -1451,6 +1451,7 @@ mod tests {
             brief_hash: Some(brief_hash.to_owned()),
             orchestration: None,
             session_ref: None,
+            session_cwd: None,
             final_message: None,
             job_token_hash: None,
             lease_epoch: 1,

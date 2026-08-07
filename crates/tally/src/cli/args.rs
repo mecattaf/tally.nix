@@ -1076,6 +1076,22 @@ pub(super) enum QueryCommand {
         /// Show only task rows in this state. Counts stay whole-run.
         #[arg(long, value_name = "STATE")]
         status: Option<RunTaskFilter>,
+        /// Read the run from the durable stores on disk instead of asking the
+        /// daemon. The same view is produced automatically when a live read
+        /// exceeds its RPC deadline; this asks for it without trying the
+        /// daemon at all. It is labelled, may be stale, and shows no in-flight
+        /// execution state.
+        #[arg(long)]
+        durable: bool,
+        /// State directory the durable view reads enqueue events from; defaults
+        /// to the XDG state directory. Point it at the daemon's configured
+        /// stateDir.
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
+        /// Data directory the durable view reads the witness ledger, lifecycle
+        /// history, and membership from; defaults to the XDG data directory.
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
     },
     Status {
         #[arg(long)]

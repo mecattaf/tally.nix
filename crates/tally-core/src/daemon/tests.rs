@@ -441,6 +441,7 @@ mod tests {
                 program.to_string_lossy().into_owned(),
                 "--structured".to_owned(),
             ],
+            resume_requires_launch_cwd: false,
             resume: Some(vec![
                 program.to_string_lossy().into_owned(),
                 "--resume".to_owned(),
@@ -675,6 +676,28 @@ mod tests {
             .await;
     }
 
+    /// Wait for the storage timer's next sample, returning its stamp.
+    ///
+    /// The deadline is a liveness backstop, not a measurement bound: it
+    /// separates "the tick was suppressed" from "the tick was late", and only
+    /// the first is a defect. A suppressed tick never samples at all, so a
+    /// ceiling two orders of magnitude above the interval still fails loudly on
+    /// it while no amount of host load reaches it.
+    async fn await_next_storage_sample(handler: &DaemonHandler, previous: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let sampled_at = handler.cached_storage().sampled_at;
+            if sampled_at != previous {
+                return sampled_at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the configured storage tick never sampled again after {previous}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn storage_timer_samples_once_per_configured_interval() {
         let local = LocalSet::new();
@@ -696,11 +719,23 @@ mod tests {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
 
-                tokio::time::sleep(Duration::from_millis(1_150)).await;
-                let first = handler.cached_storage().sampled_at;
-                assert_ne!(first, initial, "first configured tick did not sample");
-                tokio::time::sleep(Duration::from_millis(1_150)).await;
-                let second = handler.cached_storage().sampled_at;
+                // The claim is "one sample per configured interval", and its two
+                // halves have opposite relationships with load (#419). The
+                // lower bound -- no sample before the interval elapses -- is
+                // load-safe, because load can only delay a timer, never advance
+                // it. The upper bound is not: this used to sleep 1,150 ms and
+                // assert the sample had landed, which gives a tick plus a
+                // blocking filesystem walk 150 ms of slack on a host that may
+                // be running a hundred other test threads. So the lower bound
+                // is asserted and the upper bound is waited for.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert_eq!(
+                    handler.cached_storage().sampled_at,
+                    initial,
+                    "a sample landed before the configured interval elapsed"
+                );
+                let first = await_next_storage_sample(&handler, &initial).await;
+                let second = await_next_storage_sample(&handler, &first).await;
                 assert_ne!(
                     second, first,
                     "second configured tick was incorrectly suppressed"
@@ -2150,6 +2185,7 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            session_cwd: None,
             final_message: None,
             job_token_hash: None,
             lease_epoch,
@@ -3258,6 +3294,7 @@ mod tests {
                     "resumable".to_owned(),
                     AdapterConfig {
                         argv: vec![program.to_string_lossy().into_owned()],
+                        resume_requires_launch_cwd: false,
                         resume: Some(vec![
                             program.to_string_lossy().into_owned(),
                             "--resume".to_owned(),
@@ -5754,6 +5791,382 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(terminal["verdict"], "pass");
+            })
+            .await;
+    }
+
+    /// #425. A harness that resolves a session by the directory it was
+    /// launched in cannot reach that session from anywhere else, and pi's
+    /// version of "cannot reach" is exit 0 with an interactive prompt on
+    /// stderr — a successful attempt that did no work, which is the worst
+    /// shape a headless pipeline can be handed. `queue.continue` is the one
+    /// seam where the directory can move, so it is the one that refuses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_continuation_off_the_launch_directory_is_refused_naming_both_directories() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let launched_in = temp.path().join("session-home");
+                let elsewhere = temp.path().join("another-checkout");
+                std::fs::create_dir(&launched_in).unwrap();
+                std::fs::create_dir(&elsewhere).unwrap();
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-31\"}'\n",
+                );
+                let mut config = one_pool_config();
+                config.adapters.insert(
+                    "cwd-keyed".to_owned(),
+                    AdapterConfig {
+                        argv: vec![
+                            program.to_string_lossy().into_owned(),
+                            "fresh".to_owned(),
+                            "--".to_owned(),
+                        ],
+                        resume_requires_launch_cwd: true,
+                        resume: Some(vec![
+                            program.to_string_lossy().into_owned(),
+                            "resume".to_owned(),
+                            "%<sessionRef>%".to_owned(),
+                            "--".to_owned(),
+                        ]),
+                        scrape: BTreeMap::from([(
+                            "sessionRef".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..thread_id".to_owned(),
+                                fields: Default::default(),
+                            },
+                        )]),
+                        ..AdapterConfig::default()
+                    },
+                );
+                config.validate().unwrap();
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(config, paths, settings(), executor)
+                    .await
+                    .unwrap();
+                let first = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial request"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+                let first_id = first["job_id"].as_str().unwrap().to_owned();
+
+                let refused = daemon
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                        "cwd": elsewhere.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap_err();
+                let message = format!("{refused:?}");
+                assert!(
+                    message.contains(launched_in.to_str().unwrap())
+                        && message.contains(elsewhere.to_str().unwrap()),
+                    "the refusal must name the recorded and the requested directory: {message}"
+                );
+
+                // Fail-closed means nothing was admitted: no second row, no
+                // unit, nothing for an operator to mistake for progress.
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.rows.len(), 1);
+                }
+
+                // The control. The same continuation in the directory the
+                // session was launched in is admitted and renders the resume
+                // argv, so the refusal above is about the directory and not
+                // about continuation being broken.
+                let continued = daemon
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let continued_id = Uuid::parse_str(continued["job_id"].as_str().unwrap()).unwrap();
+                let continued_job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&continued_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    continued_job.invocation.argv,
+                    [
+                        program.to_string_lossy().into_owned(),
+                        "resume".to_owned(),
+                        "session-31".to_owned(),
+                        "--".to_owned(),
+                        "address review".to_owned(),
+                    ]
+                );
+                // The record travels with the pointer: the continuation row
+                // carries both, so continuing the continuation is guarded too.
+                assert_eq!(
+                    continued_job.row.session_cwd,
+                    Some(RecordedLaunchCwd::In(launched_in.clone()))
+                );
+            })
+            .await;
+    }
+
+    /// The adapter both #425 tests below share: cwd-keyed, resumable, and it
+    /// prints one session pointer.
+    fn cwd_keyed_config(program: &Path) -> Config {
+        let mut config = one_pool_config();
+        config.adapters.insert(
+            "cwd-keyed".to_owned(),
+            AdapterConfig {
+                argv: vec![
+                    program.to_string_lossy().into_owned(),
+                    "fresh".to_owned(),
+                    "--".to_owned(),
+                ],
+                resume_requires_launch_cwd: true,
+                resume: Some(vec![
+                    program.to_string_lossy().into_owned(),
+                    "resume".to_owned(),
+                    "%<sessionRef>%".to_owned(),
+                    "--".to_owned(),
+                ]),
+                scrape: BTreeMap::from([(
+                    "sessionRef".to_owned(),
+                    ScrapeCapture {
+                        stream: ScrapeStream::Stdout,
+                        mode: ScrapeMode::JsonPath,
+                        pattern: "$..thread_id".to_owned(),
+                        fields: Default::default(),
+                    },
+                )]),
+                ..AdapterConfig::default()
+            },
+        );
+        config.validate().unwrap();
+        config
+    }
+
+    /// #425 (F2). "This row declared no working directory" and "nothing
+    /// recorded where this session was launched" are different facts, and only
+    /// the second is a reason to refuse.
+    ///
+    /// A row that declares no cwd runs wherever the service manager put the
+    /// daemon; a continuation that also declares none runs in that same
+    /// directory, so the session is reachable and the continuation must be
+    /// admitted. `tally enqueue --adapter pi -- ...` with no `--cwd` produces
+    /// exactly this row -- `cli/enqueue.rs` defaults the cwd to nothing -- so
+    /// collapsing the two facts would permanently block continuations for the
+    /// one preset the invariant was written for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_continuation_declaring_no_directory_reaches_a_session_launched_with_none() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-42\"}'\n",
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    cwd_keyed_config(&program),
+                    paths,
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                // No `cwd` on either call. Both attempts inherit the daemon's.
+                let first = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial request"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+                let first_id = first["job_id"].as_str().unwrap().to_owned();
+
+                let continued = daemon
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                    })))
+                    .await
+                    .unwrap();
+                let continued_id = Uuid::parse_str(continued["job_id"].as_str().unwrap()).unwrap();
+                let continued_job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&continued_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    continued_job.invocation.argv,
+                    [
+                        program.to_string_lossy().into_owned(),
+                        "resume".to_owned(),
+                        "session-42".to_owned(),
+                        "--".to_owned(),
+                        "address review".to_owned(),
+                    ]
+                );
+                // The record says "declared none", which is a record, not the
+                // absence of one.
+                assert_eq!(
+                    continued_job.row.session_cwd,
+                    Some(RecordedLaunchCwd::ServiceManagerDefault)
+                );
+            })
+            .await;
+    }
+
+    /// #425. The record has to survive a daemon restart, because the pointer
+    /// does: startup re-derives `session_ref` from the retained adapter
+    /// attestation, and a record that is not re-derived beside it leaves a
+    /// recovered row refusing its own continuation with `UnrecordedLaunchCwd`.
+    ///
+    /// This binds the `apply_adapter_metadata` seam in `daemon/startup.rs`
+    /// directly -- the row in `context.rows` after recovery is asserted, not
+    /// only the end-to-end continuation, because the continuation path also
+    /// re-derives at `FoundJob::observed_row` and would pass without it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restarted_daemon_re_derives_the_launch_record_beside_the_pointer() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let launched_in = temp.path().join("session-home");
+                std::fs::create_dir(&launched_in).unwrap();
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-55\"}'\n",
+                );
+                let config = cwd_keyed_config(&program);
+                let state_dir = paths.state_dir.clone();
+                let absent_systemd_run = temp.path().join("absent-systemd-run");
+                let executor = || {
+                    direct_executor(&state_dir)
+                        .with_systemd_run(absent_systemd_run.clone())
+                        .with_unit_probe(ExitFileProbe)
+                };
+                let mut daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths.clone(),
+                    settings(),
+                    executor(),
+                )
+                .await
+                .unwrap();
+                let first = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial request"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+                let first_id = first["job_id"].as_str().unwrap().to_owned();
+                let first_uuid = Uuid::parse_str(&first_id).unwrap();
+                drop(daemon);
+
+                // The restart.
+                let restarted =
+                    Daemon::open_with_executor(config, paths, settings(), executor())
+                        .await
+                        .unwrap();
+                {
+                    let context = restarted.handler.context.read().await;
+                    let recovered = &context.rows[&first_uuid];
+                    assert_eq!(
+                        recovered.session_ref.as_deref(),
+                        Some("session-55"),
+                        "startup re-derives the pointer from the retained attestation"
+                    );
+                    assert_eq!(
+                        recovered.session_cwd,
+                        Some(RecordedLaunchCwd::In(launched_in.clone())),
+                        "and must re-derive the launch record beside it"
+                    );
+                }
+
+                // End to end: the recovered row continues in its launch
+                // directory, and is refused anywhere else.
+                let continued = restarted
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                assert!(continued["job_id"].is_string());
             })
             .await;
     }
@@ -9492,17 +9905,25 @@ mod tests {
             .await;
     }
 
-    /// Read every datagram already queued on `socket`, with the instant each
-    /// one was observed. The socket must carry a short read timeout.
-    fn drain_notifications(socket: &UnixDatagram) -> Vec<(String, Instant)> {
+    /// Read every datagram already queued on `socket`. The socket must carry a
+    /// short read timeout.
+    ///
+    /// Deliberately untimed (#419). This used to stamp `Instant::now()` on each
+    /// datagram as it was read, and the keepalive assertion then measured the
+    /// gaps between those stamps — which are observation instants, not send
+    /// instants. Datagrams queue in the socket buffer, so a collector thread
+    /// descheduled for longer than one watchdog period reads a burst of pings
+    /// with one large gap in front of it and reddens a daemon that pinged
+    /// perfectly. Measured: injecting a single 500 ms sleep into the collector
+    /// loop fails both keepalive tests with `a 551ms silence would have missed
+    /// a 400ms service watchdog` while the payload list still holds all 19
+    /// keepalives the daemon sent.
+    fn drain_notifications(socket: &UnixDatagram) -> Vec<String> {
         let mut seen = Vec::new();
         loop {
             let mut buffer = [0_u8; 256];
             match socket.recv(&mut buffer) {
-                Ok(read) => seen.push((
-                    String::from_utf8_lossy(&buffer[..read]).into_owned(),
-                    Instant::now(),
-                )),
+                Ok(read) => seen.push(String::from_utf8_lossy(&buffer[..read]).into_owned()),
                 Err(_) => return seen,
             }
         }
@@ -9518,7 +9939,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_keepalive_pings_while_a_dispatch_arm_awaits() {
         let observed = dispatch_stall_notifications(StallShape::Awaiting).await;
-        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST);
+        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST, WATCHDOG_UNDER_TEST * 5);
     }
 
     /// The stall that matters most is not an `await` at all. `WitnessLedger::
@@ -9529,7 +9950,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_keepalive_pings_while_a_dispatch_arm_blocks_the_runtime_thread() {
         let observed = dispatch_stall_notifications(StallShape::BlockingTheThread).await;
-        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST);
+        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST, WATCHDOG_UNDER_TEST * 5);
     }
 
     const WATCHDOG_UNDER_TEST: Duration = Duration::from_millis(400);
@@ -9542,7 +9963,7 @@ mod tests {
 
     /// Run a daemon whose first dispatch-loop arm body is held for five
     /// watchdog periods, and return every notify datagram it sent, timed.
-    async fn dispatch_stall_notifications(shape: StallShape) -> Vec<(String, Instant)> {
+    async fn dispatch_stall_notifications(shape: StallShape) -> Vec<String> {
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -9584,11 +10005,19 @@ mod tests {
                 // blocking read on the runtime thread would be indistinguishable
                 // from the stall under test.
                 let collector = std::thread::spawn(move || {
-                    let deadline = Instant::now() + stall + watchdog * 8;
+                    // The deadline is a liveness backstop, not a measurement
+                    // bound (#419). It used to be `stall + watchdog * 8`, which
+                    // on a loaded host can expire before the daemon's own
+                    // `STOPPING=1` arrives -- and then the assertion that
+                    // STOPPING is last fails for no reason but this thread's
+                    // scheduling. The loop still ends the instant STOPPING is
+                    // seen, so a generous ceiling costs nothing and only bounds
+                    // a daemon that never stops at all.
+                    let deadline = Instant::now() + Duration::from_secs(120);
                     let mut seen = Vec::new();
                     while Instant::now() < deadline {
                         seen.extend(drain_notifications(&notify_socket));
-                        if seen.iter().any(|(payload, _)| payload == "STOPPING=1") {
+                        if seen.iter().any(|payload| payload == "STOPPING=1") {
                             break;
                         }
                     }
@@ -9623,13 +10052,28 @@ mod tests {
             .await
     }
 
-    /// systemd's rule is the only one that matters: no silence longer than one
-    /// service period, from `READY=1` to `STOPPING=1`.
-    fn assert_keepalive_held(observed: &[(String, Instant)], watchdog: Duration) {
-        let payloads = observed
-            .iter()
-            .map(|(payload, _)| payload.as_str())
-            .collect::<Vec<_>>();
+    /// systemd's rule is the only one that matters: the daemon must keep
+    /// pinging right through a stalled dispatch loop, from `READY=1` to
+    /// `STOPPING=1`.
+    ///
+    /// Counted, not timed (#419), for the reason [`drain_notifications`]
+    /// records: the only clock available to an observer is its own, and its own
+    /// is the one that load perturbs. The count is not perturbed — every
+    /// datagram the daemon sent is still queued and still read — so this
+    /// asserts what the daemon did rather than when this thread noticed.
+    ///
+    /// `stall` is how long the dispatch arm was held. The keepalive owes one
+    /// ping per [`keepalive_cadence`], a quarter period, so a stall of N
+    /// service periods is covered by roughly 4N pings; requiring N is a floor
+    /// with a factor of four of headroom over correct behaviour and two orders
+    /// of magnitude over the defect, which emitted none at all because the
+    /// keepalive was a `select!` arm the stalled loop never came back to poll.
+    /// What it no longer catches is a keepalive that pings in a burst and then
+    /// falls silent inside the stall; production cadence is a fixed timer, so
+    /// that shape is not a regression this suite can produce, and a false red
+    /// on every loaded host is a certainty.
+    fn assert_keepalive_held(observed: &[String], watchdog: Duration, stall: Duration) {
+        let payloads = observed.iter().map(String::as_str).collect::<Vec<_>>();
         assert_eq!(
             payloads.first().copied(),
             Some("READY=1\nSTATUS=tally daemon ready"),
@@ -9640,13 +10084,15 @@ mod tests {
             Some("STOPPING=1"),
             "no keepalive may follow the daemon's own STOPPING: {payloads:?}"
         );
-        let mut worst = Duration::ZERO;
-        for pair in observed.windows(2) {
-            worst = worst.max(pair[1].1 - pair[0].1);
-        }
+        let pings = payloads
+            .iter()
+            .filter(|payload| payload.starts_with("WATCHDOG=1"))
+            .count();
+        let owed = (stall.as_millis() / watchdog.as_millis()) as usize;
         assert!(
-            worst < watchdog,
-            "a {worst:?} silence would have missed a {watchdog:?} service watchdog: {payloads:?}"
+            pings >= owed,
+            "{pings} keepalive(s) across a {stall:?} stall cannot cover a {watchdog:?} service \
+             watchdog; at least {owed} were owed: {payloads:?}"
         );
     }
 
@@ -9674,7 +10120,7 @@ mod tests {
         assert!(
             drain_notifications(&socket)
                 .iter()
-                .filter(|(payload, _)| payload == "WATCHDOG=1")
+                .filter(|payload| payload.as_str() == "WATCHDOG=1")
                 .count()
                 >= 3,
             "a slow dispatch arm gets headroom, not a dead service"
@@ -9684,7 +10130,7 @@ mod tests {
         std::thread::sleep(watchdog * 4);
         assert_eq!(
             drain_notifications(&socket),
-            Vec::new(),
+            Vec::<String>::new(),
             "a dispatch loop that never comes back must still reach the service watchdog"
         );
 

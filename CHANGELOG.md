@@ -6,6 +6,118 @@ authorized.
 
 ## [Unreleased]
 
+### Adapters and observability (#425, #434, #419)
+
+Three surfaces the operator reads to decide what is broken: a resume that
+must land in the directory its session lives in, a preflight tool that must
+not report failure for work that passed, and a test suite whose reds must
+mean something.
+
+#### #425 — the cross-cwd resume invariant is enforced rather than documented
+
+A harness that resolves a session by the directory it was launched in cannot
+reach that session from anywhere else. For `pi` the failure is soft: exit 0,
+`Session found in different project` on stdout, an interactive prompt on
+stderr, no work done — which in a headless pipeline reads as a successful
+attempt. No adapter argv can assert the invariant (pi exposes no cwd flag and
+a `--session-dir` pin does not bypass the filter), so enforcement is now
+Rust-side.
+
+- New adapter declaration `resumeRequiresLaunchCwd` (Nix option and
+  `AdapterConfig` field, default `false`). The `pi` preset declares it on
+  reproduced evidence; `codex` and `claude-code` do not, because codex
+  re-presents the directory in its own resume argv and claude-code has not
+  been measured here. A `false` says "unmeasured", never "safe".
+- `RowSeed` gained `session_cwd: Option<RecordedLaunchCwd>`, recorded beside
+  `session_ref` at every seam that writes the pointer from a scrape (one in
+  `daemon/completion.rs`, four in `daemon/startup.rs`, one at the retired-row
+  seam a continuation reads the pointer back through). It is `#[serde(skip)]` —
+  transport only, no durable-format change, no row-version move — because it is
+  exactly as durable as the pointer it qualifies: startup re-derives both from
+  the retained captures and the durable row.
+- **A row that declared no working directory records that fact rather than
+  recording nothing.** `RecordedLaunchCwd::ServiceManagerDefault` and an absent
+  record are different states: the first says both attempts run wherever the
+  service manager put the daemon, which is one directory, so the continuation
+  is admitted; only the second is refused. Collapsing them into a single `None`
+  would have permanently blocked continuations for every `pi` job enqueued
+  without `--cwd`.
+- `queue.continue` now refuses a continuation whose working directory is not
+  the recorded launch directory, naming **both** directories, and refuses
+  fail-closed when nothing recorded where the session was launched. Each
+  refusal names the fact it actually found. Directory equality resolves before
+  it compares, matching pi's own
+  `sessionCwdMatches(session.cwd, resolvedCwd)`.
+- `queue.retry` and recovery are deliberately not guarded: both re-render one
+  row's own resume against that row's own cwd and cannot move it.
+
+#### #434 — RPC reads stay honest during a daemon stall
+
+`adapter smoke` reported **failure** for two smokes whose daemon-side verdicts
+were exit 0 and witness-emitted PASS, because their `query.job` read timed out
+during a stall (#431). A false negative from the estate's preflight tool costs
+diagnosis time and poisons the operator's model of what is broken.
+
+- `adapter smoke`'s verdict is now three-valued on a `verdictState` field:
+  `PASS` (exit 0), `FAIL` (exit 1), `VERDICT-UNAVAILABLE` (exit **5**). A
+  timed-out result read is never rendered as adapter failure, the diagnostic
+  object is still printed in that state, and a retained commit probe is kept
+  rather than judged.
+- The smoke's result read is now bounded by `--rpc-timeout-sec` /
+  `TALLY_RPC_TIMEOUT_SEC` (default 60) instead of a private 10-second constant
+  no flag could reach; the value used is echoed on `rpcTimeoutSec`. The
+  10-second capture-*projection* window remains its own separate bound, because
+  "not projected yet" and "not answered at all" are different failures.
+- `tally query run` gained a durable-state view: automatic on RPC timeout, and
+  available outright as `--durable` (with `--state-dir`/`--data-dir`). It
+  reconstructs the run from durable enqueue events, the verified witness
+  ledger, the lifecycle history, durable membership, the advisory attestation
+  ledger, and the retained capture tree — reconciled task table, terminal
+  verdicts, usage rollup, and failure capture pointers, with no live RPC. It is
+  labelled in both renderings (`view: "durable-state"`, `live: false`, plus
+  caveats; the live path now states `view: "live"`), shows no in-flight state,
+  and is strictly read-only: it never creates, locks, or repairs a durable
+  store. That last claim is asserted over the whole state and data tree before
+  and after a read, so it covers stores this view later learns to read; it also
+  renders where the operator can read the daemon's data and not write it, which
+  is the deployment the automatic fallback exists for.
+
+#### #419 — a fifth flake-population member, and a way to keep counting
+
+The population is **not** declared closed. Four members were already fixed on
+main (b4fa724); a wave measured on this branch surfaced a fifth, with an
+unrelated mechanism, which is the pattern that keeps this issue open.
+
+- `daemon::tests::watchdog_keepalive_pings_while_a_dispatch_arm_{awaits,blocks_the_runtime_thread}`
+  asserted the gaps between *observation* instants of the daemon's notify
+  datagrams. Datagrams queue in the socket buffer, so a collector thread
+  descheduled past one watchdog period reads a burst with one large gap in
+  front of it and reddens a daemon that pinged perfectly. The assertion is now
+  **counted, not timed**: the daemon must emit at least one keepalive per
+  service period of the stall it was held through. The collector's wall-clock
+  deadline became a liveness backstop rather than a measurement bound, for the
+  same reason.
+- `daemon::tests::storage_timer_samples_once_per_configured_interval` — a
+  sixth member, found by the post-fix wave — slept 1,150 ms and asserted a
+  1 s timer plus a blocking filesystem walk had landed, i.e. 150 ms of slack
+  on a host that may run a hundred test threads. Its two halves have opposite
+  relationships with load, so they are now asserted separately: the lower
+  bound (no sample before the interval elapses) is asserted, because load can
+  only delay a timer; the upper bound is waited for, with a liveness backstop
+  that separates a suppressed tick from a late one.
+- `test/flake-probe.sh` measures the population's rate: N concurrent full
+  suites of one prebuilt test binary for a wall-clock budget, reporting runs,
+  failures, and the full output of every failing run — the panic text included,
+  because the expensive part of a wave is catching a failure, not counting it,
+  and a name alone costs the next wave a re-reproduction. The load condition is
+  the concurrent suites themselves, never a spinner. Documented in
+  `CONTRIBUTING.md` so successive waves are comparable.
+- **The bound, pooled across every wave run on this head: 1 failure in 605 runs
+  at three or more concurrent suites (~0.17%)** — the lane's 244 post-fix runs
+  plus an independent 361. The one failure was the fifth member again, with the
+  assertion uncaptured, so the residual is non-zero and the mechanism of that
+  observation is unidentified. ~0.17% is under the historical ~0.74% and is not
+  zero; the population stays open, and this is a bound, not a repair claim.
 ### Daemon under load (#431, #428, #420)
 
 One mechanism, three surfaces: work that scales with the durable corpus,

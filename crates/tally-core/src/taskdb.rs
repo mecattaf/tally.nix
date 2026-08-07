@@ -850,6 +850,41 @@ pub fn admits_durable_row(input: &AdmissionInput) -> bool {
         && (input.autonomous || input.crash_survivable || input.needs_cross_source_urgency)
 }
 
+/// Where an attempt ran, as recorded beside the session pointer it produced.
+///
+/// Two facts a bare `Option<PathBuf>` cannot hold apart: a row that declared a
+/// working directory, and a row that declared none and therefore ran wherever
+/// the service manager put the daemon. Both are records. The absence of a
+/// record is the *outer* `Option` on [`RowSeed::session_cwd`], and it means
+/// something else again: nobody wrote one down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedLaunchCwd {
+    /// The attempt's unit was given this working directory verbatim.
+    In(PathBuf),
+    /// The attempt declared no working directory, so its unit inherited the
+    /// daemon's. A later attempt that also declares none inherits the same one.
+    ServiceManagerDefault,
+}
+
+impl RecordedLaunchCwd {
+    /// Record an attempt's effective cwd, absence included.
+    #[must_use]
+    pub fn of(effective_cwd: Option<&Path>) -> Self {
+        effective_cwd.map_or(Self::ServiceManagerDefault, |cwd| {
+            Self::In(cwd.to_path_buf())
+        })
+    }
+
+    /// The declared directory, if one was declared.
+    #[must_use]
+    pub fn declared(&self) -> Option<&Path> {
+        match self {
+            Self::In(cwd) => Some(cwd),
+            Self::ServiceManagerDefault => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RowSeed {
@@ -890,6 +925,31 @@ pub struct RowSeed {
     pub orchestration: Option<Orchestration>,
     #[serde(default)]
     pub session_ref: Option<String>,
+    /// Where the attempt that yielded `session_ref` ran, recorded beside the
+    /// pointer at the moment the pointer was observed.
+    ///
+    /// A harness that resolves a session by its launch directory — `pi` is the
+    /// measured one, see [`crate::adapters::AdapterConfig::resume_requires_launch_cwd`] —
+    /// cannot reach that session from anywhere else, so the pointer alone is
+    /// not enough to resume: what is missing is where it points *from*.
+    ///
+    /// The outer `Option` and the inner variant are two different facts and are
+    /// deliberately not collapsed. `None` is **no record**: a row whose pointer
+    /// predates this field, or one whose pointer arrived without one.
+    /// `Some(ServiceManagerDefault)` is a record that says the attempt declared
+    /// no directory and therefore ran wherever the service manager put the
+    /// daemon — which is a place a later attempt declaring none reaches too. A
+    /// single `None` for both would refuse that continuation and blame a
+    /// missing record for it.
+    ///
+    /// **Deliberately transport-only: `#[serde(skip)]`, so no write path can
+    /// persist it and no wire shape widens.** That is not a shortcut around a
+    /// row migration; it is the same rule `session_ref` itself lives under.
+    /// Neither survives a restart as bytes — startup re-derives both from the
+    /// retained captures and the durable row that produced them, so this field
+    /// is exactly as durable as the pointer it qualifies, and never more.
+    #[serde(skip)]
+    pub session_cwd: Option<RecordedLaunchCwd>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<String>,
     /// Normalized usage for the attempt this row last recorded a scrape for.
@@ -984,6 +1044,20 @@ impl RowSeed {
     /// fallback included.
     pub fn effective_cwd(&self) -> Option<&Path> {
         effective_cwd(self.cwd.as_deref(), self.workspace.as_ref())
+    }
+
+    /// Record where this row's attempt ran, beside the session pointer its
+    /// stream just yielded. Called at every seam that writes `session_ref`
+    /// from a scrape, so the two are always written together or not at all.
+    ///
+    /// The directory is this row's own effective cwd because this row is the
+    /// attempt that produced the pointer: the executor passes
+    /// [`Self::effective_cwd`] to the unit verbatim as its working directory,
+    /// so it is the launch directory rather than a guess at one. A row that
+    /// declares none records that fact rather than recording nothing — see
+    /// [`RecordedLaunchCwd`].
+    pub fn record_session_launch_cwd(&mut self) {
+        self.session_cwd = Some(RecordedLaunchCwd::of(self.effective_cwd()));
     }
 
     pub fn validate(&self) -> Result<(), TaskDbError> {
@@ -1771,6 +1845,7 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            session_cwd: None,
             final_message: None,
             job_token_hash: None,
             lease_epoch: 7,

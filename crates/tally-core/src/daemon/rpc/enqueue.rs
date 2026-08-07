@@ -684,6 +684,18 @@ impl DaemonHandler {
                     adapter: resolved.adapter.clone(),
                     detail: "a continuation must use the original adapter".to_owned(),
                 })
+            } else if let Err(error) = engine.guard_resume_launch_cwd(
+                &resolved.adapter,
+                previous.session_cwd.as_ref(),
+                resolved.effective_cwd(),
+            ) {
+                // The only seam where a resume can change directories: a
+                // continuation is a *new* row, and its cwd is whatever this
+                // call resolved -- inherited from the continued row above only
+                // when the caller named none. `retry_job` and recovery both
+                // re-render one row's own resume against that same row's cwd,
+                // so neither can move it and neither is guarded here.
+                Err(error)
             } else {
                 let mut captures = BTreeMap::from([(
                     "sessionRef".to_owned(),
@@ -774,6 +786,8 @@ impl DaemonHandler {
             .map(Uuid::parse_str)
             .transpose()
             .map_err(|_| WireError::invalid("parent must be a UUID"))?;
+        // Read before the struct literal below moves `resolved.cwd` into it.
+        let inherited_session_cwd = RecordedLaunchCwd::of(resolved.effective_cwd());
         let row = RowSeed {
             row_version: crate::taskdb::CURRENT_ROW_VERSION,
             uuid: row_uuid,
@@ -794,6 +808,11 @@ impl DaemonHandler {
             brief_hash: resolved.brief_hash.clone(),
             orchestration: resolved.orchestration.clone(),
             session_ref: resumed_row.as_ref().and_then(|row| row.session_ref.clone()),
+            // Inherited beside the pointer, and it is this row's own cwd rather
+            // than the continued row's: the guard above already established
+            // that the two name one directory for any adapter that cares, and
+            // this row is where the next attempt actually runs.
+            session_cwd: resumed_row.as_ref().map(|_| inherited_session_cwd.clone()),
             final_message: None,
             // Usage is per attempt and is never inherited across a resume:
             // the prior attempt's record stays on the prior row and in the

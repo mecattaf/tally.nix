@@ -36,6 +36,7 @@ let
     {
       argv ? [ ],
       resume ? null,
+      resumeRequiresLaunchCwd ? false,
       scrape ? { },
       trace ? null,
       yieldHook ? null,
@@ -51,6 +52,11 @@ let
     assert lib.assertMsg (
       resume == null || validArgv resume
     ) "tally adapter resume must be null or a list of strings";
+    assert lib.assertMsg (builtins.isBool resumeRequiresLaunchCwd)
+      "tally adapter resumeRequiresLaunchCwd must be a boolean";
+    assert lib.assertMsg (
+      !resumeRequiresLaunchCwd || resume != null
+    ) "tally adapter resumeRequiresLaunchCwd requires a resume template to constrain";
     assert lib.assertMsg (
       yieldHook == null || validArgv yieldHook
     ) "tally adapter yieldHook must be null or a list of strings";
@@ -99,6 +105,7 @@ let
       inherit
         argv
         resume
+        resumeRequiresLaunchCwd
         scrape
         trace
         yieldHook
@@ -177,8 +184,16 @@ let
       # still filters by the session's recorded cwd
       # (`sessionCwdMatches(session.cwd, resolvedCwd)`, exact path equality)
       # and falls through to the same cross-project branch. A pi node must be
-      # resumed in the cwd it was launched in; nothing in this preset can
-      # assert that, and pi offers no cwd flag for `launch.cwdArgv` to use.
+      # resumed in the cwd it was launched in; nothing in this preset's argv
+      # can assert that, and pi offers no cwd flag for `launch.cwdArgv` to use.
+      #
+      # `resumeRequiresLaunchCwd` below is where the invariant is asserted
+      # instead. It is a declaration, not an argv: it tells tally to refuse a
+      # continuation of a pi session from any directory other than the one the
+      # session was launched in, naming both directories. That refusal is the
+      # only enforcement available, and refusing loudly is strictly better than
+      # the exit-0-having-done-nothing this preset otherwise falls into.
+      resumeRequiresLaunchCwd = true;
       resume = [
         "pi"
         "--mode"

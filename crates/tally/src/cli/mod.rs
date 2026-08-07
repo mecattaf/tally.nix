@@ -33,19 +33,21 @@ use tally_core::authorship::{verify_authorship, verify_revision_authorship};
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
 use tally_core::config::{ExecutionTargetConfig, Priority};
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings, DEFAULT_MAX_CONNECTIONS};
+use tally_core::durable_view::{durable_run_view, DurableViewError};
 use tally_core::evidence::RetryPolicy;
 use tally_core::exec_attestation::{
     compare as compare_witness_attestations, read_verified_exec_attestations, run_exec,
     ExecRunRequest, EXEC_ATTESTATION_LEDGER,
 };
 use tally_core::executor::{
-    persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, UnitLimits,
+    persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, Executor, UnitLimits,
 };
 use tally_core::producers::{
     read_orphaned_projections, record_producer_runtime, GhCliAcknowledgementSink, GhCliIntake,
     GhObservation, ProducerEngine, ProducerObservation,
 };
 use tally_core::provenance::Orchestration;
+use tally_core::query_v2::ObservabilityError;
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
 use tally_core::wire::{EnqueuePayload, SubmissionMode, SubmissionOptions};

@@ -1202,6 +1202,14 @@ impl<'a> FoundJob<'a> {
                 let mut row = (*row).clone();
                 row.session_ref = session_ref.map(ToOwned::to_owned);
                 row.model = model.map(ToOwned::to_owned);
+                // The pointer arrives from the query fact; where it points from
+                // is this seed's own working directory, because this seed is
+                // the row whose attempt produced it. Recorded here so a
+                // continuation reads the two together, exactly as the live path
+                // records them together at scrape time.
+                if row.session_ref.is_some() {
+                    row.record_session_launch_cwd();
+                }
                 row
             }
         }
