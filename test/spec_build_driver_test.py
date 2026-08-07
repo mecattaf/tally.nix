@@ -4170,6 +4170,65 @@ class BreachSteeringTests(unittest.TestCase):
                 self.assertIn("internal/cli/root.go", body)
                 self.assertIn("secrets/leak.pem", body)
 
+    def test_an_ungated_abort_never_claims_a_write_it_did_not_establish(self) -> None:
+        """#424: the two lane-aborting tree-delta verdicts are different facts.
+
+        A gate that could not judge a pass -- no ownership, no declared
+        domains, no allowlist -- aborts the lane for the same reason a breach
+        does, but it has established nothing about what the agent wrote. The
+        posted receipt is the operator's record, so it must say which one
+        happened, and the breach sentence must not appear over a refusal.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            steered = DRIVER.action_steer(
+                self.brief(
+                    checkout,
+                    abortReason="tree-delta-ungated",
+                    breachDetail=(
+                        "tree-delta gate refuses to judge task 'task-1': its agent "
+                        "node failed, so the ownership node never ran"
+                    ),
+                    diagnosis="Recorded what the failing attempt was doing.",
+                )
+            )
+            # It still aborts: both receipts, blocked as of this call.
+            self.assertTrue(steered["blocked"])
+            self.assertEqual(steered["attempt"], 2)
+
+            for attempt in (1, 2):
+                body = self.blob(config, attempt)["diagnosis"]
+                self.assertIn("could not judge this pass", body)
+                self.assertIn("declares no conflictDomains", body)
+                self.assertIn("No out-of-allowlist change has been established", body)
+                self.assertIn("will not be retried", body)
+                # The #386 sentence claims a write was found. It must not be
+                # published over a verdict that found nothing.
+                self.assertNotIn("permission breach found", body)
+
+    def test_an_unknown_abort_reason_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            with self.assertRaisesRegex(DRIVER.DriverError, "abortReason"):
+                DRIVER.action_steer(self.brief(checkout, abortReason="whatever"))
+
+    def test_a_breach_without_an_abort_reason_keeps_its_own_sentence(self) -> None:
+        """The #386 caller sent no `abortReason` and still must not change."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            DRIVER.action_steer(self.brief(checkout))
+
+            body = self.blob(config, 1)["diagnosis"]
+            self.assertIn("permission breach found", body)
+            self.assertNotIn("could not judge this pass", body)
+
     def test_a_breach_with_a_rejected_diagnosis_still_aborts_and_witnesses(self) -> None:
         """Round-1 F3: the breach path ran no validation at all.
 

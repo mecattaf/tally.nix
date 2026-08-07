@@ -802,10 +802,20 @@ const ownershipSchema = {
 // #386: the tree-delta permission gate's own result. `allowlistBasis` names
 // which of the three documented allowlist derivations governed this task, so
 // a reader of the witnessed result never has to guess whether an absent
-// `conflictDomains` fell back to something permissive.
+// `conflictDomains` fell back to something permissive. #424: `ownershipRan`
+// names which of the gate's two call sites produced the verdict -- after a
+// passing agent and its ownership node, or in place of ownership on a pass
+// whose agent failed -- so a reader can tell whether an `ownedPaths` fallback
+// was even available, and can see that a failed pass was in fact judged.
 const treeDeltaSchema = {
   type: "object",
-  required: ["taskId", "checkedPaths", "allowlistBasis", "allowlist"],
+  required: [
+    "taskId",
+    "checkedPaths",
+    "allowlistBasis",
+    "allowlist",
+    "ownershipRan"
+  ],
   properties: {
     taskId: taskIdSchema,
     checkedPaths: { type: "integer", minimum: 0 },
@@ -816,7 +826,8 @@ const treeDeltaSchema = {
       type: "array",
       uniqueItems: true,
       items: { type: "string", minLength: 1 }
-    }
+    },
+    ownershipRan: { type: "boolean" }
   },
   additionalProperties: false
 };
@@ -1267,6 +1278,14 @@ function failureClass(reconciliation, failure) {
   // existing diagnosis ledger already blocked at attempt 2.
   if (stage === "treeDelta") {
     return "breach";
+  }
+  // #424: the gate refusing to judge a pass is not the same event as the gate
+  // catching a write, and must not be posted under the other one's sentence.
+  // It is priced the same -- a gate verdict, never the agent's fault, never a
+  // steering attempt -- and it aborts the lane for the same reason: nothing
+  // downstream can certify a worktree no allowlist covers.
+  if (stage === "treeDelta:ungated") {
+    return "ungated";
   }
   if (
     stage === "agent" ||
@@ -1956,6 +1975,57 @@ function sweepDeferral(sweepNode) {
     });
     const agent = await job(agentSpec, { settle: true });
     if (agent.verdict !== "pass") {
+      // #424: the pass still runs the tree-delta gate before it ends. A
+      // failing agent is the single most likely context for a rogue write and
+      // it was the one context this gate was silent in: the lane used to
+      // return here, and the next pass's `prep` re-snapshotted the worktree
+      // with the stray write already in it, so nothing could ever see it
+      // again. `ownership` never ran, so the gate has no certified
+      // `ownedPaths` and only a declared allowlist can govern -- the driver
+      // refuses loudly rather than passing when the task declares none.
+      //
+      // The stage is chosen from what this lane already knows, so the receipt
+      // it produces is true either way: a task that declares conflictDomains
+      // can only fail this node by breaching them, and a task that declares
+      // none can only fail it by being unjudgeable.
+      const declaresDomains = Array.isArray(task.conflictDomains);
+      const strayStage = declaresDomains ? "treeDelta" : "treeDelta:ungated";
+      const strayDelta = await driverNode(
+        "treeDelta",
+        {
+          task,
+          workspace: prepared.result,
+          ownershipRan: false
+        },
+        `tree-delta-${task.id}`,
+        `tree-delta-${task.id}`,
+        treeDeltaSchema,
+        workspace,
+        true,
+        taskRef
+      );
+      if (!nodePassed(strayDelta)) {
+        return {
+          task,
+          prepared: prepared.result,
+          failure: taskFailure(
+            task,
+            strayStage,
+            strayDelta,
+            taskBrief,
+            [
+              {
+                phase: "treeDelta",
+                gateId: "tree-delta",
+                kind: "treeDelta",
+                node: strayDelta
+              }
+            ],
+            prepared.result,
+            prepared.result.baseRev
+          )
+        };
+      }
       return {
         task,
         prepared: prepared.result,
@@ -2317,6 +2387,15 @@ function sweepDeferral(sweepNode) {
       // retried.
       failure.breach = true;
       steerable.push(failure);
+    } else if (kind === "ungated") {
+      // #424: the gate could not judge this pass at all. It takes the breach
+      // routing -- both receipts posted at once, lane aborted, no steering
+      // attempt spent as if the agent were at fault -- but it is tagged
+      // separately, because "wrote outside its authorized paths" is not what
+      // happened and the posted receipt must not say it did.
+      failure.breach = true;
+      failure.ungated = true;
+      steerable.push(failure);
     } else if (kind === "machinery") {
       machineryFaults.push(failure);
     } else {
@@ -2415,8 +2494,13 @@ function sweepDeferral(sweepNode) {
         role: "diagnosis",
         // #386: a breach has no next attempt -- the lane is aborted, not
         // retried -- so the mission asks for a record of what happened
-        // rather than steering for a redispatch that will never come.
-        mission: failure.breach
+        // rather than steering for a redispatch that will never come. #424:
+        // an unjudgeable pass is aborted for the same reason but is not the
+        // same event, and asking a model to explain paths that were never
+        // named would be asking it to invent them.
+        mission: failure.ungated
+          ? `Task ${task.id} could not be judged by the tree-delta permission gate and its lane is being aborted, not retried: its agent node failed, so the ownership node never ran and certified no paths, and the task declares no conflictDomains, leaving no allowlist to judge its worktree against. No out-of-allowlist change has been established. Return a concise record of what the failing attempt was doing, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
+          : failure.breach
           ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise record of what the out-of-allowlist change(s) were and why they likely happened, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
           : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
         campaign: {
@@ -2511,7 +2595,12 @@ function sweepDeferral(sweepNode) {
               breachDetail: bounded(
                 failure.node && failure.node.error ? failure.node.error : failure.node,
                 2000
-              )
+              ),
+              // #424: which abort this is. The driver composes a different
+              // label sentence for each, because the receipt is published to
+              // the campaign thread and must claim exactly what happened --
+              // a gate that could not judge is not a gate that caught a write.
+              ...(failure.ungated ? { abortReason: "tree-delta-ungated" } : {})
             }
           : {})
       }));

@@ -3876,8 +3876,29 @@ def validated_diagnosis(diagnosis: str, gate_evidence: Any) -> str:
     return diagnosis
 
 
-def breach_note(diagnosis: str, detail_text: str) -> str:
-    """The posted breach body: a deterministic label plus witnessed evidence.
+# The label sentence each lane-aborting tree-delta verdict posts. Two verdicts
+# abort a lane and neither may be published under the other's sentence (#424):
+# a gate that CAUGHT an out-of-allowlist write and a gate that could not judge
+# the pass at all are different facts about the repository, and a receipt is a
+# claim surface.
+ABORT_REASONS = {
+    "tree-delta-breach": (
+        "Aborted the lane: a tree-delta permission breach found "
+        "out-of-allowlist change(s), so this task will not be retried."
+    ),
+    "tree-delta-ungated": (
+        "Aborted the lane: the tree-delta permission gate could not judge this "
+        "pass -- the agent node failed, so the ownership node never ran and "
+        "certified no paths, and this task declares no conflictDomains, leaving "
+        "no allowlist. No out-of-allowlist change has been established. Declare "
+        "conflictDomains for this task and re-arm; this task will not be retried "
+        "until then."
+    ),
+}
+
+
+def breach_note(diagnosis: str, detail_text: str, reason: str = "tree-delta-breach") -> str:
+    """The posted lane-abort body: a deterministic label plus witnessed evidence.
 
     #386: an out-of-allowlist delta aborts the lane -- a breach, not a
     gate-fail, because the write already happened and gates are for redoable
@@ -3885,13 +3906,14 @@ def breach_note(diagnosis: str, detail_text: str) -> str:
     wrote, so the driver's own tree-delta detail is always appended verbatim
     rather than merely required as a substring the model might paraphrase
     away. The heading stays `diagnosis_heading`'s ordinary shape -- the forge
-    read-back parses that exact prefix -- so the breach identifies itself
+    read-back parses that exact prefix -- so the abort identifies itself
     through this leading sentence instead of a second heading grammar.
+
+    #424: `reason` selects which leading sentence. Both abort and both are
+    priced identically; only one of them is a claim that a write happened, and
+    that claim is only made when the gate actually found one.
     """
-    parts = [
-        "Aborted the lane: a tree-delta permission breach found "
-        "out-of-allowlist change(s), so this task will not be retried.",
-    ]
+    parts = [ABORT_REASONS[reason]]
     if diagnosis:
         parts.append(diagnosis)
     if detail_text:
@@ -3899,7 +3921,9 @@ def breach_note(diagnosis: str, detail_text: str) -> str:
     return "\n\n".join(parts)
 
 
-def bounded_breach_note(diagnosis: str, detail_text: str) -> str:
+def bounded_breach_note(
+    diagnosis: str, detail_text: str, reason: str = "tree-delta-breach"
+) -> str:
     """`breach_note` held to the same public bound the ordinary path keeps.
 
     The ordinary steering path posts `bound_public_diagnosis(diagnosis)`, so
@@ -3910,11 +3934,11 @@ def bounded_breach_note(diagnosis: str, detail_text: str) -> str:
     what gives way, rather than truncating the paths off the end of the one
     comment that exists to name them.
     """
-    composed = breach_note(diagnosis, detail_text)
+    composed = breach_note(diagnosis, detail_text, reason)
     overflow = len(composed) - MAX_DIAGNOSIS_CHARS
     if overflow > 0:
         kept = max(0, len(diagnosis) - overflow)
-        composed = breach_note(diagnosis[:kept].rstrip(), detail_text)
+        composed = breach_note(diagnosis[:kept].rstrip(), detail_text, reason)
     # Backstop for the pathological case where the evidence alone exceeds the
     # bound: truncation there is unavoidable, and `bound_public_diagnosis`
     # leaves a visible marker rather than trimming silently.
@@ -3940,6 +3964,8 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         fields.add("breach")
     if "breachDetail" in brief:
         fields.add("breachDetail")
+    if "abortReason" in brief:
+        fields.add("abortReason")
     data = object_exact(brief, seam_fields(brief, fields), "steer brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -3962,6 +3988,11 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     if attempt not in {1, 2}:
         fail("attempt must equal 1 or 2")
     breach = bool(data.get("breach", False))
+    # #424: which lane-aborting tree-delta verdict this receipt is for. Absent
+    # is the #386 breach, which is what every caller before this sent.
+    abort_reason = data.get("abortReason", "tree-delta-breach")
+    if abort_reason not in ABORT_REASONS:
+        fail("abortReason is not a declared lane-abort reason")
     thread_number, threads = steering_thread(
         repository, config, data, capabilities, task_id
     )
@@ -4008,7 +4039,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         if isinstance(detail, str) and detail.strip():
             detail_text, redacted_detail = redact_public_text(detail)
             detail_text = bound_public_diagnosis(detail_text)
-        composed = bounded_breach_note(diagnosis, detail_text)
+        composed = bounded_breach_note(diagnosis, detail_text, abort_reason)
         posted_comment: str | None = None
         for post_attempt in (1, 2):
             if any(receipt["attempt"] == post_attempt for receipt in task_receipts):
@@ -4632,18 +4663,30 @@ def worktree_call(operation: Any, *arguments: Any, **keywords: Any) -> Any:
         fail(error.message)
 
 
-def snapshot_before_agent(worktree: Path) -> None:
+def snapshot_before_agent(worktree: Path) -> bool:
     """The pre-agent change-set fingerprint the tree-delta gate compares
-    against (#386). Called once per `prep`, whether the lane is fresh or
-    resumed: on a resumed lane the worktree may already carry legitimate
-    uncommitted content from an earlier pass, and that is exactly the state
-    the gate must be able to tell a reversion of apart later, so every prep
-    of an implementation task takes a fresh baseline right before its own
-    agent dispatch -- the earliest point after the lane is known-good and
-    the latest point before anything the gate must witness could happen.
+    against (#386). Called once per `prep` of an implementation task -- the
+    earliest point after the lane is known-good and the latest point before
+    anything the gate must witness could happen.
+
+    **A baseline is never overwritten unjudged (#424).** `action_tree_delta`
+    clears the snapshot the instant it reads it, pass or fail, so a snapshot
+    still on disk at prep time means exactly one thing: the pass it belongs to
+    ended without the gate judging it. Overwriting it there was the laundering
+    path -- pass 1's agent clobbered an out-of-allowlist file and failed, pass
+    2's prep re-fingerprinted the worktree with that write already in it, and
+    the write could never be seen again by anything. So: judged (no snapshot on
+    disk) rotates, unjudged (snapshot present) is preserved, and the next gate
+    to run judges the whole span since the last judged baseline.
+
+    Returns whether a fresh baseline was taken, so a caller can say which of
+    the two happened rather than guess.
     """
+    if worktree_call(worktrees.read_change_set_snapshot, worktree) is not None:
+        return False
     fingerprint = worktree_call(worktrees.change_set_fingerprint, worktree)
     worktree_call(worktrees.write_change_set_snapshot, worktree, fingerprint)
+    return True
 
 
 def tally_executable(value: Any) -> Path:
@@ -5828,11 +5871,13 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     uncommitted change back to its prior content is caught the same as a
     forward edit no commit ever recorded.
 
-    Scope, stated so it is not read wider than it is: this node runs after
-    the agent node passes and after `ownership`, so a pass whose agent node
-    fails returns before it and its uncommitted writes are not judged here.
-    A committed stray is still caught by `ownership` on the next pass; the
-    uncommitted case on a failing pass is open. Refs #424.
+    Scope (#424): this node runs on both outcomes of the agent node. On a pass
+    whose agent node passed it runs after `ownership`, which is what lets an
+    undeclared allowlist fall back to certified `ownedPaths`. On a pass whose
+    agent node FAILED it runs instead of `ownership` -- a failing agent is the
+    single most likely context for a rogue write, and it used to be the one
+    context this gate was silent in -- and `ownershipRan` is false, so no
+    `ownedPaths` exist and only a declared allowlist can govern.
 
     The allowlist is per-task, derived from the brief/worklist entry, with no
     silently permissive default -- an absent allowlist and an empty one are
@@ -5843,10 +5888,15 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
         allowlist, and not glob matching.
       - `task.conflictDomains` declared and explicitly empty (`[]`): the
         allowlist is empty, so any delta at all is a breach.
-      - `task.conflictDomains` absent: the allowlist falls back to exactly
-        `ownedPaths`, the paths the ownership node just certified as this
-        task's own committed change-set. The agent's proven work is
-        self-authorizing; nothing else is.
+      - `task.conflictDomains` absent AND `ownershipRan`: the allowlist falls
+        back to exactly `ownedPaths`, the paths the ownership node just
+        certified as this task's own committed change-set. The agent's proven
+        work is self-authorizing; nothing else is.
+      - `task.conflictDomains` absent AND ownership never ran: no allowlist,
+        no pass (#424). The node refuses, naming exactly why, and leaves the
+        snapshot on disk so the writes it could not judge stay judgeable by a
+        later pass that does have an allowlist. Passing here would be a gate
+        that reports success over content it never inspected.
 
     An out-of-allowlist delta fails this node with every offending path
     named -- the same mechanism every other campaign gate uses to become
@@ -5854,8 +5904,14 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     ordinary witnessed job like any other campaign node.
     """
     data = object_exact(
-        brief, {"task", "workspace", "ownedPaths"}, "tree-delta brief"
+        brief, {"task", "workspace", "ownedPaths", "ownershipRan"}, "tree-delta brief"
     )
+    # Absent means true: the node's original and still most common caller is
+    # the post-ownership one, and a brief written before this field existed
+    # described exactly that call.
+    ownership_ran = data.get("ownershipRan", True)
+    if not isinstance(ownership_ran, bool):
+        fail("ownershipRan must be a boolean")
     task = data.get("task")
     if not isinstance(task, dict):
         fail("task must be an object")
@@ -5874,15 +5930,9 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
         fail("workspace.worktreePath must be an absolute existing directory")
     git(worktree, "rev-parse", "--git-dir")
 
-    before = worktree_call(worktrees.read_change_set_snapshot, worktree)
-    if before is None:
-        fail(
-            "no change-set snapshot was recorded before the agent node; "
-            "cannot evaluate the tree-delta gate"
-        )
-    after = worktree_call(worktrees.change_set_fingerprint, worktree)
-    deltas = worktrees.change_set_delta(before, after)
-
+    # The allowlist is settled before the snapshot is touched. A pass this gate
+    # cannot judge must leave the baseline exactly as it found it, and reading
+    # it here then refusing below would put the clear() between the two.
     raw_domains = task.get("conflictDomains")
     if isinstance(raw_domains, list) and raw_domains:
         allowlist = normalize_conflict_domains(
@@ -5892,10 +5942,32 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(raw_domains, list):
         allowlist = []
         basis = "declared-empty"
-    else:
+    elif ownership_ran:
         owned = data.get("ownedPaths")
         allowlist = list(string_list(owned, "ownedPaths")) if owned is not None else []
         basis = "owned-paths-fallback"
+    else:
+        # #424 rule 3: no allowlist, no pass. This is a gate refusing to
+        # certify, not the agent being at fault, so it must be loud and it must
+        # not look like a clean pass. The snapshot stays on disk: the writes
+        # this pass could not judge remain judgeable once an allowlist exists.
+        fail(
+            f"tree-delta gate refuses to judge task {task_id!r}: its agent node "
+            "failed, so the ownership node never ran and certified no ownedPaths, "
+            "and the task declares no conflictDomains -- there is no allowlist to "
+            "judge the worktree against. Declare conflictDomains for this task and "
+            "re-arm. The pre-agent baseline is left in place, so the writes this "
+            "pass could not judge are still judgeable then."
+        )
+
+    before = worktree_call(worktrees.read_change_set_snapshot, worktree)
+    if before is None:
+        fail(
+            "no change-set snapshot was recorded before the agent node; "
+            "cannot evaluate the tree-delta gate"
+        )
+    after = worktree_call(worktrees.change_set_fingerprint, worktree)
+    deltas = worktrees.change_set_delta(before, after)
 
     breaches = [
         delta
@@ -5921,6 +5993,11 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
         "checkedPaths": len(deltas),
         "allowlistBasis": basis,
         "allowlist": allowlist,
+        # #424: which of the gate's two call sites this verdict came from, so a
+        # reader of the witnessed result knows whether an `ownedPaths` fallback
+        # was even available to it -- and can see that a pass whose agent
+        # failed was in fact judged.
+        "ownershipRan": ownership_ran,
     }
 
 

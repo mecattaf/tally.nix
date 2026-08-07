@@ -963,8 +963,37 @@ each enforcing node, so an empty parallel declaration cannot turn enforcement
 off. Serial tasks that omit the optional field keep their unrestricted existing
 behavior.
 
+A second, separate node — the tree-delta permission gate — covers what the
+ownership gate structurally cannot: content that never reached a commit. `prep`
+fingerprints every tracked and untracked path in the lane worktree immediately
+before the agent is dispatched, and the gate compares that fingerprint against
+the worktree afterwards, so an appearing, disappearing or edited path is caught
+whether or not any commit records it.
+
+It runs on both outcomes of the agent node. After a passing agent it runs after
+`ownership`, which lets a task that declares no `conflictDomains` fall back to
+the paths ownership just certified as the task's own committed change-set. After
+a *failing* agent — the single most likely context for a rogue write — it runs
+in place of `ownership`, so only a declared allowlist can govern: there are no
+certified owned paths to fall back to. A task that declares no `conflictDomains`
+therefore cannot be judged on that path at all, and the gate refuses rather than
+reporting success over content it never inspected. The refusal aborts the lane
+with a receipt naming exactly why, and is priced as a gate verdict rather than
+as the agent's work being wrong: it spends none of the task's steering attempts.
+Declare `conflictDomains` for the task and re-arm to clear it.
+
+The pre-agent fingerprint is never replaced until a gate has judged the pass it
+belongs to. A pass that ends without the gate running — a machinery fault, a
+killed runner — leaves its fingerprint in place, and the next pass's `prep`
+preserves it rather than re-fingerprinting a worktree that already contains the
+previous attempt's writes. Re-fingerprinting there would have made those writes
+permanently invisible to every gate that ever ran afterwards.
+
 Ownership results witness the requirement flag, declared domains, full sorted
-owned-path set, base revision, and head. This makes both under-declaration and
+owned-path set, base revision, and head. The tree-delta result witnesses the
+task, how many paths it compared, which allowlist derivation governed, that
+allowlist, and whether the ownership node had run — so a reader of a receipt can
+tell which of the gate's two call sites produced it. This makes both under-declaration and
 unused broad declarations visible in receipts. When enough tasks are ready but
 overlapping declarations underfill `maxParallel`, reconciliation emits a
 diagnostic naming the blocked tasks and representative overlaps. Shared files
@@ -1209,9 +1238,13 @@ if implemented is empty, an implementation is in the frontier, and command gates
        non-gating witness
   -> clean up the preflight lane
 parallel(implementation frontier):
-  prepare isolated worktree -> agent -> witness ownership
-    -> each configured gate -> recheck ownership -> push stable task branch
-    -> open/reuse PR
+  prepare isolated worktree -> agent
+    if the agent passed:
+      -> witness ownership -> tree-delta permission gate
+      -> each configured gate -> recheck ownership -> push stable task branch
+      -> open/reuse PR
+    if the agent failed:
+      -> tree-delta permission gate against the declared conflictDomains
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
 parallel(checkpoint frontier, after this pass's merges):

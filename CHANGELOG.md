@@ -120,6 +120,53 @@ canonical path would have named the defect instantly.
   body; an absent `armedManifest` asserts the unavailable wording. Dropping the
   path computation makes them fail (mutation-proven).
 
+#### #424 — the tree-delta gate now runs on a pass whose agent failed, and no baseline is overwritten unjudged
+
+An agent node that did not pass returned at stage `"agent"`, before `ownership`
+and before the `treeDelta` node. The next pass's `prep` then re-fingerprinted
+the worktree unconditionally, taking a baseline that already contained the
+previous pass's stray write — so an uncommitted out-of-allowlist write made by
+a failing agent could never be seen by any gate again. A failing agent is the
+single most likely context for a rogue write and it was the one context the
+gate was silent in.
+
+- **A baseline is never overwritten unjudged.** `action_tree_delta` clears the
+  pre-agent fingerprint the instant it reads it, pass or fail, so a fingerprint
+  still on disk at `prep` time means the pass it belongs to was never judged.
+  `snapshot_before_agent` now preserves it in that case and rotates only when
+  the previous pass was judged. The next gate to run therefore judges the whole
+  span since the last judged baseline.
+- **A pass whose agent node failed still runs the gate**, in place of
+  `ownership`, with `ownershipRan: false`. Only a declared allowlist can govern
+  there: `ownership` never ran, so no certified `ownedPaths` exist to fall back
+  to.
+- **No allowlist, no pass.** If ownership never ran and the task declares no
+  `conflictDomains`, the gate refuses with a receipt naming exactly why and
+  leaves the baseline in place, so the writes it could not judge stay judgeable
+  once an allowlist exists. An explicitly empty `conflictDomains: []` is a
+  declaration, not an absence, and still judges (any delta is a breach).
+- The refusal is priced as a gate verdict (`failureClass` → `"ungated"`), never
+  as the agent's work being wrong: it spends none of the task's two steering
+  attempts. It aborts the lane through the same both-receipts-at-once path a
+  breach takes, but under its own sentence — the #386 breach sentence claims an
+  out-of-allowlist write was found, and a gate that could not look has
+  established no such thing. `action_steer` takes an `abortReason` and composes
+  the matching label; absent keeps the #386 breach wording exactly.
+- The `treeDelta` result gains `ownershipRan`, so a reader of a witnessed
+  receipt can tell which of the gate's two call sites produced the verdict, and
+  can see that a failed pass was in fact judged.
+- The worst-case flow-node budget is unchanged: the agent-failure lane runs
+  prep, agent, treeDelta, diff, diagnosis, steer and cleanup, well inside the
+  11-per-lane allowance, and the merge-failure lane that sets the worst case
+  already counted `treeDelta`. `campaignMaxNodes`/`max_flow_nodes` do not move.
+- Tests: the eval's reproduction shape is caught directly at pass 1; a pass that
+  ends unjudged has its baseline preserved and pass 2's gate still sees the
+  stray write (restoring the unconditional re-snapshot makes that test red —
+  mutation-proven); a judged baseline still rotates; the refusal is loud, names
+  why, and does not claim a breach; the `ungated` class is pinned in the
+  executable `spec-build.js` realm; and the posted receipt for an ungated abort
+  never carries the breach sentence.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and
