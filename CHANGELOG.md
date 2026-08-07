@@ -6,6 +6,125 @@ authorized.
 
 ## [Unreleased]
 
+### flows & cli residue (#427, #416, #414, #418)
+
+Four residues from earlier waves, each with its shape already argued in its
+issue: a drain client that spent the fleet failure alarm on a busy daemon, a
+direct-file verb family whose default data dir ignored the deployment it was
+run against, an exit-20 remedy that advertised a command that cannot parse,
+and a doc-pin check whose own message claimed the wrong thing.
+
+#### #427 — a drain whose RPC deadline expires on a busy daemon is a retryable skip
+
+`tally-drain.timer` fires every five seconds, and a saturated daemon can take
+longer than the 60s client deadline to answer `queue.drain` on a connection
+that was established. That exited 1 and surfaced as a per-user unit failure —
+~52 in one day on the coordinator, every one self-healing on the next tick.
+
+- `tally daemon drain` now treats `queue.drain` deadline-exceeded as a
+  retryable skip: exit 0, with the line naming the expired deadline still
+  written to stderr, plus that the skip is retryable. The safety argument is
+  the event files': they are durable on disk and the next drain picks them
+  up, so nothing is lost.
+- The skip is narrow: only `queue.drain`'s own client deadline on the
+  periodic spelling is absorbed. `tally queue drain` keeps failing on the
+  same hang, and every other established-connection error — including a
+  daemon that is listening and refuses — keeps its exit code.
+- Proven at both seams: a unit test pins the classification (deadline on
+  `queue.drain` is the skip; another method's deadline, a rearm-window
+  exhaustion, a refusal, and an absence are all not), and an integration
+  test runs the real binary against a server that connects and never
+  answers: `daemon drain` exits 0 and names the case, `queue drain` exits 1.
+- The Home Manager `tally-drain` unit's `daemon drain` spelling is now
+  pinned in the module contract, as the NixOS one already was — the
+  user-unit half is the one whose failures the fleet watcher reports, and
+  `queue drain` there would leave both this absorption and #411's inert.
+
+#### #416 — `TALLY_DATA_DIR`, honoured by the default and exported by both modules
+
+The direct-file verbs resolved an omitted `--data-dir` to the user data
+directory, so `reader-state archive` on a deployment printed an affirmative
+record, exited 0, and wrote a brand-new store in the wrong place — a silent
+no-op with a success message.
+
+- `default_data_dir()` now honours `TALLY_DATA_DIR`, taken verbatim as the
+  directory. Precedence: an explicit `--data-dir` flag at the call site,
+  then `TALLY_DATA_DIR`, then the XDG default (`$XDG_DATA_HOME/tally`, else
+  `~/.local/share/tally`). Unset or empty, local use resolves exactly as
+  before.
+- The variable is taken verbatim, not searched: aimed at something that
+  cannot hold the store, a write verb fails naming that path rather than
+  falling back to the XDG default, because a fallback would restore the
+  silent no-op this closes.
+- Both modules export the variable alongside the data directory they
+  already configure — on their units (daemon, witness-emit, retention) and
+  in the operator's own environment, which is where an omitted `--data-dir`
+  actually resolved to the wrong store: `home.sessionVariables` on Home
+  Manager, `environment.variables` on NixOS, both `mkDefault` so an
+  operator's declaration wins. On a NixOS deployment that store is mode
+  0700 and owned by the service user, so an operator who is not that user
+  is now refused by name instead of quietly writing a store elsewhere.
+- Proven at the seam by subprocess tests for every precedence tier (flag
+  beats variable, variable beats a *set* `XDG_DATA_HOME` and yields to none,
+  empty is unset, HOME fallback unchanged, an unusable value fails loudly,
+  and a read verb follows the variable to a seeded ledger), and at the
+  modules by evaluated assertions that the export exists with the configured
+  path on both units and both login environments.
+
+#### #414 — no executable command for a malformed run identity
+
+A flag-shaped `flowRunId` from a foreign producer (a leading `-` after
+trim) still rendered a `remedy` interpolating it, advertising a command
+clap refuses with exit 2 — `--flow-run-id --reason` parses the id as the
+next flag.
+
+- The exit-20 rendering now splits on the flag shape in both fields an
+  operator reads: the `remedy` member is `null`, and the refusal message
+  keeps the why-clause but replaces the command with its own sentence
+  naming a malformed run identity — the same rendering family as the empty
+  case, but distinct from it: a run was named, badly, which is not "no run
+  named".
+- The raw `flowRunId` stays visible in `details`, preserving #401 item 3's
+  invariant. The two emptiness definitions (`trim().is_empty()` in both
+  sites) stay untouched and in agreement, and no UUID validation is
+  introduced anywhere in the fourteen-member map — the leading dash after
+  trim is the entire test.
+- The documented `remedy` nullity rule — one wording, pinned identical on
+  `submission-and-replay.md` and `errors.md` — now states both shapes that
+  produce `null`, and a doc pin checks the sentence against what the code
+  does rather than against itself.
+- Mutation-proven both ways: dropping either guard (the `remedy` arm or the
+  sentence branch) turns the new test red, and the same test asserts a
+  well-formed id still gets its command in both fields.
+
+#### #418 — the doc-pin check tells the truth about what it rejects
+
+The end-of-span check in `supersession_docs.rs` fired on any `|` line after
+an `:end` marker, including a blank line followed by a *complete* second
+table — which renders perfectly, because a blank line ends a table in
+markdown — and its panic message claimed a marker inside a table splits it,
+steering the obvious fix back into the rendering defect the pin exists to
+prevent.
+
+- The check now skips blank lines and distinguishes the shapes: a following
+  complete table (header + separator rows) is accepted; it fires only when
+  the content after the marker is a bare row, with or without a blank line.
+  The panic message and the rustdoc now describe the shape actually
+  rejected. Probe A (blank line, bare rows) stays red; probe B (blank line,
+  complete table) goes green — both as synthetic in-test documents, and the
+  mutation that restores the old check turns probe B red. "Complete" means a
+  real delimiter row: a horizontal rule under a row is still a bare row, and
+  a third probe pins that.
+- The live `replay-divergence` test's label comment pointed at "the
+  in-process tests in `tally-flow`" for coverage that was not there. The
+  comment now names the two tests that bind `recordedLabel`/`currentLabel`
+  at the site this fixture's refusal is actually raised from — the
+  dedup-conflict path in `crates/tally/src/flow_live.rs`, whose label
+  binding already existed — and separately names the runner's own
+  comparison site, where the mock ledger now returns one label while the
+  script derives another so that site is bound too. The stated limit is
+  unchanged; only the pointer was wrong.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

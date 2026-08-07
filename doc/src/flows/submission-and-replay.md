@@ -269,7 +269,7 @@ every raising site, with `null` where the code has nothing to say:
 | `reason` | The recorded rollover reason, from `flow.supersede`'s closed set. |
 | `recordedAt` | When the rollover was recorded. |
 | `kernelError` | The daemon's own message, when the refusal was found through a kernel dedup-key conflict rather than by the runner's own comparison. |
-| `remedy` | The `tally flow supersede` invocation that clears it, or <!-- remedy-nullity:start -->`null` when no single command does — including when no `flowRunId` is known, since the command needs one<!-- remedy-nullity:end -->. |
+| `remedy` | The `tally flow supersede` invocation that clears it, or <!-- remedy-nullity:start -->`null` when no single command does — including when no `flowRunId` is known, since the command needs one, and when the `flowRunId` given reads as a command flag rather than a run id, since interpolating it would advertise an invocation that cannot parse<!-- remedy-nullity:end -->. |
 | `transient` | Always `false` for this family. |
 | `resolution` | `supersede`, `run-successor`, or `investigate`. |
 <!-- supersession-detail-fields:end -->
