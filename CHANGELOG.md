@@ -155,7 +155,12 @@ gate was silent in.
   `conflictDomains`, the gate refuses with a receipt naming exactly why and
   leaves the baseline in place, so the writes it could not judge stay judgeable
   once an allowlist exists. An explicitly empty `conflictDomains: []` is a
-  declaration, not an absence, and still judges (any delta is a breach).
+  declaration, not an absence, and still judges (any delta is a breach). The
+  refusal is a fail-closed guard on the driver's own contract rather than a
+  state a campaign reaches: `spec-build.js`'s reconcile result schema requires
+  `conflictDomains` on every implementation task in the frontier, so the bases
+  reachable on a failed pass are `declared` and `declared-empty` — both judge.
+  That reachability is pinned by a test, not asserted in prose.
 - The refusal is priced as a gate verdict (`failureClass` → `"ungated"`), never
   as the agent's work being wrong: it spends none of the task's two steering
   attempts. It aborts the lane through the same both-receipts-at-once path a
@@ -177,6 +182,15 @@ gate was silent in.
   why, and does not claim a breach; the `ungated` class is pinned in the
   executable `spec-build.js` realm; and the posted receipt for an ungated abort
   never carries the breach sentence.
+- The flow-side wiring itself is bound end to end.
+  `crates/tally-flow/tests/spec_build_failed_agent_gate.rs` runs the real
+  `spec-build.js` against a scripted client with the agent node failed and
+  asserts the `tree-delta-<task>` node is dispatched, after the agent node,
+  carrying `ownershipRan: false` and no `ownedPaths`; that a breaching gate is
+  what the pass then reports; and that a clean gate leaves the agent failure
+  priced as work. Deleting the failed-agent gate block, or flipping its
+  `ownershipRan` to true, each makes it red (mutation-proven) — previously both
+  mutations left the whole workspace green.
 
 ### Steward driver gates (#385, #386)
 

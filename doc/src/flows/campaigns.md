@@ -975,12 +975,18 @@ It runs on both outcomes of the agent node. After a passing agent it runs after
 the paths ownership just certified as the task's own committed change-set. After
 a *failing* agent — the single most likely context for a rogue write — it runs
 in place of `ownership`, so only a declared allowlist can govern: there are no
-certified owned paths to fall back to. A task that declares no `conflictDomains`
-therefore cannot be judged on that path at all, and the gate refuses rather than
-reporting success over content it never inspected. The refusal aborts the lane
-with a receipt naming exactly why, and is priced as a gate verdict rather than
-as the agent's work being wrong: it spends none of the task's steering attempts.
-Declare `conflictDomains` for the task and re-arm to clear it.
+certified owned paths to fall back to. A declared allowlist that is explicitly
+empty is still a declaration: every delta is then a breach, so a failed pass is
+judged either way and cannot quietly pass.
+
+A task that declares no `conflictDomains` at all could not be judged on that
+path, and the gate refuses rather than reporting success over content it never
+inspected — the refusal aborts the lane with a receipt naming exactly why, and
+is priced as a gate verdict rather than as the agent's work being wrong, so it
+spends none of the task's steering attempts. That refusal is a fail-closed guard
+on the driver's own contract rather than a state a campaign reaches: the flow's
+reconcile result schema requires `conflictDomains` on every implementation task
+in the frontier, so a task without it is refused before any lane starts.
 
 The pre-agent fingerprint is never replaced until a gate has judged the pass it
 belongs to. A pass that ends without the gate running — a machinery fault, a

@@ -1981,13 +1981,19 @@ function sweepDeferral(sweepNode) {
       // return here, and the next pass's `prep` re-snapshotted the worktree
       // with the stray write already in it, so nothing could ever see it
       // again. `ownership` never ran, so the gate has no certified
-      // `ownedPaths` and only a declared allowlist can govern -- the driver
-      // refuses loudly rather than passing when the task declares none.
+      // `ownedPaths` and only a declared allowlist can govern.
       //
       // The stage is chosen from what this lane already knows, so the receipt
       // it produces is true either way: a task that declares conflictDomains
       // can only fail this node by breaching them, and a task that declares
-      // none can only fail it by being unjudgeable.
+      // none can only fail it by being unjudgeable. In practice only the first
+      // arm is reachable from here -- `reconcileSchema` requires
+      // `conflictDomains` on every implementation task in the frontier, so a
+      // task without it never reaches a lane at all (pinned by
+      // `the_flow_cannot_send_an_implementation_task_without_conflict_domains`).
+      // The second arm is kept as the honest label for the driver's own
+      // fail-closed refusal, so that if the schema ever relaxes, the receipt
+      // does not start calling an unjudgeable pass a breach.
       const declaresDomains = Array.isArray(task.conflictDomains);
       const strayStage = declaresDomains ? "treeDelta" : "treeDelta:ungated";
       const strayDelta = await driverNode(
