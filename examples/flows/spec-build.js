@@ -33,6 +33,12 @@ export const meta = {
         type: "string",
         pattern: "^[0-9a-fA-F-]{36}$"
       },
+      // The arm CLI's canonical manifest, carried as evidence so a reconcile
+      // digest mismatch can name its first divergent canonical path (#433).
+      // It is never part of the executable graph digest and is only read on
+      // the mismatch path, so it is admitted permissively rather than
+      // re-validated here.
+      armedManifest: { type: ["object", "null"] },
       repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
       // The two-repository seam. Each names an entry of `repositories`. A
       // campaign that sets none of them resolves every coordinate to
@@ -1614,7 +1620,14 @@ function sweepDeferral(sweepNode) {
     ? withCapabilities({
         repository: codeRepository,
         issue: args.issue,
-        worklist: args.worklist
+        worklist: args.worklist,
+        // The arm CLI's canonical manifest, forwarded so a reconcile digest
+        // mismatch can name its first divergent canonical path (#433). Spread
+        // rather than assigned: a campaign armed before the arm CLI carried it
+        // has no `armedManifest` at all, and the reconcile brief must then be
+        // byte-identical to the one that campaign already dispatches rather
+        // than gaining a key holding nothing.
+        ...(args.armedManifest ? { armedManifest: args.armedManifest } : {})
       })
     : withSeam({
         campaign: args.campaign,

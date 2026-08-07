@@ -2020,6 +2020,12 @@ async fn dispatch_campaign(
             "kind": "github-issue",
             "graphDigest": &registration.approved_graph_digest,
         },
+        // The arm CLI's canonical manifest, carried so a reconcile digest
+        // mismatch can name its first divergent canonical path (#433). This
+        // dispatch only runs because the graph's Rust digest still equals the
+        // armed digest, so this value IS the armed manifest. It is evidence
+        // for the receipt, never part of the executable graph digest.
+        "armedManifest": &graph.manifest,
         "steering": steering.master,
         "taskSteering": steering.tasks,
         "capabilities": {"subIssueWalk": registration.sub_issue_walk},
@@ -4803,6 +4809,125 @@ sys.stdout.write(module.canonical_sha256(source))
              for a manifest that leaves every optional field to each half's own \
              default; a forge-native campaign would fail reconcile with this skew"
         );
+    }
+
+    /// #433: the reconcile digest-mismatch receipt must stop starving the
+    /// operator. Two manifests differing in exactly one nested key must yield a
+    /// receipt that prints BOTH digests and names that exact canonical path —
+    /// presence/shape only, never the value. Removing the path computation from
+    /// the driver makes this red, which is the mutation this test pins.
+    #[test]
+    fn digest_mismatch_receipt_names_both_digests_and_the_first_divergent_path() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let driver = repo_root.join("examples/flows/spec_build_driver.py");
+        assert!(
+            driver.is_file(),
+            "packaged driver missing: {}",
+            driver.display()
+        );
+
+        // One agent, shared shape; the live side carries exactly one extra
+        // nested key, exactly the #429 skew shape.
+        let agent = json!({
+            "adapter": "codex",
+            "argv": [BRIEF_SENTINEL],
+            "priority": "low",
+            "runtimeMaxSec": 14_400,
+            "approvalPolicy": "never",
+            "sandboxPolicy": "danger-full-access",
+            "model": null
+        });
+        let armed_agent = agent.clone();
+        let mut live_agent = agent.clone();
+        live_agent["diagnosisSandboxPolicy"] = json!("read-only");
+        let manifest = |agent: Value| {
+            json!({
+                "schemaVersion": 1,
+                "name": "parity",
+                "agent": agent,
+                "tasks": []
+            })
+        };
+        let armed = manifest(armed_agent);
+        let live = manifest(live_agent);
+        let tasks = json!([]);
+
+        let input_dir = tempfile::tempdir().unwrap();
+        let input_path = input_dir.path().join("divergence.json");
+        fs::write(
+            &input_path,
+            serde_json::to_string(&json!({"armed": armed, "live": live, "tasks": tasks})).unwrap(),
+        )
+        .unwrap();
+        let script = r#"
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    data = json.load(handle)
+tasks = data["tasks"]
+armed_digest = module.canonical_sha256({"manifest": data["armed"], "tasks": tasks})
+live_digest = module.canonical_sha256({"manifest": data["live"], "tasks": tasks})
+receipt = module.graph_digest_mismatch_receipt(
+    data["armed"], data["live"], armed_digest, live_digest
+)
+path = module.first_divergent_canonical_path(data["armed"], data["live"])
+print(json.dumps({
+    "armedDigest": armed_digest,
+    "liveDigest": live_digest,
+    "receipt": receipt,
+    "path": path,
+}))
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(&driver)
+            .arg(&input_path)
+            .output()
+            .expect("python3 must run the packaged driver for the divergence test");
+        assert!(
+            output.status.success(),
+            "packaged driver divergence probe failed (status {:?}):\nstdout: {}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let probe: Value = serde_json::from_str(
+            &String::from_utf8(output.stdout).expect("divergence probe must print UTF-8"),
+        )
+        .expect("divergence probe must print JSON");
+
+        let armed_digest = probe["armedDigest"].as_str().unwrap();
+        let live_digest = probe["liveDigest"].as_str().unwrap();
+        let receipt = probe["receipt"].as_str().unwrap();
+        assert_ne!(armed_digest, live_digest);
+        assert_eq!(
+            probe["path"].as_str().unwrap(),
+            "agent.diagnosisSandboxPolicy: absent-in-armed / present-in-live"
+        );
+        // Both digests, in the arm CLI's `sha256:` form.
+        assert!(receipt.contains(armed_digest), "{receipt}");
+        assert!(receipt.contains(live_digest), "{receipt}");
+        // The first divergent canonical path, prefixed under the manifest.
+        assert!(
+            receipt.contains(
+                "manifest.agent.diagnosisSandboxPolicy: absent-in-armed / present-in-live"
+            ),
+            "{receipt}"
+        );
+        // The existing instruction survives: this adds evidence, it does not
+        // change the verdict.
+        assert!(
+            receipt.contains("inspect it and explicitly re-arm"),
+            "{receipt}"
+        );
+        // The receipt must not widen what it publishes: the withheld value
+        // never appears.
+        assert!(!receipt.contains("read-only"), "{receipt}");
     }
 
     #[test]

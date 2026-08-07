@@ -85,6 +85,41 @@ schema violation.
   the fatal classification, the engine rewrite, or removing the retry loop
   makes the respective test fail (mutation-proven).
 
+#### #433 — the reconcile digest-mismatch receipt prints both digests and the first divergent path
+
+On reconcile digest mismatch the operator saw only "live issue executable graph
+does not match the armed digest; inspect it and explicitly re-arm" — no digests,
+no diff. Four arms of dotfiles#163 were burned on plausible-but-wrong theories
+before source-diving both canonicalizations found #429; the first divergent
+canonical path would have named the defect instantly.
+
+- The receipt now prints BOTH digests (armed and live-computed) in the
+  `sha256:` form the arm CLI uses, and the first divergent canonical path from
+  a canonical-key-order walk of the armed manifest against the live normalized
+  one (e.g. `manifest.agent.diagnosisSandboxPolicy: absent-in-armed /
+  present-in-live`).
+- What the walk publishes, stated exactly: a path plus a shape —
+  absent-in-armed/present-in-live, a JSON type name, an array length, or the
+  bare fact that a scalar differs. Never a value. A path segment is a manifest
+  key name or an array index, so a key an operator chose (a gate id, a task id,
+  a steward environment variable's name) can appear; what is stored under it
+  cannot. Task titles and bodies live outside the manifest and the walk is only
+  ever handed the two manifests, so operator prose never reaches it.
+- The arm CLI carries its canonical manifest in the pass brief as
+  `armedManifest` (evidence for the receipt; it is never part of the executable
+  graph digest), and `spec-build.js` forwards it to the reconcile node. A
+  campaign armed before this existed carries none: the brief then omits the key
+  entirely and the receipt says the path is unavailable rather than inventing
+  one from the live side alone.
+- The gate's verdict is unchanged: it still refuses and tells the operator to
+  inspect and re-arm; this only stops the receipt starving them of evidence.
+- Tests, through the real `issue_graph_worklist` refusal path: two manifests
+  differing in exactly one nested key assert the receipt names that path and
+  both digests and withholds the value; a divergence that is only a task body
+  asserts the receipt says the manifest matched and does not republish the
+  body; an absent `armedManifest` asserts the unavailable wording. Dropping the
+  path computation makes them fail (mutation-proven).
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

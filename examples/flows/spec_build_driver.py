@@ -322,6 +322,113 @@ def canonical_sha256(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def json_type(value: Any) -> str:
+    """The JSON type name of a canonical value, with `bool` told apart from
+    `integer` (Python subclasses the former into the latter, but canonical
+    JSON keeps `true` and `1` distinct)."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+def first_divergent_canonical_path(armed: Any, live: Any, prefix: str = "") -> str | None:
+    """The first canonical path at which two values disagree, or None if equal.
+
+    Walks canonical JSON key order (sorted keys), so the answer is
+    deterministic and identical to the order `canonical_sha256` hashes. (#433)
+
+    What it publishes, stated exactly, because a receipt that under-states its
+    own reach is worse than one that says nothing. The answer is a path plus a
+    shape: `absent-in-armed`/`present-in-live`, a JSON type name, an array
+    length, or the bare fact that a scalar differs. It is never a value. A path
+    segment is a manifest key name or an array index, so a key an operator
+    chose -- a gate id, a task id, a steward environment variable's NAME --
+    can appear; the string, number or path stored under it cannot. Task titles
+    and bodies are outside the manifest, and this walk is only ever given the
+    two manifests, so operator prose never reaches it at all.
+    """
+    where = prefix or "<root>"
+    if isinstance(armed, dict) and isinstance(live, dict):
+        for key in sorted(set(armed) | set(live)):
+            child = f"{prefix}.{key}" if prefix else key
+            if key not in armed:
+                return f"{child}: absent-in-armed / present-in-live"
+            if key not in live:
+                return f"{child}: present-in-armed / absent-in-live"
+            found = first_divergent_canonical_path(armed[key], live[key], child)
+            if found is not None:
+                return found
+        return None
+    if isinstance(armed, list) and isinstance(live, list):
+        if len(armed) != len(live):
+            return f"{where}: array-length armed={len(armed)} live={len(live)}"
+        for index, (armed_item, live_item) in enumerate(zip(armed, live)):
+            found = first_divergent_canonical_path(
+                armed_item, live_item, f"{prefix}[{index}]"
+            )
+            if found is not None:
+                return found
+        return None
+    if type(armed) is not type(live):
+        return f"{where}: type-mismatch armed={json_type(armed)} live={json_type(live)}"
+    if armed != live:
+        return f"{where}: value-differs ({json_type(armed)}); value withheld"
+    return None
+
+
+def graph_digest_mismatch_receipt(
+    armed_manifest: Any,
+    live_manifest: dict[str, Any],
+    admitted_digest: str,
+    live_digest: str,
+) -> str:
+    """The reconcile digest-mismatch receipt, with the evidence to act on it.
+
+    Prints BOTH digests in the `sha256:` form the arm CLI uses, and the first
+    divergent canonical path from a canonical-key-order walk of the armed
+    manifest against the live normalized one (#433). The walk reports presence
+    and shape only — never values — because canonical values can carry operator
+    content (task bodies). The gate's verdict is unchanged: it still refuses
+    and tells the operator to inspect and re-arm; this only stops the receipt
+    starving them of the evidence. If no armed manifest was recorded (a
+    campaign armed before this existed), the path is said to be unavailable
+    rather than invented.
+    """
+    lines = [
+        "live issue executable graph does not match the armed digest; "
+        "inspect it and explicitly re-arm",
+        f"armed digest: {admitted_digest}",
+        f"live digest: {live_digest}",
+    ]
+    if isinstance(armed_manifest, dict):
+        path = first_divergent_canonical_path(armed_manifest, live_manifest)
+        if path is None:
+            lines.append(
+                "first divergent canonical path: none within the manifest; the "
+                "divergence lies in the task set or its canonicalization"
+            )
+        else:
+            lines.append(f"first divergent canonical path: manifest.{path}")
+    else:
+        lines.append(
+            "first divergent canonical path: unavailable (no armed manifest "
+            "recorded at arm); compare the armed and live digests above"
+        )
+    return "; ".join(lines)
+
+
 def run(
     command: list[str],
     *,
@@ -1426,7 +1533,9 @@ def forge_manifest(
 
 
 def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
-    data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
+    data = object_exact(
+        brief, {"repository", "issue", "worklist", "armedManifest"}, "reconcile brief"
+    )
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
         fail("repository must use owner/name form")
@@ -1527,8 +1636,12 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     digest = canonical_sha256(source_value)
     if digest != admitted_digest:
         fail(
-            "live issue executable graph does not match the armed digest; "
-            "inspect it and explicitly re-arm"
+            graph_digest_mismatch_receipt(
+                data.get("armedManifest"),
+                normalized_manifest,
+                admitted_digest,
+                digest,
+            )
         )
     for task in tasks:
         task["revision"] = canonical_sha256(
@@ -3308,7 +3421,9 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         for name in SEAM_COORDINATES:
             if brief.get(name) is not None:
                 fail(f"a forge-native campaign cannot carry {name}")
-        data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
+        data = object_exact(
+            brief, {"repository", "issue", "worklist", "armedManifest"}, "reconcile brief"
+        )
         worklist = issue_graph_worklist(data)
         campaign = worklist["config"]["campaign"]
         issue = campaign_issue(data.get("issue"))
