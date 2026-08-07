@@ -6,6 +6,48 @@ authorized.
 
 ## [Unreleased]
 
+### Campaign mechanism (#429, #432, #433, #424)
+
+The spec-build campaign path surfaced by the first real ad-hoc campaign
+(dotfiles#163): the arm CLI and the packaged driver disagree on the campaign
+agent schema, a congested daemon converts a late advisory projection into node
+death, the digest-mismatch receipt withholds the evidence needed to act on it,
+and a failed agent pass launders its stray write into the next baseline.
+
+#### #429 — the arm CLI and the packaged driver now agree on the campaign agent schema
+
+The Rust CLI's `CampaignAgent` was a 7-field `deny_unknown_fields` struct while
+the packaged driver's `forge_manifest` unconditionally normalized an 8th field
+(`diagnosisSandboxPolicy`, defaulted `"read-only"`) into the canonical agent it
+hashes. No manifest could make the two digests agree, so every forge-native arm
+failed reconcile with "live issue executable graph does not match the armed
+digest."
+
+- The field genuinely governs diagnosis-node launch behaviour that ad-hoc
+  campaigns reach: for a forge-native campaign the effective agent is the
+  driver's normalized one, and `spec-build.js` passes
+  `effective.agent.diagnosisSandboxPolicy` to the diagnosis node's sandbox
+  policy. So the field is restored to `CampaignAgent` (option 2) rather than
+  deleted, both halves now carry it, and the CLI default (`read-only`) matches
+  the driver's normalization byte-for-byte.
+- Added a schema-parity regression test
+  (`graph_digest_is_byte_identical_between_the_cli_and_the_packaged_driver`)
+  that computes the graph digest through the Rust `sha256_json` path and
+  through the packaged `spec_build_driver.py` `canonical_sha256` path (run
+  under `python3` as a subprocess, the packaged file, not a copy of its logic)
+  and asserts byte equality — so version skew inside a pin fails in CI instead
+  of at first arm. It runs two manifests: one carrying every optional field
+  explicitly, and one carrying only the required ones so each half fills the
+  rest from its own default. Deleting the driver's single
+  `diagnosisSandboxPolicy` line makes the test fail (mutation-proven).
+- The defaults fixture found a second skew of the same class: the driver
+  validated `manifest.repository` with `repo_config`, which requires
+  `baseBranch`, `remote` and `forge`, while the arm CLI's `CampaignRepository`
+  defaults all three. A manifest omitting any of them armed cleanly and then
+  died at reconcile inside the driver. `forge_manifest` now fills the arm
+  CLI's exact defaults before validating, so both halves normalize the same
+  manifest to the same canonical value.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

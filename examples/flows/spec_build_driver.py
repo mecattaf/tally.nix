@@ -1238,6 +1238,30 @@ def forge_gates(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def forge_manifest_repository(value: Any) -> dict[str, Any]:
+    """`manifest.repository` with the arm CLI's own defaults filled in first.
+
+    `repo_config` validates a *brief's* `repositoryConfig`, which this driver
+    emits itself and therefore always spells in full. A campaign manifest is
+    written by hand, and the arm CLI's `CampaignRepository` defaults
+    `baseBranch`, `remote` and `forge`. Handing the raw manifest object to
+    `repo_config` made those three required here and optional there: a manifest
+    omitting any of them armed cleanly and then died at reconcile. The defaults
+    are spelled to match `CampaignRepository`'s exactly, so both halves
+    normalize the same manifest to the same canonical value (#429).
+    """
+    if not isinstance(value, dict):
+        fail("campaign manifest.repository must be an object")
+    return repo_config(
+        {
+            "baseBranch": "main",
+            "remote": "origin",
+            "forge": "github",
+            **value,
+        }
+    )
+
+
 def forge_manifest(
     value: Any,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -1267,7 +1291,7 @@ def forge_manifest(
     campaign = required_string(manifest.get("name"), "campaign manifest.name", 80)
     if not COMPONENT.fullmatch(campaign):
         fail("campaign manifest.name is not a safe component")
-    repository_config = repo_config(manifest.get("repository"))
+    repository_config = forge_manifest_repository(manifest.get("repository"))
     max_tasks = manifest.get("maxTasks", 64)
     if not isinstance(max_tasks, int) or isinstance(max_tasks, bool) or not 1 <= max_tasks <= 100:
         fail("campaign manifest.maxTasks must be in 1..=100")

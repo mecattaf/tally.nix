@@ -24,6 +24,7 @@ const DEFAULT_RUNNER_POOL: &str = "campaign";
 const DEFAULT_AGENT_PRIORITY: &str = "low";
 const DEFAULT_AGENT_APPROVAL_POLICY: &str = "never";
 const DEFAULT_AGENT_SANDBOX_POLICY: &str = "danger-full-access";
+const DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY: &str = "read-only";
 const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
 const REGISTRY_SCHEMA_VERSION: u32 = 2;
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
@@ -55,6 +56,14 @@ struct CampaignAgent {
     approval_policy: Option<String>,
     #[serde(default = "default_agent_sandbox_policy")]
     sandbox_policy: Option<String>,
+    /// Named adapter sandbox policy for diagnosis nodes. The diagnosis brief
+    /// prohibits mutation, so the default holds that node to a read-only
+    /// policy rather than inheriting the implementation node's writable one.
+    /// The packaged driver normalizes this exact field and default into the
+    /// canonical agent it digests, so both halves of the pin must carry it
+    /// byte-identically (#429).
+    #[serde(default = "default_agent_diagnosis_sandbox_policy")]
+    diagnosis_sandbox_policy: Option<String>,
     /// The model this campaign dispatches its coder with. Absent leaves the
     /// adapter's own resolution alone and leaves the merge node with no model
     /// to name in an `Assisted-by:` trailer.
@@ -293,6 +302,10 @@ fn default_agent_approval_policy() -> Option<String> {
 
 fn default_agent_sandbox_policy() -> Option<String> {
     Some(DEFAULT_AGENT_SANDBOX_POLICY.to_owned())
+}
+
+fn default_agent_diagnosis_sandbox_policy() -> Option<String> {
+    Some(DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY.to_owned())
 }
 
 const fn default_gate_runtime_max_sec() -> u64 {
@@ -1222,6 +1235,7 @@ fn validate_agent(agent: &CampaignAgent) -> Result<()> {
     if agent.runtime_max_sec == Some(0)
         || agent.approval_policy.as_deref() == Some("")
         || agent.sandbox_policy.as_deref() == Some("")
+        || agent.diagnosis_sandbox_policy.as_deref() == Some("")
         || agent.model.as_deref() == Some("")
     {
         return Err(invalid(
@@ -4557,6 +4571,210 @@ mod tests {
         );
     }
 
+    /// The packaged driver and this CLI must agree on the canonical campaign
+    /// agent byte-for-byte, because each digests it independently and the
+    /// reconcile node refuses any mismatch. #429: the driver's `forge_manifest`
+    /// unconditionally normalized an 8th agent field (`diagnosisSandboxPolicy`)
+    /// that this struct did not carry, so no manifest could make the two
+    /// digests agree and every forge-native arm failed reconcile. This test
+    /// computes the graph digest through BOTH halves — the Rust `sha256_json`
+    /// path here, and the real `spec_build_driver.py` `canonical_sha256` path
+    /// run as a `python3` subprocess (the packaged file, not a copy of its
+    /// logic) — and asserts byte equality, so a future version skew inside a
+    /// pin fails in CI instead of at first arm.
+    ///
+    /// Two manifests, because a schema has two ways to skew. The first carries
+    /// every optional field explicitly, which catches a field one half omits
+    /// or renames. The second carries only the required ones, which catches a
+    /// field whose two halves disagree on the DEFAULT — the shape an ad-hoc
+    /// campaign manifest actually has, and the shape dotfiles#163 arm'd under.
+    #[test]
+    fn graph_digest_is_byte_identical_between_the_cli_and_the_packaged_driver() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let driver = repo_root.join("examples/flows/spec_build_driver.py");
+        assert!(
+            driver.is_file(),
+            "packaged driver missing: {}",
+            driver.display()
+        );
+
+        // `forge_manifest` validates `repository.checkout` as an existing Git
+        // directory, so the fixture needs a real one. Canonicalize it so the
+        // driver's `Path.resolve()` cannot rewrite it into a different digest.
+        let checkout_dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(checkout_dir.path())
+            .status()
+            .expect("git init must run for the schema-parity fixture");
+        assert!(
+            status.success(),
+            "git init failed for the schema-parity fixture"
+        );
+        let checkout = fs::canonicalize(checkout_dir.path()).unwrap();
+        let checkout = checkout.to_str().expect("checkout path must be UTF-8");
+
+        // The packaged driver's digest path, run once per fixture: load the
+        // real file under python3, normalize the manifest through the driver's
+        // own `forge_manifest`, and hash it with the driver's own
+        // `canonical_sha256`.
+        let driver_digest = |manifest: &Value, tasks: &Value| -> String {
+            let input_dir = tempfile::tempdir().unwrap();
+            let input_path = input_dir.path().join("parity-graph.json");
+            fs::write(
+                &input_path,
+                serde_json::to_string(&json!({"manifest": manifest, "tasks": tasks})).unwrap(),
+            )
+            .unwrap();
+            let script = r#"
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    data = json.load(handle)
+_, _, normalized_manifest = module.forge_manifest(data["manifest"])
+source = {"manifest": normalized_manifest, "tasks": data["tasks"]}
+sys.stdout.write(module.canonical_sha256(source))
+"#;
+            let output = std::process::Command::new("python3")
+                .args(["-c", script])
+                .arg(&driver)
+                .arg(&input_path)
+                .output()
+                .expect("python3 must run the packaged driver for the schema-parity test");
+            assert!(
+                output.status.success(),
+                "packaged driver parity probe failed (status {:?}):\nstdout: {}\nstderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            String::from_utf8(output.stdout)
+                .expect("driver parity probe must print UTF-8")
+                .trim()
+                .to_owned()
+        };
+
+        // The arm CLI's digest path: parse the manifest, canonicalize, hash.
+        let cli_digest = |manifest: &Value, tasks: &Value| -> String {
+            let parsed: CampaignManifest = serde_json::from_value(manifest.clone())
+                .expect("the parity manifest must parse as a CampaignManifest");
+            validate_manifest(&parsed).expect("the parity manifest must validate");
+            sha256_json(&json!({"manifest": &parsed, "tasks": tasks}))
+                .expect("sha256_json must succeed on the parity graph")
+        };
+
+        // One manifest carrying every optional field at every level.
+        let manifest = json!({
+            "schemaVersion": 1,
+            "name": "parity",
+            "repository": {
+                "checkout": checkout,
+                "baseBranch": "main",
+                "remote": "origin",
+                "forge": "github"
+            },
+            "maxTasks": 4,
+            "maxParallel": 1,
+            "driverRuntimeMaxSec": 900,
+            "runtimeMaxSec": 86_400,
+            "pool": "campaign",
+            "mergeMethod": "squash",
+            "gitAiBinding": "off",
+            "gitAiAwaitSec": 60,
+            "agent": {
+                "adapter": "codex",
+                "argv": [BRIEF_SENTINEL],
+                "priority": "low",
+                "runtimeMaxSec": 14_400,
+                "approvalPolicy": "never",
+                "sandboxPolicy": "danger-full-access",
+                "diagnosisSandboxPolicy": "read-only",
+                "model": "parity/model"
+            },
+            "steward": {
+                "adapter": "narrator",
+                "argv": ["narrate"],
+                "env": {"STEWARD_MODE": "narrate"},
+                "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
+                "runtimeMaxSec": 900
+            },
+            "gates": [
+                {
+                    "kind": "command",
+                    "id": "gate-command",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"],
+                    "runtimeMaxSec": 900
+                },
+                {
+                    "kind": "forbidPaths",
+                    "id": "gate-forbid",
+                    "forbidPaths": ["*.db"],
+                    "runtimeMaxSec": 900
+                }
+            ],
+            "tasks": [
+                {
+                    "id": "task-a",
+                    "kind": "implementation",
+                    "issue": 101,
+                    "dependencies": [],
+                    "conflictDomains": ["src"]
+                },
+                {
+                    "id": "task-b",
+                    "kind": "checkpoint",
+                    "issue": 102,
+                    "dependencies": ["task-a"],
+                    "argv": ["true"],
+                    "runtimeMaxSec": 60
+                }
+            ]
+        });
+        let tasks = json!([
+            {"number": 101, "title": "Implement the thing", "body": "Brief for task-a."},
+            {"number": 102, "title": "Checkpoint the thing", "body": "Brief for task-b."}
+        ]);
+
+        assert_eq!(
+            cli_digest(&manifest, &tasks),
+            driver_digest(&manifest, &tasks),
+            "the CLI and the packaged driver disagree on the campaign graph digest \
+             for a manifest carrying every optional field; a forge-native campaign \
+             would fail reconcile with this skew"
+        );
+
+        // The same graph with every optional field left out, so each half fills
+        // it from its OWN default. This is the shape an ad-hoc campaign manifest
+        // has, and it is the one that failed at dotfiles#163: a field the two
+        // halves default differently is invisible to the maximal fixture above.
+        let defaults = json!({
+            "schemaVersion": 1,
+            "name": "parity",
+            "repository": {"checkout": checkout},
+            "agent": {},
+            "gates": [{"kind": "forbidPaths", "id": "gate-forbid", "forbidPaths": ["*.db"]}],
+            "tasks": [
+                {"id": "task-a", "kind": "implementation", "issue": 101}
+            ]
+        });
+        let default_tasks = json!([
+            {"number": 101, "title": "Implement the thing", "body": "Brief for task-a."}
+        ]);
+        assert_eq!(
+            cli_digest(&defaults, &default_tasks),
+            driver_digest(&defaults, &default_tasks),
+            "the CLI and the packaged driver disagree on the campaign graph digest \
+             for a manifest that leaves every optional field to each half's own \
+             default; a forge-native campaign would fail reconcile with this skew"
+        );
+    }
+
     #[test]
     fn registration_v2_round_trips_local_authority() {
         let root = tempfile::tempdir().unwrap();
@@ -4634,6 +4852,7 @@ mod tests {
             runtime_max_sec: default_agent_runtime_max_sec(),
             approval_policy: default_agent_approval_policy(),
             sandbox_policy: sandbox.map(str::to_owned),
+            diagnosis_sandbox_policy: default_agent_diagnosis_sandbox_policy(),
             model: None,
         }
     }
