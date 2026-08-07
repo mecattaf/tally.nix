@@ -57,6 +57,21 @@ genuinely loaded host, set `TALLY_GATE_TIMEOUT_SCALE` instead: the runner passes
 records it on a `timeout-scale:` line in the transcript header, so a widened run is never
 byte-indistinguishable from an honest one. An unset knob records `timeout-scale: 1 (unscaled …)`.
 
+`tally-core --lib` has a tracked population of parallel-execution flakes (#419). Its exit criterion
+is a **measured rate over a wave of runs under load**, not a green run of the tests last seen
+failing — every increment to that population so far had an unrelated cause, and the discovery rate
+tracked how hard anyone looked. Measure it with `test/flake-probe.sh`, so successive waves are
+comparable:
+
+```console
+$ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test -p tally-core --lib --no-run
+$ test/flake-probe.sh target/debug/deps/tally_core-<hash> 480 3
+```
+
+The load condition is the concurrent suites themselves — never a spinner or a stress tool, which
+change the shape of the contention and corrupt any measurement sharing the host. Quote the run
+count, the concurrency, and the failing test names when reporting a rate.
+
 `test/cargo-deny.sh` checks advisories, licenses, sources, and duplicate versions with Cargo in
 offline and locked mode. The development shell supplies the RustSec database revision pinned by
 the `advisory-db` flake input; refresh that input deliberately instead of fetching during the gate.

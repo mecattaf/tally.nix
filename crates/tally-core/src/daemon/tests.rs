@@ -9582,17 +9582,25 @@ mod tests {
             .await;
     }
 
-    /// Read every datagram already queued on `socket`, with the instant each
-    /// one was observed. The socket must carry a short read timeout.
-    fn drain_notifications(socket: &UnixDatagram) -> Vec<(String, Instant)> {
+    /// Read every datagram already queued on `socket`. The socket must carry a
+    /// short read timeout.
+    ///
+    /// Deliberately untimed (#419). This used to stamp `Instant::now()` on each
+    /// datagram as it was read, and the keepalive assertion then measured the
+    /// gaps between those stamps — which are observation instants, not send
+    /// instants. Datagrams queue in the socket buffer, so a collector thread
+    /// descheduled for longer than one watchdog period reads a burst of pings
+    /// with one large gap in front of it and reddens a daemon that pinged
+    /// perfectly. Measured: injecting a single 500 ms sleep into the collector
+    /// loop fails both keepalive tests with `a 551ms silence would have missed
+    /// a 400ms service watchdog` while the payload list still holds all 19
+    /// keepalives the daemon sent.
+    fn drain_notifications(socket: &UnixDatagram) -> Vec<String> {
         let mut seen = Vec::new();
         loop {
             let mut buffer = [0_u8; 256];
             match socket.recv(&mut buffer) {
-                Ok(read) => seen.push((
-                    String::from_utf8_lossy(&buffer[..read]).into_owned(),
-                    Instant::now(),
-                )),
+                Ok(read) => seen.push(String::from_utf8_lossy(&buffer[..read]).into_owned()),
                 Err(_) => return seen,
             }
         }
@@ -9608,7 +9616,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_keepalive_pings_while_a_dispatch_arm_awaits() {
         let observed = dispatch_stall_notifications(StallShape::Awaiting).await;
-        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST);
+        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST, WATCHDOG_UNDER_TEST * 5);
     }
 
     /// The stall that matters most is not an `await` at all. `WitnessLedger::
@@ -9619,7 +9627,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_keepalive_pings_while_a_dispatch_arm_blocks_the_runtime_thread() {
         let observed = dispatch_stall_notifications(StallShape::BlockingTheThread).await;
-        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST);
+        assert_keepalive_held(&observed, WATCHDOG_UNDER_TEST, WATCHDOG_UNDER_TEST * 5);
     }
 
     const WATCHDOG_UNDER_TEST: Duration = Duration::from_millis(400);
@@ -9632,7 +9640,7 @@ mod tests {
 
     /// Run a daemon whose first dispatch-loop arm body is held for five
     /// watchdog periods, and return every notify datagram it sent, timed.
-    async fn dispatch_stall_notifications(shape: StallShape) -> Vec<(String, Instant)> {
+    async fn dispatch_stall_notifications(shape: StallShape) -> Vec<String> {
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -9674,11 +9682,19 @@ mod tests {
                 // blocking read on the runtime thread would be indistinguishable
                 // from the stall under test.
                 let collector = std::thread::spawn(move || {
-                    let deadline = Instant::now() + stall + watchdog * 8;
+                    // The deadline is a liveness backstop, not a measurement
+                    // bound (#419). It used to be `stall + watchdog * 8`, which
+                    // on a loaded host can expire before the daemon's own
+                    // `STOPPING=1` arrives -- and then the assertion that
+                    // STOPPING is last fails for no reason but this thread's
+                    // scheduling. The loop still ends the instant STOPPING is
+                    // seen, so a generous ceiling costs nothing and only bounds
+                    // a daemon that never stops at all.
+                    let deadline = Instant::now() + Duration::from_secs(120);
                     let mut seen = Vec::new();
                     while Instant::now() < deadline {
                         seen.extend(drain_notifications(&notify_socket));
-                        if seen.iter().any(|(payload, _)| payload == "STOPPING=1") {
+                        if seen.iter().any(|payload| payload == "STOPPING=1") {
                             break;
                         }
                     }
@@ -9713,13 +9729,28 @@ mod tests {
             .await
     }
 
-    /// systemd's rule is the only one that matters: no silence longer than one
-    /// service period, from `READY=1` to `STOPPING=1`.
-    fn assert_keepalive_held(observed: &[(String, Instant)], watchdog: Duration) {
-        let payloads = observed
-            .iter()
-            .map(|(payload, _)| payload.as_str())
-            .collect::<Vec<_>>();
+    /// systemd's rule is the only one that matters: the daemon must keep
+    /// pinging right through a stalled dispatch loop, from `READY=1` to
+    /// `STOPPING=1`.
+    ///
+    /// Counted, not timed (#419), for the reason [`drain_notifications`]
+    /// records: the only clock available to an observer is its own, and its own
+    /// is the one that load perturbs. The count is not perturbed — every
+    /// datagram the daemon sent is still queued and still read — so this
+    /// asserts what the daemon did rather than when this thread noticed.
+    ///
+    /// `stall` is how long the dispatch arm was held. The keepalive owes one
+    /// ping per [`keepalive_cadence`], a quarter period, so a stall of N
+    /// service periods is covered by roughly 4N pings; requiring N is a floor
+    /// with a factor of four of headroom over correct behaviour and two orders
+    /// of magnitude over the defect, which emitted none at all because the
+    /// keepalive was a `select!` arm the stalled loop never came back to poll.
+    /// What it no longer catches is a keepalive that pings in a burst and then
+    /// falls silent inside the stall; production cadence is a fixed timer, so
+    /// that shape is not a regression this suite can produce, and a false red
+    /// on every loaded host is a certainty.
+    fn assert_keepalive_held(observed: &[String], watchdog: Duration, stall: Duration) {
+        let payloads = observed.iter().map(String::as_str).collect::<Vec<_>>();
         assert_eq!(
             payloads.first().copied(),
             Some("READY=1\nSTATUS=tally daemon ready"),
@@ -9730,13 +9761,15 @@ mod tests {
             Some("STOPPING=1"),
             "no keepalive may follow the daemon's own STOPPING: {payloads:?}"
         );
-        let mut worst = Duration::ZERO;
-        for pair in observed.windows(2) {
-            worst = worst.max(pair[1].1 - pair[0].1);
-        }
+        let pings = payloads
+            .iter()
+            .filter(|payload| payload.starts_with("WATCHDOG=1"))
+            .count();
+        let owed = (stall.as_millis() / watchdog.as_millis()) as usize;
         assert!(
-            worst < watchdog,
-            "a {worst:?} silence would have missed a {watchdog:?} service watchdog: {payloads:?}"
+            pings >= owed,
+            "{pings} keepalive(s) across a {stall:?} stall cannot cover a {watchdog:?} service \
+             watchdog; at least {owed} were owed: {payloads:?}"
         );
     }
 
@@ -9764,7 +9797,7 @@ mod tests {
         assert!(
             drain_notifications(&socket)
                 .iter()
-                .filter(|(payload, _)| payload == "WATCHDOG=1")
+                .filter(|payload| payload.as_str() == "WATCHDOG=1")
                 .count()
                 >= 3,
             "a slow dispatch arm gets headroom, not a dead service"
@@ -9774,7 +9807,7 @@ mod tests {
         std::thread::sleep(watchdog * 4);
         assert_eq!(
             drain_notifications(&socket),
-            Vec::new(),
+            Vec::<String>::new(),
             "a dispatch loop that never comes back must still reach the service watchdog"
         );
 

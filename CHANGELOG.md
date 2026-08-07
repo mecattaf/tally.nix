@@ -69,6 +69,27 @@ diagnosis time and poisons the operator's model of what is broken.
   and is strictly read-only: it never creates, locks, or repairs a durable
   store.
 
+#### #419 — a fifth flake-population member, and a way to keep counting
+
+The population is **not** declared closed. Four members were already fixed on
+main (b4fa724); a wave measured on this branch surfaced a fifth, with an
+unrelated mechanism, which is the pattern that keeps this issue open.
+
+- `daemon::tests::watchdog_keepalive_pings_while_a_dispatch_arm_{awaits,blocks_the_runtime_thread}`
+  asserted the gaps between *observation* instants of the daemon's notify
+  datagrams. Datagrams queue in the socket buffer, so a collector thread
+  descheduled past one watchdog period reads a burst with one large gap in
+  front of it and reddens a daemon that pinged perfectly. The assertion is now
+  **counted, not timed**: the daemon must emit at least one keepalive per
+  service period of the stall it was held through. The collector's wall-clock
+  deadline became a liveness backstop rather than a measurement bound, for the
+  same reason.
+- `test/flake-probe.sh` measures the population's rate: N concurrent full
+  suites of one prebuilt test binary for a wall-clock budget, reporting
+  runs, failures, and the failing test names. The load condition is the
+  concurrent suites themselves, never a spinner. Documented in
+  `CONTRIBUTING.md` so successive waves are comparable.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and
