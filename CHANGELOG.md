@@ -84,6 +84,17 @@ schema violation.
   and a registration written before the knob existed still loads. Restoring
   the fatal classification, the engine rewrite, or removing the retry loop
   makes the respective test fail (mutation-proven).
+- The registration→argv delivery is pinned, not just the recording. The
+  dispatched pass's argv is built by `dispatch_flow_argv` (split out for the
+  same reason `continuation_argv` is), and
+  `a_recorded_projection_wait_reaches_the_dispatched_pass_argv` asserts that
+  `Some(n)` yields `--result-projection-wait-ms n` spelled exactly as
+  `FlowRunArgs` parses it, and that `None` yields the pre-#432 argv element for
+  element — that argv is hashed into the enqueue payload, so a stray element
+  would move every existing campaign's payload identity. Deleting the push, or
+  making it unconditional, each makes it fail (mutation-proven). The arm-side
+  `--projection-wait-ms 0` refusal is pinned by
+  `a_zero_projection_wait_is_refused_at_arm`.
 
 #### #433 — the reconcile digest-mismatch receipt prints both digests and the first divergent path
 

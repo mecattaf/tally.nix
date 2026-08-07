@@ -1937,6 +1937,56 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     (3 + preflight + manifest.max_parallel * (11 + 2 * manifest.gates.len())) as u32
 }
 
+/// The `--projection-wait-ms` an arm may record (#432).
+///
+/// Refused at arm rather than at the first pass, because the value is durable:
+/// a zero here would be written into the registration and then rejected by
+/// every `tally flow run` this campaign ever dispatches, including the ones the
+/// poll timer dispatches unattended. Absent stays absent, which is what leaves
+/// the flow host's own 10 s default alone.
+fn validated_projection_wait_ms(value: Option<u64>) -> Result<Option<u64>> {
+    if value == Some(0) {
+        return Err(invalid("--projection-wait-ms must be greater than zero"));
+    }
+    Ok(value)
+}
+
+/// Argv of the `tally flow run` this campaign dispatches for one pass.
+///
+/// Split out of `dispatch_campaign` for the same reason `continuation_argv` is:
+/// it is the only place a durable registration turns into something the pass
+/// actually executes, and an argv nothing constructs in a test is an argv
+/// nothing notices the loss of (#432).
+///
+/// `projection_wait_ms` is the seam that carries `campaign arm
+/// --projection-wait-ms` to the pass. It travels on the argv rather than in the
+/// environment because the pass runs as a daemon-launched transient unit whose
+/// environment is an explicit `--setenv` list, so nothing an operator exports at
+/// arm time is visible to it. `None` must leave the argv byte-identical to the
+/// pre-#432 shape: this vector is hashed into the enqueue payload, so a stray
+/// element would move every existing campaign's payload identity.
+fn dispatch_flow_argv(
+    executable: &Path,
+    flow: &Path,
+    max_nodes: u32,
+    projection_wait_ms: Option<u64>,
+) -> Vec<String> {
+    let mut argv = vec![
+        executable.display().to_string(),
+        "flow".to_owned(),
+        "run".to_owned(),
+        flow.display().to_string(),
+        "--args-from-brief".to_owned(),
+        "--max-nodes".to_owned(),
+        max_nodes.to_string(),
+    ];
+    if let Some(millis) = projection_wait_ms {
+        argv.push("--result-projection-wait-ms".to_owned());
+        argv.push(millis.to_string());
+    }
+    argv
+}
+
 /// Argv the pass writes into the events directory to admit its own successor.
 ///
 /// It is the poll the timer already runs: one registry scan that refetches the
@@ -2044,28 +2094,14 @@ async fn dispatch_campaign(
             "eventsDir": host.events_dir(),
         },
     });
-    let mut flow_argv = vec![
-        executable.display().to_string(),
-        "flow".to_owned(),
-        "run".to_owned(),
-        registration.flow.display().to_string(),
-        "--args-from-brief".to_owned(),
-        "--max-nodes".to_owned(),
-        max_flow_nodes(&graph.manifest).to_string(),
-    ];
-    // #432: the projection wait reaches the pass on its argv, not through the
-    // environment. This pass runs as a daemon-launched transient unit whose
-    // environment is an explicit `--setenv` list, so nothing an operator
-    // exports at arm time is visible to it. Absent leaves the argv exactly as
-    // it was, so a campaign armed without the flag dispatches byte-identically
-    // to before.
-    if let Some(millis) = registration.projection_wait_ms {
-        flow_argv.push("--result-projection-wait-ms".to_owned());
-        flow_argv.push(millis.to_string());
-    }
     let payload = EnqueuePayload {
         invocation: None,
-        argv: Some(flow_argv),
+        argv: Some(dispatch_flow_argv(
+            &executable,
+            &registration.flow,
+            max_flow_nodes(&graph.manifest),
+            registration.projection_wait_ms,
+        )),
         pools: Some(vec!["flow".to_owned(), graph.manifest.pool.clone()]),
         executor: None,
         priority: Some(priority(&graph.manifest.agent.priority)),
@@ -2160,13 +2196,7 @@ async fn run_campaign_arm(
     if !workspace_root.is_absolute() {
         return Err(invalid("campaign workspace root must be absolute"));
     }
-    // #432: refused at arm rather than at the first pass, because the value is
-    // durable — a zero here would be recorded and then rejected by every
-    // `flow run` this campaign ever dispatches, including the ones the poll
-    // timer dispatches unattended.
-    if args.projection_wait_ms == Some(0) {
-        return Err(invalid("--projection-wait-ms must be greater than zero"));
-    }
+    let projection_wait_ms = validated_projection_wait_ms(args.projection_wait_ms)?;
     let arm_serial = prior.as_ref().map_or(Ok(1), |value| {
         value
             .arm_serial
@@ -2193,7 +2223,7 @@ async fn run_campaign_arm(
         // Arming always dispatches, so the cheap precondition starts empty and
         // the first poll after an arm re-establishes it.
         last_forge_observation: None,
-        projection_wait_ms: args.projection_wait_ms,
+        projection_wait_ms,
         flow,
         driver,
         workspace_root,
@@ -4969,6 +4999,98 @@ print(json.dumps({
         // what makes `campaign poll` dispatch later passes with the same
         // widened window the operator armed with.
         assert_eq!(loaded.projection_wait_ms, Some(240_000));
+    }
+
+    /// #432 acceptance 2, the DELIVERY half of the seam.
+    ///
+    /// Recording `--projection-wait-ms` in the registration is worth nothing on
+    /// its own: what the operator is promised is that every pass this campaign
+    /// dispatches waits that long. `dispatch_flow_argv` is the only place that
+    /// promise is kept, so it is asserted here directly — a registration
+    /// carrying `Some(n)` must put `--result-projection-wait-ms n` on the
+    /// dispatched pass's argv, spelled exactly as `FlowRunArgs` parses it.
+    ///
+    /// The `None` half is not decoration. This argv is hashed into the enqueue
+    /// payload, so a stray element would move the payload identity of every
+    /// campaign armed without the flag; it is asserted element-by-element
+    /// against the literal pre-#432 shape.
+    ///
+    /// Deleting the `--result-projection-wait-ms` push from `dispatch_flow_argv`
+    /// makes this test red — that mutation used to leave the whole crate green.
+    #[test]
+    fn a_recorded_projection_wait_reaches_the_dispatched_pass_argv() {
+        let executable = Path::new("/nix/store/tally/bin/tally");
+        let flow = Path::new("/nix/store/spec-build.js");
+
+        // The pre-#432 shape, byte for byte. A campaign armed without the flag
+        // must dispatch exactly this.
+        let unset = dispatch_flow_argv(executable, flow, 51, None);
+        assert_eq!(
+            unset,
+            vec![
+                "/nix/store/tally/bin/tally".to_owned(),
+                "flow".to_owned(),
+                "run".to_owned(),
+                "/nix/store/spec-build.js".to_owned(),
+                "--args-from-brief".to_owned(),
+                "--max-nodes".to_owned(),
+                "51".to_owned(),
+            ],
+            "a campaign armed without --projection-wait-ms must dispatch the \
+             pre-#432 argv byte-identically; this vector is hashed into the \
+             enqueue payload"
+        );
+
+        // The recorded wait, delivered.
+        let widened = dispatch_flow_argv(executable, flow, 51, Some(240_000));
+        assert_eq!(
+            widened,
+            [
+                unset.as_slice(),
+                &[
+                    "--result-projection-wait-ms".to_owned(),
+                    "240000".to_owned()
+                ]
+            ]
+            .concat(),
+            "a registration carrying a projection wait must put it on the \
+             dispatched pass's argv"
+        );
+
+        // The flag this argv names must be the flag `flow run` parses, or the
+        // dispatched pass dies on an unknown argument instead of waiting.
+        let parsed = Opts::try_parse_from(widened.iter().map(String::as_str))
+            .expect("the dispatched argv must parse as a tally invocation");
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Flow {
+                command: FlowCommand::Run(FlowRunArgs {
+                    args_from_brief: true,
+                    max_nodes: 51,
+                    result_projection_wait_ms: Some(240_000),
+                    ..
+                })
+            })
+        ));
+    }
+
+    /// #432, the arm-side half of the refusal (the flow-side zero and
+    /// unparsable refusals are pinned in `cli::flow::tests`). A zero recorded
+    /// here would be durable: every pass this campaign ever dispatches,
+    /// including the unattended poll ones, would then die on its own argv.
+    #[test]
+    fn a_zero_projection_wait_is_refused_at_arm() {
+        assert_eq!(validated_projection_wait_ms(None).unwrap(), None);
+        assert_eq!(
+            validated_projection_wait_ms(Some(240_000)).unwrap(),
+            Some(240_000)
+        );
+        assert_eq!(validated_projection_wait_ms(Some(1)).unwrap(), Some(1));
+        let refused = validated_projection_wait_ms(Some(0)).unwrap_err();
+        assert!(
+            refused.to_string().contains("--projection-wait-ms"),
+            "{refused}"
+        );
     }
 
     /// #432 acceptance 2, the seam that actually reaches a campaign pass. A
