@@ -21,10 +21,14 @@
 #   env -u TALLY_TEST_REMOTE_HOST cargo test -p tally-core --lib --no-run
 #   test/flake-probe.sh target/debug/deps/tally_core-<hash> 480 2
 #
-# It prints one summary line per concurrent suite and a total, and writes the
-# failing runs' test names to <binary>.flake-probe.failures in the working
-# directory. Exit status is 0 when the wave completed, whatever the rate was:
-# this measures, it does not gate.
+# It prints one summary line per concurrent suite and a total, and appends the
+# WHOLE OUTPUT of every failing run to <binary>.flake-probe.failures in the
+# working directory. The whole output, not a grep for the test name: the
+# expensive part of a wave is catching a failure, and a name without its
+# `panicked at` line and its left/right values costs the next wave a full
+# re-reproduction to learn the mechanism -- which it did cost one. Exit status
+# is 0 when the wave completed, whatever the rate was: this measures, it does
+# not gate.
 #
 # Deliberately no `--test-threads` override. The races this counts are between
 # sibling tests inside one process, so capping the suite's own parallelism
@@ -57,7 +61,8 @@ run_suite() {
       fails=$((fails + 1))
       {
         echo "=== suite $lane run $runs failed ==="
-        printf '%s\n' "$output" | grep -E '^test .* FAILED|^    [a-z_]+::' || true
+        printf '%s\n' "$output"
+        echo "=== end suite $lane run $runs ==="
       } >>"$failures_file"
     fi
   done
@@ -79,5 +84,5 @@ while read -r lane runs fails; do
 done <"$tally_file"
 echo "flake-probe: $total_fails / $total_runs runs had at least one failing test"
 if [ "$total_fails" -gt 0 ]; then
-  echo "flake-probe: failing test names in $failures_file"
+  echo "flake-probe: full output of every failing run in $failures_file"
 fi

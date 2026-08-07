@@ -106,10 +106,18 @@ unrelated mechanism, which is the pattern that keeps this issue open.
   only delay a timer; the upper bound is waited for, with a liveness backstop
   that separates a suppressed tick from a late one.
 - `test/flake-probe.sh` measures the population's rate: N concurrent full
-  suites of one prebuilt test binary for a wall-clock budget, reporting
-  runs, failures, and the failing test names. The load condition is the
-  concurrent suites themselves, never a spinner. Documented in
+  suites of one prebuilt test binary for a wall-clock budget, reporting runs,
+  failures, and the full output of every failing run — the panic text included,
+  because the expensive part of a wave is catching a failure, not counting it,
+  and a name alone costs the next wave a re-reproduction. The load condition is
+  the concurrent suites themselves, never a spinner. Documented in
   `CONTRIBUTING.md` so successive waves are comparable.
+- **The bound, pooled across every wave run on this head: 1 failure in 605 runs
+  at three or more concurrent suites (~0.17%)** — the lane's 244 post-fix runs
+  plus an independent 361. The one failure was the fifth member again, with the
+  assertion uncaptured, so the residual is non-zero and the mechanism of that
+  observation is unidentified. ~0.17% is under the historical ~0.74% and is not
+  zero; the population stays open, and this is a bound, not a repair claim.
 
 ### Steward driver gates (#385, #386)
 
