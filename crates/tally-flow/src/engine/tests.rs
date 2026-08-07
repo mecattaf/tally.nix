@@ -868,6 +868,78 @@ fn a_refusal_that_names_no_run_advertises_no_command_anywhere() {
     );
 }
 
+/// Issue #414: a flag-shaped identity is a run named badly, not a run not
+/// named. The raw value stays visible in `flowRunId` — #401 item 3's
+/// invariant — but nothing may derive a command from it: interpolating
+/// `--reason` into the supersede argv makes clap read it as the next flag,
+/// and the advertised command exits 2 in an operator's hands. The split is
+/// rendered identically in both fields the operator can read, and no UUID
+/// validation is introduced: the leading dash after trim is the entire test.
+#[test]
+fn a_flag_shaped_run_identity_keeps_its_name_and_loses_its_command() {
+    for flag_like in ["--reason", "-", "-x", "  --flow-run-id"] {
+        for code in crate::error::SUPERSESSION_CODES {
+            let details = crate::error::supersession_details(
+                code,
+                &crate::error::SupersessionDetails {
+                    flow_run_id: flag_like,
+                    ..crate::error::SupersessionDetails::default()
+                },
+            );
+            assert_eq!(
+                details["flowRunId"], flag_like,
+                "{code} with {flag_like:?}: a badly named run stays visible"
+            );
+            assert!(
+                details["remedy"].is_null(),
+                "{code} with {flag_like:?}: {}",
+                details["remedy"]
+            );
+        }
+        // The message twin: the why-clause survives, the command does not,
+        // and the sentence names the malformed identity rather than reading
+        // like the no-run-named case.
+        let sentence =
+            crate::error::identity_refusal_remedy_sentence("script-changed-mid-run", flag_like);
+        assert!(
+            !sentence.contains("tally flow supersede"),
+            "{flag_like:?}: {sentence}"
+        );
+        assert!(
+            !sentence.contains("--flow-run-id"),
+            "{flag_like:?}: the command's operands must not appear either: {sentence}"
+        );
+        assert!(
+            sentence.contains("malformed"),
+            "{flag_like:?}: the sentence must name the malformed identity: {sentence}"
+        );
+        assert!(
+            sentence.contains("refused for script it never changed"),
+            "the why-clause survives the missing command: {sentence}"
+        );
+    }
+
+    // A well-formed id keeps its command in both fields: the rendering split
+    // binds only if this side still renders.
+    let uuid = "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321";
+    let details = crate::error::supersession_details(
+        "script-changed-mid-run",
+        &crate::error::SupersessionDetails {
+            flow_run_id: uuid,
+            ..crate::error::SupersessionDetails::default()
+        },
+    );
+    assert_eq!(
+        details["remedy"],
+        format!(
+            "tally flow supersede --flow-run-id {uuid} --new-flow-run-id <FRESH-UUID> \
+             --reason script-changed"
+        )
+    );
+    let sentence = crate::error::identity_refusal_remedy_sentence("script-changed-mid-run", uuid);
+    assert!(sentence.contains("tally flow supersede"), "{sentence}");
+}
+
 /// Completion is a floor under the contract, not a filter over it.
 #[test]
 fn a_run_named_badly_is_preserved_rather_than_dropped() {

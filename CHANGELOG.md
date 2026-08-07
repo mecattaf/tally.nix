@@ -71,6 +71,32 @@ no-op with a success message.
   modules by evaluated assertions that the export exists with the configured
   path on both units and both login environments.
 
+#### #414 — no executable command for a malformed run identity
+
+A flag-shaped `flowRunId` from a foreign producer (a leading `-` after
+trim) still rendered a `remedy` interpolating it, advertising a command
+clap refuses with exit 2 — `--flow-run-id --reason` parses the id as the
+next flag.
+
+- The exit-20 rendering now splits on the flag shape in both fields an
+  operator reads: the `remedy` member is `null`, and the refusal message
+  keeps the why-clause but replaces the command with its own sentence
+  naming a malformed run identity — the same rendering family as the empty
+  case, but distinct from it: a run was named, badly, which is not "no run
+  named".
+- The raw `flowRunId` stays visible in `details`, preserving #401 item 3's
+  invariant. The two emptiness definitions (`trim().is_empty()` in both
+  sites) stay untouched and in agreement, and no UUID validation is
+  introduced anywhere in the fourteen-member map — the leading dash after
+  trim is the entire test.
+- The documented `remedy` nullity rule — one wording, pinned identical on
+  `submission-and-replay.md` and `errors.md` — now states both shapes that
+  produce `null`, and a doc pin checks the sentence against what the code
+  does rather than against itself.
+- Mutation-proven both ways: dropping either guard (the `remedy` arm or the
+  sentence branch) turns the new test red, and the same test asserts a
+  well-formed id still gets its command in both fields.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

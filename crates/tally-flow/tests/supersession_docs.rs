@@ -321,6 +321,44 @@ fn the_remedy_nullity_rule_is_stated_once_and_the_code_obeys_the_stated_rule() {
     );
 }
 
+/// Issue #414: the stated rule has a second half now — a `flowRunId` that
+/// reads as a command flag also yields `null` — and the same discipline
+/// applies to it: the sentence is checked against what the code does, not
+/// against itself. A rule that names only the missing-id half while the code
+/// suppresses two shapes is the defect this file exists to catch, one level
+/// up.
+#[test]
+fn the_stated_rule_covers_the_flag_shaped_identity_the_code_also_suppresses() {
+    let flag_shaped = supersession_details(
+        "script-changed-mid-run",
+        &SupersessionDetails {
+            flow_run_id: "--reason",
+            ..SupersessionDetails::default()
+        },
+    );
+    assert!(
+        flag_shaped["remedy"].is_null(),
+        "a flag-shaped identity must advertise no command: {}",
+        flag_shaped["remedy"]
+    );
+    assert_eq!(
+        flag_shaped["flowRunId"], "--reason",
+        "and the badly named run stays visible"
+    );
+
+    for (page, doc) in [
+        ("submission-and-replay.md", FLOW_DOC),
+        ("errors.md", ERROR_DOC),
+    ] {
+        let rule = marked(doc, "remedy-nullity");
+        assert!(
+            rule.contains("command flag"),
+            "{page} states only the missing-id half of a rule the code applies to two \
+             shapes: {rule:?}"
+        );
+    }
+}
+
 #[test]
 fn both_pages_state_the_size_of_the_contract() {
     let size = match SUPERSESSION_DETAIL_FIELDS.len() {
