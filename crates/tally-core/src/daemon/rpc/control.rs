@@ -1170,7 +1170,7 @@ impl<'a> FoundJob<'a> {
             Self::Retired {
                 status: RowStatus::Deleted,
                 ..
-            } => "deleted-cache",
+            } => crate::query::row_status_name(RowStatus::Deleted),
             Self::Retired { .. } => state_name(JobState::Completed),
         }
     }
