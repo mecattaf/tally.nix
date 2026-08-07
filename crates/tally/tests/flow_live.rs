@@ -1974,8 +1974,12 @@ async fn a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire()
             // the same unchanged script, so they are the same string here. Making
             // them differ would mean changing the script between the two runs,
             // which the startup identity pin refuses before an ordinal is ever
-            // admitted, so no scenario in this suite can see it. The in-process
-            // tests in `tally-flow` cover the label sides.
+            // admitted, so no scenario in this suite can see it. The sides are
+            // bound where that shape is reachable in-process: the mock ledger in
+            // `payload_divergence_stops_admission_at_the_mismatched_ordinal`
+            // (crates/tally-flow/src/engine/tests.rs) returns one label and the
+            // script derives another, and the test pins recordedLabel and
+            // currentLabel to the two different strings.
             assert_eq!(
                 details.get("currentLabel").and_then(Value::as_str),
                 Some("task-ref-child")

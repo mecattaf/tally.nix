@@ -13,6 +13,7 @@ struct Reply {
     stderr_truncated: Option<bool>,
     result: Option<Value>,
     divergent_hash: bool,
+    recorded_label: Option<String>,
     client_error: Option<ClientError>,
 }
 
@@ -26,6 +27,7 @@ impl Reply {
             stderr_truncated: None,
             result: Some(json!({"ok": true})),
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
         }
     }
@@ -39,6 +41,7 @@ impl Reply {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: Some(ClientError::new(code, format!("{code} from mock"))),
         }
     }
@@ -177,7 +180,7 @@ impl FlowClient for MockClient {
             payload_hash,
             attempt: 0,
             terminal: inline,
-            recorded_label: None,
+            recorded_label: reply.recorded_label.clone(),
             reused_rejected: None,
         }));
         let delayed = self.delayed_submissions.borrow().contains(&index);
@@ -550,13 +553,17 @@ fn payload_divergence_stops_admission_at_the_mismatched_ordinal() {
     let source = format!(
         "{}\n(async () => parallel([\n\
          () => sh(['zero'], {{pools: ['cpu']}}),\n\
-         () => sh(['one'], {{pools: ['cpu']}}),\n\
+         () => sh(['one'], {{pools: ['cpu'], label: 're-derived'}}),\n\
          () => sh(['two'], {{pools: ['cpu']}})\n\
          ]))()",
         meta(&["cpu"], &[])
     );
     let mut mismatch = Reply::pass(Disposition::Reused, 2);
     mismatch.divergent_hash = true;
+    // The ledger's own label for the row, distinct from the label the
+    // runner derives for the same ordinal, so the two sides of the
+    // disagreement are bound as the two different strings they are.
+    mismatch.recorded_label = Some("ledger-label".to_owned());
     let client = MockClient::new(vec![
         Reply::pass(Disposition::Reused, 1),
         mismatch,
@@ -575,6 +582,12 @@ fn payload_divergence_stops_admission_at_the_mismatched_ordinal() {
     assert_eq!(error.details["flowRunId"], "run-1");
     assert_eq!(error.details["divergentInput"], "payload");
     assert_eq!(error.details["recordedHash"], "sha256:divergent");
+    // Which member carries which side of the label disagreement, bound
+    // against two strings that differ — the shape the live replay-divergence
+    // fixture structurally cannot produce (#418): recordedLabel is what the
+    // ledger's admission returned, currentLabel what this runner derived.
+    assert_eq!(error.details["recordedLabel"], "ledger-label");
+    assert_eq!(error.details["currentLabel"], "re-derived");
     // A rollover does not clear a payload divergence, so the resolution differs
     // from the identity pins' — but it is still permanent, and says so.
     assert_eq!(error.details["transient"], false);
@@ -1202,6 +1215,7 @@ fn selector_quorum_preserves_dissent_and_materializes_one_repair_key() {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
         },
         Reply::pass(Disposition::Created, 3),
@@ -1359,6 +1373,7 @@ fn drv_sugar_is_store_native_replay_stable_and_substituted_is_success() {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
         }]);
         let (report, _) = run(&source, client.clone()).unwrap();
@@ -1802,6 +1817,7 @@ fn aggregate_and_loop_errors_keep_their_public_classes_and_call_sites() {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
         },
     ]);
@@ -1853,6 +1869,7 @@ fn documented_admission_terminal_and_node_cap_rejections_are_typed() {
         stderr_truncated: Some(false),
         result: None,
         divergent_hash: false,
+        recorded_label: None,
         client_error: None,
     };
     let error = run(&source, MockClient::new(vec![failed])).unwrap_err();
@@ -1873,6 +1890,7 @@ fn documented_admission_terminal_and_node_cap_rejections_are_typed() {
         stderr_truncated: None,
         result: None,
         divergent_hash: false,
+        recorded_label: None,
         client_error: None,
     };
     let error = run(&source, MockClient::new(vec![cancelled])).unwrap_err();

@@ -97,6 +97,32 @@ next flag.
   sentence branch) turns the new test red, and the same test asserts a
   well-formed id still gets its command in both fields.
 
+#### #418 — the doc-pin check tells the truth about what it rejects
+
+The end-of-span check in `supersession_docs.rs` fired on any `|` line after
+an `:end` marker, including a blank line followed by a *complete* second
+table — which renders perfectly, because a blank line ends a table in
+markdown — and its panic message claimed a marker inside a table splits it,
+steering the obvious fix back into the rendering defect the pin exists to
+prevent.
+
+- The check now skips blank lines and distinguishes the shapes: a following
+  complete table (header + separator rows) is accepted; it fires only when
+  the content after the marker is a bare row, with or without a blank line.
+  The panic message and the rustdoc now describe the shape actually
+  rejected. Probe A (blank line, bare rows) stays red; probe B (blank line,
+  complete table) goes green — both as synthetic in-test documents, and the
+  mutation that restores the old check turns probe B red. "Complete" means a
+  real delimiter row: a horizontal rule under a row is still a bare row, and
+  a third probe pins that.
+- The live `replay-divergence` test's label comment pointed at "the
+  in-process tests in `tally-flow`" for coverage that was not there. The
+  label sides are now bound in-process — the mock ledger returns one label
+  and the script derives another, and
+  `payload_divergence_stops_admission_at_the_mismatched_ordinal` pins
+  `recordedLabel`/`currentLabel` to the two different strings — and the
+  comment names that test instead of claiming a crate.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and
