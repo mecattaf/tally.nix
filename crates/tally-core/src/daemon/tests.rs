@@ -14555,10 +14555,21 @@ mod tests {
                     "an admission waited {worst_enqueue:?} behind corpus-scale query work"
                 );
                 let ticks = ticks.borrow();
+                // The instrument must have measured across the storm window;
+                // how many samples that took is the host's business. A fixed
+                // sample count flaked on a loaded gate host (19 live ticks in
+                // ~10 s under a full parallel suite), while a deaf loop is
+                // caught by the max-gap bound below regardless of how many
+                // ticks it eventually produced.
                 assert!(
-                    ticks.len() >= 20,
-                    "expected a live tick cadence, saw {} ticks",
+                    ticks.len() >= 2,
+                    "the tick instrument produced too few samples to measure absence ({} ticks)",
                     ticks.len()
+                );
+                let span = *ticks.last().unwrap() - *ticks.first().unwrap();
+                assert!(
+                    span >= STORM,
+                    "tick samples span {span:?}, less than the {STORM:?} storm window"
                 );
                 let mut max_gap = Duration::ZERO;
                 for pair in ticks.windows(2) {
