@@ -374,9 +374,14 @@ They differ in one place. `tally daemon drain` is what `tally-drain.timer` runs 
 seconds, and a daemon restart takes longer than that, so it treats an unreachable socket as
 nothing to drain and exits **0** rather than 3 — otherwise every activation that restarts the
 daemon raises a unit failure indistinguishable from a real one. The line naming the unreachable
-socket is still written to stderr, so an operator running it by hand still sees which case it was,
-and every other drain failure — including a daemon that is listening and refuses — keeps its exit
-code. `tally queue drain` is unchanged and still exits 3 on an unreachable socket. The unit also
+socket is still written to stderr, so an operator running it by hand still sees which case it was.
+It also absorbs the busy-daemon shape: a daemon that connected but did not answer `queue.drain`
+within the client deadline (60s by default; `--rpc-timeout-sec` / `TALLY_RPC_TIMEOUT_SEC`)
+records a retryable skip and likewise exits **0**, because the producer event files are durable
+on disk and the next tick drains them — nothing is lost. The line naming the expired deadline is
+written to stderr the same way. Every other drain failure — including a daemon that is listening
+and refuses — keeps its exit code. `tally queue drain` is unchanged and still exits 3 on an
+unreachable socket, and 1 when the deadline expires. The unit also
 carries `ConditionPathExists` on the socket, so a drain scheduled while the daemon is down is
 recorded as a skipped start rather than being invoked at all.
 

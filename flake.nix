@@ -3881,6 +3881,12 @@
           assert homeTimers.tally-producer-drop.Timer.OnUnitActiveSec == "60s";
           assert homeTimers.tally-drain.Timer.OnActiveSec == "1s";
           assert homeTimers.tally-drain.Timer.OnUnitActiveSec == "5s";
+          # The periodic spelling, which is the only one that absorbs an
+          # absent socket (#411) or an expired `queue.drain` deadline (#427).
+          # The NixOS side is pinned above; this is the user-unit half, and it
+          # is the half whose failures the fleet's per-user-unit watcher
+          # reports. `queue drain` here would leave both absorptions inert.
+          assert pkgs.lib.hasInfix "daemon drain" (homeServiceExec "tally-drain");
           assert homeServices ? tally-meter-programmatic;
           assert homeServices.tally-meter-programmatic.Service.Restart == "always";
           assert homeServices.tally-meter-programmatic.Unit.StartLimitIntervalSec == 0;

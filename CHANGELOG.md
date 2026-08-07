@@ -6,6 +6,40 @@ authorized.
 
 ## [Unreleased]
 
+### flows & cli residue (#427, #416, #414, #418)
+
+Four residues from earlier waves, each with its shape already argued in its
+issue: a drain client that spent the fleet failure alarm on a busy daemon, a
+direct-file verb family whose default data dir ignored the deployment it was
+run against, an exit-20 remedy that advertised a command that cannot parse,
+and a doc-pin check whose own message claimed the wrong thing.
+
+#### #427 — a drain whose RPC deadline expires on a busy daemon is a retryable skip
+
+`tally-drain.timer` fires every five seconds, and a saturated daemon can take
+longer than the 60s client deadline to answer `queue.drain` on a connection
+that was established. That exited 1 and surfaced as a per-user unit failure —
+~52 in one day on the coordinator, every one self-healing on the next tick.
+
+- `tally daemon drain` now treats `queue.drain` deadline-exceeded as a
+  retryable skip: exit 0, with the line naming the expired deadline still
+  written to stderr, plus that the skip is retryable. The safety argument is
+  the event files': they are durable on disk and the next drain picks them
+  up, so nothing is lost.
+- The skip is narrow: only `queue.drain`'s own client deadline on the
+  periodic spelling is absorbed. `tally queue drain` keeps failing on the
+  same hang, and every other established-connection error — including a
+  daemon that is listening and refuses — keeps its exit code.
+- Proven at both seams: a unit test pins the classification (deadline on
+  `queue.drain` is the skip; another method's deadline, a rearm-window
+  exhaustion, a refusal, and an absence are all not), and an integration
+  test runs the real binary against a server that connects and never
+  answers: `daemon drain` exits 0 and names the case, `queue drain` exits 1.
+- The Home Manager `tally-drain` unit's `daemon drain` spelling is now
+  pinned in the module contract, as the NixOS one already was — the
+  user-unit half is the one whose failures the fleet watcher reports, and
+  `queue drain` there would leave both this absorption and #411's inert.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

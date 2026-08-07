@@ -37,6 +37,27 @@ pub(super) fn is_daemon_absent(error: &anyhow::Error) -> bool {
         .any(|cause| matches!(cause.downcast_ref(), Some(WireIoError::Unreachable { .. })))
 }
 
+/// Whether this failure is the drain RPC's client deadline expiring on an
+/// ESTABLISHED connection (#427).
+///
+/// The daemon is present — the socket connected — but too busy to answer
+/// `queue.drain` within the client's deadline. The producer event files are
+/// durable on disk and the next `tally-drain` tick picks them up, so nothing
+/// is lost: for the periodic drain this is a retryable skip, symmetric with
+/// #411's connect-time absence handling. Deliberately narrow: only
+/// `queue.drain`'s own client deadline counts. A drained rearm window
+/// (`RearmDeadlineExceeded`) is a different path this verb never takes, and
+/// every other established-connection failure — including a daemon that is
+/// listening and refuses — keeps failing the unit.
+pub(super) fn is_drain_deadline_exceeded(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref(),
+            Some(WireIoError::DeadlineExceeded { method, .. }) if method == "queue.drain"
+        )
+    })
+}
+
 pub(super) fn error_exit_code(error: &anyhow::Error) -> i32 {
     for cause in error.chain() {
         if let Some(failure) = cause.downcast_ref::<ExitFailure>() {
@@ -202,5 +223,80 @@ mod tests {
         })
         .context("draining the queue");
         assert!(is_daemon_absent(&wrapped));
+
+        // #427: the deadline skip is a separate predicate, and the absence
+        // predicate must not grow to cover it — a busy daemon answering
+        // nothing is still present.
+        let busy = anyhow::Error::new(WireIoError::DeadlineExceeded {
+            method: "queue.drain".to_owned(),
+            deadline: Duration::from_secs(60),
+        });
+        assert!(!is_daemon_absent(&busy));
+        assert_eq!(
+            error_exit_code(&busy),
+            1,
+            "a deadline expiry keeps the ordinary failure exit until the drain absorbs it"
+        );
+    }
+
+    /// Issue #427: the absorption is scoped to "the drain's own RPC deadline
+    /// expired on a connection that was established", and that scope is what
+    /// keeps it honest. Nothing is lost — the event files are durable and the
+    /// next tick drains them — but the same latitude for any other error would
+    /// turn a genuinely failing drain into a quiet success.
+    #[test]
+    fn only_the_drain_deadline_counts_as_a_retryable_drain_skip() {
+        // The case itself: connected, answered nothing within the deadline.
+        let busy = anyhow::Error::new(WireIoError::DeadlineExceeded {
+            method: "queue.drain".to_owned(),
+            deadline: Duration::from_secs(60),
+        });
+        assert!(is_drain_deadline_exceeded(&busy));
+
+        // Wrapped in context the way the call sites raise it.
+        let wrapped = anyhow::Error::new(WireIoError::DeadlineExceeded {
+            method: "queue.drain".to_owned(),
+            deadline: Duration::from_secs(1),
+        })
+        .context("draining the queue");
+        assert!(is_drain_deadline_exceeded(&wrapped));
+
+        // Another method's deadline is not the drain's skip: the predicate
+        // names its method, not the error variant alone.
+        let other_method = anyhow::Error::new(WireIoError::DeadlineExceeded {
+            method: "queue.await_job".to_owned(),
+            deadline: Duration::from_secs(60),
+        });
+        assert!(
+            !is_drain_deadline_exceeded(&other_method),
+            "only queue.drain's own deadline is a retryable skip"
+        );
+
+        // A drained rearm window is present-and-not-answering on the
+        // reconnect path, not a single-call deadline: not the skip.
+        let rearm = anyhow::Error::new(WireIoError::RearmDeadlineExceeded {
+            method: "queue.drain".to_owned(),
+            path: PathBuf::from("/run/user/0/tally/tally.sock"),
+            window: Duration::from_secs(60),
+        });
+        assert!(
+            !is_drain_deadline_exceeded(&rearm),
+            "a rearm-window exhaustion is a different fault than a call deadline"
+        );
+
+        // A daemon that is listening and refuses is still a failure.
+        let refused = anyhow::Error::new(WireIoError::Rpc(
+            WireErrorCode::InvalidParams,
+            "drain refused".to_owned(),
+            None,
+        ));
+        assert!(!is_drain_deadline_exceeded(&refused));
+
+        // The socket-absent case is #411's predicate, not this one.
+        let absent = anyhow::Error::new(WireIoError::Unreachable {
+            path: PathBuf::from("/run/user/0/tally/tally.sock"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+        assert!(!is_drain_deadline_exceeded(&absent));
     }
 }
