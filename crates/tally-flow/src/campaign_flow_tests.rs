@@ -165,6 +165,34 @@ fn a_tree_delta_failure_is_priced_as_a_breach_not_work() {
     );
 }
 
+/// #424: the gate refusing to judge a pass is priced as a gate verdict, not as
+/// the agent's work being wrong. It gets its own class rather than reusing
+/// `breach`, because a receipt saying the task "wrote outside its authorized
+/// paths" would be a claim the gate never established -- it could not look.
+/// Both classes abort the lane and neither spends a steering attempt.
+#[test]
+fn a_tree_delta_refusal_is_priced_as_a_gate_verdict_not_as_work_or_a_breach() {
+    let mut realm = CampaignFlowRealm::new(&json!({}));
+    let quiet = json!({"deferrals": []});
+    let failure = json!({
+        "task": {"id": "build", "kind": "implementation"},
+        "stage": "treeDelta:ungated",
+        "node": {"verdict": "fail"},
+    });
+    assert_eq!(
+        realm.call("failureClass", &[quiet.clone(), failure]),
+        json!("ungated")
+    );
+    // The agent stage it stands in for is still `work`, so the two are not
+    // being conflated in the other direction either.
+    let agent = json!({
+        "task": {"id": "build", "kind": "implementation"},
+        "stage": "agent",
+        "node": {"verdict": "fail"},
+    });
+    assert_eq!(realm.call("failureClass", &[quiet, agent]), json!("work"));
+}
+
 /// An implementation lane is never deferred, whatever the deferral set says.
 #[test]
 fn an_implementation_lane_is_priced_by_its_stage_alone() {

@@ -1698,6 +1698,81 @@ class GitHubForgeTests(unittest.TestCase):
                 with self.assertRaisesRegex(DRIVER.DriverError, "explicitly re-arm"):
                     DRIVER.issue_graph_worklist(brief)
 
+            # #433: the same refusal, read for what it now tells the operator.
+            # The manifest is byte-identical on both sides here and only a task
+            # body moved, so the receipt must say the manifest matched rather
+            # than invent a path -- and it must not republish the body text
+            # that diverged, which is exactly the operator content the receipt
+            # channel is not allowed to widen.
+            armed = dict(brief, armedManifest=normalized)
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
+                with self.assertRaises(DRIVER.DriverError) as raised:
+                    DRIVER.issue_graph_worklist(armed)
+            receipt = str(raised.exception)
+            self.assertIn("inspect it and explicitly re-arm", receipt)
+            self.assertIn(f"armed digest: {digest}", receipt)
+            live_digest = DRIVER.canonical_sha256(
+                {
+                    "manifest": normalized,
+                    "tasks": [
+                        {
+                            "number": reference["issue"],
+                            "title": changed[index]["title"],
+                            "body": changed[index]["body"],
+                        }
+                        for index, reference in enumerate(references)
+                    ],
+                }
+            )
+            self.assertIn(f"live digest: {live_digest}", receipt)
+            self.assertNotEqual(digest, live_digest)
+            self.assertIn(
+                "first divergent canonical path: none within the manifest", receipt
+            )
+            self.assertNotIn("Edited after arm.", receipt)
+
+            # #433 acceptance 3: two manifests differing in exactly one nested
+            # key. The armed side is the #429 shape -- an agent without
+            # `diagnosisSandboxPolicy` -- and the live normalized manifest has
+            # it, so the receipt must name that exact path, both digests, and
+            # not the value.
+            skewed = json.loads(json.dumps(normalized))
+            del skewed["agent"]["diagnosisSandboxPolicy"]
+            stale = dict(brief, armedManifest=skewed)
+            stale["worklist"] = {
+                "kind": "github-issue",
+                "graphDigest": DRIVER.canonical_sha256(
+                    {"manifest": skewed, "tasks": source["tasks"]}
+                ),
+            }
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
+                with self.assertRaises(DRIVER.DriverError) as raised:
+                    DRIVER.issue_graph_worklist(stale)
+            receipt = str(raised.exception)
+            self.assertIn(f"armed digest: {stale['worklist']['graphDigest']}", receipt)
+            self.assertIn(f"live digest: {digest}", receipt)
+            self.assertIn(
+                "first divergent canonical path: "
+                "manifest.agent.diagnosisSandboxPolicy: "
+                "absent-in-armed / present-in-live",
+                receipt,
+            )
+            self.assertIn("inspect it and explicitly re-arm", receipt)
+            self.assertNotIn("read-only", receipt)
+
+            # A campaign armed before `armedManifest` existed carries none, and
+            # the receipt says the path is unavailable rather than inventing
+            # one from the live side alone.
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
+                with self.assertRaises(DRIVER.DriverError) as raised:
+                    DRIVER.issue_graph_worklist(brief)
+            receipt = str(raised.exception)
+            self.assertIn(
+                "first divergent canonical path: unavailable (no armed manifest",
+                receipt,
+            )
+            self.assertIn(f"armed digest: {digest}", receipt)
+
     def test_merged_pr_completion_is_bound_to_task_revision(self) -> None:
         revision = "sha256:" + "1" * 64
         task_value = {"id": "task-1", "kind": "implementation", "revision": revision}
@@ -4094,6 +4169,65 @@ class BreachSteeringTests(unittest.TestCase):
                 self.assertIn("Witnessed evidence:", body)
                 self.assertIn("internal/cli/root.go", body)
                 self.assertIn("secrets/leak.pem", body)
+
+    def test_an_ungated_abort_never_claims_a_write_it_did_not_establish(self) -> None:
+        """#424: the two lane-aborting tree-delta verdicts are different facts.
+
+        A gate that could not judge a pass -- no ownership, no declared
+        domains, no allowlist -- aborts the lane for the same reason a breach
+        does, but it has established nothing about what the agent wrote. The
+        posted receipt is the operator's record, so it must say which one
+        happened, and the breach sentence must not appear over a refusal.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            steered = DRIVER.action_steer(
+                self.brief(
+                    checkout,
+                    abortReason="tree-delta-ungated",
+                    breachDetail=(
+                        "tree-delta gate refuses to judge task 'task-1': its agent "
+                        "node failed, so the ownership node never ran"
+                    ),
+                    diagnosis="Recorded what the failing attempt was doing.",
+                )
+            )
+            # It still aborts: both receipts, blocked as of this call.
+            self.assertTrue(steered["blocked"])
+            self.assertEqual(steered["attempt"], 2)
+
+            for attempt in (1, 2):
+                body = self.blob(config, attempt)["diagnosis"]
+                self.assertIn("could not judge this pass", body)
+                self.assertIn("declares no conflictDomains", body)
+                self.assertIn("No out-of-allowlist change has been established", body)
+                self.assertIn("will not be retried", body)
+                # The #386 sentence claims a write was found. It must not be
+                # published over a verdict that found nothing.
+                self.assertNotIn("permission breach found", body)
+
+    def test_an_unknown_abort_reason_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            with self.assertRaisesRegex(DRIVER.DriverError, "abortReason"):
+                DRIVER.action_steer(self.brief(checkout, abortReason="whatever"))
+
+    def test_a_breach_without_an_abort_reason_keeps_its_own_sentence(self) -> None:
+        """The #386 caller sent no `abortReason` and still must not change."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            DRIVER.action_steer(self.brief(checkout))
+
+            body = self.blob(config, 1)["diagnosis"]
+            self.assertIn("permission breach found", body)
+            self.assertNotIn("could not judge this pass", body)
 
     def test_a_breach_with_a_rejected_diagnosis_still_aborts_and_witnesses(self) -> None:
         """Round-1 F3: the breach path ran no validation at all.

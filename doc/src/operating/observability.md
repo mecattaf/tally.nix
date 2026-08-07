@@ -226,15 +226,20 @@ are aliases on `tally query jobs`, `tally query log`, `tally query proof`, and
 
 Once a run is dealt with, mark it so it stops crowding the standup and job
 lists. Every verb below targets the daemon's own **data directory**, not the
-socket — `tally reader-state` never talks to the daemon at all, so pass
-`--data-dir` explicitly if it differs from the default
-(`$XDG_DATA_HOME/tally`, else `~/.local/share/tally`); a NixOS deployment's
-daemon normally runs against `/var/lib/tally/data`. Omitting it against a
-different data directory than the one the daemon reads is not an error — it
-creates a fresh, unrelated store, prints a normal-looking success line, and
-changes nothing any `query` command shows. Making that misdirection harder
-to hit (an env var for the whole direct-file verb family) is tracked as
-issue #416:
+socket — `tally reader-state` never talks to the daemon at all. An omitted
+`--data-dir` resolves through `TALLY_DATA_DIR`, then `$XDG_DATA_HOME/tally`,
+else `~/.local/share/tally` (#416); both modules export `TALLY_DATA_DIR` into
+the operator's environment as well as onto their units, so on a deployment
+the family aims at the deployment's store by default. A NixOS deployment's
+daemon normally runs against `/var/lib/tally/data`, mode 0700 and owned by
+the service user — so with the export inherited these verbs are refused by
+name unless run as that user, which is the intended outcome. An invocation
+that inherits neither the export nor an explicit flag — one run through a
+privilege boundary that resets the environment, say — still resolves to the
+user default, and omitting both against a different data directory than the
+one the daemon reads is not an error: it creates a fresh, unrelated store,
+prints a normal-looking success line, and changes nothing any `query`
+command shows. Passing the flag is what settles it in every case:
 
 ```console
 $ tally reader-state archive <flow-run-uuid> --tag flaky-fixture --data-dir /var/lib/tally/data

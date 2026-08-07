@@ -248,9 +248,20 @@ pub fn collect_durable_recovery_facts(
     Ok(facts)
 }
 
+/// Collect the local unit facts recovery reconciles against, one durable
+/// event row at a time.
+///
+/// `progress` is invoked once per row, before that row is handled. The loop
+/// probes the executor for most rows — every local row, and every remote row
+/// without a canonically terminal witness — so its total cost is
+/// O(event corpus), which on a large-corpus host exceeds any fixed startup
+/// budget (#428). The daemon's caller turns those callbacks into
+/// `EXTEND_TIMEOUT_USEC=` notifications, so the budget bounds progress
+/// stalls rather than the phase's total cost.
 pub async fn collect_local_unit_facts(
     executor: &Executor,
     durable: &DurableRecoveryFacts,
+    mut progress: impl FnMut(),
 ) -> Result<BTreeMap<Uuid, LocalUnitFact>, RecoveryError> {
     let mut latest_records = BTreeMap::new();
     for record in &durable.witness {
@@ -271,6 +282,7 @@ pub async fn collect_local_unit_facts(
     // 23 crash-loops instead of one migration.
     let mut failures = Vec::new();
     for event in &durable.events {
+        progress();
         let uuid = event.row.uuid;
         let identity = row_execution_identity(&event.row);
         // A non-retryable witness is already the canonical proof that this
@@ -1482,7 +1494,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = collect_local_unit_facts(&executor, &durable)
+        let error = collect_local_unit_facts(&executor, &durable, || {})
             .await
             .expect_err("pre-label records must still be refused");
         let RecoveryError::UnitFacts(failures) = error else {
@@ -1524,7 +1536,7 @@ mod tests {
         );
         assert!(report.skipped.is_empty());
 
-        let facts = collect_local_unit_facts(&executor, &durable)
+        let facts = collect_local_unit_facts(&executor, &durable, || {})
             .await
             .expect("startup is clean once the migration has run");
         assert_eq!(facts.len(), 4);
@@ -1639,7 +1651,7 @@ mod tests {
 
         let durable =
             DurableRecoveryFacts::from_verified(vec![event(row.clone())], Vec::new()).unwrap();
-        let error = collect_local_unit_facts(&executor, &durable)
+        let error = collect_local_unit_facts(&executor, &durable, || {})
             .await
             .expect_err("a foreign unit name is still refused");
         let RecoveryError::UnitFacts(failures) = error else {
@@ -1689,7 +1701,7 @@ mod tests {
             witness(&terminal, &[(Verdict::Pass, 3)]),
         )
         .unwrap();
-        let facts = collect_local_unit_facts(&executor, &terminal_facts)
+        let facts = collect_local_unit_facts(&executor, &terminal_facts, || {})
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1702,7 +1714,7 @@ mod tests {
             witness(&retryable, &[(Verdict::PoolVanished, 3)]),
         )
         .unwrap();
-        collect_local_unit_facts(&executor, &retryable_facts)
+        collect_local_unit_facts(&executor, &retryable_facts, || {})
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1717,13 +1729,57 @@ mod tests {
         });
         let retried_facts =
             DurableRecoveryFacts::from_verified(vec![retried_event], records).unwrap();
-        collect_local_unit_facts(&executor, &retried_facts)
+        collect_local_unit_facts(&executor, &retried_facts, || {})
             .await
             .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
             "a pending explicit retry must probe its remote execution unit"
+        );
+    }
+
+    /// #428: the unit-facts loop reports progress once per durable event row
+    /// — including rows it skips without probing — so the daemon can renew
+    /// the start timeout from inside the loop. Deleting the in-loop callback
+    /// turns the phase budget back into a bound on total corpus size, which
+    /// is the restart loop this issue was filed on.
+    #[tokio::test]
+    async fn unit_facts_report_progress_once_per_durable_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = executor_with_probe_transport(temp.path(), calls.clone());
+
+        // One canonically terminal remote row (skipped without a probe) and
+        // two rows that must be probed: progress counts rows, not probes.
+        let mut terminal = row(Uuid::new_v4(), "worker", 3);
+        terminal.executor = Some("worker".to_owned());
+        let mut probed_one = row(Uuid::new_v4(), "worker", 3);
+        probed_one.executor = Some("worker".to_owned());
+        let mut probed_two = row(Uuid::new_v4(), "worker", 3);
+        probed_two.executor = Some("worker".to_owned());
+        let facts_in = DurableRecoveryFacts::from_verified(
+            vec![
+                event(terminal.clone()),
+                event(probed_one.clone()),
+                event(probed_two.clone()),
+            ],
+            witness(&terminal, &[(Verdict::Pass, 3)]),
+        )
+        .unwrap();
+
+        let mut progressed = 0_usize;
+        collect_local_unit_facts(&executor, &facts_in, || progressed += 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            progressed, 3,
+            "every durable event row reports progress exactly once"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the canonically terminal remote row is still not probed"
         );
     }
 

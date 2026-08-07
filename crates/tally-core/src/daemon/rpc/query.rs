@@ -106,7 +106,6 @@ impl DaemonHandler {
 
         let QueryProjection {
             history,
-            journal,
             rows,
             details,
             attestations_path,
@@ -137,23 +136,27 @@ impl DaemonHandler {
                         .map(|pool| (pool.pool, pool.signal))
                         .collect::<BTreeMap<_, _>>()
                 };
-                let lanes = trace_lanes(&details, &live, &history);
                 let adapters = {
                     let context = self.context.read().await;
                     context.config.adapters.clone()
                 };
-                let mut result = query_job_v2(
-                    &params.id,
-                    &details,
-                    &live,
-                    &history,
-                    &witness,
-                    &pool_signals,
-                )
-                .map_err(observability_wire)?;
-                result.job.trace =
-                    trace_availability(&result.job.anchor, &lanes, &adapters, &self.executor);
-                serde_json::to_value(result).map_err(internal_wire)
+                let executor = self.executor.clone();
+                off_thread(move || {
+                    let lanes = trace_lanes(&details, &live, &history);
+                    let mut result = query_job_v2(
+                        &params.id,
+                        &details,
+                        &live,
+                        &history,
+                        &witness,
+                        &pool_signals,
+                    )
+                    .map_err(observability_wire)?;
+                    result.job.trace =
+                        trace_availability(&result.job.anchor, &lanes, &adapters, &executor);
+                    serde_json::to_value(result).map_err(internal_wire)
+                })
+                .await
             }
             "query.run" => {
                 #[derive(Deserialize)]
@@ -165,72 +168,75 @@ impl DaemonHandler {
                 if params.id.trim().is_empty() {
                     return Err(WireError::invalid("query run ID must not be empty"));
                 }
-                // Not read until the id is known to resolve (#404). The chain
-                // is parsed and hash-verified end to end on every read --
-                // ~2.7 ms/MB, projecting ~120 ms per call at this repo's own
-                // completion count -- and an id that does not resolve never
-                // reaches the rollup that consumes it. `query_run` raises its
-                // `UnknownJob` from the same predicate, so it, not this, is
-                // still what answers; skipping the read cannot change what
-                // comes back.
-                let (ledger_verified, attestations) = if flow_run_exists(
-                    &params.id,
-                    &details,
-                    &live,
-                    &history,
-                    &witness,
-                    &membership,
-                ) {
-                    read_attestations_advisory(&attestations_path).await
-                } else {
-                    (false, Vec::new())
-                };
-                let mut result = query_run(
-                    &params.id,
-                    &details,
-                    &live,
-                    &history,
-                    &witness,
-                    Utc::now(),
-                    &membership,
-                    &AttestationEvidence::new(ledger_verified, &attestations),
-                )
-                .map_err(observability_wire)?;
                 let lineage = self.flow_lineage().await?;
-                apply_run_lineage(&mut result, &lineage);
                 let reader_state = self.reader_state_advisory().await;
-                apply_reader_state_to_run(&mut result, &reader_state);
-                for failure in &mut result.failures {
-                    let (Some(attempt), Some(lease_epoch), Ok(uuid)) = (
-                        failure.attempt,
-                        failure.lease_epoch,
-                        Uuid::parse_str(&failure.task_uuid),
-                    ) else {
-                        continue;
+                let executor = self.executor.clone();
+                off_thread(move || {
+                    // Not read until the id is known to resolve (#404). The
+                    // chain is parsed and hash-verified end to end on every
+                    // read -- ~2.7 ms/MB, projecting ~120 ms per call at this
+                    // repo's own completion count -- and an id that does not
+                    // resolve never reaches the rollup that consumes it.
+                    // `query_run` raises its `UnknownJob` from the same
+                    // predicate, so it, not this, is still what answers;
+                    // skipping the read cannot change what comes back.
+                    let (ledger_verified, attestations) = if flow_run_exists(
+                        &params.id,
+                        &details,
+                        &live,
+                        &history,
+                        &witness,
+                        &membership,
+                    ) {
+                        read_attestations_advisory(&attestations_path)
+                    } else {
+                        (false, Vec::new())
                     };
-                    let identity = ExecutionIdentity {
-                        job_id: uuid,
-                        task_uuid: Some(uuid),
-                        task_ref: failure.task_ref.clone(),
-                    };
-                    let Ok(Some(paths)) =
-                        self.executor
-                            .retained_capture_paths(&identity, attempt, lease_epoch)
-                    else {
-                        continue;
-                    };
-                    let Some(path) = paths.failure_stderr.as_ref() else {
-                        continue;
-                    };
-                    failure.capture_path = Some(path.display().to_string());
-                    if failure.stderr_tail.is_none() {
-                        if let Ok(excerpt) = crate::executor::read_capture_excerpt(path) {
-                            failure.stderr_tail = Some(excerpt.text);
-                            failure.stderr_truncated = Some(excerpt.truncated);
+                    let mut result = query_run(
+                        &params.id,
+                        &details,
+                        &live,
+                        &history,
+                        &witness,
+                        Utc::now(),
+                        &membership,
+                        &AttestationEvidence::new(ledger_verified, &attestations),
+                    )
+                    .map_err(observability_wire)?;
+                    apply_run_lineage(&mut result, &lineage);
+                    apply_reader_state_to_run(&mut result, &reader_state);
+                    for failure in &mut result.failures {
+                        let (Some(attempt), Some(lease_epoch), Ok(uuid)) = (
+                            failure.attempt,
+                            failure.lease_epoch,
+                            Uuid::parse_str(&failure.task_uuid),
+                        ) else {
+                            continue;
+                        };
+                        let identity = ExecutionIdentity {
+                            job_id: uuid,
+                            task_uuid: Some(uuid),
+                            task_ref: failure.task_ref.clone(),
+                        };
+                        let Ok(Some(paths)) =
+                            executor.retained_capture_paths(&identity, attempt, lease_epoch)
+                        else {
+                            continue;
+                        };
+                        let Some(path) = paths.failure_stderr.as_ref() else {
+                            continue;
+                        };
+                        failure.capture_path = Some(path.display().to_string());
+                        if failure.stderr_tail.is_none() {
+                            if let Ok(excerpt) = crate::executor::read_capture_excerpt(path) {
+                                failure.stderr_tail = Some(excerpt.text);
+                                failure.stderr_truncated = Some(excerpt.truncated);
+                            }
                         }
                     }
-                }
-                serde_json::to_value(result).map_err(internal_wire)
+                    serde_json::to_value(result).map_err(internal_wire)
+                })
+                .await
             }
             "query.status" => {
                 #[derive(Deserialize)]
@@ -244,14 +250,18 @@ impl DaemonHandler {
                     let mut context = self.context.write().await;
                     pool_headroom_facts(&mut context)?
                 };
-                let mut view =
-                    query_status(&pools, params.pool.as_deref(), &rows, &journal, &witness)
-                        .map_err(query_wire)?;
-                overlay_live_states(&mut view.jobs, &live_states);
-                let mut value = serde_json::to_value(view).map_err(internal_wire)?;
-                value["storage"] =
-                    serde_json::to_value(self.cached_storage()).map_err(internal_wire)?;
-                Ok(value)
+                let storage = self.cached_storage();
+                off_thread(move || {
+                    let journal = journal_entries(&history);
+                    let mut view =
+                        query_status(&pools, params.pool.as_deref(), &rows, &journal, &witness)
+                            .map_err(query_wire)?;
+                    overlay_live_states(&mut view.jobs, &live_states);
+                    let mut value = serde_json::to_value(view).map_err(internal_wire)?;
+                    value["storage"] = serde_json::to_value(storage).map_err(internal_wire)?;
+                    Ok(value)
+                })
+                .await
             }
             "query.proof" => {
                 #[derive(Deserialize)]
@@ -297,41 +307,43 @@ impl DaemonHandler {
                         ));
                     }
                 };
-                let (attestation_report, attestations) =
-                    read_attestations(&attestations_path).await?;
-                if !attestation_report.ok {
-                    return Err(internal_wire(
-                        "attestation verification failed during proof query",
-                    ));
-                }
-                match target {
-                    ProofTarget::Task(task) => serde_json::to_value(
-                        query_proof(
-                            &task,
-                            params.attempt,
-                            &details,
-                            &history,
-                            &report,
-                            &witness,
-                            &attestations,
+                off_thread(move || {
+                    let (attestation_report, attestations) = read_attestations(&attestations_path)?;
+                    if !attestation_report.ok {
+                        return Err(internal_wire(
+                            "attestation verification failed during proof query",
+                        ));
+                    }
+                    match target {
+                        ProofTarget::Task(task) => serde_json::to_value(
+                            query_proof(
+                                &task,
+                                params.attempt,
+                                &details,
+                                &history,
+                                &report,
+                                &witness,
+                                &attestations,
+                            )
+                            .map_err(observability_wire)?,
                         )
-                        .map_err(observability_wire)?,
-                    )
-                    .map_err(internal_wire),
-                    ProofTarget::FlowRun(flow_run) => serde_json::to_value(
-                        query_flow_proofs(
-                            &flow_run,
-                            &details,
-                            &history,
-                            &report,
-                            &witness,
-                            &attestations,
-                            &membership,
+                        .map_err(internal_wire),
+                        ProofTarget::FlowRun(flow_run) => serde_json::to_value(
+                            query_flow_proofs(
+                                &flow_run,
+                                &details,
+                                &history,
+                                &report,
+                                &witness,
+                                &attestations,
+                                &membership,
+                            )
+                            .map_err(observability_wire)?,
                         )
-                        .map_err(observability_wire)?,
-                    )
-                    .map_err(internal_wire),
-                }
+                        .map_err(internal_wire),
+                    }
+                })
+                .await
             }
             "query.producers" | "query.watch" | "query.jobs" | "query.log" | "query.trace" => {
                 unreachable!("early read-only query paths return before projection setup")
@@ -353,15 +365,19 @@ impl DaemonHandler {
                 {
                     return Err(WireError::invalid("format must be text or json"));
                 }
-                let mut view = query_render(params.scope, &rows, &journal, &witness);
-                overlay_live_states(&mut view.jobs, &live_states);
-                if params.format.as_deref() == Some("text") {
-                    serde_json::to_string_pretty(&view)
-                        .map(Value::String)
-                        .map_err(internal_wire)
-                } else {
-                    serde_json::to_value(view).map_err(internal_wire)
-                }
+                off_thread(move || {
+                    let journal = journal_entries(&history);
+                    let mut view = query_render(params.scope, &rows, &journal, &witness);
+                    overlay_live_states(&mut view.jobs, &live_states);
+                    if params.format.as_deref() == Some("text") {
+                        serde_json::to_string_pretty(&view)
+                            .map(Value::String)
+                            .map_err(internal_wire)
+                    } else {
+                        serde_json::to_value(view).map_err(internal_wire)
+                    }
+                })
+                .await
             }
             "query.standup" => {
                 #[derive(Deserialize)]
@@ -394,52 +410,56 @@ impl DaemonHandler {
                     })
                     .transpose()?;
                 let until = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-                let mut digest = query_standup(
-                    &rows,
-                    &journal,
-                    &witness,
-                    &StandupOptions {
-                        since: params.since,
-                        since_realtime_us,
-                        until,
-                        source: params.source,
-                    },
-                );
-                for entry in &mut digest.in_flight {
-                    if let Some(state) = entry
-                        .task_uuid
-                        .as_ref()
-                        .and_then(|task_uuid| live_states.get(task_uuid))
-                    {
-                        entry.state.clone_from(state);
-                    }
-                }
-                // Same deferral as `query.run` (#404): a window that touched no
-                // flow run has nothing to roll up, and the chain read is a full
-                // parse and hash-verify. `apply_standup_usage` computes the
-                // touched set from this same function, so it cannot find work
-                // this skipped the evidence for.
-                let (ledger_verified, attestations) =
-                    if standup_touched_runs(&digest, &details, &membership).is_empty() {
-                        (false, Vec::new())
-                    } else {
-                        read_attestations_advisory(&attestations_path).await
-                    };
-                apply_standup_usage(
-                    &mut digest,
-                    &details,
-                    &witness,
-                    &membership,
-                    &AttestationEvidence::new(ledger_verified, &attestations),
-                );
                 let reader_state = self.reader_state_advisory().await;
-                apply_reader_state_to_standup(
-                    &mut digest,
-                    &details,
-                    &reader_state,
-                    include_archived,
-                );
-                serde_json::to_value(digest).map_err(internal_wire)
+                off_thread(move || {
+                    let journal = journal_entries(&history);
+                    let mut digest = query_standup(
+                        &rows,
+                        &journal,
+                        &witness,
+                        &StandupOptions {
+                            since: params.since,
+                            since_realtime_us,
+                            until,
+                            source: params.source,
+                        },
+                    );
+                    for entry in &mut digest.in_flight {
+                        if let Some(state) = entry
+                            .task_uuid
+                            .as_ref()
+                            .and_then(|task_uuid| live_states.get(task_uuid))
+                        {
+                            entry.state.clone_from(state);
+                        }
+                    }
+                    // Same deferral as `query.run` (#404): a window that touched
+                    // no flow run has nothing to roll up, and the chain read is a
+                    // full parse and hash-verify. `apply_standup_usage` computes
+                    // the touched set from this same function, so it cannot find
+                    // work this skipped the evidence for.
+                    let (ledger_verified, attestations) =
+                        if standup_touched_runs(&digest, &details, &membership).is_empty() {
+                            (false, Vec::new())
+                        } else {
+                            read_attestations_advisory(&attestations_path)
+                        };
+                    apply_standup_usage(
+                        &mut digest,
+                        &details,
+                        &witness,
+                        &membership,
+                        &AttestationEvidence::new(ledger_verified, &attestations),
+                    );
+                    apply_reader_state_to_standup(
+                        &mut digest,
+                        &details,
+                        &reader_state,
+                        include_archived,
+                    );
+                    serde_json::to_value(digest).map_err(internal_wire)
+                })
+                .await
             }
             "query.pools" => {
                 #[derive(Deserialize)]
@@ -458,21 +478,37 @@ impl DaemonHandler {
     }
 }
 
-/// Read and verify the advisory attestation chain off the async runtime.
+/// Run one fresh query's corpus-scale construction on the blocking pool.
 ///
-/// The verification report travels back with the records rather than being
-/// consumed here: `query.proof` fails closed on a chain that did not verify,
-/// while the usage rollup carries the same fact onto the wire, because a
-/// rollup that answered an unverified ledger with a confident zero would be
-/// the wrong-evidence defect this whole surface exists to avoid.
-async fn read_attestations(
+/// The daemon's runtime is a single thread: every `select!` arm and every RPC
+/// connection share it, so query construction that scales with the durable
+/// corpus used to be time the dispatch loop could not re-enter its select —
+/// at ~30k durable rows, minutes of it (#431). The closure receives only
+/// immutable snapshots taken under the context lock, so it computes over one
+/// consistent frozen view: admission, scheduling, and completion proceed on
+/// the dispatch thread while it runs, and a mutation that lands after the
+/// snapshot is simply not visible to this answer — never partially visible.
+async fn off_thread<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, WireError> + Send + 'static,
+) -> Result<T, WireError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| internal_wire(format!("query construction worker failed: {error}")))?
+}
+
+/// Read and verify the advisory attestation chain.
+///
+/// Called from inside [`off_thread`] closures, so the parse and hash-verify
+/// already run on the blocking pool. The verification report travels back with
+/// the records rather than being consumed here: `query.proof` fails closed on
+/// a chain that did not verify, while the usage rollup carries the same fact
+/// onto the wire, because a rollup that answered an unverified ledger with a
+/// confident zero would be the wrong-evidence defect this whole surface exists
+/// to avoid.
+fn read_attestations(
     path: &Path,
 ) -> Result<(AttestationVerifyReport, Vec<AttestationRecord>), WireError> {
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || read_verified_attestations(&path))
-        .await
-        .map_err(|error| internal_wire(format!("attestation query worker failed: {error}")))?
-        .map_err(internal_wire)
+    read_verified_attestations(path).map_err(internal_wire)
 }
 
 /// The same read, for the callers whose answer must survive an unreadable
@@ -486,8 +522,8 @@ async fn read_attestations(
 /// not depend on advisory-chain health; the rollup degrades to
 /// [`AttestationEvidence::unavailable`], which is the state that type exists
 /// for, and says so in its own caveats.
-async fn read_attestations_advisory(path: &Path) -> (bool, Vec<AttestationRecord>) {
-    match read_attestations(path).await {
+fn read_attestations_advisory(path: &Path) -> (bool, Vec<AttestationRecord>) {
+    match read_attestations(path) {
         Ok((report, records)) => (report.ok, records),
         Err(error) => {
             eprintln!(
@@ -499,36 +535,47 @@ async fn read_attestations_advisory(path: &Path) -> (bool, Vec<AttestationRecord
     }
 }
 
+/// The journal projection of a lifecycle snapshot, one entry per record.
+///
+/// Built inside [`off_thread`] closures by the consumers that need it: it
+/// clones every record's fields, which is exactly the O(all lifecycle records)
+/// copying that must not run on the dispatch thread (#431).
+fn journal_entries(history: &crate::history::LifecycleSnapshot) -> Vec<JournalEntry> {
+    history
+        .records
+        .iter()
+        .map(|record| JournalEntry {
+            fields: record.fields.clone(),
+            realtime_us: Some(record.realtime_us),
+        })
+        .collect()
+}
+
 // The shared read-only projection every fresh (non-continuation) query
 // envelope is built from. Assembling it re-verifies the witness ledger, so
-// continuation pages never construct one.
-struct QueryProjection {
-    history: crate::history::LifecycleSnapshot,
-    journal: Vec<JournalEntry>,
-    rows: std::sync::Arc<Vec<RowFact>>,
-    details: std::sync::Arc<Vec<RowDetailFact>>,
-    attestations_path: PathBuf,
-    live_states: HashMap<String, String>,
-    live: Vec<LiveJobFact>,
-    report: crate::witness::VerifyReport,
-    witness: std::sync::Arc<Vec<WitnessRecord>>,
+// continuation pages never construct one. Every field is Send and cheap to
+// move: the corpus-scale consumers run on the blocking pool, and what this
+// assembly leaves on the dispatch thread is amortized O(live jobs) per query
+// plus `Arc` clones — with one O(corpus) snapshot-cache rebuild per mutation,
+// paid by the first query after it (#431).
+pub(crate) struct QueryProjection {
+    pub(crate) history: std::sync::Arc<crate::history::LifecycleSnapshot>,
+    pub(crate) rows: std::sync::Arc<Vec<RowFact>>,
+    pub(crate) details: std::sync::Arc<Vec<RowDetailFact>>,
+    pub(crate) attestations_path: PathBuf,
+    pub(crate) live_states: HashMap<String, String>,
+    pub(crate) live: Vec<LiveJobFact>,
+    pub(crate) report: crate::witness::VerifyReport,
+    pub(crate) witness: std::sync::Arc<Vec<WitnessRecord>>,
     /// Durable run membership, so that a `flowRun`-scoped projection resolves
     /// the nodes a run was handed and not only the ones whose row it owns.
-    membership: Rc<FlowMembership>,
+    pub(crate) membership: Arc<FlowMembership>,
 }
 
 impl DaemonHandler {
-    async fn query_projection(&self) -> Result<QueryProjection, WireError> {
+    pub(crate) async fn query_projection(&self) -> Result<QueryProjection, WireError> {
         let membership = self.flow_membership().await?;
-        let history = self.history.borrow().snapshot();
-        let journal = history
-            .records
-            .iter()
-            .map(|record| JournalEntry {
-                fields: record.fields.clone(),
-                realtime_us: Some(record.realtime_us),
-            })
-            .collect::<Vec<_>>();
+        let history = self.history.borrow_mut().shared_snapshot();
         let (rows, details, attestations_path, live_states, live, report, witness) = {
             let mut context = self.context.write().await;
             // The cached view verifies only bytes appended since the last
@@ -565,7 +612,6 @@ impl DaemonHandler {
         };
         Ok(QueryProjection {
             history,
-            journal,
             rows,
             details,
             attestations_path,
@@ -657,43 +703,66 @@ impl DaemonHandler {
                 .map(|pool| (pool.pool, pool.signal))
                 .collect::<BTreeMap<_, _>>()
         };
-        let lanes = trace_lanes(&details, &live, &history);
         let adapters = {
             let context = self.context.read().await;
             context.config.adapters.clone()
         };
-        let mut result = query_jobs_v2(
-            &details,
-            &live,
-            &history,
-            &witness,
-            &pool_signals,
-            &JobsFilter {
-                live_state: params.live_state,
-                terminal_verdict: params.terminal_verdict,
-                pool: params.pool,
-                executor: params.executor,
-                adapter: params.adapter,
-                source: params.source,
-                origin: params.origin,
-                parent: params.parent,
-                flow_run: params.flow_run,
-                session: params.session,
-                since: params.since,
-                until: params.until,
-            },
-            &membership,
-        )
-        .map_err(observability_wire)?;
-        for item in &mut result.items {
-            item.trace = trace_availability(&item.anchor, &lanes, &adapters, &self.executor);
-        }
         let reader_state = self.reader_state_advisory().await;
-        apply_reader_state_to_jobs(&mut result.items, &reader_state, params.archived);
-        let envelope = Some(serde_json::to_value(result).map_err(internal_wire)?);
+        let executor = self.executor.clone();
+        let limit = params.limit;
+        let envelope = off_thread(move || {
+            let lanes = trace_lanes(&details, &live, &history);
+            // Grouped once: resolving the lane set through the public
+            // `trace_availability` scan once per item made this collection
+            // quadratic in the corpus (#431).
+            let mut lanes_by_anchor = HashMap::<&str, Vec<&TraceLane>>::new();
+            for lane in &lanes {
+                lanes_by_anchor
+                    .entry(lane.task_uuid.as_str())
+                    .or_default()
+                    .push(lane);
+            }
+            let mut result = query_jobs_v2(
+                &details,
+                &live,
+                &history,
+                &witness,
+                &pool_signals,
+                &JobsFilter {
+                    live_state: params.live_state,
+                    terminal_verdict: params.terminal_verdict,
+                    pool: params.pool,
+                    executor: params.executor,
+                    adapter: params.adapter,
+                    source: params.source,
+                    origin: params.origin,
+                    parent: params.parent,
+                    flow_run: params.flow_run,
+                    session: params.session,
+                    since: params.since,
+                    until: params.until,
+                },
+                &membership,
+            )
+            .map_err(observability_wire)?;
+            for item in &mut result.items {
+                item.trace = anchor_trace_availability(
+                    lanes_by_anchor
+                        .get(item.anchor.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                    &adapters,
+                    &executor,
+                );
+            }
+            apply_reader_state_to_jobs(&mut result.items, &reader_state, params.archived);
+            let envelope = serde_json::to_value(result).map_err(internal_wire)?;
+            crate::pagination::prepare_snapshot(envelope).map_err(pagination_wire)
+        })
+        .await?;
         self.pages
             .borrow_mut()
-            .page("query.jobs", &fingerprint, params.limit, None, envelope)
+            .page_prepared("query.jobs", &fingerprint, limit, envelope)
             .map_err(pagination_wire)
     }
 
@@ -758,46 +827,51 @@ impl DaemonHandler {
             ..
         } = self.query_projection().await?;
         let explicit_event = params.event.is_some();
-        let mut result = query_lifecycle_log(
-            &details,
-            &history,
-            &witness,
-            &LifecycleLogFilter {
-                task: params.task,
-                flow_run: params.flow_run,
-                attempt: params.attempt,
-                session: params.session,
-                event: params.event,
-                source: params.source,
-                since: params.since,
-                until: params.until,
-            },
-            &membership,
-        )
-        .map_err(observability_wire)?;
-        if params.provenance == Some(false) {
-            result = collapse_lifecycle_echoes(result, !explicit_event);
-        }
-        // The durable position is applied after echo collapse so a terminal
-        // transition is still merged with its witness before the window is
-        // narrowed; collapse semantics stay exactly as they were.
-        let head = log_position_head(&history, &witness);
-        if let Some(after) = params.after.as_deref() {
-            let after = LogPosition::parse(after).map_err(observability_wire)?;
-            result.items.retain(|item| after.precedes(&item.cursor));
-            let floor = log_position_floor(&history, &witness);
-            if after.lifecycle < floor.lifecycle || after.witness < floor.witness {
-                result.position_gap = Some(PositionGap {
-                    requested: after.render(),
-                    earliest_available: floor.render(),
-                });
+        let limit = params.limit;
+        let envelope = off_thread(move || {
+            let mut result = query_lifecycle_log(
+                &details,
+                &history,
+                &witness,
+                &LifecycleLogFilter {
+                    task: params.task,
+                    flow_run: params.flow_run,
+                    attempt: params.attempt,
+                    session: params.session,
+                    event: params.event,
+                    source: params.source,
+                    since: params.since,
+                    until: params.until,
+                },
+                &membership,
+            )
+            .map_err(observability_wire)?;
+            if params.provenance == Some(false) {
+                result = collapse_lifecycle_echoes(result, !explicit_event);
             }
-        }
-        result.position = Some(head.render());
-        let envelope = Some(serde_json::to_value(result).map_err(internal_wire)?);
+            // The durable position is applied after echo collapse so a terminal
+            // transition is still merged with its witness before the window is
+            // narrowed; collapse semantics stay exactly as they were.
+            let head = log_position_head(&history, &witness);
+            if let Some(after) = params.after.as_deref() {
+                let after = LogPosition::parse(after).map_err(observability_wire)?;
+                result.items.retain(|item| after.precedes(&item.cursor));
+                let floor = log_position_floor(&history, &witness);
+                if after.lifecycle < floor.lifecycle || after.witness < floor.witness {
+                    result.position_gap = Some(PositionGap {
+                        requested: after.render(),
+                        earliest_available: floor.render(),
+                    });
+                }
+            }
+            result.position = Some(head.render());
+            let envelope = serde_json::to_value(result).map_err(internal_wire)?;
+            crate::pagination::prepare_snapshot(envelope).map_err(pagination_wire)
+        })
+        .await?;
         self.pages
             .borrow_mut()
-            .page("query.log", &fingerprint, params.limit, None, envelope)
+            .page_prepared("query.log", &fingerprint, limit, envelope)
             .map_err(pagination_wire)
     }
 
@@ -842,28 +916,32 @@ impl DaemonHandler {
             witness,
             ..
         } = self.query_projection().await?;
-        let lanes = trace_lanes(&details, &live, &history);
         let adapters = {
             let context = self.context.read().await;
             context.config.adapters.clone()
         };
-        let envelope = Some(
-            serde_json::to_value(
+        let executor = self.executor.clone();
+        let limit = params.limit;
+        let envelope = off_thread(move || {
+            let lanes = trace_lanes(&details, &live, &history);
+            let envelope = serde_json::to_value(
                 query_trace(
                     &params.task,
                     params.attempt,
                     &lanes,
                     &adapters,
-                    &self.executor,
+                    &executor,
                     snapshot_metadata(&history, &witness),
                 )
                 .map_err(trace_wire)?,
             )
-            .map_err(internal_wire)?,
-        );
+            .map_err(internal_wire)?;
+            crate::pagination::prepare_snapshot(envelope).map_err(pagination_wire)
+        })
+        .await?;
         self.pages
             .borrow_mut()
-            .page("query.trace", &fingerprint, params.limit, None, envelope)
+            .page_prepared("query.trace", &fingerprint, limit, envelope)
             .map_err(pagination_wire)
     }
 }

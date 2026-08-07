@@ -40,6 +40,67 @@ impl Drop for DaemonLockGuard {
 /// one phase rather than all of them.
 pub(super) const STARTUP_PHASE_BUDGET: Duration = Duration::from_secs(90);
 
+/// How often the unit-facts loop renews the start timeout while it is making
+/// progress.
+///
+/// The phase-boundary extension gives each phase one fresh budget, but the
+/// unit-facts phase probes the executor once per non-terminal durable row —
+/// O(event corpus) inside a single budget, ~90–95 s at the coordinator's
+/// ~25k rows, so whether a restart succeeded was a coin flip on load (#428).
+/// Renewing from inside the loop makes the budget bound progress stalls: a
+/// daemon still visiting rows keeps starting, one wedged on a single probe
+/// dies on the same 90 s clock. The interval is a small fraction of the
+/// budget so a slow-but-moving loop never comes near the deadline, while a
+/// fast startup (under 10 s of unit facts) sends nothing extra.
+pub(super) const UNIT_FACTS_EXTEND_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Turns the unit-facts loop's per-row progress callbacks into throttled
+/// `EXTEND_TIMEOUT_USEC=` notifications.
+pub(super) struct UnitFactsExtension {
+    notifier: SystemdNotifier,
+    interval: Duration,
+    last: std::time::Instant,
+    visited: usize,
+    total: usize,
+}
+
+impl UnitFactsExtension {
+    pub(super) fn new(notifier: SystemdNotifier, interval: Duration, total: usize) -> Self {
+        Self {
+            notifier,
+            interval,
+            // The phase-boundary extension for `unit-facts` was just sent, so
+            // the first in-loop renewal is owed one interval from now, not
+            // immediately.
+            last: std::time::Instant::now(),
+            visited: 0,
+            total,
+        }
+    }
+
+    /// Record one visited row; renew the start timeout if an interval passed.
+    ///
+    /// "Visited", not "probed": canonically terminal remote rows are counted
+    /// too, because the loop advanced past them — the status line claims
+    /// progress through the corpus, not a probe per row. A notification
+    /// failure is not fatal here for the same reason it is not fatal at phase
+    /// boundaries: `ready()` still reports a broken notify socket.
+    pub(super) fn row_visited(&mut self) {
+        self.visited += 1;
+        if self.last.elapsed() < self.interval {
+            return;
+        }
+        let _ = self.notifier.extend_start_timeout(
+            STARTUP_PHASE_BUDGET,
+            &format!(
+                "starting: unit-facts ({}/{} rows)",
+                self.visited, self.total
+            ),
+        );
+        self.last = std::time::Instant::now();
+    }
+}
+
 /// Per-phase startup accounting, and the systemd budget that pays for it.
 ///
 /// Everything `Daemon::open` and the pre-`READY` half of `run_loop` do is
@@ -199,7 +260,13 @@ impl Daemon {
             }
         }
         timeline.phase("unit-facts");
-        let units = collect_local_unit_facts(&executor, &durable).await?;
+        let mut extension = UnitFactsExtension::new(
+            notifier.clone(),
+            UNIT_FACTS_EXTEND_INTERVAL,
+            durable.events().len(),
+        );
+        let units =
+            collect_local_unit_facts(&executor, &durable, || extension.row_visited()).await?;
         timeline.phase("recovery-plan");
         let producer_engine = ProducerEngine::new(
             &config.producers,

@@ -166,10 +166,30 @@ pub fn trace_availability(
             ..TraceAvailability::default()
         };
     };
-    let mut selected = lanes
+    let selected = lanes
         .iter()
         .filter(|lane| lane.task_uuid == anchor)
         .collect::<Vec<_>>();
+    anchor_trace_availability(selected, adapters, executor)
+}
+
+/// [`trace_availability`] for lanes already resolved to one anchor.
+///
+/// The public entry above scans the whole lane table to resolve a task-or-job
+/// spelling; a caller decorating every item of a collection has already grouped
+/// lanes by anchor and must not pay that scan once per item — at ~30k rows the
+/// per-item scan alone made one `query.jobs` collection quadratic (#431).
+pub fn anchor_trace_availability(
+    mut selected: Vec<&TraceLane>,
+    adapters: &BTreeMap<String, AdapterConfig>,
+    executor: &Executor,
+) -> TraceAvailability {
+    if selected.is_empty() {
+        return TraceAvailability {
+            reason: "no-attempt-trace-metadata".to_owned(),
+            ..TraceAvailability::default()
+        };
+    }
     selected.sort_by_key(|lane| (lane.attempt, lane.lease_epoch, lane.job_id.clone()));
 
     let mut available_generations = Vec::new();

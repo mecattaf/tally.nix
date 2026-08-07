@@ -51,6 +51,24 @@ fn backticked(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Whether one line is a markdown table separator row: cell-delimited, and
+/// nothing but `-` and `:` inside its cells, e.g. `|---|:---:|`.
+///
+/// The `|` is required because the end-of-span check reads this as "a table
+/// starts here". A bare `---` under a row is a horizontal rule, not a
+/// delimiter row, and accepting it would let the check bless a shape that
+/// renders as literal pipes — the very thing it exists to reject.
+fn is_table_separator(line: &str) -> bool {
+    line.contains('|')
+        && line.trim().trim_matches('|').split('|').all(|cell| {
+            !cell.trim().is_empty()
+                && cell
+                    .trim()
+                    .chars()
+                    .all(|glyph| glyph == '-' || glyph == ':')
+        })
+}
+
 /// A marked span that must be a whole markdown table, header row and all.
 ///
 /// A marker line dropped *between* two rows ends the table as far as the
@@ -66,13 +84,30 @@ fn backticked(text: &str) -> Vec<&str> {
 /// remaining rows as prose below it. Guarding only the start would state an
 /// anti-recurrence guarantee this helper does not provide — which is the same
 /// gap between a claim and its evidence that these pins exist to close.
+///
+/// What the end guard rejects, exactly, is a *bare row* after the marker: a
+/// row with no header and separator of its own, which renders as literal-pipe
+/// prose whether or not a blank line sits between it and the marker. A
+/// following *complete* table — header row and separator row — is accepted:
+/// a blank line genuinely ends a table in markdown, so the second table
+/// renders as its own table (#418, probe B). An earlier version fired on
+/// that shape too, and its message claimed a marker inside a table splits it
+/// in the rendered book — false of a separated second table — which steered
+/// the obvious fix, re-merging the two tables, straight back into the
+/// rendering defect this pin exists to prevent.
 fn marked_table<'a>(doc: &'a str, name: &str) -> &'a str {
     let (span, after) = marked_and_after(doc, name);
-    if let Some(next) = after.lines().find(|line| !line.trim().is_empty()) {
+    let mut rest = after.lines().skip_while(|line| line.trim().is_empty());
+    if let Some(next) = rest.next() {
+        let bare_row =
+            next.trim_start().starts_with('|') && !rest.next().is_some_and(is_table_separator);
         assert!(
-            !next.trim_start().starts_with('|'),
+            !bare_row,
             "{name} must wrap the whole table: the end marker is followed by {next:?}, \
-             another table row — a marker inside a table splits it in the rendered book"
+             a bare table row — a row with no header and separator of its own renders as \
+             literal pipes, not a table. End the span after the last row of the table it \
+             names; a following *complete* table (header and separator rows) is fine, \
+             because a blank line ends a table in markdown"
         );
     }
     let mut lines = span.lines().filter(|line| !line.trim().is_empty());
@@ -88,15 +123,7 @@ fn marked_table<'a>(doc: &'a str, name: &str) -> &'a str {
          inside a table splits it in the rendered book"
     );
     assert!(
-        separator
-            .trim()
-            .trim_matches('|')
-            .split('|')
-            .all(|cell| !cell.trim().is_empty()
-                && cell
-                    .trim()
-                    .chars()
-                    .all(|glyph| glyph == '-' || glyph == ':')),
+        is_table_separator(separator),
         "{name} must wrap the whole table: the second line is {separator:?}, not a \
          header separator"
     );
@@ -321,6 +348,44 @@ fn the_remedy_nullity_rule_is_stated_once_and_the_code_obeys_the_stated_rule() {
     );
 }
 
+/// Issue #414: the stated rule has a second half now — a `flowRunId` that
+/// reads as a command flag also yields `null` — and the same discipline
+/// applies to it: the sentence is checked against what the code does, not
+/// against itself. A rule that names only the missing-id half while the code
+/// suppresses two shapes is the defect this file exists to catch, one level
+/// up.
+#[test]
+fn the_stated_rule_covers_the_flag_shaped_identity_the_code_also_suppresses() {
+    let flag_shaped = supersession_details(
+        "script-changed-mid-run",
+        &SupersessionDetails {
+            flow_run_id: "--reason",
+            ..SupersessionDetails::default()
+        },
+    );
+    assert!(
+        flag_shaped["remedy"].is_null(),
+        "a flag-shaped identity must advertise no command: {}",
+        flag_shaped["remedy"]
+    );
+    assert_eq!(
+        flag_shaped["flowRunId"], "--reason",
+        "and the badly named run stays visible"
+    );
+
+    for (page, doc) in [
+        ("submission-and-replay.md", FLOW_DOC),
+        ("errors.md", ERROR_DOC),
+    ] {
+        let rule = marked(doc, "remedy-nullity");
+        assert!(
+            rule.contains("command flag"),
+            "{page} states only the missing-id half of a rule the code applies to two \
+             shapes: {rule:?}"
+        );
+    }
+}
+
 #[test]
 fn both_pages_state_the_size_of_the_contract() {
     let size = match SUPERSESSION_DETAIL_FIELDS.len() {
@@ -335,4 +400,79 @@ fn both_pages_state_the_size_of_the_contract() {
         "submission-and-replay.md must say {phrase:?}"
     );
     assert!(ERROR_DOC.contains(&phrase), "errors.md must say {phrase:?}");
+}
+
+/// Issue #418, probe B, rendered not reasoned: a blank line ends a table in
+/// markdown, so a *complete* second table after the end marker renders as
+/// its own table — `tables=10`, zero literal-pipe paragraphs — and the pin
+/// must not fire on it. The probe doc is synthetic on purpose: the shape is
+/// about the helper, not about any page currently in the tree.
+#[test]
+fn the_end_of_span_check_accepts_a_complete_table_after_the_marker() {
+    let doc = concat!(
+        "<!-- probe:start -->\n",
+        "| Header | Row |\n",
+        "|---|---|\n",
+        "| `a` | 1 |\n",
+        "<!-- probe:end -->\n",
+        "\n",
+        "| Second | Table |\n",
+        "|---|---|\n",
+        "| `b` | 2 |\n",
+    );
+    marked_table(doc, "probe");
+}
+
+/// The acceptance is "a *complete* table follows", not "any two lines
+/// follow": a row under which sits a horizontal rule rather than a delimiter
+/// row is still a bare row, and still renders as literal pipes.
+#[test]
+#[should_panic(expected = "a bare table row")]
+fn a_horizontal_rule_is_not_the_delimiter_row_that_makes_a_second_table() {
+    let doc = concat!(
+        "<!-- probe:start -->\n",
+        "| Header | Row |\n",
+        "|---|---|\n",
+        "| `a` | 1 |\n",
+        "<!-- probe:end -->\n",
+        "\n",
+        "| Second | Table |\n",
+        "---\n",
+        "| `b` | 2 |\n",
+    );
+    marked_table(doc, "probe");
+}
+
+/// Issue #418, probe A: the shape the check was written against. A bare row
+/// after the marker — here behind a blank line — falls out of the table and
+/// renders as literal pipes, so the pin stays red on it.
+#[test]
+#[should_panic(expected = "a bare table row")]
+fn the_end_of_span_check_rejects_a_bare_row_after_a_blank_line() {
+    let doc = concat!(
+        "<!-- probe:start -->\n",
+        "| Header | Row |\n",
+        "|---|---|\n",
+        "| `a` | 1 |\n",
+        "<!-- probe:end -->\n",
+        "\n",
+        "| `b` | 2 |\n",
+    );
+    marked_table(doc, "probe");
+}
+
+/// The original defect shape: the end marker sitting directly between two
+/// rows, no blank line. Same rejection.
+#[test]
+#[should_panic(expected = "a bare table row")]
+fn the_end_of_span_check_rejects_a_bare_row_directly_after_the_marker() {
+    let doc = concat!(
+        "<!-- probe:start -->\n",
+        "| Header | Row |\n",
+        "|---|---|\n",
+        "| `a` | 1 |\n",
+        "<!-- probe:end -->\n",
+        "| `b` | 2 |\n",
+    );
+    marked_table(doc, "probe");
 }

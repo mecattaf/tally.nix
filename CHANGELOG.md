@@ -118,6 +118,409 @@ unrelated mechanism, which is the pattern that keeps this issue open.
   assertion uncaptured, so the residual is non-zero and the mechanism of that
   observation is unidentified. ~0.17% is under the historical ~0.74% and is not
   zero; the population stays open, and this is a bound, not a repair claim.
+### Daemon under load (#431, #428, #420)
+
+One mechanism, three surfaces: work that scales with the durable corpus,
+executed where it can starve everything else. Measured live on the
+coordinator on 2026-08-06/07 at ~25–30k durable rows.
+
+#### #431 — dispatch loop stays live at estate scale; query service moves off the dispatch thread
+
+The daemon's runtime is a single thread: the dispatch `select!`, every RPC
+connection, and every fresh query shared it. Two query builders were also
+quadratic in the corpus — `query.jobs`/`query.job` re-scanned the whole
+lifecycle history and witness ledger once per task anchor, and decorating a
+collection resolved trace lanes with a whole-table scan per item. At ~30k
+durable rows one such call held the select loop for minutes; a synthetic
+30k-row corpus reproduced the estate's 60–183 s deaf windows as a
+never-returning `query.jobs` (did not finish in 9.5 minutes, debug build)
+while `tick_leases` stayed at microseconds.
+
+- `query_jobs`/`query_job` now group history and witness records by task in
+  one pass instead of filtering the whole corpus per anchor; trace-lane
+  decoration in `query.jobs` resolves lanes through a per-anchor index
+  (`anchor_trace_availability`) instead of the per-item whole-table scan.
+- Fresh-query construction, response serialization, and page-snapshot
+  splitting/sizing (`pagination::prepare_snapshot`) run on the blocking pool
+  via `spawn_blocking`, over immutable snapshots taken under the context
+  lock. What remains on the dispatch thread is amortized O(live jobs) per
+  query, plus one O(corpus) snapshot-cache rebuild per mutation on the first
+  query that follows it. The lifecycle store hands out a
+  cached `Arc` snapshot (`LifecycleStore::shared_snapshot`), rebuilt at most
+  once per mutation instead of deep-cloned per query; the flow lineage and
+  membership caches moved from `Rc` to `Arc` so the blocking pool can read
+  them.
+- Reads that race a scheduling mutation answer from their frozen snapshot:
+  the mutation is entirely invisible to that answer or entirely visible to a
+  later one, never partially visible (tested). Admission keeps making
+  progress while corpus-scale queries are in flight (tested). The
+  self-reported dispatch-loop absence line and the watchdog
+  keepalive/withhold behaviour are untouched — the instrument that found
+  this defect still tells the truth.
+- Acceptance is estate-scale and in-tree: a generated 30,000-row durable
+  corpus (plus 40 live rows recovery re-presents and runs) under a
+  continuous `query.jobs`/`query.job`/`query.status` storm with admissions
+  landing mid-storm. The dispatch loop's maximum absence, measured at its
+  own lease-tick boundaries, stays under a 5 s bound (healthy cadence is
+  100 ms; the unfixed loop fails by minutes), and a `query.job` issued
+  mid-storm answers inside the estate's 10 s client deadline.
+
+#### #428 — the unit-facts startup phase renews its budget from inside the loop
+
+`collect_local_unit_facts` probes the executor once per durable event row
+that is not canonically terminal (and every local row unconditionally), so
+the unit-facts phase is O(event corpus) — ~90–95 s at the coordinator's
+~25k rows, exactly astride its single 90 s `EXTEND_TIMEOUT_USEC=` budget,
+which put the 2026-08-06 switch into a restart loop.
+
+- The loop now reports progress once per visited row, and the daemon turns
+  those callbacks into time-throttled `EXTEND_TIMEOUT_USEC=` renewals (every
+  10 s of progress, `STATUS=starting: unit-facts (k/N rows)`), so the 90 s
+  budget bounds progress stalls rather than the phase's total cost: a daemon
+  still visiting rows keeps starting; one wedged on a single probe dies on
+  the same clock. A fast startup sends nothing extra.
+- Tested at both ends and mutation-proved: the loop reports exactly one
+  progress callback per durable event row (skipped canonically-terminal
+  remote rows included, still unprobed), and the renewal datagrams flow
+  through the notify socket from inside the loop — deleting the in-loop
+  callback turns both tests red.
+- The coordinator's interim dotfiles override
+  (`TimeoutStartSec = mkForce "10min"`) becomes revertible once this lands;
+  that revert is the operator's, not this change's.
+
+#### #420 — two residues of the context.jobs prune
+
+Both arrived with #395, which retires terminal jobs out of `context.jobs`;
+neither changed behaviour today, both were unbounded-or-untrue surfaces.
+
+- `unreachable_paused_jobs` reclaims uuids whose job is absent from the
+  live map: a pool-loss-paused job that then completed or was cancelled used
+  to pin its uuid in the set for the daemon's lifetime, because the GC read
+  only the map that no longer retains terminal jobs. A retired job can never
+  be resumed, so any pool-return sweep of the set now drops such uuids.
+  Mutation-proved: reverting the reclaim arm turns the test red.
+- `cancel`'s already-terminal answer derives `"was"` from the query
+  fact that admitted the retired job instead of asserting `"completed"`:
+  a row recovered as `Deleted` (latest witness verdict `cancelled`)
+  answers `"deleted-cache"`, the same label its query projection uses.
+  Mutation-proved: fabricating the constant back turns the test red.
+
+### Campaign mechanism (#429, #432, #433, #424)
+
+The spec-build campaign path surfaced by the first real ad-hoc campaign
+(dotfiles#163): the arm CLI and the packaged driver disagree on the campaign
+agent schema, a congested daemon converts a late advisory projection into node
+death, the digest-mismatch receipt withholds the evidence needed to act on it,
+and a failed agent pass launders its stray write into the next baseline.
+
+#### #429 — the arm CLI and the packaged driver now agree on the campaign agent schema
+
+The Rust CLI's `CampaignAgent` was a 7-field `deny_unknown_fields` struct while
+the packaged driver's `forge_manifest` unconditionally normalized an 8th field
+(`diagnosisSandboxPolicy`, defaulted `"read-only"`) into the canonical agent it
+hashes. No manifest could make the two digests agree, so every forge-native arm
+failed reconcile with "live issue executable graph does not match the armed
+digest."
+
+- The field genuinely governs diagnosis-node launch behaviour that ad-hoc
+  campaigns reach: for a forge-native campaign the effective agent is the
+  driver's normalized one, and `spec-build.js` passes
+  `effective.agent.diagnosisSandboxPolicy` to the diagnosis node's sandbox
+  policy. So the field is restored to `CampaignAgent` (option 2) rather than
+  deleted, both halves now carry it, and the CLI default (`read-only`) matches
+  the driver's normalization byte-for-byte.
+- Added a schema-parity regression test
+  (`graph_digest_is_byte_identical_between_the_cli_and_the_packaged_driver`)
+  that computes the graph digest through the Rust `sha256_json` path and
+  through the packaged `spec_build_driver.py` `canonical_sha256` path (run
+  under `python3` as a subprocess, the packaged file, not a copy of its logic)
+  and asserts byte equality — so version skew inside a pin fails in CI instead
+  of at first arm. It runs two manifests: one carrying every optional field
+  explicitly, and one carrying only the required ones so each half fills the
+  rest from its own default. Deleting the driver's single
+  `diagnosisSandboxPolicy` line makes the test fail (mutation-proven).
+- The defaults fixture found a second skew of the same class: the driver
+  validated `manifest.repository` with `repo_config`, which requires
+  `baseBranch`, `remote` and `forge`, while the arm CLI's `CampaignRepository`
+  defaults all three. A manifest omitting any of them armed cleanly and then
+  died at reconcile inside the driver. `forge_manifest` now fills the arm
+  CLI's exact defaults before validating, so both halves normalize the same
+  manifest to the same canonical value.
+
+#### #432 — a congested daemon no longer converts a late advisory projection into node death
+
+After a driver node completed, the flow host polled `query.job` for the
+finalMessage projection for at most a compile-time 10 s and then failed the node
+`result-schema-mismatch` — killing work whose exit evidence had already passed,
+because the daemon's dispatch loop was briefly stalled. The capture is advisory
+by declaration; a projection that never arrived is daemon congestion, not a
+schema violation.
+
+- A terminal node whose exit evidence passed but whose advisory projection did
+  not arrive inside the window is now classified `retryable-projection`
+  (bounded exponential-backoff retries inside a configurable wait, then a
+  receipt naming congestion: "projection unavailable within N ms; daemon
+  congested?") and is never rewritten into `result-schema-mismatch`, both in
+  the live client and in the engine host. A node whose exit evidence failed
+  keeps the pre-existing `result-projection-timeout` behaviour.
+- The projection wait is configurable, default 10 s. The seam that reaches a
+  campaign is `tally campaign arm --projection-wait-ms MILLISECONDS`: the value
+  is recorded in the registration and put on the argv of every `tally flow run`
+  the campaign dispatches, including the ones `campaign poll` dispatches later.
+  A campaign pass runs as a daemon-launched transient unit whose environment is
+  an explicit `--setenv` list, so an environment-only knob would never have
+  reached it. A `flow run` launched by hand takes
+  `--result-projection-wait-ms`, or `TALLY_RESULT_PROJECTION_TIMEOUT_MS` with
+  the flag winning. The knob stays out of the digest-bearing manifest, so
+  widening a host's wait is not a change to what was approved. Documented in
+  `doc/src/flows/campaigns.md`.
+- Tests: one stall longer than the window is bounded and classified
+  `retryable-projection` under a narrow window and completes the node under a
+  widened one (the pass survives, on the projection rather than on exit
+  evidence alone); a failed node keeps `result-projection-timeout`; the engine
+  propagates `retryable-projection` instead of `result-schema-mismatch` on both
+  the thrown and the settled path; the flag/environment precedence is pinned;
+  and a registration written before the knob existed still loads. Restoring
+  the fatal classification, the engine rewrite, or removing the retry loop
+  makes the respective test fail (mutation-proven).
+- The registration→argv delivery is pinned, not just the recording. The
+  dispatched pass's argv is built by `dispatch_flow_argv` (split out for the
+  same reason `continuation_argv` is), and
+  `a_recorded_projection_wait_reaches_the_dispatched_pass_argv` asserts that
+  `Some(n)` yields `--result-projection-wait-ms n` spelled exactly as
+  `FlowRunArgs` parses it, and that `None` yields the pre-#432 argv element for
+  element — that argv is hashed into the enqueue payload, so a stray element
+  would move every existing campaign's payload identity. Deleting the push, or
+  making it unconditional, each makes it fail (mutation-proven). The arm-side
+  `--projection-wait-ms 0` refusal is pinned by
+  `a_zero_projection_wait_is_refused_at_arm`.
+
+#### #433 — the reconcile digest-mismatch receipt prints both digests and the first divergent path
+
+On reconcile digest mismatch the operator saw only "live issue executable graph
+does not match the armed digest; inspect it and explicitly re-arm" — no digests,
+no diff. Four arms of dotfiles#163 were burned on plausible-but-wrong theories
+before source-diving both canonicalizations found #429; the first divergent
+canonical path would have named the defect instantly.
+
+- The receipt now prints BOTH digests (armed and live-computed) in the
+  `sha256:` form the arm CLI uses, and the first divergent canonical path from
+  a canonical-key-order walk of the armed manifest against the live normalized
+  one (e.g. `manifest.agent.diagnosisSandboxPolicy: absent-in-armed /
+  present-in-live`).
+- What the walk publishes, stated exactly: a path plus a shape —
+  absent-in-armed/present-in-live, a JSON type name, an array length, or the
+  bare fact that a scalar differs. Never a value. A path segment is a manifest
+  key name or an array index, so a key an operator chose (a gate id, a task id,
+  a steward environment variable's name) can appear; what is stored under it
+  cannot. Task titles and bodies live outside the manifest and the walk is only
+  ever handed the two manifests, so operator prose never reaches it.
+- The arm CLI carries its canonical manifest in the pass brief as
+  `armedManifest` (evidence for the receipt; it is never part of the executable
+  graph digest), and `spec-build.js` forwards it to the reconcile node. A
+  campaign armed before this existed carries none: the brief then omits the key
+  entirely and the receipt says the path is unavailable rather than inventing
+  one from the live side alone.
+- The gate's verdict is unchanged: it still refuses and tells the operator to
+  inspect and re-arm; this only stops the receipt starving them of evidence.
+- Tests, through the real `issue_graph_worklist` refusal path: two manifests
+  differing in exactly one nested key assert the receipt names that path and
+  both digests and withholds the value; a divergence that is only a task body
+  asserts the receipt says the manifest matched and does not republish the
+  body; an absent `armedManifest` asserts the unavailable wording. Dropping the
+  path computation makes them fail (mutation-proven).
+
+#### #424 — the tree-delta gate now runs on a pass whose agent failed, and no baseline is overwritten unjudged
+
+An agent node that did not pass returned at stage `"agent"`, before `ownership`
+and before the `treeDelta` node. The next pass's `prep` then re-fingerprinted
+the worktree unconditionally, taking a baseline that already contained the
+previous pass's stray write — so an uncommitted out-of-allowlist write made by
+a failing agent could never be seen by any gate again. A failing agent is the
+single most likely context for a rogue write and it was the one context the
+gate was silent in.
+
+- **A baseline is never overwritten unjudged.** `action_tree_delta` clears the
+  pre-agent fingerprint the instant it reads it, pass or fail, so a fingerprint
+  still on disk at `prep` time means the pass it belongs to was never judged.
+  `snapshot_before_agent` now preserves it in that case and rotates only when
+  the previous pass was judged. The next gate to run therefore judges the whole
+  span since the last judged baseline.
+- **A pass whose agent node failed still runs the gate**, in place of
+  `ownership`, with `ownershipRan: false`. Only a declared allowlist can govern
+  there: `ownership` never ran, so no certified `ownedPaths` exist to fall back
+  to.
+- **No allowlist, no pass.** If ownership never ran and the task declares no
+  `conflictDomains`, the gate refuses with a receipt naming exactly why and
+  leaves the baseline in place, so the writes it could not judge stay judgeable
+  once an allowlist exists. An explicitly empty `conflictDomains: []` is a
+  declaration, not an absence, and still judges (any delta is a breach). The
+  refusal is a fail-closed guard on the driver's own contract rather than a
+  state a campaign reaches: `spec-build.js`'s reconcile result schema requires
+  `conflictDomains` on every implementation task in the frontier — on the
+  file-based arm and on the forge-native arm alike — so the bases reachable on a
+  failed pass are `declared` and `declared-empty`, and both judge. That
+  reachability is pinned by a test on both arms, not asserted in prose:
+  relaxing `required` on either arm makes
+  `the_flow_cannot_send_an_implementation_task_without_conflict_domains` red,
+  naming the arm that was relaxed.
+- The same is true of the passing path, and `doc/src/flows/campaigns.md` now
+  says so: through the flow the gate is governed by `declared` or
+  `declared-empty` on BOTH agent outcomes. The `owned-paths-fallback` derivation
+  needs a task whose `conflictDomains` key is absent rather than empty, and both
+  worklist producers normalize an omitted field to `[]`, so like the ungated
+  refusal it is reachable only through the directly-invoked driver. Whether the
+  producers should instead preserve absence is an open design question tracked
+  in #439; the doc describes the shipped behaviour and does not promise either
+  resolution.
+- The refusal is priced as a gate verdict (`failureClass` → `"ungated"`), never
+  as the agent's work being wrong: it spends none of the task's two steering
+  attempts. It aborts the lane through the same both-receipts-at-once path a
+  breach takes, but under its own sentence — the #386 breach sentence claims an
+  out-of-allowlist write was found, and a gate that could not look has
+  established no such thing. `action_steer` takes an `abortReason` and composes
+  the matching label; absent keeps the #386 breach wording exactly.
+- The `treeDelta` result gains `ownershipRan`, so a reader of a witnessed
+  receipt can tell which of the gate's two call sites produced the verdict, and
+  can see that a failed pass was in fact judged.
+- The worst-case flow-node budget is unchanged: the agent-failure lane runs
+  prep, agent, treeDelta, diff, diagnosis, steer and cleanup, well inside the
+  11-per-lane allowance, and the merge-failure lane that sets the worst case
+  already counted `treeDelta`. `campaignMaxNodes`/`max_flow_nodes` do not move.
+- Tests: the eval's reproduction shape is caught directly at pass 1; a pass that
+  ends unjudged has its baseline preserved and pass 2's gate still sees the
+  stray write (restoring the unconditional re-snapshot makes that test red —
+  mutation-proven); a judged baseline still rotates; the refusal is loud, names
+  why, and does not claim a breach; the `ungated` class is pinned in the
+  executable `spec-build.js` realm; and the posted receipt for an ungated abort
+  never carries the breach sentence.
+- The flow-side wiring itself is bound end to end.
+  `crates/tally-flow/tests/spec_build_failed_agent_gate.rs` runs the real
+  `spec-build.js` against a scripted client with the agent node failed and
+  asserts the `tree-delta-<task>` node is dispatched, after the agent node,
+  carrying `ownershipRan: false` and no `ownedPaths`; that a breaching gate is
+  what the pass then reports; and that a clean gate leaves the agent failure
+  priced as work. Deleting the failed-agent gate block, or flipping its
+  `ownershipRan` to true, each makes it red (mutation-proven) — previously both
+  mutations left the whole workspace green.
+### flows & cli residue (#427, #416, #414, #418)
+
+Four residues from earlier waves, each with its shape already argued in its
+issue: a drain client that spent the fleet failure alarm on a busy daemon, a
+direct-file verb family whose default data dir ignored the deployment it was
+run against, an exit-20 remedy that advertised a command that cannot parse,
+and a doc-pin check whose own message claimed the wrong thing.
+
+#### #427 — a drain whose RPC deadline expires on a busy daemon is a retryable skip
+
+`tally-drain.timer` fires every five seconds, and a saturated daemon can take
+longer than the 60s client deadline to answer `queue.drain` on a connection
+that was established. That exited 1 and surfaced as a per-user unit failure —
+~52 in one day on the coordinator, every one self-healing on the next tick.
+
+- `tally daemon drain` now treats `queue.drain` deadline-exceeded as a
+  retryable skip: exit 0, with the line naming the expired deadline still
+  written to stderr, plus that the skip is retryable. The safety argument is
+  the event files': they are durable on disk and the next drain picks them
+  up, so nothing is lost.
+- The skip is narrow: only `queue.drain`'s own client deadline on the
+  periodic spelling is absorbed. `tally queue drain` keeps failing on the
+  same hang, and every other established-connection error — including a
+  daemon that is listening and refuses — keeps its exit code.
+- Proven at both seams: a unit test pins the classification (deadline on
+  `queue.drain` is the skip; another method's deadline, a rearm-window
+  exhaustion, a refusal, and an absence are all not), and an integration
+  test runs the real binary against a server that connects and never
+  answers: `daemon drain` exits 0 and names the case, `queue drain` exits 1.
+- The Home Manager `tally-drain` unit's `daemon drain` spelling is now
+  pinned in the module contract, as the NixOS one already was — the
+  user-unit half is the one whose failures the fleet watcher reports, and
+  `queue drain` there would leave both this absorption and #411's inert.
+
+#### #416 — `TALLY_DATA_DIR`, honoured by the default and exported by both modules
+
+The direct-file verbs resolved an omitted `--data-dir` to the user data
+directory, so `reader-state archive` on a deployment printed an affirmative
+record, exited 0, and wrote a brand-new store in the wrong place — a silent
+no-op with a success message.
+
+- `default_data_dir()` now honours `TALLY_DATA_DIR`, taken verbatim as the
+  directory. Precedence: an explicit `--data-dir` flag at the call site,
+  then `TALLY_DATA_DIR`, then the XDG default (`$XDG_DATA_HOME/tally`, else
+  `~/.local/share/tally`). Unset or empty, local use resolves exactly as
+  before.
+- The variable is taken verbatim, not searched: aimed at something that
+  cannot hold the store, a write verb fails naming that path rather than
+  falling back to the XDG default, because a fallback would restore the
+  silent no-op this closes.
+- Both modules export the variable alongside the data directory they
+  already configure — on their units (daemon, witness-emit, retention) and
+  in the operator's own environment, which is where an omitted `--data-dir`
+  actually resolved to the wrong store: `home.sessionVariables` on Home
+  Manager, `environment.variables` on NixOS, both `mkDefault` so an
+  operator's declaration wins. On a NixOS deployment that store is mode
+  0700 and owned by the service user, so an operator who is not that user
+  is now refused by name instead of quietly writing a store elsewhere.
+- Proven at the seam by subprocess tests for every precedence tier (flag
+  beats variable, variable beats a *set* `XDG_DATA_HOME` and yields to none,
+  empty is unset, HOME fallback unchanged, an unusable value fails loudly,
+  and a read verb follows the variable to a seeded ledger), and at the
+  modules by evaluated assertions that the export exists with the configured
+  path on both units and both login environments.
+
+#### #414 — no executable command for a malformed run identity
+
+A flag-shaped `flowRunId` from a foreign producer (a leading `-` after
+trim) still rendered a `remedy` interpolating it, advertising a command
+clap refuses with exit 2 — `--flow-run-id --reason` parses the id as the
+next flag.
+
+- The exit-20 rendering now splits on the flag shape in both fields an
+  operator reads: the `remedy` member is `null`, and the refusal message
+  keeps the why-clause but replaces the command with its own sentence
+  naming a malformed run identity — the same rendering family as the empty
+  case, but distinct from it: a run was named, badly, which is not "no run
+  named".
+- The raw `flowRunId` stays visible in `details`, preserving #401 item 3's
+  invariant. The two emptiness definitions (`trim().is_empty()` in both
+  sites) stay untouched and in agreement, and no UUID validation is
+  introduced anywhere in the fourteen-member map — the leading dash after
+  trim is the entire test.
+- The documented `remedy` nullity rule — one wording, pinned identical on
+  `submission-and-replay.md` and `errors.md` — now states both shapes that
+  produce `null`, and a doc pin checks the sentence against what the code
+  does rather than against itself.
+- Mutation-proven both ways: dropping either guard (the `remedy` arm or the
+  sentence branch) turns the new test red, and the same test asserts a
+  well-formed id still gets its command in both fields.
+
+#### #418 — the doc-pin check tells the truth about what it rejects
+
+The end-of-span check in `supersession_docs.rs` fired on any `|` line after
+an `:end` marker, including a blank line followed by a *complete* second
+table — which renders perfectly, because a blank line ends a table in
+markdown — and its panic message claimed a marker inside a table splits it,
+steering the obvious fix back into the rendering defect the pin exists to
+prevent.
+
+- The check now skips blank lines and distinguishes the shapes: a following
+  complete table (header + separator rows) is accepted; it fires only when
+  the content after the marker is a bare row, with or without a blank line.
+  The panic message and the rustdoc now describe the shape actually
+  rejected. Probe A (blank line, bare rows) stays red; probe B (blank line,
+  complete table) goes green — both as synthetic in-test documents, and the
+  mutation that restores the old check turns probe B red. "Complete" means a
+  real delimiter row: a horizontal rule under a row is still a bare row, and
+  a third probe pins that.
+- The live `replay-divergence` test's label comment pointed at "the
+  in-process tests in `tally-flow`" for coverage that was not there. The
+  comment now names the two tests that bind `recordedLabel`/`currentLabel`
+  at the site this fixture's refusal is actually raised from — the
+  dedup-conflict path in `crates/tally/src/flow_live.rs`, whose label
+  binding already existed — and separately names the runner's own
+  comparison site, where the mock ledger now returns one label while the
+  script derives another so that site is bound too. The stated limit is
+  unchanged; only the pointer was wrong.
 
 ### Steward driver gates (#385, #386)
 

@@ -627,20 +627,43 @@ impl HostShared {
         result.disposition = admission.disposition;
         validate_terminal_result(&result, &admission, plan.location, plan.ordinal)?;
         if plan.result_schema.is_none()
-            && result
-                .error
-                .as_ref()
-                .is_some_and(|error| error.code == "result-projection-timeout")
+            && result.error.as_ref().is_some_and(|error| {
+                error.code == RESULT_PROJECTION_TIMEOUT_CODE
+                    || error.code == RETRYABLE_PROJECTION_CODE
+            })
         {
             result.error = None;
         }
         if let Some(schema) = &plan.result_schema {
             let validation = result.result.as_ref().map_or_else(
                 || {
+                    // #432: a node whose exit evidence passed but whose advisory
+                    // projection never arrived is retryable-projection. That is
+                    // daemon congestion, not a contract violation, so the engine
+                    // must propagate that classification instead of rewriting it
+                    // into result-schema-mismatch.
+                    if let Some(projection_error) = result
+                        .error
+                        .as_ref()
+                        .filter(|error| error.code == RETRYABLE_PROJECTION_CODE)
+                    {
+                        return Err(FlowError::new(
+                            "FlowResultError",
+                            RETRYABLE_PROJECTION_CODE,
+                            projection_error.message.as_str(),
+                        )
+                        .at(plan.location)
+                        .with_ordinal(plan.ordinal)
+                        .detail(
+                            "projection",
+                            serde_json::to_value(projection_error)
+                                .expect("node projection failures always serialize"),
+                        ));
+                    }
                     let projection_error = result
                         .error
                         .as_ref()
-                        .filter(|error| error.code == "result-projection-timeout");
+                        .filter(|error| error.code == RESULT_PROJECTION_TIMEOUT_CODE);
                     let mut error = FlowError::new(
                         "FlowResultError",
                         "result-schema-mismatch",

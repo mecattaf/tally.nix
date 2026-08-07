@@ -13,7 +13,9 @@ struct Reply {
     stderr_truncated: Option<bool>,
     result: Option<Value>,
     divergent_hash: bool,
+    recorded_label: Option<String>,
     client_error: Option<ClientError>,
+    error: Option<NodeFailure>,
 }
 
 impl Reply {
@@ -26,7 +28,9 @@ impl Reply {
             stderr_truncated: None,
             result: Some(json!({"ok": true})),
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
+            error: None,
         }
     }
 
@@ -39,7 +43,32 @@ impl Reply {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: Some(ClientError::new(code, format!("{code} from mock"))),
+            error: None,
+        }
+    }
+
+    /// A node whose exit evidence passed but whose advisory projection never
+    /// arrived (#432): verdict pass, no structured result, and the live client
+    /// has already raised `retryable-projection`.
+    fn retryable_projection() -> Self {
+        Self {
+            disposition: Disposition::Created,
+            witness_seq: 1,
+            verdict: Verdict::Pass,
+            stderr_excerpt: None,
+            stderr_truncated: None,
+            result: None,
+            divergent_hash: false,
+            recorded_label: None,
+            client_error: None,
+            error: Some(NodeFailure {
+                code: RETRYABLE_PROJECTION_CODE.to_owned(),
+                message: "projection unavailable within 10000 ms for adapter \"spec-build-driver\": daemon congested?"
+                    .to_owned(),
+                details: None,
+            }),
         }
     }
 }
@@ -149,10 +178,12 @@ impl FlowClient for MockClient {
             model: None,
             result: reply.result,
             gates: None,
-            error: (!reply.verdict.is_pass()).then(|| NodeFailure {
-                code: "worker-failed".to_owned(),
-                message: "worker failed".to_owned(),
-                details: None,
+            error: reply.error.clone().or_else(|| {
+                (!reply.verdict.is_pass()).then(|| NodeFailure {
+                    code: "worker-failed".to_owned(),
+                    message: "worker failed".to_owned(),
+                    details: None,
+                })
             }),
         };
         let inline = matches!(
@@ -177,7 +208,7 @@ impl FlowClient for MockClient {
             payload_hash,
             attempt: 0,
             terminal: inline,
-            recorded_label: None,
+            recorded_label: reply.recorded_label.clone(),
             reused_rejected: None,
         }));
         let delayed = self.delayed_submissions.borrow().contains(&index);
@@ -550,13 +581,17 @@ fn payload_divergence_stops_admission_at_the_mismatched_ordinal() {
     let source = format!(
         "{}\n(async () => parallel([\n\
          () => sh(['zero'], {{pools: ['cpu']}}),\n\
-         () => sh(['one'], {{pools: ['cpu']}}),\n\
+         () => sh(['one'], {{pools: ['cpu'], label: 're-derived'}}),\n\
          () => sh(['two'], {{pools: ['cpu']}})\n\
          ]))()",
         meta(&["cpu"], &[])
     );
     let mut mismatch = Reply::pass(Disposition::Reused, 2);
     mismatch.divergent_hash = true;
+    // The ledger's own label for the row, distinct from the label the
+    // runner derives for the same ordinal, so the two sides of the
+    // disagreement are bound as the two different strings they are.
+    mismatch.recorded_label = Some("ledger-label".to_owned());
     let client = MockClient::new(vec![
         Reply::pass(Disposition::Reused, 1),
         mismatch,
@@ -575,6 +610,12 @@ fn payload_divergence_stops_admission_at_the_mismatched_ordinal() {
     assert_eq!(error.details["flowRunId"], "run-1");
     assert_eq!(error.details["divergentInput"], "payload");
     assert_eq!(error.details["recordedHash"], "sha256:divergent");
+    // Which member carries which side of the label disagreement, bound
+    // against two strings that differ — the shape the live replay-divergence
+    // fixture structurally cannot produce (#418): recordedLabel is what the
+    // ledger's admission returned, currentLabel what this runner derived.
+    assert_eq!(error.details["recordedLabel"], "ledger-label");
+    assert_eq!(error.details["currentLabel"], "re-derived");
     // A rollover does not clear a payload divergence, so the resolution differs
     // from the identity pins' — but it is still permanent, and says so.
     assert_eq!(error.details["transient"], false);
@@ -868,6 +909,78 @@ fn a_refusal_that_names_no_run_advertises_no_command_anywhere() {
     );
 }
 
+/// Issue #414: a flag-shaped identity is a run named badly, not a run not
+/// named. The raw value stays visible in `flowRunId` — #401 item 3's
+/// invariant — but nothing may derive a command from it: interpolating
+/// `--reason` into the supersede argv makes clap read it as the next flag,
+/// and the advertised command exits 2 in an operator's hands. The split is
+/// rendered identically in both fields the operator can read, and no UUID
+/// validation is introduced: the leading dash after trim is the entire test.
+#[test]
+fn a_flag_shaped_run_identity_keeps_its_name_and_loses_its_command() {
+    for flag_like in ["--reason", "-", "-x", "  --flow-run-id"] {
+        for code in crate::error::SUPERSESSION_CODES {
+            let details = crate::error::supersession_details(
+                code,
+                &crate::error::SupersessionDetails {
+                    flow_run_id: flag_like,
+                    ..crate::error::SupersessionDetails::default()
+                },
+            );
+            assert_eq!(
+                details["flowRunId"], flag_like,
+                "{code} with {flag_like:?}: a badly named run stays visible"
+            );
+            assert!(
+                details["remedy"].is_null(),
+                "{code} with {flag_like:?}: {}",
+                details["remedy"]
+            );
+        }
+        // The message twin: the why-clause survives, the command does not,
+        // and the sentence names the malformed identity rather than reading
+        // like the no-run-named case.
+        let sentence =
+            crate::error::identity_refusal_remedy_sentence("script-changed-mid-run", flag_like);
+        assert!(
+            !sentence.contains("tally flow supersede"),
+            "{flag_like:?}: {sentence}"
+        );
+        assert!(
+            !sentence.contains("--flow-run-id"),
+            "{flag_like:?}: the command's operands must not appear either: {sentence}"
+        );
+        assert!(
+            sentence.contains("malformed"),
+            "{flag_like:?}: the sentence must name the malformed identity: {sentence}"
+        );
+        assert!(
+            sentence.contains("refused for script it never changed"),
+            "the why-clause survives the missing command: {sentence}"
+        );
+    }
+
+    // A well-formed id keeps its command in both fields: the rendering split
+    // binds only if this side still renders.
+    let uuid = "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321";
+    let details = crate::error::supersession_details(
+        "script-changed-mid-run",
+        &crate::error::SupersessionDetails {
+            flow_run_id: uuid,
+            ..crate::error::SupersessionDetails::default()
+        },
+    );
+    assert_eq!(
+        details["remedy"],
+        format!(
+            "tally flow supersede --flow-run-id {uuid} --new-flow-run-id <FRESH-UUID> \
+             --reason script-changed"
+        )
+    );
+    let sentence = crate::error::identity_refusal_remedy_sentence("script-changed-mid-run", uuid);
+    assert!(sentence.contains("tally flow supersede"), "{sentence}");
+}
+
 /// Completion is a floor under the contract, not a filter over it.
 #[test]
 fn a_run_named_badly_is_preserved_rather_than_dropped() {
@@ -1031,6 +1144,48 @@ fn duplicate_keys_and_result_mismatches_are_typed_with_positions() {
     );
 }
 
+/// #432: a node whose exit evidence passed but whose advisory projection never
+/// arrived is `retryable-projection`. The engine must propagate that
+/// classification instead of rewriting it into `result-schema-mismatch`, so an
+/// operator grepping a dead campaign can tell daemon congestion from a
+/// contract violation. Restoring the rewrite (converting this to
+/// result-schema-mismatch) makes the test red.
+#[test]
+fn an_unprojected_advisory_capture_is_retryable_projection_not_schema_mismatch() {
+    let failing = format!(
+        "{}\n(async () => sh(['driver'], {{\n\
+         pools: ['cpu'], resultSchema: {{type: 'object'}}\n\
+         }}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(
+        &failing,
+        MockClient::new(vec![Reply::retryable_projection()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, RETRYABLE_PROJECTION_CODE);
+    assert_ne!(error.code, "result-schema-mismatch");
+
+    let settled = format!(
+        "{}\n(async () => {{\n\
+         const node = await sh(['driver'], {{\n\
+           pools: ['cpu'], resultSchema: {{type: 'object'}}, settle: true\n\
+         }});\n\
+         return node.error.code;\n\
+         }})()",
+        meta(&["cpu"], &[])
+    );
+    let (report, _) = run(
+        &settled,
+        MockClient::new(vec![Reply::retryable_projection()]),
+    )
+    .unwrap();
+    assert_eq!(
+        report.final_value,
+        Some(Value::String(RETRYABLE_PROJECTION_CODE.to_owned()))
+    );
+}
+
 fn catalog() -> Catalog {
     Catalog {
         version: 1,
@@ -1130,7 +1285,9 @@ fn selector_quorum_preserves_dissent_and_materializes_one_repair_key() {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
+            error: None,
         },
         Reply::pass(Disposition::Created, 3),
         Reply::pass(Disposition::Created, 4),
@@ -1287,7 +1444,9 @@ fn drv_sugar_is_store_native_replay_stable_and_substituted_is_success() {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
+            error: None,
         }]);
         let (report, _) = run(&source, client.clone()).unwrap();
         assert_eq!(
@@ -1730,7 +1889,9 @@ fn aggregate_and_loop_errors_keep_their_public_classes_and_call_sites() {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
+            error: None,
         },
     ]);
     let error = run(&aggregate, client).unwrap_err();
@@ -1781,7 +1942,9 @@ fn documented_admission_terminal_and_node_cap_rejections_are_typed() {
         stderr_truncated: Some(false),
         result: None,
         divergent_hash: false,
+        recorded_label: None,
         client_error: None,
+        error: None,
     };
     let error = run(&source, MockClient::new(vec![failed])).unwrap_err();
     assert_eq!(error.name, "FlowTerminalError");
@@ -1801,7 +1964,9 @@ fn documented_admission_terminal_and_node_cap_rejections_are_typed() {
         stderr_truncated: None,
         result: None,
         divergent_hash: false,
+        recorded_label: None,
         client_error: None,
+        error: None,
     };
     let error = run(&source, MockClient::new(vec![cancelled])).unwrap_err();
     assert_eq!(error.name, "FlowCancelledError");

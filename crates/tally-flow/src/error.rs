@@ -205,7 +205,11 @@ pub struct SupersessionDetails<'a> {
     /// The run whose recorded identity is in question. Every raising site in
     /// this tree knows it; blank — empty or whitespace-only, the same test
     /// `run_script` applies — renders as `null` rather than as a blank string,
-    /// and suppresses the `remedy` derived from it.
+    /// and suppresses the `remedy` derived from it. A flag-shaped identity
+    /// (leading `-` after trim) is a run named badly rather than not named:
+    /// it stays visible, but suppresses the `remedy` the same way, because a
+    /// command interpolating it parses as flags and exits 2 in an operator's
+    /// hands (#414).
     pub flow_run_id: &'a str,
     /// The hash the ledger recorded for the divergent input.
     pub recorded_hash: Option<&'a str>,
@@ -307,9 +311,14 @@ fn complete_supersession_details(code: &str, details: &mut Map<String, Value>) {
             // A remedy is a command an operator can type, so it exists only when
             // every argument of that command does. Only the three pins have one;
             // `flow-run-superseded` names its successor instead, and
-            // `replay-divergence` resolves by investigation.
+            // `replay-divergence` resolves by investigation. A flag-shaped id is
+            // present but cannot be typed: interpolating it puts a flag where
+            // the command needs an operand, so the command exits 2 in an
+            // operator's hands and none is rendered (#414).
             "remedy" => match (divergent_input(code), flow_run_id.as_deref()) {
-                (Some(_), Some(flow_run_id)) => supersede_remedy(code, flow_run_id).into(),
+                (Some(_), Some(flow_run_id)) if !is_flag_shaped(flow_run_id) => {
+                    supersede_remedy(code, flow_run_id).into()
+                }
                 _ => Value::Null,
             },
             "transient" => {
@@ -382,16 +391,34 @@ pub fn supersede_remedy(code: &str, flow_run_id: &str) -> String {
     )
 }
 
+/// Whether a run identity reads as a command flag rather than as a run id.
+///
+/// `trim().starts_with('-')` is the entire test — deliberately not UUID
+/// validation. A producer can send anything, and the fourteen-member map
+/// preserves whatever it sent; a pasted `--reason` names a run, badly, and
+/// #401 item 3's ruling says a badly named run stays visible rather than
+/// being dropped. But a remedy interpolates the id straight into argv, where
+/// anything starting with a dash parses as a flag and the advertised command
+/// exits 2 in the operator's hands, so no command may be derived from this
+/// shape (#414).
+fn is_flag_shaped(flow_run_id: &str) -> bool {
+    flow_run_id.trim().starts_with('-')
+}
+
 /// The sentence appended to a mid-run identity refusal, naming both why a
 /// byte-identical input can still be refused and the command that clears it.
 ///
 /// The command is omitted when no run is named, on the same rule
 /// `complete_supersession_details` applies to the `remedy` member: a refusal
 /// that cannot say which run this is must not hand an operator an invocation
-/// missing the argument that makes it run. `message` is the field a human
-/// actually reads, so the guard has to be here too — every call site in this
-/// tree sits downstream of `run_script`'s `flow-run-id-missing` refusal, but
-/// this function is public and a future one need not.
+/// missing the argument that makes it run. A flag-shaped identity is the
+/// sibling case (#414): a run *was* named, but in a form that parses as a
+/// flag, so the sentence names the malformed identity instead of rendering a
+/// command that cannot parse — and keeps the raw id visible, because a badly
+/// named run is not the same fact as no run named. `message` is the field a
+/// human actually reads, so the guards have to be here too — every call site
+/// in this tree sits downstream of `run_script`'s `flow-run-id-missing`
+/// refusal, but this function is public and a future one need not.
 #[must_use]
 pub fn identity_refusal_remedy_sentence(code: &str, flow_run_id: &str) -> String {
     let input = divergent_input(code).unwrap_or("input");
@@ -401,6 +428,13 @@ pub fn identity_refusal_remedy_sentence(code: &str, flow_run_id: &str) -> String
     );
     if flow_run_id.trim().is_empty() {
         return format!("{why}.");
+    }
+    if is_flag_shaped(flow_run_id) {
+        return format!(
+            "{why}. The run was named, but its identity is malformed: it starts with a dash \
+             and reads as a command flag, so no supersede command is rendered for it; the raw \
+             identity stays visible in flowRunId."
+        );
     }
     format!(
         "{why}. Retire the run and start a successor: {}",

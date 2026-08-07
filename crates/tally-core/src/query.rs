@@ -540,7 +540,7 @@ fn project_job_details(
     jobs
 }
 
-fn row_status_name(status: RowStatus) -> &'static str {
+pub(crate) fn row_status_name(status: RowStatus) -> &'static str {
     match status {
         RowStatus::Pending => "pending",
         RowStatus::Completed => "completed-cache",

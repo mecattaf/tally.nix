@@ -26,6 +26,26 @@ The default config is `$XDG_CONFIG_HOME/tally/config.json`, falling back to
 `--socket`, `TALLY_SOCKET`, `$XDG_RUNTIME_DIR/tally/tally.sock`, then the temporary directory's
 `tally/tally.sock`.
 
+Every verb that resolves an omitted `--data-dir` — the direct-file family (`reader-state`,
+`witness verify` and `witness compare`, `witness append`, `gc`, `history compact`, and the
+producer diagnostics) and `daemon run` — takes it from `TALLY_DATA_DIR`, verbatim as the
+directory, before the XDG default `$XDG_DATA_HOME/tally`, else `~/.local/share/tally`. An
+explicit `--data-dir` flag wins over the variable; every unit either module renders that runs
+one of these verbs is given an explicit path — `--data-dir`, or `--ledger` for the witness
+emitter's `witness append` — so the variable never changes what a deployment's own units read.
+With the variable unset or empty, resolution is
+exactly what it was before it existed. It is taken verbatim, not searched: if it names something
+that cannot hold the store, the verb fails naming that path rather than falling back to the XDG
+default.
+
+Both modules export `TALLY_DATA_DIR` alongside the data directory they configure — on their
+units, and on the operator's environment (`home.sessionVariables` on Home Manager,
+`environment.variables` on NixOS, both `mkDefault`), because the operator's shell is where an
+omitted `--data-dir` used to resolve to a different store than the daemon's. On a NixOS
+deployment that store is mode 0700 and owned by the service user, so an operator who is not
+that user is now refused by name instead of quietly writing a new store elsewhere; run the verb
+as the service user to change the deployment's own state.
+
 One-shot RPC commands have a 60-second client deadline. Override it with
 `--rpc-timeout-sec SECONDS` or `TALLY_RPC_TIMEOUT_SEC`; the flag takes precedence. Both values
 must be positive whole seconds. Long-polling `queue.await_job` and `query.watch` calls are not
@@ -381,9 +401,14 @@ They differ in one place. `tally daemon drain` is what `tally-drain.timer` runs 
 seconds, and a daemon restart takes longer than that, so it treats an unreachable socket as
 nothing to drain and exits **0** rather than 3 — otherwise every activation that restarts the
 daemon raises a unit failure indistinguishable from a real one. The line naming the unreachable
-socket is still written to stderr, so an operator running it by hand still sees which case it was,
-and every other drain failure — including a daemon that is listening and refuses — keeps its exit
-code. `tally queue drain` is unchanged and still exits 3 on an unreachable socket. The unit also
+socket is still written to stderr, so an operator running it by hand still sees which case it was.
+It also absorbs the busy-daemon shape: a daemon that connected but did not answer `queue.drain`
+within the client deadline (60s by default; `--rpc-timeout-sec` / `TALLY_RPC_TIMEOUT_SEC`)
+records a retryable skip and likewise exits **0**, because the producer event files are durable
+on disk and the next tick drains them — nothing is lost. The line naming the expired deadline is
+written to stderr the same way. Every other drain failure — including a daemon that is listening
+and refuses — keeps its exit code. `tally queue drain` is unchanged and still exits 3 on an
+unreachable socket, and 1 when the deadline expires. The unit also
 carries `ConditionPathExists` on the socket, so a drain scheduled while the daemon is down is
 recorded as a skipped start rather than being invoked at all.
 

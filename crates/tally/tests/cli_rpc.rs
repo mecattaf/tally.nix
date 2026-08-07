@@ -1902,6 +1902,23 @@ impl RpcHandler for RefusingDrainHandler {
     }
 }
 
+/// A handler that is listening, connects, and then never answers
+/// `queue.drain` — the busy-daemon shape whose client deadline #427 absorbs.
+#[derive(Clone, Copy)]
+struct HangingDrainHandler;
+
+impl RpcHandler for HangingDrainHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            assert_eq!(request.method, "queue.drain");
+            std::future::pending::<Result<Value, WireError>>().await
+        })
+    }
+}
+
 /// Issue #411: `tally-drain` runs every five seconds, so a daemon restart
 /// under it is routine, and exiting 3 on that turned every deploy that touches
 /// the daemon unit into a per-user unit failure the fleet's journal watcher
@@ -1954,6 +1971,59 @@ async fn a_periodic_drain_that_finds_no_daemon_is_not_a_failure() {
             let refused = run_tally(&socket, &["daemon", "drain"]).await;
             assert_eq!(refused.status.code(), Some(2), "{:?}", refused.status);
             server.await.unwrap();
+        })
+        .await;
+}
+
+/// Issue #427: the daemon is present — the connection is established — but
+/// saturated enough that `queue.drain` cannot answer within the client's
+/// deadline. On the coordinator this surfaced as ~52 `tally-drain.service`
+/// failures in one day, every one self-healing on the next tick, because the
+/// producer event files are durable on disk and the next drain picks them up.
+/// The periodic drain therefore records a retryable skip — systemd success
+/// plus the warning line — and the pin holds the scope in all three
+/// directions: the skip happens, the identical hang through `queue drain`
+/// still fails, and the predicate unit tests hold every other
+/// established-connection error outside the skip.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drain_whose_deadline_expires_on_a_busy_daemon_is_a_retryable_skip() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                // Never returns on its own: the handler is hung, and this
+                // server is aborted once the client side is proven.
+                let _ = serve_connection(stream, HangingDrainHandler).await;
+            });
+
+            // The periodic drain records a skip: exit 0, and the line naming
+            // the case is still written so an operator running the verb by
+            // hand still sees which one it was.
+            let skipped = run_tally(&socket, &["--rpc-timeout-sec", "1", "daemon", "drain"]).await;
+            assert_eq!(skipped.status.code(), Some(0), "{:?}", skipped.status);
+            let stderr = String::from_utf8_lossy(&skipped.stderr).into_owned();
+            assert!(
+                stderr.contains("RPC method queue.drain exceeded its 1s deadline"),
+                "the absorbed case must still name itself:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("retryable skip"),
+                "the absorbed case must say why it is safe:\n{stderr}"
+            );
+            // A skip, not a drain: nothing may claim a result happened.
+            let stdout = String::from_utf8_lossy(&skipped.stdout).into_owned();
+            assert!(stdout.is_empty(), "{stdout}");
+
+            // The identical hang reached through the manual verb is untouched:
+            // the skip belongs to the periodic spelling alone.
+            let failed = run_tally(&socket, &["--rpc-timeout-sec", "1", "queue", "drain"]).await;
+            assert_eq!(failed.status.code(), Some(1), "{:?}", failed.status);
+
+            server.abort();
         })
         .await;
 }

@@ -161,7 +161,9 @@ use crate::taskdb::{
     update_enqueue_event_atomic, write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin,
     DurableEnqueueEvent, DurableRetry, EnqueueSource, RecordedLaunchCwd, RowSeed, TaskDbError,
 };
-use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
+use crate::trace::{
+    anchor_trace_availability, query_trace, trace_availability, TraceError, TraceLane,
+};
 use crate::usage::UsageObservation;
 use crate::usage_rollup::AttestationEvidence;
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
@@ -638,10 +640,11 @@ struct DaemonHandler {
 ///
 /// Every flow start reads this store, so it is cached rather than re-parsed per
 /// run. The stamp is revalidated on each read, so an operator repairing the
-/// ledger by hand does not have to restart the daemon.
+/// ledger by hand does not have to restart the daemon. `Arc`, not `Rc`: query
+/// construction reads this index from the blocking pool (#431).
 pub(crate) struct CachedFlowLineage {
     stamp: Option<(u64, Option<std::time::SystemTime>)>,
-    lineage: Rc<FlowLineage>,
+    lineage: Arc<FlowLineage>,
 }
 
 /// The parsed membership index plus the file stamp it was parsed from.
@@ -651,10 +654,11 @@ pub(crate) struct CachedFlowLineage {
 /// own append rather than dropped: re-parsing the whole ledger once per
 /// admission would make admission linear in the ledger. The stamp is still
 /// revalidated on every read, so an operator repairing the ledger by hand does
-/// not have to restart the daemon.
+/// not have to restart the daemon. `Arc`, not `Rc`: query construction reads
+/// this index from the blocking pool (#431).
 pub(crate) struct CachedFlowMembership {
     stamp: Option<(u64, Option<std::time::SystemTime>)>,
-    membership: Rc<FlowMembership>,
+    membership: Arc<FlowMembership>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
