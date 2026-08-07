@@ -14634,6 +14634,129 @@ mod tests {
             .await;
     }
 
+    /// #431 repair (eval finding D1-1): the trace decoration on job envelopes
+    /// is pinned. `query.jobs` decorates every item through the per-anchor
+    /// lane index and `query.job` decorates its single summary; both surfaces
+    /// were rewritten by #431 and neither was asserted anywhere, so emptying
+    /// the index — or deleting `query.job`'s assignment outright — shipped
+    /// every job as "no trace metadata" with the whole suite green.
+    ///
+    /// Positive shape: a completed job under a trace-declaring adapter with
+    /// retained captures reports `trace.available == true` on both verbs.
+    /// Negative shape: a job under an adapter with no declared trace reports
+    /// exactly `adapter-does-not-declare-a-provider-trace` — the reason that
+    /// proves its lanes were found and consulted, where a broken index would
+    /// report `no-attempt-trace-metadata` instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_envelopes_report_trace_availability_from_the_lane_index() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let program = temp.path().join("traced-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    concat!(
+                        "#!/bin/sh\n",
+                        "printf '%s\\n' '{\"event\":{\"session_id\":\"trace-session\"}}'\n"
+                    ),
+                );
+                let mut config = one_pool_config();
+                let mut adapter = structured_adapter(&program);
+                adapter.trace = Some(AdapterTrace {
+                    stream: ScrapeStream::Stdout,
+                    framing: TraceFraming::JsonLines,
+                });
+                config.adapters.insert("traced".to_owned(), adapter);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+
+                let mut finished_uuids = Vec::new();
+                for adapter in ["traced", "shell"] {
+                    let admitted = daemon
+                        .handler
+                        .enqueue_as_client(Some(json!({
+                            "argv": if adapter == "traced" {
+                                json!(["ignored-by-template"])
+                            } else {
+                                json!(["true"])
+                            },
+                            "pool": "slot",
+                            "adapter": adapter,
+                            "source": "manual",
+                            "evidence": ["exit:0"]
+                        })))
+                        .await
+                        .unwrap();
+                    let finished = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        daemon.completion_rx.recv(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    daemon.finish_job(finished).await.unwrap();
+                    let terminal = daemon
+                        .handler
+                        .await_job(Some(json!({"task_uuid": admitted["task_uuid"]})))
+                        .await
+                        .unwrap();
+                    assert_eq!(terminal["verdict"], "pass");
+                    finished_uuids.push(admitted["task_uuid"].as_str().unwrap().to_owned());
+                }
+                let (traced_uuid, plain_uuid) = (&finished_uuids[0], &finished_uuids[1]);
+
+                let job = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": traced_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    job["job"]["trace"]["available"], true,
+                    "query.job must report the retained trace: {}",
+                    job["job"]["trace"]
+                );
+
+                let jobs = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({})))
+                    .await
+                    .unwrap();
+                let item = |uuid: &str| {
+                    jobs["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|item| item["taskUuid"] == uuid)
+                        .unwrap()
+                        .clone()
+                };
+                assert_eq!(
+                    item(traced_uuid)["trace"]["available"],
+                    true,
+                    "query.jobs must decorate items from the lane index: {}",
+                    item(traced_uuid)["trace"]
+                );
+                assert_eq!(
+                    item(plain_uuid)["trace"]["reason"],
+                    "adapter-does-not-declare-a-provider-trace",
+                    "an adapter without a trace still has its lanes consulted: {}",
+                    item(plain_uuid)["trace"]
+                );
+            })
+            .await;
+    }
+
     /// #420 (1): `unreachable_paused_jobs` reclaims uuids whose job was
     /// retired out of `context.jobs`. Before this fix the set's GC walked only
     /// the live map, which no longer retains terminal jobs (#395), so a

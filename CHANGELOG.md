@@ -31,8 +31,9 @@ while `tick_leases` stayed at microseconds.
 - Fresh-query construction, response serialization, and page-snapshot
   splitting/sizing (`pagination::prepare_snapshot`) run on the blocking pool
   via `spawn_blocking`, over immutable snapshots taken under the context
-  lock. What remains on the dispatch thread per query is O(live jobs) plus
-  `Arc` clones — never O(durable corpus). The lifecycle store hands out a
+  lock. What remains on the dispatch thread is amortized O(live jobs) per
+  query, plus one O(corpus) snapshot-cache rebuild per mutation on the first
+  query that follows it. The lifecycle store hands out a
   cached `Arc` snapshot (`LifecycleStore::shared_snapshot`), rebuilt at most
   once per mutation instead of deep-cloned per query; the flow lineage and
   membership caches moved from `Rc` to `Arc` so the blocking pool can read

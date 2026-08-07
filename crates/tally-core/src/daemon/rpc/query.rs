@@ -555,8 +555,9 @@ fn journal_entries(history: &crate::history::LifecycleSnapshot) -> Vec<JournalEn
 // envelope is built from. Assembling it re-verifies the witness ledger, so
 // continuation pages never construct one. Every field is Send and cheap to
 // move: the corpus-scale consumers run on the blocking pool, and what this
-// assembly leaves on the dispatch thread is O(live jobs) plus `Arc` clones,
-// never O(durable corpus) (#431).
+// assembly leaves on the dispatch thread is amortized O(live jobs) per query
+// plus `Arc` clones — with one O(corpus) snapshot-cache rebuild per mutation,
+// paid by the first query after it (#431).
 pub(crate) struct QueryProjection {
     pub(crate) history: std::sync::Arc<crate::history::LifecycleSnapshot>,
     pub(crate) rows: std::sync::Arc<Vec<RowFact>>,
