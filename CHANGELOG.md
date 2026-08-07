@@ -84,6 +84,14 @@ unrelated mechanism, which is the pattern that keeps this issue open.
   service period of the stall it was held through. The collector's wall-clock
   deadline became a liveness backstop rather than a measurement bound, for the
   same reason.
+- `daemon::tests::storage_timer_samples_once_per_configured_interval` — a
+  sixth member, found by the post-fix wave — slept 1,150 ms and asserted a
+  1 s timer plus a blocking filesystem walk had landed, i.e. 150 ms of slack
+  on a host that may run a hundred test threads. Its two halves have opposite
+  relationships with load, so they are now asserted separately: the lower
+  bound (no sample before the interval elapses) is asserted, because load can
+  only delay a timer; the upper bound is waited for, with a liveness backstop
+  that separates a suppressed tick from a late one.
 - `test/flake-probe.sh` measures the population's rate: N concurrent full
   suites of one prebuilt test binary for a wall-clock budget, reporting
   runs, failures, and the failing test names. The load condition is the

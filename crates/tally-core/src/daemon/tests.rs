@@ -676,6 +676,28 @@ mod tests {
             .await;
     }
 
+    /// Wait for the storage timer's next sample, returning its stamp.
+    ///
+    /// The deadline is a liveness backstop, not a measurement bound: it
+    /// separates "the tick was suppressed" from "the tick was late", and only
+    /// the first is a defect. A suppressed tick never samples at all, so a
+    /// ceiling two orders of magnitude above the interval still fails loudly on
+    /// it while no amount of host load reaches it.
+    async fn await_next_storage_sample(handler: &DaemonHandler, previous: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let sampled_at = handler.cached_storage().sampled_at;
+            if sampled_at != previous {
+                return sampled_at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the configured storage tick never sampled again after {previous}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn storage_timer_samples_once_per_configured_interval() {
         let local = LocalSet::new();
@@ -697,11 +719,23 @@ mod tests {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
 
-                tokio::time::sleep(Duration::from_millis(1_150)).await;
-                let first = handler.cached_storage().sampled_at;
-                assert_ne!(first, initial, "first configured tick did not sample");
-                tokio::time::sleep(Duration::from_millis(1_150)).await;
-                let second = handler.cached_storage().sampled_at;
+                // The claim is "one sample per configured interval", and its two
+                // halves have opposite relationships with load (#419). The
+                // lower bound -- no sample before the interval elapses -- is
+                // load-safe, because load can only delay a timer, never advance
+                // it. The upper bound is not: this used to sleep 1,150 ms and
+                // assert the sample had landed, which gives a tick plus a
+                // blocking filesystem walk 150 ms of slack on a host that may
+                // be running a hundred other test threads. So the lower bound
+                // is asserted and the upper bound is waited for.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert_eq!(
+                    handler.cached_storage().sampled_at,
+                    initial,
+                    "a sample landed before the configured interval elapsed"
+                );
+                let first = await_next_storage_sample(&handler, &initial).await;
+                let second = await_next_storage_sample(&handler, &first).await;
                 assert_ne!(
                     second, first,
                     "second configured tick was incorrectly suppressed"
