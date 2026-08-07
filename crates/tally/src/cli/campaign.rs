@@ -4839,6 +4839,26 @@ sys.stdout.write(module.canonical_sha256(source))
              for a manifest that leaves every optional field to each half's own \
              default; a forge-native campaign would fail reconcile with this skew"
         );
+
+        // Explicit nulls, the third way the two halves can disagree: absent
+        // (defaulted) and present-but-null are different manifests, and the CLI
+        // reaches them through `Option::None` while the driver reaches them
+        // through Python `None`. An operator whose adapter declares no
+        // read-only policy writes exactly this.
+        let mut nulled = defaults.clone();
+        nulled["agent"] = json!({
+            "diagnosisSandboxPolicy": null,
+            "approvalPolicy": null,
+            "sandboxPolicy": null,
+            "runtimeMaxSec": null,
+            "model": null
+        });
+        assert_eq!(
+            cli_digest(&nulled, &default_tasks),
+            driver_digest(&nulled, &default_tasks),
+            "the CLI and the packaged driver disagree on the campaign graph digest \
+             for a manifest whose optional agent fields are explicitly null"
+        );
     }
 
     /// #433: the reconcile digest-mismatch receipt must stop starving the
