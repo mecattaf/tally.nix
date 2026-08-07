@@ -61,6 +61,7 @@ impl Reply {
             stderr_truncated: None,
             result: None,
             divergent_hash: false,
+            recorded_label: None,
             client_error: None,
             error: Some(NodeFailure {
                 code: RETRYABLE_PROJECTION_CODE.to_owned(),
