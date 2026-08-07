@@ -22,8 +22,12 @@
 //!   has not written to the attestation ledger is not on disk to be read.
 //!
 //! Everything it does say is read-only. It never opens a durable store for
-//! write, never repairs a torn tail, and never takes a lock a live daemon
-//! wants: a diagnostic must not be able to damage the thing it is diagnosing.
+//! write, never creates one, never repairs a torn tail, and never takes a lock
+//! a live daemon wants: a diagnostic must not be able to damage the thing it is
+//! diagnosing. That is a tested claim, not a habit —
+//! `a_durable_read_creates_nothing_anywhere_under_the_state_or_data_dir`
+//! asserts the whole tree before and after, so a store this view later learns
+//! to read is covered without anyone remembering to extend it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,6 +38,7 @@ use thiserror::Error;
 use crate::daemon::DaemonPaths;
 use crate::executor::{read_capture_excerpt, ExecutionIdentity, Executor};
 use crate::flow_lineage::FlowLineage;
+use crate::flow_membership::FlowMembership;
 use crate::history::{
     LifecycleRecord, LifecycleSnapshot, RetentionMetadata, LIFECYCLE_FILE,
     LIFECYCLE_RETENTION_FILE, LIFECYCLE_RETENTION_POLICY,
@@ -139,7 +144,15 @@ pub fn durable_run_view(
         })
         .collect::<Vec<_>>();
     let history = read_lifecycle_read_only(&paths.data_dir)?;
-    let membership = crate::flow_membership::preflight(&paths.flow_membership_path())?;
+    // `read`, never `preflight`. `preflight` is this read plus
+    // `probe_appendable`, which `create_dir_all`s the parent and opens the
+    // ledger `create(true).append(true)` — so a diagnostic pointed at a live
+    // daemon's data directory would create the directory tree and the ledger,
+    // and would die outright where the operator can read the daemon's data but
+    // not write it, which is the deployment this whole surface exists for. The
+    // durable view has no reason to care whether the ledger is appendable: it
+    // never appends.
+    let membership = FlowMembership::read(&paths.flow_membership_path())?;
     let (ledger_verified, attestations) =
         match read_verified_attestations(&paths.attestations_path()) {
             Ok((report, records)) => (report.ok, records),
@@ -327,8 +340,46 @@ mod tests {
         );
     }
 
+    /// Every path below `root`, sorted, so a test can state what a read left
+    /// behind rather than checking the one file it happened to think of.
+    fn tree(root: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                found.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// #434 (eval F1). The module doc, the operator docs, the CHANGELOG and the
+    /// PR body all give "it never creates, locks, or repairs a durable store"
+    /// as the *reason* an automatic fallback into a live daemon's data
+    /// directory is safe. That claim was false: the view called
+    /// `flow_membership::preflight`, whose `probe_appendable` half
+    /// `create_dir_all`s the parent and opens the ledger
+    /// `create(true).append(true)`, so the diagnostic materialised a `0600`
+    /// membership ledger inside the store it was diagnosing.
+    ///
+    /// Asserted over the whole tree rather than over one filename, so the next
+    /// store this view learns to read is covered without anyone remembering to
+    /// extend it.
     #[test]
-    fn an_unknown_run_is_unknown_rather_than_empty() {
+    fn a_durable_read_creates_nothing_anywhere_under_the_state_or_data_dir() {
         let temp = tempfile::tempdir().unwrap();
         let paths = DaemonPaths {
             socket: temp.path().join("run/tally.sock"),
@@ -337,6 +388,8 @@ mod tests {
         };
         std::fs::create_dir_all(paths.events_dir()).unwrap();
         std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let before = (tree(&paths.state_dir), tree(&paths.data_dir));
+
         let error = durable_run_view(
             &paths,
             "00000000-0000-4000-8000-000000000001",
@@ -344,6 +397,52 @@ mod tests {
             Utc::now(),
         )
         .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DurableViewError::Projection(ObservabilityError::UnknownJob(_))
+            ),
+            "{error}"
+        );
+
+        assert_eq!(
+            (tree(&paths.state_dir), tree(&paths.data_dir)),
+            before,
+            "the durable view must leave the stores it read exactly as it found them"
+        );
+    }
+
+    /// #434 (eval F1). The deployment this surface exists for: the operator can
+    /// read the daemon's data directory and cannot write it. An appendability
+    /// probe dies here with an I/O error that is itself false — the file is
+    /// readable and the read would have succeeded — and it dies on the
+    /// *automatic* fallback path too, so the operator's only honest window into
+    /// a stalled daemon closes exactly when it is needed.
+    #[test]
+    fn an_unwritable_membership_ledger_is_read_rather_than_probed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            socket: temp.path().join("run/tally.sock"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        std::fs::create_dir_all(paths.events_dir()).unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let membership = paths.flow_membership_path();
+        std::fs::write(&membership, "").unwrap();
+        std::fs::set_permissions(&membership, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let error = durable_run_view(
+            &paths,
+            "00000000-0000-4000-8000-000000000001",
+            None,
+            Utc::now(),
+        )
+        .unwrap_err();
+        // The projection is reached and answers about the run. A membership
+        // error here would mean the read never got that far.
         assert!(
             matches!(
                 error,

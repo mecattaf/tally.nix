@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -493,6 +494,45 @@ async fn query_run_falls_back_to_a_labelled_durable_view_that_agrees_with_the_li
                 String::from_utf8_lossy(&explicit.stderr)
             );
             assert_eq!(parse_stdout(&explicit)["view"], "durable-state");
+
+            // #434 (eval F1). The deployment this surface exists for: the
+            // operator can read the daemon's data and cannot write it. The
+            // view must still *render* — it used to probe the membership
+            // ledger for appendability and die with an I/O error that was
+            // itself false, on the automatic fallback path as well as this
+            // one.
+            let membership = paths.data_dir.join("flow-membership.jsonl");
+            if !membership.exists() {
+                std::fs::write(&membership, "").unwrap();
+            }
+            std::fs::set_permissions(&membership, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let read_only = run_tally(
+                &config_path,
+                &stalled_socket,
+                &[
+                    "query",
+                    "run",
+                    &task_uuid,
+                    "--json",
+                    "--durable",
+                    "--state-dir",
+                    paths.state_dir.to_str().unwrap(),
+                    "--data-dir",
+                    paths.data_dir.to_str().unwrap(),
+                ],
+            )
+            .await;
+            assert_eq!(
+                read_only.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&read_only.stderr)
+            );
+            let read_only = parse_stdout(&read_only);
+            assert_eq!(read_only["view"], "durable-state");
+            assert_eq!(read_only["flowRunId"], live["flowRunId"]);
+            assert_eq!(task_ids(&read_only), task_ids(&live));
+            std::fs::set_permissions(&membership, std::fs::Permissions::from_mode(0o644)).unwrap();
         })
         .await;
 }

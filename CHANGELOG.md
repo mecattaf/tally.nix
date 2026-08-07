@@ -77,7 +77,10 @@ diagnosis time and poisons the operator's model of what is broken.
   labelled in both renderings (`view: "durable-state"`, `live: false`, plus
   caveats; the live path now states `view: "live"`), shows no in-flight state,
   and is strictly read-only: it never creates, locks, or repairs a durable
-  store.
+  store. That last claim is asserted over the whole state and data tree before
+  and after a read, so it covers stores this view later learns to read; it also
+  renders where the operator can read the daemon's data and not write it, which
+  is the deployment the automatic fallback exists for.
 
 #### #419 — a fifth flake-population member, and a way to keep counting
 

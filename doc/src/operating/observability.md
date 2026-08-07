@@ -200,7 +200,10 @@ terminal verdicts, the usage rollup, and failure capture pointers. It cannot car
 state: a task the daemon is running right now has no terminal witness yet and reads as pending,
 because the systemd unit facts that distinguish the two are the daemon's to collect. It is also
 not a snapshot at one instant, and it is read-only — it never creates, locks, or repairs a
-durable store, because a diagnostic must not be able to damage the thing it is diagnosing.
+durable store, because a diagnostic must not be able to damage the thing it is diagnosing. Two
+consequences worth stating: reading a directory that is not a tally store leaves that directory
+exactly as it found it, and the view renders where you can read the daemon's data and not write
+it — which is the ordinary case for an operator reading a system daemon's store.
 
 The two directories are the daemon's own, and they default to `$XDG_STATE_HOME/tally` and
 `$XDG_DATA_HOME/tally`. Pass `--state-dir` and `--data-dir` when the daemon's are elsewhere — a

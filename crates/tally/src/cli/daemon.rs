@@ -2,10 +2,11 @@ use super::*;
 
 /// The recovery policy this CLI starts its daemon under.
 ///
-/// Named rather than spelled inline because a second reader now depends on it:
-/// `query run --durable` derives row states by running the same recovery
-/// derivation over the same durable facts, and a durable view computed under a
-/// different policy would report states the daemon would not.
+/// Named rather than spelled inline so the one place that decides it is
+/// findable by name. It has exactly one reader — the daemon entry point below.
+/// `query run --durable` deliberately does **not** consume it: the durable view
+/// derives row state from the witness ledger rather than by running the
+/// recovery planner, so it is not coupled to this policy at all.
 pub(super) const DAEMON_RECOVERY_POLICY: RecoveryPolicy = RecoveryPolicy {
     retry: RetryPolicy {
         auto_pool_return: true,
