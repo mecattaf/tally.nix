@@ -159,7 +159,7 @@ use crate::storage::{StorageError, StorageMetrics, StorageMonitor, StorageWarnin
 use crate::taskdb::{
     admits_durable_row, migrate_acknowledged_events, read_acknowledged_events,
     update_enqueue_event_atomic, write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin,
-    DurableEnqueueEvent, DurableRetry, EnqueueSource, RowSeed, TaskDbError,
+    DurableEnqueueEvent, DurableRetry, EnqueueSource, RecordedLaunchCwd, RowSeed, TaskDbError,
 };
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
 use crate::usage::UsageObservation;

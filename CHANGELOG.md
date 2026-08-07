@@ -28,16 +28,26 @@ Rust-side.
   reproduced evidence; `codex` and `claude-code` do not, because codex
   re-presents the directory in its own resume argv and claude-code has not
   been measured here. A `false` says "unmeasured", never "safe".
-- `RowSeed` gained `session_cwd`, recorded beside `session_ref` at every seam
-  that writes the pointer from a scrape. It is `#[serde(skip)]` — transport
-  only, no durable-format change, no row-version move — because it is exactly
-  as durable as the pointer it qualifies: startup re-derives both from the
-  retained captures and the durable row.
+- `RowSeed` gained `session_cwd: Option<RecordedLaunchCwd>`, recorded beside
+  `session_ref` at every seam that writes the pointer from a scrape (one in
+  `daemon/completion.rs`, four in `daemon/startup.rs`, one at the retired-row
+  seam a continuation reads the pointer back through). It is `#[serde(skip)]` —
+  transport only, no durable-format change, no row-version move — because it is
+  exactly as durable as the pointer it qualifies: startup re-derives both from
+  the retained captures and the durable row.
+- **A row that declared no working directory records that fact rather than
+  recording nothing.** `RecordedLaunchCwd::ServiceManagerDefault` and an absent
+  record are different states: the first says both attempts run wherever the
+  service manager put the daemon, which is one directory, so the continuation
+  is admitted; only the second is refused. Collapsing them into a single `None`
+  would have permanently blocked continuations for every `pi` job enqueued
+  without `--cwd`.
 - `queue.continue` now refuses a continuation whose working directory is not
   the recorded launch directory, naming **both** directories, and refuses
-  fail-closed when no launch directory was recorded rather than assuming
-  compatibility. Directory equality resolves before it compares, matching
-  pi's own `sessionCwdMatches(session.cwd, resolvedCwd)`.
+  fail-closed when nothing recorded where the session was launched. Each
+  refusal names the fact it actually found. Directory equality resolves before
+  it compares, matching pi's own
+  `sessionCwdMatches(session.cwd, resolvedCwd)`.
 - `queue.retry` and recovery are deliberately not guarded: both re-render one
   row's own resume against that row's own cwd and cannot move it.
 

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::executor::ExecutionPaths;
+use crate::taskdb::RecordedLaunchCwd;
 
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -323,15 +324,19 @@ pub enum AdapterError {
     /// which one is wrong: re-run the continuation from the recorded directory,
     /// or accept that this session belongs to a workspace that is gone.
     #[error(
-        "adapter {adapter:?} resolves a session by its launch directory, so this resume would reach no session: it was launched in {recorded} and this attempt would run in {current}"
+        "adapter {adapter:?} resolves a session by its launch directory, so this resume would reach no session: the recorded launch directory is {recorded} and this attempt would run in {current}"
     )]
     CrossCwdResume {
         adapter: String,
         recorded: String,
         current: String,
     },
+    /// Distinct from [`Self::CrossCwdResume`]: no record exists at all, rather
+    /// than a record that disagrees. The message says which, because "nobody
+    /// wrote one down" and "it ran somewhere else" send an operator to
+    /// different places.
     #[error(
-        "adapter {adapter:?} resolves a session by its launch directory, and no launch cwd was recorded for this session, so this resume ({current}) cannot be shown to reach it"
+        "adapter {adapter:?} resolves a session by its launch directory, and nothing recorded where this session was launched -- the pointer predates the record, or arrived without one -- so this resume ({current}) cannot be shown to reach it"
     )]
     UnrecordedLaunchCwd { adapter: String, current: String },
 }
@@ -469,14 +474,19 @@ impl<'a> AdapterEngine<'a> {
     /// will run. Only a caller that continues a *different* row can get the
     /// second one wrong; re-rendering one row's own resume cannot move its cwd.
     ///
-    /// Both refusals are fail-closed. `recorded` absent is refused rather than
-    /// assumed compatible: a session whose launch directory tally never
-    /// recorded is one whose reachability tally cannot state, and rendering it
-    /// anyway is how a cross-cwd pi resume exits 0 having done nothing.
+    /// The absence of a *record* is refused rather than assumed compatible: a
+    /// session whose launch directory tally never wrote down is one whose
+    /// reachability tally cannot state, and rendering it anyway is how a
+    /// cross-cwd pi resume exits 0 having done nothing. A record that says the
+    /// attempt declared no directory is a different fact and is **not** that
+    /// refusal: both attempts then run wherever the service manager put the
+    /// daemon, which is one directory, so the resume reaches the session.
+    /// Collapsing the two blocks a continuation that does reach its session and
+    /// blames a missing record for it.
     pub fn guard_resume_launch_cwd(
         &self,
         name: &str,
-        recorded: Option<&Path>,
+        recorded: Option<&RecordedLaunchCwd>,
         current: Option<&Path>,
     ) -> Result<(), AdapterError> {
         if !self.adapter(name)?.resume_requires_launch_cwd {
@@ -489,12 +499,18 @@ impl<'a> AdapterEngine<'a> {
                 current: current_label,
             });
         };
-        if current.is_some_and(|current| same_directory(recorded, current)) {
+        let reaches = match (recorded.declared(), current) {
+            (Some(recorded), Some(current)) => same_directory(recorded, current),
+            // Neither attempt declares one, so both inherit the daemon's.
+            (None, None) => true,
+            _ => false,
+        };
+        if reaches {
             return Ok(());
         }
         Err(AdapterError::CrossCwdResume {
             adapter: name.to_owned(),
-            recorded: recorded.display().to_string(),
+            recorded: display_cwd(recorded.declared()),
             current: current_label,
         })
     }
@@ -560,12 +576,13 @@ impl<'a> AdapterEngine<'a> {
     }
 }
 
-/// How an absent working directory is named in a refusal. A job with no cwd
-/// runs wherever the service manager put the daemon, which tally never
-/// recorded — so this is a statement of ignorance, not a path.
+/// How an undeclared working directory is named in a refusal. A job with no cwd
+/// runs wherever the service manager put the daemon — a real place tally does
+/// not know the name of, which is why this is a phrase and not a path. It is
+/// not the same as having no record; see [`AdapterError::UnrecordedLaunchCwd`].
 fn display_cwd(cwd: Option<&Path>) -> String {
     cwd.map_or_else(
-        || "<no working directory declared>".to_owned(),
+        || "<none declared: the daemon's own working directory>".to_owned(),
         |cwd| cwd.display().to_string(),
     )
 }
@@ -1831,15 +1848,16 @@ mod tests {
         let engine = engine(&adapters);
         engine.validate_all().unwrap();
 
-        let launched = Path::new("/workspace/repo-a");
+        let launched = RecordedLaunchCwd::In(PathBuf::from("/workspace/repo-a"));
+        let launched_path = Path::new("/workspace/repo-a");
         let elsewhere = Path::new("/workspace/repo-b");
 
         engine
-            .guard_resume_launch_cwd("keyed", Some(launched), Some(launched))
+            .guard_resume_launch_cwd("keyed", Some(&launched), Some(launched_path))
             .unwrap();
 
         let refused = engine
-            .guard_resume_launch_cwd("keyed", Some(launched), Some(elsewhere))
+            .guard_resume_launch_cwd("keyed", Some(&launched), Some(elsewhere))
             .unwrap_err();
         let message = refused.to_string();
         assert!(matches!(refused, AdapterError::CrossCwdResume { .. }));
@@ -1848,38 +1866,71 @@ mod tests {
             "the refusal must name both directories: {message}"
         );
 
-        // A row that declared no working directory ran wherever the service
-        // manager put the daemon. Naming that absence is the honest refusal;
-        // guessing the current directory would be a fabricated launch site.
-        let undeclared = engine
-            .guard_resume_launch_cwd("keyed", Some(launched), None)
+        // A resume that declares no directory would run wherever the service
+        // manager put the daemon, which is not where this session was launched.
+        // Naming that as a place rather than as a missing record is the honest
+        // refusal; guessing the current directory would fabricate a launch site.
+        let undeclared_resume = engine
+            .guard_resume_launch_cwd("keyed", Some(&launched), None)
             .unwrap_err();
-        assert!(matches!(undeclared, AdapterError::CrossCwdResume { .. }));
+        assert!(matches!(
+            undeclared_resume,
+            AdapterError::CrossCwdResume { .. }
+        ));
         assert!(
-            undeclared
+            undeclared_resume
                 .to_string()
-                .contains("<no working directory declared>"),
-            "{undeclared}"
+                .contains("<none declared: the daemon's own working directory>"),
+            "{undeclared_resume}"
         );
 
-        // No record at all — a pointer observed before this field existed, or
-        // one whose row never declared a cwd. Refusing beats assuming.
+        // The two facts a single `None` used to collapse (#425 repair, F2).
+        // A row that DECLARED none ran in the daemon's own directory, and a
+        // resume that also declares none runs in that same directory -- so the
+        // session is reachable and the continuation is admitted.
+        engine
+            .guard_resume_launch_cwd(
+                "keyed",
+                Some(&RecordedLaunchCwd::ServiceManagerDefault),
+                None,
+            )
+            .unwrap();
+
+        // The same record against a resume that names a directory is a genuine
+        // mismatch, and it is refused as one rather than as a missing record.
+        let moved_off_default = engine
+            .guard_resume_launch_cwd(
+                "keyed",
+                Some(&RecordedLaunchCwd::ServiceManagerDefault),
+                Some(launched_path),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            moved_off_default,
+            AdapterError::CrossCwdResume { .. }
+        ));
+
+        // No record at all -- a pointer observed before this field existed, or
+        // one that arrived without one. Refusing beats assuming, and the
+        // message says which of the two facts it found.
         let unrecorded = engine
-            .guard_resume_launch_cwd("keyed", None, Some(launched))
+            .guard_resume_launch_cwd("keyed", None, Some(launched_path))
             .unwrap_err();
         assert!(matches!(
             unrecorded,
             AdapterError::UnrecordedLaunchCwd { .. }
         ));
+        let unrecorded = unrecorded.to_string();
         assert!(
-            unrecorded.to_string().contains("/workspace/repo-a"),
+            unrecorded.contains("nothing recorded where this session was launched")
+                && unrecorded.contains("/workspace/repo-a"),
             "{unrecorded}"
         );
 
         // An adapter that declares nothing is unaffected in every one of those
         // shapes, including the unrecorded one.
         engine
-            .guard_resume_launch_cwd("silent", Some(launched), Some(elsewhere))
+            .guard_resume_launch_cwd("silent", Some(&launched), Some(elsewhere))
             .unwrap();
         engine
             .guard_resume_launch_cwd("silent", None, None)

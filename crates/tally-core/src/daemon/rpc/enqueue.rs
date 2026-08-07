@@ -686,7 +686,7 @@ impl DaemonHandler {
                 })
             } else if let Err(error) = engine.guard_resume_launch_cwd(
                 &resolved.adapter,
-                previous.session_cwd.as_deref(),
+                previous.session_cwd.as_ref(),
                 resolved.effective_cwd(),
             ) {
                 // The only seam where a resume can change directories: a
@@ -787,7 +787,7 @@ impl DaemonHandler {
             .transpose()
             .map_err(|_| WireError::invalid("parent must be a UUID"))?;
         // Read before the struct literal below moves `resolved.cwd` into it.
-        let inherited_session_cwd = resolved.effective_cwd().map(|cwd| cwd.to_path_buf());
+        let inherited_session_cwd = RecordedLaunchCwd::of(resolved.effective_cwd());
         let row = RowSeed {
             row_version: crate::taskdb::CURRENT_ROW_VERSION,
             uuid: row_uuid,
@@ -812,9 +812,7 @@ impl DaemonHandler {
             // than the continued row's: the guard above already established
             // that the two name one directory for any adapter that cares, and
             // this row is where the next attempt actually runs.
-            session_cwd: resumed_row
-                .as_ref()
-                .and_then(|_| inherited_session_cwd.clone()),
+            session_cwd: resumed_row.as_ref().map(|_| inherited_session_cwd.clone()),
             final_message: None,
             // Usage is per attempt and is never inherited across a resume:
             // the prior attempt's record stays on the prior row and in the

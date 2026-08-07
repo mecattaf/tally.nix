@@ -5934,9 +5934,239 @@ mod tests {
                 // The record travels with the pointer: the continuation row
                 // carries both, so continuing the continuation is guarded too.
                 assert_eq!(
-                    continued_job.row.session_cwd.as_deref(),
-                    Some(launched_in.as_path())
+                    continued_job.row.session_cwd,
+                    Some(RecordedLaunchCwd::In(launched_in.clone()))
                 );
+            })
+            .await;
+    }
+
+    /// The adapter both #425 tests below share: cwd-keyed, resumable, and it
+    /// prints one session pointer.
+    fn cwd_keyed_config(program: &Path) -> Config {
+        let mut config = one_pool_config();
+        config.adapters.insert(
+            "cwd-keyed".to_owned(),
+            AdapterConfig {
+                argv: vec![
+                    program.to_string_lossy().into_owned(),
+                    "fresh".to_owned(),
+                    "--".to_owned(),
+                ],
+                resume_requires_launch_cwd: true,
+                resume: Some(vec![
+                    program.to_string_lossy().into_owned(),
+                    "resume".to_owned(),
+                    "%<sessionRef>%".to_owned(),
+                    "--".to_owned(),
+                ]),
+                scrape: BTreeMap::from([(
+                    "sessionRef".to_owned(),
+                    ScrapeCapture {
+                        stream: ScrapeStream::Stdout,
+                        mode: ScrapeMode::JsonPath,
+                        pattern: "$..thread_id".to_owned(),
+                        fields: Default::default(),
+                    },
+                )]),
+                ..AdapterConfig::default()
+            },
+        );
+        config.validate().unwrap();
+        config
+    }
+
+    /// #425 (F2). "This row declared no working directory" and "nothing
+    /// recorded where this session was launched" are different facts, and only
+    /// the second is a reason to refuse.
+    ///
+    /// A row that declares no cwd runs wherever the service manager put the
+    /// daemon; a continuation that also declares none runs in that same
+    /// directory, so the session is reachable and the continuation must be
+    /// admitted. `tally enqueue --adapter pi -- ...` with no `--cwd` produces
+    /// exactly this row -- `cli/enqueue.rs` defaults the cwd to nothing -- so
+    /// collapsing the two facts would permanently block continuations for the
+    /// one preset the invariant was written for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_continuation_declaring_no_directory_reaches_a_session_launched_with_none() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-42\"}'\n",
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    cwd_keyed_config(&program),
+                    paths,
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                // No `cwd` on either call. Both attempts inherit the daemon's.
+                let first = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial request"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+                let first_id = first["job_id"].as_str().unwrap().to_owned();
+
+                let continued = daemon
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                    })))
+                    .await
+                    .unwrap();
+                let continued_id = Uuid::parse_str(continued["job_id"].as_str().unwrap()).unwrap();
+                let continued_job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&continued_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    continued_job.invocation.argv,
+                    [
+                        program.to_string_lossy().into_owned(),
+                        "resume".to_owned(),
+                        "session-42".to_owned(),
+                        "--".to_owned(),
+                        "address review".to_owned(),
+                    ]
+                );
+                // The record says "declared none", which is a record, not the
+                // absence of one.
+                assert_eq!(
+                    continued_job.row.session_cwd,
+                    Some(RecordedLaunchCwd::ServiceManagerDefault)
+                );
+            })
+            .await;
+    }
+
+    /// #425. The record has to survive a daemon restart, because the pointer
+    /// does: startup re-derives `session_ref` from the retained adapter
+    /// attestation, and a record that is not re-derived beside it leaves a
+    /// recovered row refusing its own continuation with `UnrecordedLaunchCwd`.
+    ///
+    /// This binds the `apply_adapter_metadata` seam in `daemon/startup.rs`
+    /// directly -- the row in `context.rows` after recovery is asserted, not
+    /// only the end-to-end continuation, because the continuation path also
+    /// re-derives at `FoundJob::observed_row` and would pass without it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restarted_daemon_re_derives_the_launch_record_beside_the_pointer() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let launched_in = temp.path().join("session-home");
+                std::fs::create_dir(&launched_in).unwrap();
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-55\"}'\n",
+                );
+                let config = cwd_keyed_config(&program);
+                let state_dir = paths.state_dir.clone();
+                let absent_systemd_run = temp.path().join("absent-systemd-run");
+                let executor = || {
+                    direct_executor(&state_dir)
+                        .with_systemd_run(absent_systemd_run.clone())
+                        .with_unit_probe(ExitFileProbe)
+                };
+                let mut daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths.clone(),
+                    settings(),
+                    executor(),
+                )
+                .await
+                .unwrap();
+                let first = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial request"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+                let first_id = first["job_id"].as_str().unwrap().to_owned();
+                let first_uuid = Uuid::parse_str(&first_id).unwrap();
+                drop(daemon);
+
+                // The restart.
+                let restarted =
+                    Daemon::open_with_executor(config, paths, settings(), executor())
+                        .await
+                        .unwrap();
+                {
+                    let context = restarted.handler.context.read().await;
+                    let recovered = &context.rows[&first_uuid];
+                    assert_eq!(
+                        recovered.session_ref.as_deref(),
+                        Some("session-55"),
+                        "startup re-derives the pointer from the retained attestation"
+                    );
+                    assert_eq!(
+                        recovered.session_cwd,
+                        Some(RecordedLaunchCwd::In(launched_in.clone())),
+                        "and must re-derive the launch record beside it"
+                    );
+                }
+
+                // End to end: the recovered row continues in its launch
+                // directory, and is refused anywhere else.
+                let continued = restarted
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                assert!(continued["job_id"].is_string());
             })
             .await;
     }
