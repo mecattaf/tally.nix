@@ -112,12 +112,14 @@ unrelated mechanism, which is the pattern that keeps this issue open.
   and a name alone costs the next wave a re-reproduction. The load condition is
   the concurrent suites themselves, never a spinner. Documented in
   `CONTRIBUTING.md` so successive waves are comparable.
-- **The bound, pooled across every wave run on this head: 1 failure in 605 runs
+- **The bound, pooled across the waves run at `e12ce64`: 1 failure in 605 runs
   at three or more concurrent suites (~0.17%)** — the lane's 244 post-fix runs
   plus an independent 361. The one failure was the fifth member again, with the
   assertion uncaptured, so the residual is non-zero and the mechanism of that
   observation is unidentified. ~0.17% is under the historical ~0.74% and is not
   zero; the population stays open, and this is a bound, not a repair claim.
+  A later eval wave on the shipped head pooled it up to 3/761 (~0.39%) and named
+  four further wall-clock-deadline members — the running record is on #419.
 ### Daemon under load (#431, #428, #420)
 
 One mechanism, three surfaces: work that scales with the durable corpus,
