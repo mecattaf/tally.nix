@@ -34,7 +34,7 @@ pub use model::{
     FlowSubmission, NodeCanonicalProjection, NodeFailure, NodeResult, NodeSpec,
     NodeSpecFieldContract, NodeSpecSurface, NodeWireProjection, Orchestration, RunInspection,
     RunReport, RunSupersede, SelectionProvenance, TaskRef, Verdict, FLOW_ENQUEUE_FIELD_PARITY,
-    NODE_SPEC_FIELD_CONTRACT,
+    NODE_SPEC_FIELD_CONTRACT, RESULT_PROJECTION_TIMEOUT_CODE, RETRYABLE_PROJECTION_CODE,
 };
 
 /// The one prompt-delivery argument used by every agent adapter sugar.

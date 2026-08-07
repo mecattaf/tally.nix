@@ -65,6 +65,12 @@ use crate::flow_live::{LiveFlowClient, RunnerIdentity};
 
 const DEFAULT_RPC_TIMEOUT_SEC: u64 = 60;
 const RPC_TIMEOUT_ENV: &str = "TALLY_RPC_TIMEOUT_SEC";
+/// How long `flow run` waits for an advisory finalMessage projection after a
+/// node's exit evidence passes (#432). Milliseconds, so a test can widen the
+/// window without touching seconds. Unset keeps the 10 s default. It is
+/// captured before the inherited-environment sanitize removes `TALLY_*`, the
+/// same way `TALLY_RPC_TIMEOUT_SEC` is.
+const RESULT_PROJECTION_TIMEOUT_ENV: &str = "TALLY_RESULT_PROJECTION_TIMEOUT_MS";
 use adapter::*;
 use args::*;
 use campaign::*;
@@ -305,6 +311,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
                 rpc_timeout,
                 command,
                 environment.flow_runner.unwrap_or_default(),
+                environment.result_projection_timeout,
             )
             .await
         }

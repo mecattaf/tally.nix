@@ -227,6 +227,13 @@ pub(super) struct CampaignArmArgs {
     /// Override the per-campaign worktree root.
     #[arg(long, value_name = "PATH")]
     pub(super) workspace_root: Option<PathBuf>,
+    /// How long each pass of this campaign waits for a node's advisory
+    /// finalMessage projection before classifying the node
+    /// `retryable-projection` (#432). Recorded in the registration and passed
+    /// to every `tally flow run` this campaign dispatches, including the ones
+    /// `campaign poll` dispatches later. Defaults to the flow host's 10 s.
+    #[arg(long, value_name = "MILLISECONDS")]
+    pub(super) projection_wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -434,6 +441,11 @@ pub(super) struct FlowRunArgs {
     pub(super) max_nodes: u32,
     #[arg(long, value_name = "SECONDS")]
     pub(super) rpc_call_deadline_sec: Option<u64>,
+    /// How long a terminal node waits for its advisory finalMessage projection
+    /// before the node is classified `retryable-projection` (#432). Defaults to
+    /// 10 s. Takes precedence over `TALLY_RESULT_PROJECTION_TIMEOUT_MS`.
+    #[arg(long, value_name = "MILLISECONDS")]
+    pub(super) result_projection_wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Args)]

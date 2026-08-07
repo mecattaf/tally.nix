@@ -14,6 +14,7 @@ struct Reply {
     result: Option<Value>,
     divergent_hash: bool,
     client_error: Option<ClientError>,
+    error: Option<NodeFailure>,
 }
 
 impl Reply {
@@ -27,6 +28,7 @@ impl Reply {
             result: Some(json!({"ok": true})),
             divergent_hash: false,
             client_error: None,
+            error: None,
         }
     }
 
@@ -40,6 +42,29 @@ impl Reply {
             result: None,
             divergent_hash: false,
             client_error: Some(ClientError::new(code, format!("{code} from mock"))),
+            error: None,
+        }
+    }
+
+    /// A node whose exit evidence passed but whose advisory projection never
+    /// arrived (#432): verdict pass, no structured result, and the live client
+    /// has already raised `retryable-projection`.
+    fn retryable_projection() -> Self {
+        Self {
+            disposition: Disposition::Created,
+            witness_seq: 1,
+            verdict: Verdict::Pass,
+            stderr_excerpt: None,
+            stderr_truncated: None,
+            result: None,
+            divergent_hash: false,
+            client_error: None,
+            error: Some(NodeFailure {
+                code: RETRYABLE_PROJECTION_CODE.to_owned(),
+                message: "projection unavailable within 10000 ms for adapter \"spec-build-driver\": daemon congested?"
+                    .to_owned(),
+                details: None,
+            }),
         }
     }
 }
@@ -149,10 +174,12 @@ impl FlowClient for MockClient {
             model: None,
             result: reply.result,
             gates: None,
-            error: (!reply.verdict.is_pass()).then(|| NodeFailure {
-                code: "worker-failed".to_owned(),
-                message: "worker failed".to_owned(),
-                details: None,
+            error: reply.error.clone().or_else(|| {
+                (!reply.verdict.is_pass()).then(|| NodeFailure {
+                    code: "worker-failed".to_owned(),
+                    message: "worker failed".to_owned(),
+                    details: None,
+                })
             }),
         };
         let inline = matches!(
@@ -1031,6 +1058,48 @@ fn duplicate_keys_and_result_mismatches_are_typed_with_positions() {
     );
 }
 
+/// #432: a node whose exit evidence passed but whose advisory projection never
+/// arrived is `retryable-projection`. The engine must propagate that
+/// classification instead of rewriting it into `result-schema-mismatch`, so an
+/// operator grepping a dead campaign can tell daemon congestion from a
+/// contract violation. Restoring the rewrite (converting this to
+/// result-schema-mismatch) makes the test red.
+#[test]
+fn an_unprojected_advisory_capture_is_retryable_projection_not_schema_mismatch() {
+    let failing = format!(
+        "{}\n(async () => sh(['driver'], {{\n\
+         pools: ['cpu'], resultSchema: {{type: 'object'}}\n\
+         }}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(
+        &failing,
+        MockClient::new(vec![Reply::retryable_projection()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, RETRYABLE_PROJECTION_CODE);
+    assert_ne!(error.code, "result-schema-mismatch");
+
+    let settled = format!(
+        "{}\n(async () => {{\n\
+         const node = await sh(['driver'], {{\n\
+           pools: ['cpu'], resultSchema: {{type: 'object'}}, settle: true\n\
+         }});\n\
+         return node.error.code;\n\
+         }})()",
+        meta(&["cpu"], &[])
+    );
+    let (report, _) = run(
+        &settled,
+        MockClient::new(vec![Reply::retryable_projection()]),
+    )
+    .unwrap();
+    assert_eq!(
+        report.final_value,
+        Some(Value::String(RETRYABLE_PROJECTION_CODE.to_owned()))
+    );
+}
+
 fn catalog() -> Catalog {
     Catalog {
         version: 1,
@@ -1131,6 +1200,7 @@ fn selector_quorum_preserves_dissent_and_materializes_one_repair_key() {
             result: None,
             divergent_hash: false,
             client_error: None,
+            error: None,
         },
         Reply::pass(Disposition::Created, 3),
         Reply::pass(Disposition::Created, 4),
@@ -1288,6 +1358,7 @@ fn drv_sugar_is_store_native_replay_stable_and_substituted_is_success() {
             result: None,
             divergent_hash: false,
             client_error: None,
+            error: None,
         }]);
         let (report, _) = run(&source, client.clone()).unwrap();
         assert_eq!(
@@ -1731,6 +1802,7 @@ fn aggregate_and_loop_errors_keep_their_public_classes_and_call_sites() {
             result: None,
             divergent_hash: false,
             client_error: None,
+            error: None,
         },
     ]);
     let error = run(&aggregate, client).unwrap_err();
@@ -1782,6 +1854,7 @@ fn documented_admission_terminal_and_node_cap_rejections_are_typed() {
         result: None,
         divergent_hash: false,
         client_error: None,
+        error: None,
     };
     let error = run(&source, MockClient::new(vec![failed])).unwrap_err();
     assert_eq!(error.name, "FlowTerminalError");
@@ -1802,6 +1875,7 @@ fn documented_admission_terminal_and_node_cap_rejections_are_typed() {
         result: None,
         divergent_hash: false,
         client_error: None,
+        error: None,
     };
     let error = run(&source, MockClient::new(vec![cancelled])).unwrap_err();
     assert_eq!(error.name, "FlowCancelledError");

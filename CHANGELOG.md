@@ -48,6 +48,43 @@ digest."
   CLI's exact defaults before validating, so both halves normalize the same
   manifest to the same canonical value.
 
+#### #432 — a congested daemon no longer converts a late advisory projection into node death
+
+After a driver node completed, the flow host polled `query.job` for the
+finalMessage projection for at most a compile-time 10 s and then failed the node
+`result-schema-mismatch` — killing work whose exit evidence had already passed,
+because the daemon's dispatch loop was briefly stalled. The capture is advisory
+by declaration; a projection that never arrived is daemon congestion, not a
+schema violation.
+
+- A terminal node whose exit evidence passed but whose advisory projection did
+  not arrive inside the window is now classified `retryable-projection`
+  (bounded exponential-backoff retries inside a configurable wait, then a
+  receipt naming congestion: "projection unavailable within N ms; daemon
+  congested?") and is never rewritten into `result-schema-mismatch`, both in
+  the live client and in the engine host. A node whose exit evidence failed
+  keeps the pre-existing `result-projection-timeout` behaviour.
+- The projection wait is configurable, default 10 s. The seam that reaches a
+  campaign is `tally campaign arm --projection-wait-ms MILLISECONDS`: the value
+  is recorded in the registration and put on the argv of every `tally flow run`
+  the campaign dispatches, including the ones `campaign poll` dispatches later.
+  A campaign pass runs as a daemon-launched transient unit whose environment is
+  an explicit `--setenv` list, so an environment-only knob would never have
+  reached it. A `flow run` launched by hand takes
+  `--result-projection-wait-ms`, or `TALLY_RESULT_PROJECTION_TIMEOUT_MS` with
+  the flag winning. The knob stays out of the digest-bearing manifest, so
+  widening a host's wait is not a change to what was approved. Documented in
+  `doc/src/flows/campaigns.md`.
+- Tests: one stall longer than the window is bounded and classified
+  `retryable-projection` under a narrow window and completes the node under a
+  widened one (the pass survives, on the projection rather than on exit
+  evidence alone); a failed node keeps `result-projection-timeout`; the engine
+  propagates `retryable-projection` instead of `result-schema-mismatch` on both
+  the thrown and the settled path; the flag/environment precedence is pinned;
+  and a registration written before the knob existed still loads. Restoring
+  the fatal classification, the engine rewrite, or removing the retry loop
+  makes the respective test fail (mutation-proven).
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

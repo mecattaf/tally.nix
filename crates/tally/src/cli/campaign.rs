@@ -263,6 +263,17 @@ struct CampaignRegistration {
     /// written before this existed, which only costs one extra walk.
     #[serde(default)]
     last_forge_observation: Option<String>,
+    /// How long each pass of this campaign waits for a node's advisory
+    /// finalMessage projection before classifying the node
+    /// `retryable-projection` (#432). Absent leaves the flow host's own 10 s
+    /// default alone, which is what a registration written before this
+    /// existed carries and what every campaign armed without the flag carries.
+    /// It lives here rather than in the manifest because it is a property of
+    /// this host's daemon congestion, not of the campaign: putting it in the
+    /// manifest would fold a host tuning knob into the executable graph digest
+    /// and force a re-arm to change it.
+    #[serde(default)]
+    projection_wait_ms: Option<u64>,
     flow: PathBuf,
     driver: PathBuf,
     workspace_root: PathBuf,
@@ -2027,17 +2038,28 @@ async fn dispatch_campaign(
             "eventsDir": host.events_dir(),
         },
     });
+    let mut flow_argv = vec![
+        executable.display().to_string(),
+        "flow".to_owned(),
+        "run".to_owned(),
+        registration.flow.display().to_string(),
+        "--args-from-brief".to_owned(),
+        "--max-nodes".to_owned(),
+        max_flow_nodes(&graph.manifest).to_string(),
+    ];
+    // #432: the projection wait reaches the pass on its argv, not through the
+    // environment. This pass runs as a daemon-launched transient unit whose
+    // environment is an explicit `--setenv` list, so nothing an operator
+    // exports at arm time is visible to it. Absent leaves the argv exactly as
+    // it was, so a campaign armed without the flag dispatches byte-identically
+    // to before.
+    if let Some(millis) = registration.projection_wait_ms {
+        flow_argv.push("--result-projection-wait-ms".to_owned());
+        flow_argv.push(millis.to_string());
+    }
     let payload = EnqueuePayload {
         invocation: None,
-        argv: Some(vec![
-            executable.display().to_string(),
-            "flow".to_owned(),
-            "run".to_owned(),
-            registration.flow.display().to_string(),
-            "--args-from-brief".to_owned(),
-            "--max-nodes".to_owned(),
-            max_flow_nodes(&graph.manifest).to_string(),
-        ]),
+        argv: Some(flow_argv),
         pools: Some(vec!["flow".to_owned(), graph.manifest.pool.clone()]),
         executor: None,
         priority: Some(priority(&graph.manifest.agent.priority)),
@@ -2132,6 +2154,13 @@ async fn run_campaign_arm(
     if !workspace_root.is_absolute() {
         return Err(invalid("campaign workspace root must be absolute"));
     }
+    // #432: refused at arm rather than at the first pass, because the value is
+    // durable — a zero here would be recorded and then rejected by every
+    // `flow run` this campaign ever dispatches, including the ones the poll
+    // timer dispatches unattended.
+    if args.projection_wait_ms == Some(0) {
+        return Err(invalid("--projection-wait-ms must be greater than zero"));
+    }
     let arm_serial = prior.as_ref().map_or(Ok(1), |value| {
         value
             .arm_serial
@@ -2158,6 +2187,7 @@ async fn run_campaign_arm(
         // Arming always dispatches, so the cheap precondition starts empty and
         // the first poll after an arm re-establishes it.
         last_forge_observation: None,
+        projection_wait_ms: args.projection_wait_ms,
         flow,
         driver,
         workspace_root,
@@ -4795,6 +4825,7 @@ sys.stdout.write(module.canonical_sha256(source))
             sub_issue_walk: true,
             last_observation: None,
             last_forge_observation: None,
+            projection_wait_ms: Some(240_000),
             flow: PathBuf::from("/nix/store/flow.js"),
             driver: PathBuf::from("/nix/store/driver"),
             workspace_root: PathBuf::from("/srv/tally-campaigns"),
@@ -4809,6 +4840,47 @@ sys.stdout.write(module.canonical_sha256(source))
             loaded.approved_graph_digest,
             registration.approved_graph_digest
         );
+        // #432: the durable projection wait survives the round trip, which is
+        // what makes `campaign poll` dispatch later passes with the same
+        // widened window the operator armed with.
+        assert_eq!(loaded.projection_wait_ms, Some(240_000));
+    }
+
+    /// #432 acceptance 2, the seam that actually reaches a campaign pass. A
+    /// registration written before `--projection-wait-ms` existed carries no
+    /// field at all; it must still load, and it must leave the flow host's own
+    /// default alone rather than being refused or defaulted to zero.
+    #[test]
+    fn a_registration_without_a_projection_wait_still_loads() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path();
+        let url = "https://github.com/acme/widgets/issues/42";
+        let path = registration_path(state_dir, url);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "schemaVersion": REGISTRY_SCHEMA_VERSION,
+                "registrationId": uuid::Uuid::now_v7().to_string(),
+                "issueUrl": url,
+                "repository": "acme/widgets",
+                "issueNumber": 42,
+                "armedAt": "2026-08-01T00:00:00Z",
+                "armSerial": 1,
+                "approvedGraphDigest": format!("sha256:{}", "a".repeat(64)),
+                "authenticatedActor": "operator",
+                "allowedActors": ["operator"],
+                "allowTestLocalForge": false,
+                "subIssueWalk": true,
+                "flow": "/nix/store/flow.js",
+                "driver": "/nix/store/driver",
+                "workspaceRoot": "/srv/tally-campaigns",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = read_registration(&path).unwrap();
+        assert_eq!(loaded.projection_wait_ms, None);
     }
 
     fn codex_shaped_adapter(commit_capable: &[&str]) -> AdapterConfig {
