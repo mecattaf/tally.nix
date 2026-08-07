@@ -963,8 +963,55 @@ each enforcing node, so an empty parallel declaration cannot turn enforcement
 off. Serial tasks that omit the optional field keep their unrestricted existing
 behavior.
 
+A second, separate node — the tree-delta permission gate — covers what the
+ownership gate structurally cannot: content that never reached a commit. `prep`
+fingerprints every tracked and untracked path in the lane worktree immediately
+before the agent is dispatched, and the gate compares that fingerprint against
+the worktree afterwards, so an appearing, disappearing or edited path is caught
+whether or not any commit records it.
+
+It runs on both outcomes of the agent node. After a passing agent it runs after
+`ownership`; after a *failing* agent — the single most likely context for a
+rogue write — it runs in place of `ownership`, since ownership never ran. What
+governs is the same on both outcomes: the task's declared `conflictDomains`. A
+non-empty declaration allows exactly those prefixes. A declaration that is
+explicitly empty allows nothing, so every delta is a breach. A failed pass is
+therefore judged either way and cannot quietly pass.
+
+Those two are the only bases a campaign reaches. The driver knows two further
+allowlist derivations, and both require a task whose `conflictDomains` key is
+*absent* rather than empty — a shape the flow cannot produce, because its
+reconcile result schema requires the key on every implementation task in the
+frontier (on both the file-based and the forge-native arm), so such a task is
+refused before any lane starts. With the key absent the driver would, on the
+passing path, fall back to the paths `ownership` certified as the task's own
+committed change-set; and on the failing path, where there is nothing certified
+to fall back to, refuse outright rather than report a clean gate — aborting the
+lane with a receipt naming exactly why, priced as a gate verdict rather than as
+the agent's work being wrong, so it spends none of the task's steering attempts.
+Both are fail-closed guards on the driver's own contract, which is directly
+invocable; neither is a state a campaign reaches today.
+
+That has a consequence worth stating plainly: a serial campaign whose tasks omit
+`conflictDomains` is judged by this gate as *declared-empty*, not by the
+owned-paths fallback, because both worklist producers normalize an omitted field
+to `[]`. Whether that is the right answer — or whether the producers should
+preserve absence so the fallback becomes reachable — is an open design question
+tracked in #439; this page describes what the shipped code does, not which way
+that question will be resolved.
+
+The pre-agent fingerprint is never replaced until a gate has judged the pass it
+belongs to. A pass that ends without the gate running — a machinery fault, a
+killed runner — leaves its fingerprint in place, and the next pass's `prep`
+preserves it rather than re-fingerprinting a worktree that already contains the
+previous attempt's writes. Re-fingerprinting there would have made those writes
+permanently invisible to every gate that ever ran afterwards.
+
 Ownership results witness the requirement flag, declared domains, full sorted
-owned-path set, base revision, and head. This makes both under-declaration and
+owned-path set, base revision, and head. The tree-delta result witnesses the
+task, how many paths it compared, which allowlist derivation governed, that
+allowlist, and whether the ownership node had run — so a reader of a receipt can
+tell which of the gate's two call sites produced it. This makes both under-declaration and
 unused broad declarations visible in receipts. When enough tasks are ready but
 overlapping declarations underfill `maxParallel`, reconciliation emits a
 diagnostic naming the blocked tasks and representative overlaps. Shared files
@@ -1209,9 +1256,13 @@ if implemented is empty, an implementation is in the frontier, and command gates
        non-gating witness
   -> clean up the preflight lane
 parallel(implementation frontier):
-  prepare isolated worktree -> agent -> witness ownership
-    -> each configured gate -> recheck ownership -> push stable task branch
-    -> open/reuse PR
+  prepare isolated worktree -> agent
+    if the agent passed:
+      -> witness ownership -> tree-delta permission gate
+      -> each configured gate -> recheck ownership -> push stable task branch
+      -> open/reuse PR
+    if the agent failed:
+      -> tree-delta permission gate against the declared conflictDomains
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
 parallel(checkpoint frontier, after this pass's merges):
@@ -1578,6 +1629,53 @@ continuation event so the retry is actually taken. That retry
 budget is bounded at two per task and is read back from the forge like every
 other campaign fact, so a permanently broken lane still spends its two steering
 attempts and reaches escalation rather than retrying forever.
+
+### Daemon congestion and the advisory projection wait
+
+After a flow node's exit evidence has passed, the flow host keeps polling the
+daemon for the node's advisory `finalMessage` projection — the structured result
+a driver such as `spec-build-driver` prints on its last line. The daemon's
+dispatch loop can briefly stall under load, and while it does the projection
+does not move. The host therefore does not give up at the first empty poll: it
+retries with a bounded exponential backoff inside a configurable wait, and a
+projection that lands late still completes the node, so the pass survives the
+stall instead of dying on work that already succeeded.
+
+If the projection is still absent when the wait is exhausted, the node is
+classified `retryable-projection` — "projection unavailable within N ms; daemon
+congested?" — and never `result-schema-mismatch`: congestion is not a contract
+violation, and an operator grepping a dead campaign can tell the two apart.
+(`retryable-projection` is raised only when the exit evidence passed; a node
+whose exit evidence failed keeps the older `result-projection-timeout`.)
+
+The wait defaults to 10 s and is widened per campaign at arm time:
+
+```
+tally campaign arm <issue-url> --projection-wait-ms 240000
+```
+
+The value is recorded in the campaign's registration and put on the argv of
+every `tally flow run` the campaign dispatches — the arming pass and every later
+pass `tally campaign poll` dispatches — as `--result-projection-wait-ms`. Arming
+is the seam because a campaign pass runs as a daemon-launched transient unit
+whose environment is built from an explicit `--setenv` list: nothing an operator
+exports in their own shell reaches it, so an environment-only knob would not
+have been reachable from where campaigns are actually started. Re-arm with a
+different value to change it; re-arming without the flag clears it back to the
+10 s default.
+
+It stays out of the campaign manifest deliberately. The manifest is hashed into
+the executable graph digest, so putting a host tuning knob there would make
+"wait longer for this host's stalls" a change to what was approved.
+
+A `tally flow run` you launch yourself takes the same value directly, either as
+`--result-projection-wait-ms MILLISECONDS` or from the
+`TALLY_RESULT_PROJECTION_TIMEOUT_MS` environment variable; the flag wins, and a
+zero or unparsable value is refused rather than silently falling back to the
+default.
+
+Set it comfortably above the longest stall you have observed; it only bounds a
+wait, never changes what a node asserts.
 
 A checkpoint reads the accumulated tree, so a red verdict while unrelated
 implementation work is still outstanding says nothing about the checkpoint. Such

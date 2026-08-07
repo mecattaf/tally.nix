@@ -12,6 +12,7 @@ use tally_core::taskdb::RelatedTrigger;
 use tally_flow::{
     Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, LifecycleSink,
     NodeFailure, NodeResult, RunInspection, RunSupersede, SupersessionDetails, TaskRef, Verdict,
+    RESULT_PROJECTION_TIMEOUT_CODE, RETRYABLE_PROJECTION_CODE,
 };
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -21,6 +22,12 @@ const LIVE_RETRY_LIMIT: u32 = 64;
 const LIVE_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
 const LIVE_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const RESULT_PROJECTION_RETRY: Duration = Duration::from_millis(10);
+/// The retry backoff cap while polling for an advisory finalMessage
+/// projection. The daemon's dispatch loop can stall for minutes under
+/// congestion (#431); polling flat-out during that window only loads it, so
+/// the interval backs off exponentially from `RESULT_PROJECTION_RETRY` to this
+/// cap. The total wait is still bounded by `result_projection_timeout`.
+const RESULT_PROJECTION_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const RESULT_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,6 +102,17 @@ impl LiveFlowClient {
     #[must_use]
     pub(crate) fn with_call_timeout(mut self, call_timeout: Duration) -> Self {
         self.call_timeout = call_timeout;
+        self
+    }
+
+    /// Override how long the client waits for an advisory finalMessage
+    /// projection after a node's exit evidence has passed. The default is
+    /// `RESULT_PROJECTION_TIMEOUT`; `flow run` widens it from
+    /// `TALLY_RESULT_PROJECTION_TIMEOUT_MS` so an operator who knows the
+    /// daemon stalls can out-wait the stall instead of losing the node.
+    #[must_use]
+    pub(crate) fn with_result_projection_timeout(mut self, timeout: Duration) -> Self {
+        self.result_projection_timeout = timeout;
         self
     }
 
@@ -252,8 +270,19 @@ impl LiveFlowClient {
         Ok(())
     }
 
+    /// Poll `query.job` for the advisory finalMessage projection until it
+    /// lands or the (configurable) wait budget is exhausted.
+    ///
+    /// This is the #432 bounded-retry loop: each poll is a retry, the gap
+    /// between polls backs off exponentially from `RESULT_PROJECTION_RETRY` to
+    /// `RESULT_PROJECTION_MAX_BACKOFF`, and the whole thing is bounded by
+    /// `result_projection_timeout`. A daemon whose dispatch loop briefly
+    /// stalls (#431) is exactly the case this has to out-wait, so a projection
+    /// that lands late still completes the node instead of being treated as a
+    /// schema mismatch.
     async fn await_projected_result(&self, task_uuid: &str) -> Result<Option<Value>, ClientError> {
         let deadline = Instant::now() + self.result_projection_timeout;
+        let mut backoff = RESULT_PROJECTION_RETRY;
         loop {
             let response = match tokio::time::timeout_at(
                 deadline,
@@ -276,7 +305,8 @@ impl LiveFlowClient {
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            tokio::time::sleep_until(deadline.min(Instant::now() + RESULT_PROJECTION_RETRY)).await;
+            tokio::time::sleep_until(deadline.min(Instant::now() + backoff)).await;
+            backoff = (backoff * 2).min(RESULT_PROJECTION_MAX_BACKOFF);
         }
     }
 
@@ -295,18 +325,39 @@ impl LiveFlowClient {
         if let Some(projected) = projected? {
             result.result = Some(projected);
         } else if let Some(expectation) = expectation.filter(|_| result.error.is_none()) {
-            result.error = Some(NodeFailure {
-                code: "result-projection-timeout".to_owned(),
-                message: format!(
+            // Exit evidence passed but the advisory projection never landed:
+            // that is daemon congestion, not a contract violation, and it gets
+            // its own retryable classification (#432). A node whose exit
+            // evidence failed keeps the pre-#432 result-projection-timeout.
+            let exit_evidence_passed = result.verdict.is_pass();
+            let code = if exit_evidence_passed {
+                RETRYABLE_PROJECTION_CODE
+            } else {
+                RESULT_PROJECTION_TIMEOUT_CODE
+            };
+            let message = if exit_evidence_passed {
+                format!(
+                    "projection unavailable within {} ms for adapter {:?}: the node's exit evidence passed but its advisory finalMessage never landed (daemon congested?); classified {}, not result-schema-mismatch",
+                    self.result_projection_timeout.as_millis(),
+                    expectation.adapter,
+                    RETRYABLE_PROJECTION_CODE,
+                )
+            } else {
+                format!(
                     "configured finalMessage capture for adapter {:?} was not projected within {} ms",
                     expectation.adapter,
                     self.result_projection_timeout.as_millis()
-                ),
+                )
+            };
+            result.error = Some(NodeFailure {
+                code: code.to_owned(),
+                message,
                 details: Some(json!({
                     "adapter": expectation.adapter,
                     "attempt": attempt,
                     "taskUuid": result.task_uuid,
                     "timeoutMs": self.result_projection_timeout.as_millis(),
+                    "exitEvidencePassed": exit_evidence_passed,
                 })),
             });
         }
@@ -2401,8 +2452,43 @@ export const meta = {
         assert_eq!(client.socket, Path::new("/tmp/tally flow.sock"));
     }
 
+    fn projection_node_result(verdict: Verdict, exit_code: Option<i32>) -> NodeResult {
+        NodeResult {
+            task_uuid: "00000000-0000-4000-8000-000000000053".to_owned(),
+            task_ref: None,
+            verdict,
+            exit_code,
+            stderr_excerpt: None,
+            stderr_truncated: None,
+            witness_seq: 1,
+            disposition: Disposition::Created,
+            model: None,
+            result: None,
+            gates: None,
+            error: None,
+        }
+    }
+
+    async fn projection_client(socket: &Path) -> LiveFlowClient {
+        let mut client = LiveFlowClient::new(socket, 16 * 1024 * 1024, RunnerIdentity::default());
+        client.result_projection_timeout = Duration::from_millis(40);
+        client.result_expected.lock().await.insert(
+            ("00000000-0000-4000-8000-000000000053".to_owned(), 1),
+            ResultProjectionExpectation {
+                adapter: "structured".to_owned(),
+            },
+        );
+        client
+    }
+
+    /// #432: a node whose exit evidence passed but whose advisory projection is
+    /// blocked must be bounded AND classified `retryable-projection` — daemon
+    /// congestion, never `result-schema-mismatch`. Restoring the fatal
+    /// classification (returning `result-projection-timeout` here) makes this
+    /// red, which is the mutation this test exists to catch.
     #[tokio::test]
-    async fn required_projection_timeout_bounds_a_blocked_query_and_names_the_capture() {
+    async fn a_passed_node_with_a_blocked_projection_is_bounded_and_classified_retryable_projection(
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("tally.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2414,38 +2500,143 @@ export const meta = {
             std::future::pending::<()>().await;
         });
 
-        let mut client = LiveFlowClient::new(&socket, 16 * 1024 * 1024, RunnerIdentity::default());
-        client.result_projection_timeout = Duration::from_millis(40);
-        let task_uuid = "00000000-0000-4000-8000-000000000053";
-        client.result_expected.lock().await.insert(
-            (task_uuid.to_owned(), 1),
-            ResultProjectionExpectation {
-                adapter: "structured".to_owned(),
-            },
-        );
-        let mut result = NodeResult {
-            task_uuid: task_uuid.to_owned(),
-            task_ref: None,
-            verdict: Verdict::Pass,
-            exit_code: Some(0),
-            stderr_excerpt: None,
-            stderr_truncated: None,
-            witness_seq: 1,
-            disposition: Disposition::Created,
-            model: None,
-            result: None,
-            gates: None,
-            error: None,
-        };
+        let client = projection_client(&socket).await;
+        let mut result = projection_node_result(Verdict::Pass, Some(0));
 
         let started = Instant::now();
         client.enrich_terminal_result(&mut result, 1).await.unwrap();
         assert!(started.elapsed() < Duration::from_millis(500));
         let error = result.error.unwrap();
-        assert_eq!(error.code, "result-projection-timeout");
+        assert_eq!(error.code, RETRYABLE_PROJECTION_CODE);
         assert!(error.message.contains("finalMessage"));
+        assert!(error.message.contains("congested"));
         assert_eq!(error.details.unwrap()["adapter"], "structured");
         server.abort();
+    }
+
+    /// #432 acceptance 1, second clause: a node whose exit evidence FAILED
+    /// keeps the pre-#432 `result-projection-timeout` classification. This pins
+    /// the "failed evidence keeps today's behaviour" half so the retryable
+    /// path cannot quietly swallow it.
+    #[tokio::test]
+    async fn a_failed_node_with_a_missing_projection_keeps_result_projection_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, _write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap().unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let client = projection_client(&socket).await;
+        let mut result = projection_node_result(Verdict::Failed, Some(1));
+
+        client.enrich_terminal_result(&mut result, 1).await.unwrap();
+        let error = result.error.unwrap();
+        assert_eq!(error.code, RESULT_PROJECTION_TIMEOUT_CODE);
+        assert_eq!(error.details.unwrap()["adapter"], "structured");
+        server.abort();
+    }
+
+    /// A daemon whose dispatch loop is stalled: every `query.job` is answered,
+    /// but without the finalMessage projection, until `stall` has elapsed. That
+    /// is the observed #431 shape — the daemon is reachable and the job row is
+    /// there, the projection is simply not moving yet.
+    fn stalled_projection_server(socket: &Path, stall: Duration) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let id = serde_json::from_str::<Value>(&line).unwrap()["id"].clone();
+                let mut job = json!({"taskUuid": "00000000-0000-4000-8000-000000000053"});
+                if Instant::now().duration_since(started) >= stall {
+                    job["finalMessage"] = json!({"value": "{\"ok\":true}"});
+                }
+                let mut response = serde_json::to_vec(&json!({
+                    "id": id,
+                    "result": {
+                        "schemaVersion": 1,
+                        "protocolVersion": QUERY_PROTOCOL_VERSION,
+                        "job": job
+                    }
+                }))
+                .unwrap();
+                response.push(b'\n');
+                write.write_all(&response).await.unwrap();
+            }
+        })
+    }
+
+    /// #432 acceptance 3, both halves, against one stall.
+    ///
+    /// The daemon withholds the projection for longer than the flow host's
+    /// window while the node's exit evidence is green. Under a window narrower
+    /// than the stall the node is classified `retryable-projection` — never
+    /// `result-schema-mismatch` — and the wait is bounded. Widening the window
+    /// past the stall (which is exactly what `--result-projection-wait-ms` and
+    /// `campaign arm --projection-wait-ms` do) makes the same pass survive: the
+    /// late projection lands, the node completes with its structured result,
+    /// and there is no error at all.
+    ///
+    /// The design choice this pins, stated: the node completes on the
+    /// projection, not on exit evidence alone. A `resultSchema` node has to
+    /// hand its caller a value, and inventing one from a green exit code would
+    /// be a fabricated result. What #432 changes is that the wait is long
+    /// enough to out-wait a stall and that exhausting it is named as
+    /// congestion.
+    ///
+    /// Removing the retry loop (returning after the first empty poll) makes
+    /// the widened half red.
+    #[tokio::test]
+    async fn a_projection_slower_than_the_window_is_retryable_and_survives_a_widened_window() {
+        const STALL: Duration = Duration::from_millis(400);
+        let temp = tempfile::tempdir().unwrap();
+
+        // Narrow window: the stall outlasts it.
+        let narrow_socket = temp.path().join("narrow.sock");
+        let narrow_server = stalled_projection_server(&narrow_socket, STALL);
+        let mut narrow =
+            LiveFlowClient::new(&narrow_socket, 16 * 1024 * 1024, RunnerIdentity::default());
+        narrow.result_projection_timeout = Duration::from_millis(60);
+        narrow.result_expected.lock().await.insert(
+            ("00000000-0000-4000-8000-000000000053".to_owned(), 1),
+            ResultProjectionExpectation {
+                adapter: "structured".to_owned(),
+            },
+        );
+        let mut result = projection_node_result(Verdict::Pass, Some(0));
+        let started = Instant::now();
+        narrow.enrich_terminal_result(&mut result, 1).await.unwrap();
+        assert!(started.elapsed() < STALL);
+        let error = result.error.expect("the narrow window must be exhausted");
+        assert_eq!(error.code, RETRYABLE_PROJECTION_CODE);
+        assert_ne!(error.code, "result-schema-mismatch");
+        assert!(result.result.is_none());
+        narrow_server.abort();
+
+        // The same stall, out-waited by the configurable window.
+        let wide_socket = temp.path().join("wide.sock");
+        let wide_server = stalled_projection_server(&wide_socket, STALL);
+        let mut wide =
+            LiveFlowClient::new(&wide_socket, 16 * 1024 * 1024, RunnerIdentity::default());
+        wide.result_projection_timeout = Duration::from_secs(30);
+        wide.result_expected.lock().await.insert(
+            ("00000000-0000-4000-8000-000000000053".to_owned(), 1),
+            ResultProjectionExpectation {
+                adapter: "structured".to_owned(),
+            },
+        );
+        let mut result = projection_node_result(Verdict::Pass, Some(0));
+        wide.enrich_terminal_result(&mut result, 1).await.unwrap();
+        assert_eq!(result.result, Some(json!({"ok": true})));
+        assert!(result.error.is_none());
+        wide_server.abort();
     }
 
     #[tokio::test]

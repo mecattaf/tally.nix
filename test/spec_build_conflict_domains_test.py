@@ -952,7 +952,11 @@ class TreeDeltaGateTests(PublicationHarness):
         driver.snapshot_before_agent(self.checkout)
 
     def workspace_brief(
-        self, task_value: dict[str, Any], *, owned_paths: object = MISSING
+        self,
+        task_value: dict[str, Any],
+        *,
+        owned_paths: object = MISSING,
+        ownership_ran: object = MISSING,
     ) -> dict[str, Any]:
         brief: dict[str, Any] = {
             "task": task_value,
@@ -965,7 +969,162 @@ class TreeDeltaGateTests(PublicationHarness):
         }
         if owned_paths is not MISSING:
             brief["ownedPaths"] = owned_paths
+        if ownership_ran is not MISSING:
+            brief["ownershipRan"] = ownership_ran
         return brief
+
+    # ------------------------------------------------------------------
+    # #424: the gate on a pass whose agent node failed, and the baseline
+    # that must not be overwritten before a gate has judged it.
+    # ------------------------------------------------------------------
+
+    def test_a_failed_agent_pass_is_judged_against_the_declared_allowlist(self) -> None:
+        """The eval's reproduction, caught where it happens.
+
+        Pass 1: `prep` snapshots, the agent clobbers an out-of-allowlist file
+        and its node fails. `ownership` never runs, so the gate is called with
+        `ownershipRan: False` and only the task's declared `conflictDomains`
+        can govern. It must name the stray path rather than never running.
+        """
+        self.snapshot()
+        clobbered = self.checkout / "internal/cli/root.go"
+        clobbered.write_text("package cli\n// clobbered by a failing agent\n", encoding="utf-8")
+
+        with self.assertRaises(driver.DriverError) as raised:
+            driver.action_tree_delta(
+                self.workspace_brief(
+                    task("conflict-domain", ["README.md"]), ownership_ran=False
+                )
+            )
+        message = str(raised.exception)
+        self.assertIn("changed", message)
+        self.assertIn("internal/cli/root.go", message)
+        self.assertIn("declared", message)
+
+    def test_a_failed_agent_pass_that_stayed_in_bounds_passes_and_says_so(self) -> None:
+        self.snapshot()
+        (self.checkout / "README.md").write_text("base\nhalf a feature\n", encoding="utf-8")
+
+        result = driver.action_tree_delta(
+            self.workspace_brief(
+                task("conflict-domain", ["README.md"]), ownership_ran=False
+            )
+        )
+        self.assertEqual(result["allowlistBasis"], "declared")
+        self.assertFalse(result["ownershipRan"])
+        # The snapshot is consumed on a pass exactly as on a fail: this pass
+        # was judged, so the next one takes a fresh baseline.
+        self.assertIsNone(driver.worktrees.read_change_set_snapshot(self.checkout))
+
+    def test_the_ordinary_post_ownership_verdict_records_that_ownership_ran(self) -> None:
+        self.snapshot()
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        self.commit("fixture: deliver the feature")
+
+        result = driver.action_tree_delta(
+            self.workspace_brief(task("conflict-domain"), owned_paths=["README.md"])
+        )
+        self.assertEqual(result["allowlistBasis"], "owned-paths-fallback")
+        self.assertTrue(result["ownershipRan"])
+
+    def test_no_allowlist_no_pass_when_ownership_never_ran(self) -> None:
+        """#424 rule 3: the gate refuses rather than certifying blindly.
+
+        Ownership never ran, so there are no certified `ownedPaths`, and the
+        task declares no `conflictDomains`. There is nothing to judge against.
+        The gate must refuse loudly, name exactly why, and leave the baseline
+        on disk so the writes it could not judge stay judgeable.
+        """
+        self.snapshot()
+        clobbered = self.checkout / "internal/cli/root.go"
+        clobbered.write_text("package cli\n// clobbered by a failing agent\n", encoding="utf-8")
+
+        with self.assertRaises(driver.DriverError) as raised:
+            driver.action_tree_delta(
+                self.workspace_brief(task("conflict-domain"), ownership_ran=False)
+            )
+        message = str(raised.exception)
+        self.assertIn("refuses to judge", message)
+        self.assertIn("no allowlist", message.replace("there is no allowlist", "no allowlist"))
+        self.assertIn("conflictDomains", message)
+        # It must not claim a breach it never established.
+        self.assertNotIn("out-of-allowlist change(s)", message)
+        # And the baseline survives, because this pass was never judged.
+        self.assertIsNotNone(driver.worktrees.read_change_set_snapshot(self.checkout))
+
+    def test_a_declared_empty_allowlist_still_judges_a_failed_agent_pass(self) -> None:
+        """An explicitly empty allowlist is a declaration, not an absence.
+
+        It does not trigger the refusal: the operator said "nothing", so any
+        delta at all is a breach, on a failed pass exactly as on a passing one.
+        """
+        self.snapshot()
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(driver.DriverError, "declared-empty"):
+            driver.action_tree_delta(
+                self.workspace_brief(task("conflict-domain", []), ownership_ran=False)
+            )
+
+    def test_an_unjudged_baseline_is_preserved_so_the_next_pass_sees_the_write(
+        self,
+    ) -> None:
+        """The laundering path, killed.
+
+        Pass 1 snapshots and its agent clobbers an out-of-allowlist file, and
+        the pass then ends without the gate judging it at all -- a machinery
+        fault, a node cap, a killed runner. Pass 2's `prep` must NOT take a
+        fresh baseline over the stray write: if it does, the write is invisible
+        to every gate that will ever run. With the baseline preserved, pass 2's
+        gate still sees it.
+
+        Mutation: make `snapshot_before_agent` re-snapshot unconditionally and
+        this test goes red -- pass 2's gate reports a clean tree over content
+        that is still on disk.
+        """
+        self.assertTrue(driver.snapshot_before_agent(self.checkout))
+        clobbered = self.checkout / "internal/cli/root.go"
+        clobbered.write_text("package cli\n// clobbered in pass 1\n", encoding="utf-8")
+        # Pass 1 ends here without `action_tree_delta` ever running.
+
+        # Pass 2's prep. The baseline it finds belongs to a pass no gate
+        # judged, so it is preserved rather than rotated.
+        rotated = driver.snapshot_before_agent(self.checkout)
+
+        # The load-bearing assertion, made before the bookkeeping one: pass 2's
+        # gate still sees the write, and the content is still on disk.
+        with self.assertRaises(driver.DriverError) as raised:
+            driver.action_tree_delta(
+                self.workspace_brief(
+                    task("conflict-domain", ["README.md"]), ownership_ran=False
+                )
+            )
+        self.assertIn("internal/cli/root.go", str(raised.exception))
+        self.assertTrue(clobbered.exists())
+        self.assertFalse(rotated)
+
+    def test_a_judged_baseline_rotates_on_the_next_prep(self) -> None:
+        """The other half of the same rule: judged means rotate.
+
+        A pass the gate did judge must not leave its baseline behind, or the
+        next pass would be judged against a span that has already been ruled
+        on and an in-allowlist edit would be re-reported for ever.
+        """
+        self.assertTrue(driver.snapshot_before_agent(self.checkout))
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        self.commit("fixture: deliver the feature")
+        driver.action_tree_delta(
+            self.workspace_brief(task("conflict-domain", ["README.md"]))
+        )
+        self.assertIsNone(driver.worktrees.read_change_set_snapshot(self.checkout))
+
+        # The next prep takes a fresh baseline, so an untouched worktree is a
+        # clean gate rather than a replay of the previous pass's deltas.
+        self.assertTrue(driver.snapshot_before_agent(self.checkout))
+        result = driver.action_tree_delta(
+            self.workspace_brief(task("conflict-domain", ["README.md"]))
+        )
+        self.assertEqual(result["checkedPaths"], 0)
 
     def test_a_reversion_of_an_uncommitted_change_is_a_breach(self) -> None:
         # A prior partial pass left a legitimate uncommitted edit sitting in
