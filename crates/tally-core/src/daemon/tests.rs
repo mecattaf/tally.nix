@@ -14204,4 +14204,473 @@ mod tests {
             })
             .await;
     }
+
+    /// Seed a durable corpus at estate scale: `terminal` completed rows (event
+    /// file + lifecycle trail + witness Pass) and `queued` rows with no
+    /// witness, which recovery re-presents as live jobs. Event files and
+    /// lifecycle lines are written directly in their durable formats — the
+    /// fixture needs the bytes on disk, not the writers' per-line fsyncs.
+    fn seed_scale_corpus(root: &Path, terminal: usize, queued: usize) -> (DaemonPaths, Vec<Uuid>) {
+        let paths = DaemonPaths {
+            socket: root.join("run/tally.sock"),
+            state_dir: root.join("state"),
+            data_dir: root.join("data"),
+        };
+        prepare_paths(&paths).unwrap();
+        assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
+        let events_dir = paths.events_dir();
+        fs::create_dir_all(&events_dir).unwrap();
+
+        let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+        let mut lifecycle = Vec::new();
+        let mut sequence = 0_u64;
+        let mut realtime = 1_786_000_000_000_000_u64;
+        let mut uuids = Vec::with_capacity(terminal + queued);
+        let mut append_lifecycle = |row: &RowSeed, event: TallyEvent, sequence: &mut u64, realtime: &mut u64| {
+            let terminal_event = matches!(event, TallyEvent::Completed | TallyEvent::Failed);
+            let fields = EmitEvent {
+                event,
+                task_uuid: row.uuid.to_string(),
+                task_ref: None,
+                class: row.priority,
+                source: row.source,
+                message: Some(format!("scale fixture {event}")),
+                agent: Some(row.adapter.clone()),
+                session_ref: None,
+                unit: Some(format!("tally-job-{}.service", row.uuid)),
+                exit_code: terminal_event.then_some(0),
+                stderr_tail: None,
+                stderr_truncated: None,
+                gpu_seconds: terminal_event.then_some(0.0),
+                context_tokens: None,
+                context_window: None,
+                artifact_hash: (event == TallyEvent::Completed)
+                    .then(|| format!("sha256:{}", "a".repeat(64))),
+                evidence: event.is_evidence().then(|| "exit:0".to_owned()),
+                attempt: Some(1),
+                lease_epoch: Some(1),
+                labor_class: Some(LaborClass::Fresh),
+                job_id: Some(row.uuid.to_string()),
+                parent: None,
+                pools: Some(row.pools.clone()),
+                executor: None,
+            }
+            .into_fields()
+            .unwrap();
+            *sequence += 1;
+            *realtime += 1;
+            let cursor = crate::history::lifecycle_cursor(*sequence);
+            let record = crate::history::LifecycleRecord {
+                schema_version: crate::history::LIFECYCLE_SCHEMA_VERSION,
+                sequence: *sequence,
+                event_id: cursor.clone(),
+                cursor,
+                observed_at: chrono::DateTime::<Utc>::from_timestamp_micros(
+                    i64::try_from(*realtime).unwrap(),
+                )
+                .unwrap()
+                .to_rfc3339_opts(SecondsFormat::Micros, true),
+                realtime_us: *realtime,
+                fields,
+            };
+            lifecycle.extend_from_slice(&serde_json::to_vec(&record).unwrap());
+            lifecycle.push(b'\n');
+        };
+
+        for index in 0..(terminal + queued) {
+            let uuid = Uuid::new_v4();
+            uuids.push(uuid);
+            let row = durable_row(uuid, &format!("scale-{index}"), 1);
+            let event = DurableEnqueueEvent::new(row.clone()).unwrap();
+            fs::write(
+                events_dir.join(format!("{}.enqueue.json", event.event_id)),
+                serde_json::to_vec(&event).unwrap(),
+            )
+            .unwrap();
+            if index < terminal {
+                for lifecycle_event in [
+                    TallyEvent::Enqueued,
+                    TallyEvent::Dispatched,
+                    TallyEvent::Started,
+                    TallyEvent::EvidencePass,
+                    TallyEvent::Completed,
+                ] {
+                    append_lifecycle(&row, lifecycle_event, &mut sequence, &mut realtime);
+                }
+                append_fixture_witness(
+                    &mut ledger,
+                    &row,
+                    "2026-08-05T12:00:00.000Z",
+                    Verdict::Pass,
+                    0,
+                    1,
+                    1,
+                );
+            } else {
+                append_lifecycle(&row, TallyEvent::Enqueued, &mut sequence, &mut realtime);
+            }
+        }
+        drop(ledger);
+        fs::write(paths.data_dir.join(crate::history::LIFECYCLE_FILE), lifecycle).unwrap();
+        (paths, uuids)
+    }
+
+    /// #431 acceptance: with a ~30k-row durable corpus, the dispatch loop's
+    /// maximum absence over a sustained scheduling period stays under a
+    /// single-digit-second bound, and RPCs issued during that period answer
+    /// within the 10 s client deadline the estate's readers use.
+    ///
+    /// Shape of the proof:
+    /// - The corpus is 30,000 terminal rows plus 40 queued rows that recovery
+    ///   re-presents; the queued cohort dispatches, runs, and completes through
+    ///   the live loop, and twelve more admissions land mid-storm, so
+    ///   admission, scheduling, and completion are all exercised while the
+    ///   query storm runs.
+    /// - Clients run on their own OS threads with their own runtimes, the way
+    ///   estate clients are their own processes, so client-side JSON decoding
+    ///   cannot pollute the loop measurement.
+    /// - Loop absence is measured at tick boundaries with the loop's own lease
+    ///   tick (100 ms cadence when live): the hook stamps an instant per tick,
+    ///   and the maximum inter-tick gap is the loop's maximum absence as its
+    ///   own watchdog witness would see it.
+    /// - The bound is 5 s. That is deliberately far above the healthy ~100 ms
+    ///   cadence (this suite shares hosts with compiling siblings and the
+    ///   corpus makes some O(live)+fsync arm bodies real) and far below the
+    ///   60–183 s absences measured live on 2026-08-07 — which one inline
+    ///   corpus-scale query reproduces, so the unfixed loop fails this test by
+    ///   minutes, not by margin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_loop_stays_live_under_query_storm_at_estate_scale() {
+        const STORM: Duration = Duration::from_secs(6);
+        const ABSENCE_BOUND: Duration = Duration::from_secs(5);
+        const CLIENT_DEADLINE: Duration = Duration::from_secs(10);
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let (paths, uuids) = seed_scale_corpus(temp.path(), 30_000, 40);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let (tick_tx, mut tick_rx) = mpsc::unbounded_channel();
+                let (_release_tx, release_rx) = watch::channel(true);
+                daemon.lease_tick_hook = Some(LeaseTickHook {
+                    started: tick_tx,
+                    release: release_rx,
+                });
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+
+                let ticks = Rc::new(RefCell::new(Vec::<Instant>::new()));
+                let collected = ticks.clone();
+                let collector = tokio::task::spawn_local(async move {
+                    while tick_rx.recv().await.is_some() {
+                        collected.borrow_mut().push(Instant::now());
+                    }
+                });
+
+                // Query storm: corpus-scale reads back to back for the whole
+                // period, from a dedicated OS thread.
+                let storm_socket = paths.socket.clone();
+                let probe_uuid = uuids[0].to_string();
+                let storm_uuid = probe_uuid.clone();
+                let storm = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let client = RpcClient::connect(&storm_socket).await.unwrap();
+                            let started = Instant::now();
+                            let mut completed = 0_usize;
+                            while started.elapsed() < STORM {
+                                client
+                                    .call("query.jobs", Some(json!({"limit": 100})))
+                                    .await
+                                    .unwrap();
+                                client
+                                    .call("query.job", Some(json!({"id": storm_uuid})))
+                                    .await
+                                    .unwrap();
+                                client.call("query.status", Some(json!({}))).await.unwrap();
+                                completed += 3;
+                            }
+                            completed
+                        })
+                });
+                // Scheduling activity: admissions landing mid-storm, each of
+                // which must not wait behind a corpus-scale query.
+                let sched_socket = paths.socket.clone();
+                let scheduler = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let client = RpcClient::connect(&sched_socket).await.unwrap();
+                            let mut worst = Duration::ZERO;
+                            for round in 0..12 {
+                                let started = Instant::now();
+                                client
+                                    .call(
+                                        "queue.enqueue",
+                                        Some(json!({
+                                            "argv": ["true"],
+                                            "pool": "slot",
+                                            "adapter": "shell",
+                                            "source": "manual",
+                                            "evidence": ["exit:0"],
+                                            "dedupKey": format!("storm-{round}"),
+                                        })),
+                                    )
+                                    .await
+                                    .unwrap();
+                                worst = worst.max(started.elapsed());
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                            }
+                            worst
+                        })
+                });
+                // The acceptance probe: a `query.job` read issued in the middle
+                // of the storm, with the client deadline the estate's readers
+                // use. On the unfixed loop this is the read that timed out.
+                let probe_socket = paths.socket.clone();
+                let probe = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let client = RpcClient::connect(&probe_socket).await.unwrap();
+                            tokio::time::sleep(STORM / 3).await;
+                            let mut elapsed = Vec::new();
+                            for _ in 0..2 {
+                                let started = Instant::now();
+                                client
+                                    .call_with_deadline(
+                                        "query.job",
+                                        Some(json!({"id": probe_uuid})),
+                                        CLIENT_DEADLINE,
+                                    )
+                                    .await
+                                    .unwrap();
+                                elapsed.push(started.elapsed());
+                                tokio::time::sleep(STORM / 3).await;
+                            }
+                            elapsed
+                        })
+                });
+
+                let queries = tokio::task::spawn_blocking(move || storm.join().unwrap())
+                    .await
+                    .unwrap();
+                let worst_enqueue = tokio::task::spawn_blocking(move || scheduler.join().unwrap())
+                    .await
+                    .unwrap();
+                let probe_elapsed = tokio::task::spawn_blocking(move || probe.join().unwrap())
+                    .await
+                    .unwrap();
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+                collector.abort();
+
+                assert!(queries >= 3, "the storm must actually run corpus-scale queries");
+                for elapsed in &probe_elapsed {
+                    assert!(
+                        *elapsed < CLIENT_DEADLINE,
+                        "a query.job issued during the storm took {elapsed:?}, past the \
+                         {CLIENT_DEADLINE:?} client deadline"
+                    );
+                }
+                assert!(
+                    worst_enqueue < CLIENT_DEADLINE,
+                    "an admission waited {worst_enqueue:?} behind corpus-scale query work"
+                );
+                let ticks = ticks.borrow();
+                assert!(
+                    ticks.len() >= 20,
+                    "expected a live tick cadence, saw {} ticks",
+                    ticks.len()
+                );
+                let mut max_gap = Duration::ZERO;
+                for pair in ticks.windows(2) {
+                    max_gap = max_gap.max(pair[1] - pair[0]);
+                }
+                assert!(
+                    max_gap < ABSENCE_BOUND,
+                    "the dispatch loop was absent for {max_gap:?} during the storm \
+                     (bound {ABSENCE_BOUND:?}, {} ticks observed)",
+                    ticks.len()
+                );
+            })
+            .await;
+    }
+
+    /// #431: an RPC read that races a scheduling mutation answers from the
+    /// frozen snapshot its projection took — the mutation is either entirely
+    /// invisible to that answer or entirely visible to a later one, never
+    /// partially visible. This is the torn-read discipline that moving query
+    /// construction off the dispatch thread must keep.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_projection_is_frozen_against_racing_mutations() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+
+                let before = daemon.handler.query_projection().await.unwrap();
+                let rows_before = before.rows.len();
+
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let new_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+
+                // The projection taken before the admission is immutable: the
+                // mutation cannot appear in any of its facts, so a query built
+                // from it cannot observe the admission half-applied.
+                assert_eq!(before.rows.len(), rows_before);
+                assert!(!before.rows.iter().any(|row| row.task_uuid == new_uuid));
+                assert!(!before
+                    .live
+                    .iter()
+                    .any(|fact| fact.anchor == new_uuid));
+                let frozen = query_jobs_v2(
+                    &before.details,
+                    &before.live,
+                    &before.history,
+                    &before.witness,
+                    &BTreeMap::new(),
+                    &JobsFilter::default(),
+                    &before.membership,
+                )
+                .unwrap();
+                assert!(!frozen.items.iter().any(|item| item.anchor == new_uuid));
+
+                // A projection taken after the admission sees it whole.
+                let after = daemon.handler.query_projection().await.unwrap();
+                assert_eq!(after.rows.len(), rows_before + 1);
+                assert!(after.rows.iter().any(|row| row.task_uuid == new_uuid));
+                assert!(after.live.iter().any(|fact| fact.anchor == new_uuid));
+            })
+            .await;
+    }
+
+    /// Timing probe for #431: what does each dispatch-loop-resident operation
+    /// cost against a corpus at estate scale? Run with
+    /// `TALLY_EXP_CORPUS=30000 cargo test -p tally-core exp_corpus -- --ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn exp_corpus_scale_timing() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let terminal = std::env::var("TALLY_EXP_CORPUS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(30_000);
+                let queued = 60;
+                let temp = tempdir().unwrap();
+                let started = Instant::now();
+                let (paths, uuids) = seed_scale_corpus(temp.path(), terminal, queued);
+                eprintln!("seed: {terminal} terminal + {queued} queued rows in {:?}", started.elapsed());
+
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let started = Instant::now();
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                eprintln!("open: {:?}", started.elapsed());
+                eprintln!(
+                    "phases: {:?}",
+                    daemon.startup.as_ref().map(|timeline| timeline.phase_names())
+                );
+
+                for method in ["query.status", "query.standup", "query.render"] {
+                    let started = Instant::now();
+                    let result = daemon.handler.query(method, Some(json!({}))).await;
+                    eprintln!("{method}: {:?} ok={}", started.elapsed(), result.is_ok());
+                }
+                let started = Instant::now();
+                let result = daemon.handler.query("query.jobs", Some(json!({}))).await;
+                eprintln!("query.jobs: {:?} ok={}", started.elapsed(), result.is_ok());
+                let started = Instant::now();
+                let result = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": uuids[0].to_string()})))
+                    .await;
+                eprintln!("query.job: {:?} ok={}", started.elapsed(), result.is_ok());
+                let started = Instant::now();
+                let result = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": uuids[0].to_string()})))
+                    .await;
+                eprintln!("query.run(unknown): {:?} ok={}", started.elapsed(), result.is_ok());
+
+                // Repeat, now warm.
+                for method in ["query.status", "query.standup"] {
+                    let started = Instant::now();
+                    let result = daemon.handler.query(method, Some(json!({}))).await;
+                    eprintln!("warm {method}: {:?} ok={}", started.elapsed(), result.is_ok());
+                }
+
+                // Admission with the corpus resident.
+                let started = Instant::now();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await;
+                eprintln!("enqueue: {:?} ok={}", started.elapsed(), admitted.is_ok());
+
+                // A query right after the mutation (cold snapshot rebuild).
+                let started = Instant::now();
+                let result = daemon.handler.query("query.status", Some(json!({}))).await;
+                eprintln!("post-mutation query.status: {:?} ok={}", started.elapsed(), result.is_ok());
+
+                // One lease tick with the queued cohort resident.
+                let started = Instant::now();
+                Daemon::tick_leases_at(daemon.handler.clone(), Utc::now())
+                    .await
+                    .unwrap();
+                eprintln!("tick_leases: {:?}", started.elapsed());
+                let started = Instant::now();
+                Daemon::tick_leases_at(daemon.handler.clone(), Utc::now())
+                    .await
+                    .unwrap();
+                eprintln!("tick_leases again: {:?}", started.elapsed());
+            })
+            .await;
+    }
 }

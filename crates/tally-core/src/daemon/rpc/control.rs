@@ -521,7 +521,7 @@ impl DaemonHandler {
     /// record per retired generation. The daemon caches the parsed index and
     /// revalidates it against the file's length and modification time, so an
     /// external edit is still picked up.
-    pub(crate) async fn flow_lineage(&self) -> Result<Rc<FlowLineage>, WireError> {
+    pub(crate) async fn flow_lineage(&self) -> Result<Arc<FlowLineage>, WireError> {
         let path = self.context.read().await.paths.flow_lineage_path();
         let stamp = std::fs::metadata(&path)
             .ok()
@@ -531,7 +531,7 @@ impl DaemonHandler {
                 return Ok(cached.lineage.clone());
             }
         }
-        let lineage = Rc::new(FlowLineage::read(&path).map_err(lineage_wire)?);
+        let lineage = Arc::new(FlowLineage::read(&path).map_err(lineage_wire)?);
         *self.flow_lineage_cache.borrow_mut() = Some(CachedFlowLineage {
             stamp,
             lineage: lineage.clone(),
@@ -545,7 +545,7 @@ impl DaemonHandler {
     }
 
     /// The parsed run-membership ledger, re-read only when its bytes changed.
-    pub(crate) async fn flow_membership(&self) -> Result<Rc<FlowMembership>, WireError> {
+    pub(crate) async fn flow_membership(&self) -> Result<Arc<FlowMembership>, WireError> {
         let path = self.context.read().await.paths.flow_membership_path();
         let stamp = membership_stamp(&path);
         if let Some(cached) = self.flow_membership_cache.borrow().as_ref() {
@@ -553,7 +553,7 @@ impl DaemonHandler {
                 return Ok(cached.membership.clone());
             }
         }
-        let membership = Rc::new(FlowMembership::read(&path).map_err(membership_wire)?);
+        let membership = Arc::new(FlowMembership::read(&path).map_err(membership_wire)?);
         *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
             stamp,
             membership: membership.clone(),
@@ -587,7 +587,7 @@ impl DaemonHandler {
             return crate::flow_membership::probe_appendable(&path).map_err(membership_wire);
         }
         let membership =
-            Rc::new(crate::flow_membership::preflight(&path).map_err(membership_wire)?);
+            Arc::new(crate::flow_membership::preflight(&path).map_err(membership_wire)?);
         *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
             stamp: membership_stamp(&path),
             membership,
@@ -613,7 +613,7 @@ impl DaemonHandler {
     ) -> Result<(), WireError> {
         let path = self.context.read().await.paths.flow_membership_path();
         // Scoped so the borrowed index is dropped before the cache is taken:
-        // holding it here would keep the `Rc` strong count at two, `try_unwrap`
+        // holding it here would keep the `Arc` strong count at two, `try_unwrap`
         // below would fail, and every admission would deep-clone the whole
         // index — linear in the ledger, which is the cost this repair removes.
         let already_held = {
@@ -650,7 +650,7 @@ impl DaemonHandler {
         };
         let owned = match self.flow_membership_cache.borrow_mut().take() {
             Some(cached) => {
-                Rc::try_unwrap(cached.membership).unwrap_or_else(|shared| (*shared).clone())
+                Arc::try_unwrap(cached.membership).unwrap_or_else(|shared| (*shared).clone())
             }
             // Only reachable if a concurrent reader invalidated it in between.
             None => FlowMembership::read(&path).map_err(membership_wire)?,
@@ -687,7 +687,7 @@ impl DaemonHandler {
                 // whole ledger on every later admission.
                 *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
                     stamp: membership_stamp(&path),
-                    membership: Rc::new(updated),
+                    membership: Arc::new(updated),
                 });
                 Ok(())
             }
