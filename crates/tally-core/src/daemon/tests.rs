@@ -14634,6 +14634,160 @@ mod tests {
             .await;
     }
 
+    /// #420 (1): `unreachable_paused_jobs` reclaims uuids whose job was
+    /// retired out of `context.jobs`. Before this fix the set's GC walked only
+    /// the live map, which no longer retains terminal jobs (#395), so a
+    /// pool-loss-paused job that was then cancelled pinned its uuid in the
+    /// set for the daemon's lifetime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_return_reclaims_unreachable_paused_uuids_whose_job_was_retired() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    two_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+
+                // Hold zeta so the admission queues instead of running.
+                daemon
+                    .handler
+                    .acquire(Some(json!({"pool": "zeta"})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "zeta",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(admitted["state"], "queued");
+                let task_uuid = Uuid::parse_str(admitted["task_uuid"].as_str().unwrap()).unwrap();
+
+                daemon.handler.apply_pool_loss("zeta").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert!(context.unreachable_paused_jobs.contains(&task_uuid));
+                }
+
+                // The paused job reaches a terminal disposition and is retired
+                // out of the live map — the exact membership the old GC could
+                // never reclaim.
+                let cancelled = daemon
+                    .handler
+                    .cancel(Some(json!({"task_uuid": task_uuid.to_string(), "force": true})))
+                    .await
+                    .unwrap();
+                assert_eq!(cancelled["affected"], 1);
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(!context.jobs.contains_key(&task_uuid));
+                    assert!(
+                        context.unreachable_paused_jobs.contains(&task_uuid),
+                        "precondition: the uuid is still held when the pool returns"
+                    );
+                }
+
+                daemon.handler.apply_pool_return("zeta").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(
+                        !context.unreachable_paused_jobs.contains(&task_uuid),
+                        "a retired job's uuid must not survive a sweep of the set"
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// #420 (2): `cancel`'s already-terminal answer derives `was` from the
+    /// query fact that admitted the retired job, instead of asserting
+    /// `completed`. A row recovered as `Deleted` — latest witness verdict
+    /// `cancelled` — answers with the same `deleted-cache` label its query
+    /// projection uses; reporting it `completed` claimed a verdict the daemon
+    /// does not hold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_reports_deleted_cache_for_a_row_recovered_as_deleted() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                prepare_paths(&paths).unwrap();
+                assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
+                let row = durable_row(Uuid::new_v4(), "deleted-cache-answer", 1);
+                write_enqueue_event_atomic(
+                    &paths.events_dir(),
+                    &DurableEnqueueEvent::new(row.clone()).unwrap(),
+                )
+                .unwrap();
+                let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+                append_fixture_witness(
+                    &mut ledger,
+                    &row,
+                    "2026-08-06T12:00:00.000Z",
+                    Verdict::Cancelled,
+                    1,
+                    1,
+                    1,
+                );
+                drop(ledger);
+
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(!context.jobs.contains_key(&row.uuid));
+                    assert_eq!(context.query_rows[&row.uuid].status, RowStatus::Deleted);
+                }
+
+                let already = daemon
+                    .handler
+                    .cancel(Some(json!({"task_uuid": row.uuid.to_string(), "force": true})))
+                    .await
+                    .unwrap();
+                assert_eq!(already["already_terminal"], true);
+                assert_eq!(already["affected"], 0);
+                assert_eq!(
+                    already["was"], "deleted-cache",
+                    "the label is the query fact's status, not a constant"
+                );
+            })
+            .await;
+    }
+
     /// Timing probe for #431: what does each dispatch-loop-resident operation
     /// cost against a corpus at estate scale? Run with
     /// `TALLY_EXP_CORPUS=30000 cargo test -p tally-core exp_corpus -- --ignored --nocapture`.

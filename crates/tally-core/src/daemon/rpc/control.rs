@@ -714,7 +714,7 @@ impl DaemonHandler {
                 "ok": true,
                 "affected": 0,
                 "task_uuid": found.task_uuid().map(|uuid| uuid.to_string()),
-                "was": state_name(JobState::Completed),
+                "was": found.terminal_was(),
                 "lease_epoch": found.lease_epoch(),
                 "already_terminal": true,
             });
@@ -1141,6 +1141,11 @@ pub(crate) enum FoundJob<'a> {
         /// and a continuation needs the observations, not the seed.
         session_ref: Option<&'a str>,
         model: Option<&'a str>,
+        /// The query-fact status this retired job was admitted on:
+        /// `Completed`, or `Deleted` for a row recovered as a deleted cache
+        /// entry (`startup.rs`). Carried so an already-terminal answer can
+        /// report the status that actually admitted it (#420).
+        status: RowStatus,
     },
 }
 
@@ -1149,6 +1154,24 @@ impl<'a> FoundJob<'a> {
         match self {
             Self::Live(job) => matches!(job.state, JobState::Completed),
             Self::Retired { .. } => true,
+        }
+    }
+
+    /// What an already-terminal answer reports this job "was".
+    ///
+    /// Derived from the same fact `find_job` admitted the retired job on,
+    /// not asserted: a live job only reaches the already-terminal branch at
+    /// `JobState::Completed`, but a retired row recovered as `Deleted`
+    /// answers with the deleted-cache label its query projection uses,
+    /// instead of a `"completed"` constant standing in for evidence (#420).
+    pub(crate) fn terminal_was(&self) -> &'static str {
+        match self {
+            Self::Live(_) => state_name(JobState::Completed),
+            Self::Retired {
+                status: RowStatus::Deleted,
+                ..
+            } => "deleted-cache",
+            Self::Retired { .. } => state_name(JobState::Completed),
         }
     }
 
@@ -1174,6 +1197,7 @@ impl<'a> FoundJob<'a> {
                 row,
                 session_ref,
                 model,
+                ..
             } => {
                 let mut row = (*row).clone();
                 row.session_ref = session_ref.map(ToOwned::to_owned);
@@ -1235,6 +1259,9 @@ pub(crate) fn find_job<'a>(
         row,
         session_ref: fact.and_then(|fact| fact.session_ref.as_deref()),
         model: fact.and_then(|fact| fact.model.as_deref()),
+        status: fact
+            .map(|fact| fact.status)
+            .expect("the terminal predicate above read this fact"),
     })
 }
 

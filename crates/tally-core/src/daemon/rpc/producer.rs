@@ -348,25 +348,33 @@ impl DaemonHandler {
                 .expect("attestation ledger lock poisoned"),
         )
         .map_err(|error| self.fail_stop(error))?;
-        let paused = context
-            .unreachable_paused_jobs
-            .iter()
-            .filter_map(|job_id| {
-                context
-                    .jobs
-                    .get(job_id)
-                    .filter(|job| {
-                        job.row.pools.iter().any(|name| name == pool)
-                            && !job
-                                .row
-                                .pools
-                                .iter()
-                                .any(|name| context.unreachable_pools.contains(name))
-                    })
-                    .map(|_| *job_id)
-            })
-            .collect::<Vec<_>>();
-        for job_id in &paused {
+        // Two kinds of member leave the set here. A live paused job whose
+        // pools are all reachable again is collected to resume. A uuid whose
+        // job is absent from `context.jobs` was retired at a terminal
+        // disposition (#395); it can never be resumed, so any sweep of the
+        // set drops it. Before #420 that second kind never left: this GC read
+        // only the live map, which no longer retains terminal jobs, so every
+        // pool-loss-paused job that then completed or was cancelled pinned
+        // its uuid here for the daemon's lifetime.
+        let mut paused = Vec::new();
+        let mut retired = Vec::new();
+        for job_id in &context.unreachable_paused_jobs {
+            match context.jobs.get(job_id) {
+                Some(job) => {
+                    if job.row.pools.iter().any(|name| name == pool)
+                        && !job
+                            .row
+                            .pools
+                            .iter()
+                            .any(|name| context.unreachable_pools.contains(name))
+                    {
+                        paused.push(*job_id);
+                    }
+                }
+                None => retired.push(*job_id),
+            }
+        }
+        for job_id in paused.iter().chain(&retired) {
             context.unreachable_paused_jobs.remove(job_id);
         }
         launches.extend(resume_paused_jobs_locked(

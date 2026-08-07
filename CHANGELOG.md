@@ -75,6 +75,24 @@ which put the 2026-08-06 switch into a restart loop.
   (`TimeoutStartSec = mkForce "10min"`) becomes revertible once this lands;
   that revert is the operator's, not this change's.
 
+#### #420 — two residues of the context.jobs prune
+
+Both arrived with #395, which retires terminal jobs out of `context.jobs`;
+neither changed behaviour today, both were unbounded-or-untrue surfaces.
+
+- `unreachable_paused_jobs` reclaims uuids whose job is absent from the
+  live map: a pool-loss-paused job that then completed or was cancelled used
+  to pin its uuid in the set for the daemon's lifetime, because the GC read
+  only the map that no longer retains terminal jobs. A retired job can never
+  be resumed, so any pool-return sweep of the set now drops such uuids.
+  Mutation-proved: reverting the reclaim arm turns the test red.
+- `cancel`'s already-terminal answer derives `"was"` from the query
+  fact that admitted the retired job instead of asserting `"completed"`:
+  a row recovered as `Deleted` (latest witness verdict `cancelled`)
+  answers `"deleted-cache"`, the same label its query projection uses.
+  Mutation-proved: fabricating the constant back turns the test red.
+
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and
