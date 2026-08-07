@@ -117,11 +117,13 @@ prevent.
   a third probe pins that.
 - The live `replay-divergence` test's label comment pointed at "the
   in-process tests in `tally-flow`" for coverage that was not there. The
-  label sides are now bound in-process — the mock ledger returns one label
-  and the script derives another, and
-  `payload_divergence_stops_admission_at_the_mismatched_ordinal` pins
-  `recordedLabel`/`currentLabel` to the two different strings — and the
-  comment names that test instead of claiming a crate.
+  comment now names the two tests that bind `recordedLabel`/`currentLabel`
+  at the site this fixture's refusal is actually raised from — the
+  dedup-conflict path in `crates/tally/src/flow_live.rs`, whose label
+  binding already existed — and separately names the runner's own
+  comparison site, where the mock ledger now returns one label while the
+  script derives another so that site is bound too. The stated limit is
+  unchanged; only the pointer was wrong.
 
 ### Steward driver gates (#385, #386)
 
