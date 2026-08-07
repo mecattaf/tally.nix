@@ -27,11 +27,13 @@ The default config is `$XDG_CONFIG_HOME/tally/config.json`, falling back to
 `tally/tally.sock`.
 
 Every verb that resolves an omitted `--data-dir` — the direct-file family (`reader-state`,
-`witness verify` and `witness compare`, `gc`, `history compact`, and the producer diagnostics)
-and `daemon run` — takes it from `TALLY_DATA_DIR`, verbatim as the directory, before the XDG
-default `$XDG_DATA_HOME/tally`, else `~/.local/share/tally`. An explicit `--data-dir` flag wins
-over the variable; both modules pass that flag to every unit they render, so the variable never
-changes what a deployment's own units read. With the variable unset or empty, resolution is
+`witness verify` and `witness compare`, `witness append`, `gc`, `history compact`, and the
+producer diagnostics) and `daemon run` — takes it from `TALLY_DATA_DIR`, verbatim as the
+directory, before the XDG default `$XDG_DATA_HOME/tally`, else `~/.local/share/tally`. An
+explicit `--data-dir` flag wins over the variable; every unit either module renders that runs
+one of these verbs is given an explicit path — `--data-dir`, or `--ledger` for the witness
+emitter's `witness append` — so the variable never changes what a deployment's own units read.
+With the variable unset or empty, resolution is
 exactly what it was before it existed. It is taken verbatim, not searched: if it names something
 that cannot hold the store, the verb fails naming that path rather than falling back to the XDG
 default.
