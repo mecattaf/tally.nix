@@ -266,7 +266,10 @@ impl DaemonHandler {
             let durable =
                 collect_durable_recovery_facts(&paths.events_dir(), &paths.witness_path())
                     .map_err(|error| self.fail_stop(error.into()))?;
-            let units = collect_local_unit_facts(&self.executor, &durable)
+            // No progress sink: this is the runtime pool-return path, where no
+            // start timeout exists to renew. (Its corpus-scale cost is #431's
+            // territory, not #428's.)
+            let units = collect_local_unit_facts(&self.executor, &durable, || {})
                 .await
                 .map_err(|error| self.fail_stop(error.into()))?;
             let facts = RecoveryFacts {

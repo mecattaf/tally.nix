@@ -52,6 +52,29 @@ while `tick_leases` stayed at microseconds.
   100 ms; the unfixed loop fails by minutes), and a `query.job` issued
   mid-storm answers inside the estate's 10 s client deadline.
 
+#### #428 — the unit-facts startup phase renews its budget from inside the loop
+
+`collect_local_unit_facts` probes the executor once per durable event row
+that is not canonically terminal (and every local row unconditionally), so
+the unit-facts phase is O(event corpus) — ~90–95 s at the coordinator's
+~25k rows, exactly astride its single 90 s `EXTEND_TIMEOUT_USEC=` budget,
+which put the 2026-08-06 switch into a restart loop.
+
+- The loop now reports progress once per visited row, and the daemon turns
+  those callbacks into time-throttled `EXTEND_TIMEOUT_USEC=` renewals (every
+  10 s of progress, `STATUS=starting: unit-facts (k/N rows)`), so the 90 s
+  budget bounds progress stalls rather than the phase's total cost: a daemon
+  still visiting rows keeps starting; one wedged on a single probe dies on
+  the same clock. A fast startup sends nothing extra.
+- Tested at both ends and mutation-proved: the loop reports exactly one
+  progress callback per durable event row (skipped canonically-terminal
+  remote rows included, still unprobed), and the renewal datagrams flow
+  through the notify socket from inside the loop — deleting the in-loop
+  callback turns both tests red.
+- The coordinator's interim dotfiles override
+  (`TimeoutStartSec = mkForce "10min"`) becomes revertible once this lands;
+  that revert is the operator's, not this change's.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

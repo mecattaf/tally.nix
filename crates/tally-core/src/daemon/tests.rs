@@ -9315,7 +9315,10 @@ mod tests {
                 format!("EXTEND_TIMEOUT_USEC=90000000\nSTATUS=starting: {phase}"),
             );
         }
-        // Nothing else is sent: the extension is per phase, not per operation.
+        // Nothing else is sent by the timeline: its extension is per phase.
+        // (The unit-facts loop additionally renews on its own time-throttled
+        // cadence while it is visiting rows — #428 — but that is driven by
+        // row progress, not by these phase boundaries.)
         let mut buffer = [0_u8; 256];
         assert!(socket.recv(&mut buffer).is_err());
 
@@ -9330,6 +9333,62 @@ mod tests {
                 "{report} omits {phase}"
             );
         }
+    }
+
+    /// #428: the unit-facts phase renews the start timeout from inside its
+    /// per-row loop, so the 90 s budget bounds progress stalls rather than
+    /// the phase's total O(corpus) cost. The throttle is time-based; driving
+    /// it with a zero interval makes every visited row renew, which is the
+    /// seam that proves the notification actually flows from inside
+    /// `collect_local_unit_facts` — remove the in-loop extension and this
+    /// observes no datagrams.
+    #[tokio::test]
+    async fn unit_facts_progress_renews_the_start_timeout_from_inside_the_loop() {
+        let temp = tempdir().unwrap();
+        let (paths, _) = seed_scale_corpus(temp.path(), 0, 3);
+        let durable = crate::recovery::collect_durable_recovery_facts(
+            &paths.events_dir(),
+            &paths.witness_path(),
+        )
+        .unwrap();
+        let executor = direct_executor(&paths.state_dir)
+            .with_systemd_run(temp.path().join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+
+        let notify_path = temp.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&notify_path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let notifier = SystemdNotifier::with_socket(notify_path, None);
+        let mut extension =
+            startup::UnitFactsExtension::new(notifier, Duration::ZERO, durable.events().len());
+        collect_local_unit_facts(&executor, &durable, || extension.row_visited())
+            .await
+            .unwrap();
+
+        for visited in 1..=3 {
+            let mut buffer = [0_u8; 256];
+            let read = socket.recv(&mut buffer).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&buffer[..read]).unwrap(),
+                format!("EXTEND_TIMEOUT_USEC=90000000\nSTATUS=starting: unit-facts ({visited}/3 rows)"),
+            );
+        }
+        let mut buffer = [0_u8; 256];
+        assert!(
+            socket.recv(&mut buffer).is_err(),
+            "one renewal per visited row, nothing more"
+        );
+    }
+
+    /// The shipped in-loop renewal interval, pinned: a small fraction of the
+    /// phase budget, so a slow-but-moving unit-facts loop renews several
+    /// times per budget and never rides the 90 s deadline.
+    #[test]
+    fn unit_facts_extend_interval_is_a_small_fraction_of_the_phase_budget() {
+        assert_eq!(startup::UNIT_FACTS_EXTEND_INTERVAL, Duration::from_secs(10));
+        assert!(startup::UNIT_FACTS_EXTEND_INTERVAL * 3 < startup::STARTUP_PHASE_BUDGET);
     }
 
     /// The full phase list, pinned through the line `run_loop` actually emits.
