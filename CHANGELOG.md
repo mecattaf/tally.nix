@@ -40,6 +40,37 @@ that was established. That exited 1 and surfaced as a per-user unit failure —
   user-unit half is the one whose failures the fleet watcher reports, and
   `queue drain` there would leave both this absorption and #411's inert.
 
+#### #416 — `TALLY_DATA_DIR`, honoured by the default and exported by both modules
+
+The direct-file verbs resolved an omitted `--data-dir` to the user data
+directory, so `reader-state archive` on a deployment printed an affirmative
+record, exited 0, and wrote a brand-new store in the wrong place — a silent
+no-op with a success message.
+
+- `default_data_dir()` now honours `TALLY_DATA_DIR`, taken verbatim as the
+  directory. Precedence: an explicit `--data-dir` flag at the call site,
+  then `TALLY_DATA_DIR`, then the XDG default (`$XDG_DATA_HOME/tally`, else
+  `~/.local/share/tally`). Unset or empty, local use resolves exactly as
+  before.
+- The variable is taken verbatim, not searched: aimed at something that
+  cannot hold the store, a write verb fails naming that path rather than
+  falling back to the XDG default, because a fallback would restore the
+  silent no-op this closes.
+- Both modules export the variable alongside the data directory they
+  already configure — on their units (daemon, witness-emit, retention) and
+  in the operator's own environment, which is where an omitted `--data-dir`
+  actually resolved to the wrong store: `home.sessionVariables` on Home
+  Manager, `environment.variables` on NixOS, both `mkDefault` so an
+  operator's declaration wins. On a NixOS deployment that store is mode
+  0700 and owned by the service user, so an operator who is not that user
+  is now refused by name instead of quietly writing a store elsewhere.
+- Proven at the seam by subprocess tests for every precedence tier (flag
+  beats variable, variable beats a *set* `XDG_DATA_HOME` and yields to none,
+  empty is unset, HOME fallback unchanged, an unusable value fails loudly,
+  and a read verb follows the variable to a seeded ledger), and at the
+  modules by evaluated assertions that the export exists with the configured
+  path on both units and both login environments.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

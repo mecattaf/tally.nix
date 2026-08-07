@@ -3909,10 +3909,34 @@
           assert builtins.elem
             "TALLY_ATTESTATION_LEDGER=/tmp/tally-stock-home/.local/share/tally/attestations.jsonl"
             homeServices."tally-witness-emit@".Service.Environment;
+          # #416: the module exports the data directory it configures beside,
+          # so a direct-file verb resolving its default through TALLY_DATA_DIR
+          # aims at the deployment's store.
+          assert builtins.elem "TALLY_DATA_DIR=/tmp/tally-stock-home/.local/share/tally"
+            homeServices.tally-daemon.Service.Environment;
+          assert builtins.elem "TALLY_DATA_DIR=/tmp/tally-stock-home/.local/share/tally"
+            homeServices."tally-witness-emit@".Service.Environment;
+          assert builtins.elem "TALLY_DATA_DIR=/tmp/tally-stock-home/.local/share/tally"
+            homeServices.tally-retention.Service.Environment;
+          # And, on the Home Manager module, into the operator's own session
+          # too: this module's direct-file verbs run from the operator's
+          # shell, and the units' environments never reach it.
+          assert
+            stockHome.config.home.sessionVariables.TALLY_DATA_DIR == "/tmp/tally-stock-home/.local/share/tally";
           assert builtins.elem tallyWitnessEmit stockHome.config.home.packages;
           assert builtins.elem tallyWitnessEmit stockNixos.config.environment.systemPackages;
           assert builtins.elem "TALLY_ATTESTATION_LEDGER=/var/lib/tally/data/attestations.jsonl"
             systemWitnessEmitter.serviceConfig.Environment;
+          assert builtins.elem "TALLY_DATA_DIR=/var/lib/tally/data" systemDaemon.serviceConfig.Environment;
+          assert builtins.elem "TALLY_DATA_DIR=/var/lib/tally/data"
+            systemWitnessEmitter.serviceConfig.Environment;
+          assert builtins.elem "TALLY_DATA_DIR=/var/lib/tally/data"
+            systemServices.tally-retention.serviceConfig.Environment;
+          # And into the login environment, the same reason as the Home
+          # Manager module's session export: the units are handed
+          # `--data-dir` anyway, and the operator's own shell is where an
+          # omitted one used to resolve to the wrong store.
+          assert stockNixos.config.environment.variables.TALLY_DATA_DIR == "/var/lib/tally/data";
           assert stockNixos.config.services.tally.user == "tally";
           assert stockNixos.config.services.tally.group == "tally";
           assert stockNixos.config.users.users.tally.isSystemUser;

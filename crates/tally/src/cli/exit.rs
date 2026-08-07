@@ -162,11 +162,24 @@ pub(super) fn default_state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/tally"))
 }
 
+/// The default data directory for the direct-file verbs (#416).
+///
+/// Precedence: an explicit `--data-dir` flag wins at every call site (each
+/// resolves the flag first and only falls back here), then `TALLY_DATA_DIR`
+/// taken verbatim as the directory itself, then the XDG default
+/// (`$XDG_DATA_HOME/tally`, else `~/.local/share/tally`). The variable is
+/// what a deployment exports so the whole verb family — reader-state,
+/// `witness verify`, and the rest — aims at the deployment's store by
+/// default; unset or empty, local use keeps resolving exactly as before.
 pub(super) fn default_data_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("TALLY_DATA_DIR").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
     if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(path).join("tally"));
     }
-    let home = std::env::var_os("HOME").context("HOME and XDG_DATA_HOME are both unset")?;
+    let home = std::env::var_os("HOME")
+        .context("TALLY_DATA_DIR is unset or empty and HOME and XDG_DATA_HOME are both unset")?;
     Ok(PathBuf::from(home).join(".local/share/tally"))
 }
 

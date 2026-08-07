@@ -26,6 +26,24 @@ The default config is `$XDG_CONFIG_HOME/tally/config.json`, falling back to
 `--socket`, `TALLY_SOCKET`, `$XDG_RUNTIME_DIR/tally/tally.sock`, then the temporary directory's
 `tally/tally.sock`.
 
+Every verb that resolves an omitted `--data-dir` — the direct-file family (`reader-state`,
+`witness verify` and `witness compare`, `gc`, `history compact`, and the producer diagnostics)
+and `daemon run` — takes it from `TALLY_DATA_DIR`, verbatim as the directory, before the XDG
+default `$XDG_DATA_HOME/tally`, else `~/.local/share/tally`. An explicit `--data-dir` flag wins
+over the variable; both modules pass that flag to every unit they render, so the variable never
+changes what a deployment's own units read. With the variable unset or empty, resolution is
+exactly what it was before it existed. It is taken verbatim, not searched: if it names something
+that cannot hold the store, the verb fails naming that path rather than falling back to the XDG
+default.
+
+Both modules export `TALLY_DATA_DIR` alongside the data directory they configure — on their
+units, and on the operator's environment (`home.sessionVariables` on Home Manager,
+`environment.variables` on NixOS, both `mkDefault`), because the operator's shell is where an
+omitted `--data-dir` used to resolve to a different store than the daemon's. On a NixOS
+deployment that store is mode 0700 and owned by the service user, so an operator who is not
+that user is now refused by name instead of quietly writing a new store elsewhere; run the verb
+as the service user to change the deployment's own state.
+
 One-shot RPC commands have a 60-second client deadline. Override it with
 `--rpc-timeout-sec SECONDS` or `TALLY_RPC_TIMEOUT_SEC`; the flag takes precedence. Both values
 must be positive whole seconds. Long-polling `queue.await_job` and `query.watch` calls are not
