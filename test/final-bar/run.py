@@ -147,8 +147,7 @@ def main() -> int:
     )
     exit_code = 2 if summary["ERROR"] else (1 if summary["FAIL"] else 0)
     if temporary:
-        # The complete report has already been emitted in the per-case stream;
-        # preserve caller-selected artifacts, clean automatic scratch.
+        print("final-bar: report-json=" + json.dumps(report, sort_keys=True))
         shutil.rmtree(work, ignore_errors=True)
     return exit_code
 
