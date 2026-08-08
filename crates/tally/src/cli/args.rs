@@ -269,6 +269,9 @@ pub(super) struct CampaignPollArgs {
     /// Wait for each newly admitted reconcile pass to become terminal.
     #[arg(long)]
     pub(super) wait: bool,
+    /// Compatibility input for continuation events emitted by older binaries.
+    #[arg(long, value_name = "TOKEN", hide = true)]
+    pub(super) continuation_token: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }

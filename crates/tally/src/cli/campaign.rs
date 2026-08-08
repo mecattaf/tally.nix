@@ -899,20 +899,102 @@ fn forge_state_value(graph: &CampaignGraph) -> Value {
     })
 }
 
-/// The half of the observation that the poll's two REST reads already paid for.
+fn campaign_state_ref_prefix(campaign: &str, issue_number: u64) -> String {
+    let scope = format!("{campaign}\0{issue_number}");
+    let digest = format!("{:x}", Sha256::digest(scope.as_bytes()));
+    format!("refs/tally/spec-build/v1/{}", &digest[..24])
+}
+
+/// Durable Git state that can advance without touching an issue or comment.
 ///
-/// Every surface the expensive GraphQL walk reads hangs off one of these
-/// items: a comment posted or edited on the master or on a task sub-issue, a
-/// sub-issue closing behind a merged pull request, an edit to the master body.
-/// Each of those moves that item's `updated_at` or `state`, so an unchanged
-/// digest here means the walk would return what it returned last time. It is
-/// therefore a sound precondition for skipping the walk — and skipping it is
-/// what makes a short poll interval genuinely cheap, which is what the
-/// interval's own documentation has always claimed.
-fn forge_observation(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
+/// The driver treats the remote base plus its campaign-scoped hidden refs as
+/// the source of truth for local merges, checkpoints, and continuation
+/// receipts. Public polls must read the same facts: otherwise a completed
+/// local pass is indistinguishable from an idle campaign when the forge issue
+/// itself did not move.
+fn repository_progress_value(graph: &CampaignGraph) -> Result<Value> {
+    let repository = &graph.canonical.manifest.repository;
+    let base_ref = format!("refs/heads/{}", repository.base_branch);
+    let state_prefix =
+        campaign_state_ref_prefix(&graph.canonical.manifest.name, graph.locator.number);
+    let state_pattern = format!("{state_prefix}/*");
+    let listed = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&repository.checkout)
+        .args([
+            "ls-remote",
+            "--refs",
+            repository.remote.as_str(),
+            base_ref.as_str(),
+            state_pattern.as_str(),
+        ])
+        .output()
+        .context("cannot query durable campaign repository state")?;
+    if !listed.status.success() {
+        bail!(
+            "cannot query durable campaign repository state: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        );
+    }
+    let stdout =
+        String::from_utf8(listed.stdout).context("git ls-remote output was not valid UTF-8")?;
+    let mut base = None;
+    let mut campaign_refs = BTreeMap::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let (target, name) = line
+            .split_once('\t')
+            .ok_or_else(|| invalid("campaign repository state contained a malformed ref"))?;
+        if !((40..=64).contains(&target.len())
+            && target.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(invalid(format!(
+                "campaign repository ref {name} returned a malformed object ID"
+            )));
+        }
+        if name == base_ref {
+            if base.replace(target.to_owned()).is_some() {
+                bail!("campaign repository returned the base ref more than once");
+            }
+        } else if name
+            .strip_prefix(&state_prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+            && campaign_refs
+                .insert(name.to_owned(), target.to_owned())
+                .is_some()
+        {
+            bail!("campaign repository returned state ref {name} more than once");
+        }
+    }
+    let base = base.ok_or_else(|| {
+        invalid(format!(
+            "campaign repository remote has no base ref {base_ref}"
+        ))
+    })?;
+    Ok(json!({
+        "base": {
+            "ref": base_ref,
+            "target": base,
+        },
+        "campaignRefs": campaign_refs,
+    }))
+}
+
+/// The cheap external-state half of the full campaign observation.
+///
+/// The two REST reads cover every forge surface the expensive GraphQL steering
+/// walk can reveal through issue `updated_at` or `state`. The one bounded
+/// `ls-remote` covers driver progress that moves only Git. If both are stable,
+/// the full observation is stable and the poll can skip the walk; if either
+/// moves, the full revision and enqueue identity include the same change.
+fn forge_observation(
+    graph: &CampaignGraph,
+    repository_progress: &Value,
+    arm_serial: u64,
+) -> Result<String> {
     sha256_json(&json!({
         "graph": graph.canonical.executable_digest,
         "forgeState": forge_state_value(graph),
+        "repositoryProgress": repository_progress,
         "armSerial": arm_serial,
     }))
 }
@@ -920,11 +1002,13 @@ fn forge_observation(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
 fn campaign_observation(
     graph: &CampaignGraph,
     steering: &CampaignSteering,
+    repository_progress: &Value,
     arm_serial: u64,
 ) -> Result<String> {
     sha256_json(&json!({
         "graph": graph.canonical.executable_digest,
         "forgeState": forge_state_value(graph),
+        "repositoryProgress": repository_progress,
         "steering": steering.master,
         // A comment on one task's sub-issue thread must nudge the campaign
         // exactly like a comment on the master does.
@@ -1215,42 +1299,6 @@ fn validated_projection_wait_ms(value: Option<u64>) -> Result<Option<u64>> {
     Ok(value)
 }
 
-/// Argv of the `tally flow run` this campaign dispatches for one pass.
-///
-/// Split out of `dispatch_campaign` for the same reason `continuation_argv` is:
-/// it is the only place a durable registration turns into something the pass
-/// actually executes, and an argv nothing constructs in a test is an argv
-/// nothing notices the loss of (#432).
-///
-/// `projection_wait_ms` is the seam that carries `campaign arm
-/// --projection-wait-ms` to the pass. It travels on the argv rather than in the
-/// environment because the pass runs as a daemon-launched transient unit whose
-/// environment is an explicit `--setenv` list, so nothing an operator exports at
-/// arm time is visible to it. `None` must leave the argv byte-identical to the
-/// pre-#432 shape: this vector is hashed into the enqueue payload, so a stray
-/// element would move every existing campaign's payload identity.
-fn dispatch_flow_argv(
-    executable: &Path,
-    flow: &Path,
-    max_nodes: u32,
-    projection_wait_ms: Option<u64>,
-) -> Vec<String> {
-    let mut argv = vec![
-        executable.display().to_string(),
-        "flow".to_owned(),
-        "run".to_owned(),
-        flow.display().to_string(),
-        "--args-from-brief".to_owned(),
-        "--max-nodes".to_owned(),
-        max_nodes.to_string(),
-    ];
-    if let Some(millis) = projection_wait_ms {
-        argv.push("--result-projection-wait-ms".to_owned());
-        argv.push(millis.to_string());
-    }
-    argv
-}
-
 /// Argv the pass writes into the events directory to admit its own successor.
 ///
 /// It is the poll the timer already runs: one registry scan that refetches the
@@ -1269,15 +1317,61 @@ struct CampaignHost<'a> {
 }
 
 impl CampaignHost<'_> {
-    fn continuation_argv(&self, executable: &Path) -> Vec<String> {
+    /// The one global CLI prefix inherited by every campaign child.
+    ///
+    /// Global flags have to precede `flow`/`campaign` for clap to parse the
+    /// child exactly like the host that admitted it. In particular, a NixOS
+    /// host keeps its only configuration at `/etc/tally/config.json`; allowing
+    /// the initial flow to fall back to the service account's XDG home made it
+    /// disagree with both the daemon and the continuation poll (#442).
+    fn tally_argv_prefix(&self, executable: &Path) -> Vec<String> {
         let mut argv = vec![executable.display().to_string()];
         if let Some(config) = self.config_path {
             argv.push("--config".to_owned());
             argv.push(config.display().to_string());
         }
+        argv.push("--socket".to_owned());
+        argv.push(self.socket.display().to_string());
+        argv
+    }
+
+    /// Argv of the `tally flow run` this campaign dispatches for one pass.
+    ///
+    /// This is the only place a durable registration turns into something the
+    /// pass actually executes, and an argv nothing constructs in a test is an
+    /// argv nothing notices the loss of (#432). `projection_wait_ms` travels on
+    /// the argv rather than in the environment because the pass runs as a
+    /// daemon-launched transient unit whose environment is an explicit
+    /// `--setenv` list, so nothing an operator exports at arm time is visible to
+    /// it. `None` adds no projection-wait elements: this vector is hashed into
+    /// the enqueue payload, so an unconditional flag would move every existing
+    /// campaign's payload identity.
+    fn dispatch_flow_argv(
+        &self,
+        executable: &Path,
+        flow: &Path,
+        max_nodes: u32,
+        projection_wait_ms: Option<u64>,
+    ) -> Vec<String> {
+        let mut argv = self.tally_argv_prefix(executable);
         argv.extend([
-            "--socket".to_owned(),
-            self.socket.display().to_string(),
+            "flow".to_owned(),
+            "run".to_owned(),
+            flow.display().to_string(),
+            "--args-from-brief".to_owned(),
+            "--max-nodes".to_owned(),
+            max_nodes.to_string(),
+        ]);
+        if let Some(millis) = projection_wait_ms {
+            argv.push("--result-projection-wait-ms".to_owned());
+            argv.push(millis.to_string());
+        }
+        argv
+    }
+
+    fn continuation_argv(&self, executable: &Path) -> Vec<String> {
+        let mut argv = self.tally_argv_prefix(executable);
+        argv.extend([
             "campaign".to_owned(),
             "poll".to_owned(),
             "--once".to_owned(),
@@ -1296,6 +1390,7 @@ async fn dispatch_campaign(
     host: CampaignHost<'_>,
     graph: &CampaignGraph,
     steering: &CampaignSteering,
+    repository_progress: &Value,
     registration: &mut CampaignRegistration,
     wait: bool,
 ) -> Result<Value> {
@@ -1321,7 +1416,12 @@ async fn dispatch_campaign(
         &registration.driver,
         registration.allow_test_local_forge,
     )?;
-    let revision = campaign_observation(graph, steering, registration.arm_serial)?;
+    let revision = campaign_observation(
+        graph,
+        steering,
+        repository_progress,
+        registration.arm_serial,
+    )?;
     let executable = std::env::current_exe().context("cannot resolve tally executable")?;
     let brief = json!({
         "campaignIdentity": &registration.registration_id,
@@ -1364,7 +1464,7 @@ async fn dispatch_campaign(
     });
     let payload = EnqueuePayload {
         invocation: None,
-        argv: Some(dispatch_flow_argv(
+        argv: Some(host.dispatch_flow_argv(
             &executable,
             &registration.flow,
             max_flow_nodes(manifest),
@@ -1517,6 +1617,7 @@ async fn run_campaign_arm(
         );
         return Ok(());
     }
+    let repository_progress = repository_progress_value(&graph)?;
     let result = dispatch_campaign(
         CampaignHost {
             socket,
@@ -1526,6 +1627,7 @@ async fn run_campaign_arm(
         },
         &graph,
         &steering,
+        &repository_progress,
         &mut registration,
         args.wait,
     )
@@ -1556,6 +1658,10 @@ async fn run_campaign_poll(
     if !args.once {
         return Err(invalid("campaign poll currently requires --once"));
     }
+    // Events written by the previous release may still carry this hidden
+    // argument. Accept it during the rollback window, but derive progress from
+    // the same durable repository state as every public poll.
+    let _legacy_continuation_token = args.continuation_token.as_deref();
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
     let entries = registry.registrations()?;
@@ -1582,12 +1688,13 @@ async fn run_campaign_poll(
                     graph.canonical.executable_digest
                 );
             }
+            let repository_progress = repository_progress_value(&graph)?;
             // The cheap comparison comes first. Reading the steering surfaces
             // runs the full bounded GraphQL walk over every sub-issue thread,
             // and running it before deciding whether anything moved made every
             // tick of a 60 s timer pay for a traversal that almost always
             // returned what the previous tick returned.
-            let forge = forge_observation(&graph, registration.arm_serial)?;
+            let forge = forge_observation(&graph, &repository_progress, registration.arm_serial)?;
             if registration.last_forge_observation.as_deref() == Some(&forge) {
                 return Ok((false, false));
             }
@@ -1596,7 +1703,12 @@ async fn run_campaign_poll(
                 &registration.allowed_actors,
                 registration.sub_issue_walk,
             )?;
-            let observation = campaign_observation(&graph, &steering, registration.arm_serial)?;
+            let observation = campaign_observation(
+                &graph,
+                &steering,
+                &repository_progress,
+                registration.arm_serial,
+            )?;
             if registration.last_observation.as_deref() == Some(&observation) {
                 registration.last_forge_observation = Some(forge);
                 registry.write(&mut registration)?;
@@ -1612,6 +1724,7 @@ async fn run_campaign_poll(
                 },
                 &graph,
                 &steering,
+                &repository_progress,
                 &mut registration,
                 args.wait,
             )
@@ -2441,13 +2554,9 @@ fn checkpoint_reference_prefix(
         .strip_prefix("sha256:")
         .filter(|value| value.len() == 64)
         .ok_or_else(|| invalid("checkpoint source is not a SHA-256 identity"))?;
-    let scope = format!(
-        "{:x}",
-        Sha256::digest(format!("{campaign}\0{issue_number}").as_bytes())
-    );
     Ok(format!(
-        "refs/tally/spec-build/v1/{}/checkpoint/{task_id}-{digest}",
-        &scope[..24],
+        "{}/checkpoint/{task_id}-{digest}",
+        campaign_state_ref_prefix(campaign, issue_number),
     ))
 }
 
@@ -3363,9 +3472,10 @@ mod tests {
             master: Vec::new(),
             tasks: BTreeMap::from([("43".to_owned(), vec![json!({"body": "rerun it"})])]),
         };
+        let repository_progress = json!({"base": "a"});
         assert_ne!(
-            campaign_observation(&graph, &quiet, 1).unwrap(),
-            campaign_observation(&graph, &steered, 1).unwrap()
+            campaign_observation(&graph, &quiet, &repository_progress, 1).unwrap(),
+            campaign_observation(&graph, &steered, &repository_progress, 1).unwrap()
         );
     }
 
@@ -3375,29 +3485,120 @@ mod tests {
     fn the_cheap_poll_precondition_moves_with_every_surface_the_walk_reads() {
         let base = graph_for_forge_observation();
         let unchanged = graph_for_forge_observation();
+        let repository_progress = json!({"base": "a", "campaignRefs": {}});
         assert_eq!(
-            forge_observation(&base, 1).unwrap(),
-            forge_observation(&unchanged, 1).unwrap()
+            forge_observation(&base, &repository_progress, 1).unwrap(),
+            forge_observation(&unchanged, &repository_progress, 1).unwrap()
         );
-        let quiet = forge_observation(&base, 1).unwrap();
+        let quiet = forge_observation(&base, &repository_progress, 1).unwrap();
 
         // A comment on the master thread bumps the master's updated_at.
         let mut master_touched = graph_for_forge_observation();
         master_touched.master.updated_at = "2026-08-01T11:00:00Z".to_owned();
-        assert_ne!(forge_observation(&master_touched, 1).unwrap(), quiet);
+        assert_ne!(
+            forge_observation(&master_touched, &repository_progress, 1).unwrap(),
+            quiet
+        );
 
         // A comment on a task's own sub-issue bumps that sub-issue's.
         let mut task_touched = graph_for_forge_observation();
         task_touched.tasks[0].updated_at = "2026-08-01T11:00:00Z".to_owned();
-        assert_ne!(forge_observation(&task_touched, 1).unwrap(), quiet);
+        assert_ne!(
+            forge_observation(&task_touched, &repository_progress, 1).unwrap(),
+            quiet
+        );
 
         // A merged pull request closing a sub-issue changes its state.
         let mut task_closed = graph_for_forge_observation();
         task_closed.tasks[0].state = "closed".to_owned();
-        assert_ne!(forge_observation(&task_closed, 1).unwrap(), quiet);
+        assert_ne!(
+            forge_observation(&task_closed, &repository_progress, 1).unwrap(),
+            quiet
+        );
+
+        // A local merge or checkpoint moves durable Git state even when every
+        // issue and comment remains byte-for-byte unchanged.
+        let advanced_repository = json!({"base": "b", "campaignRefs": {}});
+        assert_ne!(
+            forge_observation(&base, &advanced_repository, 1).unwrap(),
+            quiet
+        );
 
         // Re-arming always dispatches, so it must invalidate the precondition.
-        assert_ne!(forge_observation(&base, 2).unwrap(), quiet);
+        assert_ne!(
+            forge_observation(&base, &repository_progress, 2).unwrap(),
+            quiet
+        );
+    }
+
+    #[test]
+    fn repository_progress_tracks_the_driver_base_and_scoped_refs() {
+        assert_eq!(
+            campaign_state_ref_prefix("final-bar", 7),
+            "refs/tally/spec-build/v1/049836c3e38c7ecc9c638e9c"
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        let remote = temporary.path().join("remote.git");
+        fs::create_dir(&checkout).unwrap();
+        let bare = ProcessCommand::new("git")
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        assert!(bare.success());
+        let git = |arguments: &[&str]| -> String {
+            let output = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                arguments,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "Campaign Test"]);
+        git(&["config", "user.email", "campaign@example.invalid"]);
+        fs::write(checkout.join("README.md"), "base\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "--quiet", "--set-upstream", "origin", "main"]);
+
+        let mut graph = graph_for_forge_observation();
+        graph.canonical.manifest.repository.checkout = checkout.clone();
+        graph.canonical.manifest.repository.forge = "local".to_owned();
+        let initial = repository_progress_value(&graph).unwrap();
+
+        fs::write(checkout.join("README.md"), "base\nmerged\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "merge"]);
+        git(&["push", "--quiet", "origin", "main"]);
+        let merged = repository_progress_value(&graph).unwrap();
+        assert_ne!(merged, initial, "a local base merge must wake a plain poll");
+
+        fs::write(checkout.join("checkpoint.json"), "{}\n").unwrap();
+        let object = git(&["hash-object", "-w", "checkpoint.json"])
+            .trim()
+            .to_owned();
+        let reference = format!(
+            "{}/checkpoint/gate",
+            campaign_state_ref_prefix(&graph.canonical.manifest.name, graph.locator.number,)
+        );
+        let refspec = format!("{object}:{reference}");
+        git(&["push", "--quiet", "origin", &refspec]);
+        let checkpointed = repository_progress_value(&graph).unwrap();
+        assert_ne!(
+            checkpointed, merged,
+            "a campaign-scoped checkpoint must wake a plain poll"
+        );
     }
 
     fn graph_for_forge_observation() -> CampaignGraph {
@@ -3629,9 +3830,40 @@ mod tests {
             state_dir: Path::new("/home/operator/.local/state/tally"),
             rpc_timeout: Duration::from_secs(30),
         };
-        // Byte-for-byte the invocation tally-campaign-poll.service runs, so a
-        // continuation event and a timer firing produce the same observation
-        // revision and therefore the same dispatch dedup key.
+        assert_eq!(
+            host.tally_argv_prefix(Path::new("/nix/store/tally/bin/tally")),
+            vec![
+                "/nix/store/tally/bin/tally",
+                "--config",
+                "/home/operator/.config/tally/config.json",
+                "--socket",
+                "/run/user/1000/tally/tally.sock",
+            ]
+        );
+        assert_eq!(
+            host.dispatch_flow_argv(
+                Path::new("/nix/store/tally/bin/tally"),
+                Path::new("/nix/store/spec-build.js"),
+                16,
+                None,
+            ),
+            vec![
+                "/nix/store/tally/bin/tally",
+                "--config",
+                "/home/operator/.config/tally/config.json",
+                "--socket",
+                "/run/user/1000/tally/tally.sock",
+                "flow",
+                "run",
+                "/nix/store/spec-build.js",
+                "--args-from-brief",
+                "--max-nodes",
+                "16",
+            ]
+        );
+        // Byte-for-byte the public poll an operator or timer runs. Durable Git
+        // progress, not a private argument, gives the successor a fresh
+        // observation and enqueue identity.
         assert_eq!(
             host.continuation_argv(Path::new("/nix/store/tally/bin/tally")),
             vec![
@@ -3656,8 +3888,27 @@ mod tests {
             ..host
         };
         assert_eq!(
-            without_config.continuation_argv(Path::new("/nix/store/tally/bin/tally"))[1],
-            "--socket"
+            without_config.tally_argv_prefix(Path::new("/nix/store/tally/bin/tally")),
+            vec![
+                "/nix/store/tally/bin/tally",
+                "--socket",
+                "/run/user/1000/tally/tally.sock",
+            ],
+            "an omitted config locator must not synthesize an XDG path or a \
+             --config flag"
+        );
+        assert_eq!(
+            without_config.continuation_argv(Path::new("/nix/store/tally/bin/tally")),
+            vec![
+                "/nix/store/tally/bin/tally",
+                "--socket",
+                "/run/user/1000/tally/tally.sock",
+                "campaign",
+                "poll",
+                "--once",
+                "--state-dir",
+                "/home/operator/.local/state/tally",
+            ]
         );
     }
 
@@ -4718,30 +4969,40 @@ print(json.dumps({
     ///
     /// Recording `--projection-wait-ms` in the registration is worth nothing on
     /// its own: what the operator is promised is that every pass this campaign
-    /// dispatches waits that long. `dispatch_flow_argv` is the only place that
-    /// promise is kept, so it is asserted here directly — a registration
-    /// carrying `Some(n)` must put `--result-projection-wait-ms n` on the
-    /// dispatched pass's argv, spelled exactly as `FlowRunArgs` parses it.
+    /// dispatches waits that long. `CampaignHost::dispatch_flow_argv` is the
+    /// only place that promise is kept, so it is asserted here directly — a
+    /// registration carrying `Some(n)` must put
+    /// `--result-projection-wait-ms n` on the dispatched pass's argv, spelled
+    /// exactly as `FlowRunArgs` parses it.
     ///
     /// The `None` half is not decoration. This argv is hashed into the enqueue
     /// payload, so a stray element would move the payload identity of every
-    /// campaign armed without the flag; it is asserted element-by-element
-    /// against the literal pre-#432 shape.
+    /// campaign armed without the flag; it is asserted element-by-element.
     ///
-    /// Deleting the `--result-projection-wait-ms` push from `dispatch_flow_argv`
-    /// makes this test red — that mutation used to leave the whole crate green.
+    /// Deleting the `--result-projection-wait-ms` push from the host's dispatch
+    /// argv makes this test red — that mutation used to leave the whole crate
+    /// green.
     #[test]
     fn a_recorded_projection_wait_reaches_the_dispatched_pass_argv() {
         let executable = Path::new("/nix/store/tally/bin/tally");
         let flow = Path::new("/nix/store/spec-build.js");
+        let host = CampaignHost {
+            socket: Path::new("/run/user/1000/tally/tally.sock"),
+            config_path: None,
+            state_dir: Path::new("/home/operator/.local/state/tally"),
+            rpc_timeout: Duration::from_secs(30),
+        };
 
-        // The pre-#432 shape, byte for byte. A campaign armed without the flag
-        // must dispatch exactly this.
-        let unset = dispatch_flow_argv(executable, flow, 51, None);
+        // No projection-wait flag means no projection-wait elements. A host
+        // without an explicit config likewise emits no --config pair, while
+        // the socket locator still precedes the flow subcommand.
+        let unset = host.dispatch_flow_argv(executable, flow, 51, None);
         assert_eq!(
             unset,
             vec![
                 "/nix/store/tally/bin/tally".to_owned(),
+                "--socket".to_owned(),
+                "/run/user/1000/tally/tally.sock".to_owned(),
                 "flow".to_owned(),
                 "run".to_owned(),
                 "/nix/store/spec-build.js".to_owned(),
@@ -4750,12 +5011,12 @@ print(json.dumps({
                 "51".to_owned(),
             ],
             "a campaign armed without --projection-wait-ms must dispatch the \
-             pre-#432 argv byte-identically; this vector is hashed into the \
-             enqueue payload"
+             same argv without projection-wait elements; this vector is hashed \
+             into the enqueue payload"
         );
 
         // The recorded wait, delivered.
-        let widened = dispatch_flow_argv(executable, flow, 51, Some(240_000));
+        let widened = host.dispatch_flow_argv(executable, flow, 51, Some(240_000));
         assert_eq!(
             widened,
             [

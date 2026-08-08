@@ -15,6 +15,32 @@ fn rpc_timeout_flag_is_global() {
 }
 
 #[test]
+fn legacy_campaign_continuation_token_remains_parseable() {
+    let options = Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "poll",
+        "--once",
+        "--continuation-token",
+        "sha256:legacy",
+        "--state-dir",
+        "/var/lib/tally/state",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Campaign {
+            command: CampaignCommand::Poll(CampaignPollArgs {
+                once: true,
+                continuation_token: Some(token),
+                state_dir: Some(state_dir),
+                ..
+            })
+        }) if token == "sha256:legacy" && state_dir == Path::new("/var/lib/tally/state")
+    ));
+}
+
+#[test]
 fn flow_run_jobs_lookup_conflicts_with_broad_archive_controls() {
     let flow_run = "00000000-0000-4000-8000-000000000415";
     assert!(Opts::try_parse_from(["tally", "query", "jobs", "--flow-run", flow_run]).is_ok());

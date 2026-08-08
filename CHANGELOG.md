@@ -6,6 +6,32 @@ authorized.
 
 ## [Unreleased]
 
+### Campaign child host locators (#442)
+
+- Forge-native initial flow runners and continuation polls now extend one
+  `CampaignHost` argv prefix containing the exact optional config locator and
+  required socket locator, with both global flags before the subcommand.
+- NixOS campaigns therefore keep using `/etc/tally/config.json` inside both
+  daemon-launched children instead of letting the initial `flow run` fall back
+  to a nonexistent or unrelated config in the service account's XDG home.
+- Campaign poll observations now include the remote base and the driver's
+  campaign-scoped state refs. A plain public poll therefore admits a fresh
+  successor after a local merge or checkpoint even when the forge is unchanged,
+  allowing the terminal digest and issue close to converge without depending
+  on the daemon's continuation event.
+- Campaign checkbox repairs now pass `gh issue edit --body-file` a private
+  temporary file instead of the stdin sentinel `-`, so recorded forge adapters
+  and the real GitHub CLI execute the same terminal mutation grammar.
+- Forge-native completion summaries now follow the GitHub campaign thread even
+  when `--allow-test-local-forge` selects local Git state for code merges, so
+  closeout posts one digest-bound comment before closing the master issue. Its
+  idempotence lookup uses the same paginated JSON grammar as every other issue
+  comment read, keeping record/replay forge adapters on one invocation surface.
+- The system-socket VM now runs an initial and continued fake-forge campaign
+  against a sentinel pool, a 20 MiB frame bound, and a real-file-only forge
+  recorder, then mutation-replays both real argvs without their `--config` pair
+  and requires failure before a flow node is admitted.
+
 ### Preserved conflict-domain states (#439)
 
 - Project conversion, canonical Rust admission, the packaged driver, and both

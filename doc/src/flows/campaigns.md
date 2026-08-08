@@ -353,9 +353,14 @@ is a mechanism-test mode and has no autonomous continuation contract.
 
 Merge/checkpoint projection changes and allowed steering comments advance the
 observation revision, so the poller submits a fresh pass behind the capacity-one
-campaign mutex. When every task has durable proof, reconcile repairs all boxes,
-closes task issues, posts one digest-bound closing summary, and closes the
-master. The next poll prunes that registration.
+campaign mutex. Both the cheap poll precondition and the full revision include
+the remote base plus the driver's campaign-scoped state refs. A plain
+`campaign poll --once` therefore sees a completed local merge or checkpoint and
+admits its successor even when every forge timestamp is unchanged; the
+flow-authored continuation merely schedules that same public scan. When every
+task has durable proof, reconcile repairs all boxes, closes task issues, posts
+one digest-bound closing summary, and closes the master. The next poll prunes
+that registration.
 
 A campaign has two terminal outcomes and both render the same closing summary:
 completion, and escalation at frontier quiescence. The summary is markdown
@@ -367,9 +372,12 @@ projection of facts the pass already witnessed; the digest is not a state
 store. On completion the summary is the campaign's single
 `tally:campaign-complete:v1` comment. A forge-native campaign posts it and then
 closes its task sub-issues and its master issue, so the digest is the last thing
-a reader of the closed issue sees. A file-worklist campaign posts the same
-comment and stops: its master issue is a projection whose lifecycle tally has
-never owned, so it stays open for whoever does. At quiescence the summary is
+a reader of the closed issue sees. That campaign thread remains GitHub-owned
+when `--allow-test-local-forge` selects local Git state for code merges; the
+merge backend never redirects the terminal comment into a local state ref. A
+file-worklist campaign posts the same comment and stops: its master issue is a
+projection whose lifecycle tally has never owned, so it stays open for whoever
+does. At quiescence the summary is
 published *before* the escalation, because the escalation is what every later
 pass reads back to decide the campaign has already stopped — publishing it
 second would mean one transient failure lost the digest for good, with no later
@@ -378,9 +386,11 @@ pass willing to retry.
 Neither summary is ever an upsert — a summary the operator is not notified
 about is not a summary — and both are idempotent: a repeated terminal pass
 finds its own marker and stays quiet. Both render inside nodes the campaign
-already had, so neither adds a flow node. On a local forge the summary is a
-durable blob at `refs/tally/spec-build/v1/<scope>/summary/<outcome>`. Operators can remove an open registration
-without changing forge state with `tally campaign disarm ISSUE-URL`; registry
+already had, so neither adds a flow node. For a non-native campaign whose issue
+coordinate uses the local forge, the summary is a durable blob at
+`refs/tally/spec-build/v1/<scope>/summary/<outcome>`. Operators can remove an
+open registration without changing forge state with
+`tally campaign disarm ISSUE-URL`; registry
 read/modify/write and asset ownership operations are file-locked against timer
 and re-arm races. Disarm removes that registration's sidecar, snapshots, and
 both indirect roots after removing its authority record.
@@ -528,6 +538,16 @@ wrote the issues; here it is the bot, so the human who filed them has to be name
     --config /etc/tally/config.json --socket /run/tally/tally.sock \
     campaign list --state-dir /var/lib/tally/state
 ```
+
+Those two global locators become the prefix of every child the campaign host
+creates, not just the interactive arm: both the initial `tally flow run` and
+the machine continuation start with
+`tally --config /etc/tally/config.json --socket /run/tally/tally.sock ...`.
+The flags remain before the `flow` or `campaign` subcommand. This matters on a
+system host because `/etc/tally/config.json` is the only rendered tally config;
+the service account's XDG home intentionally carries forge identity, not a
+second config copy. A manually started host that did not select `--config`
+continues to omit the pair rather than serializing a guessed XDG path.
 
 The alternative is to have the bot author the issue graph in the first place, by
 running `campaign project` under the same `runuser`; then the default allowlist

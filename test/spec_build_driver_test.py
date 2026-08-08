@@ -304,11 +304,15 @@ class FakeGitHub:
                         ]))
                     elif "/comments" in endpoint:
                         number = endpoint.split("/issues/", 1)[1].split("/", 1)[0]
-                        if "--slurp" in args:
-                            print(json.dumps([thread(number)]))
-                        else:
-                            for comment in thread(number):
-                                print(comment.get("body", ""))
+                        expected = ["api", "--paginate", "--slurp", endpoint]
+                        if args != expected:
+                            print(
+                                f"fake gh requires recorded comment-list grammar, got {args!r}",
+                                file=sys.stderr,
+                            )
+                            state_path.write_text(json.dumps(state), encoding="utf-8")
+                            raise SystemExit(96)
+                        print(json.dumps([thread(number)]))
                     elif "/issues/" in endpoint:
                         number = endpoint.rsplit("/issues/", 1)[1]
                         if number == "7":
@@ -349,7 +353,22 @@ class FakeGitHub:
                     })
                     print(url)
                 elif args[:2] == ["issue", "edit"]:
-                    body = sys.stdin.read()
+                    if "--body-file" not in args:
+                        print("fake gh requires --body-file for issue edits", file=sys.stderr)
+                        raise SystemExit(94)
+                    argument = args[args.index("--body-file") + 1]
+                    body_file = Path(argument)
+                    if argument == "-" or not body_file.is_file():
+                        print(
+                            f"fake gh requires a real --body-file path, got {argument!r}",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(95)
+                    body = body_file.read_text(encoding="utf-8")
+                    state.setdefault("bodyFiles", []).append({
+                        "argument": argument,
+                        "body": body,
+                    })
                     state.setdefault("master", {})["body"] = body
                     print("https://github.com/acme/spec/issues/7")
                 elif args[:2] == ["issue", "close"]:
@@ -1064,7 +1083,7 @@ class GitHubForgeTests(unittest.TestCase):
             posted = subprocess.CompletedProcess(
                 [], 0, "https://github.com/acme/spec/issues/7#issuecomment-1\n", ""
             )
-            empty = subprocess.CompletedProcess([], 0, "", "")
+            empty = subprocess.CompletedProcess([], 0, "[[]]", "")
             with mock.patch.object(
                 DRIVER, "run", side_effect=[empty, posted]
             ) as run:
@@ -1074,6 +1093,7 @@ class GitHubForgeTests(unittest.TestCase):
                     "fixture",
                     "7",
                     DRIVER.campaign_digest(reconciliation, "complete"),
+                    issue_forge="github",
                 )
             commands = [call.args[0] for call in run.call_args_list]
             summary = next(
@@ -1086,7 +1106,9 @@ class GitHubForgeTests(unittest.TestCase):
                 any("--edit-last" in command or "updateIssueComment" in command for command in commands)
             )
             # A repeated terminal pass finds its own marker and stays quiet.
-            seen = subprocess.CompletedProcess([], 0, summary[-1], "")
+            seen = subprocess.CompletedProcess(
+                [], 0, json.dumps([[{"body": summary[-1]}]]), ""
+            )
             with mock.patch.object(DRIVER, "run", side_effect=[seen]) as run:
                 DRIVER.publish_closing_summary(
                     "acme/spec",
@@ -1094,6 +1116,7 @@ class GitHubForgeTests(unittest.TestCase):
                     "fixture",
                     "7",
                     DRIVER.campaign_digest(reconciliation, "complete"),
+                    issue_forge="github",
                 )
             self.assertFalse(
                 any(
@@ -1954,14 +1977,25 @@ class GitHubForgeTests(unittest.TestCase):
             f"{DRIVER.WORKLIST_BEGIN}\n\nold projection\n\n"
             f"{DRIVER.WORKLIST_END}\n"
         )
-        completed = subprocess.CompletedProcess([], 0, "", "")
-        with mock.patch.object(DRIVER, "run", return_value=completed) as run:
-            DRIVER.sync_issue_checkboxes("acme/spec", "1", body, tasks, {"first"})
-        edited = run.call_args.kwargs["input_text"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with FakeGitHub(
+                root,
+                {"master": {"body": body, "state": "open"}, "calls": []},
+            ) as github:
+                DRIVER.sync_issue_checkboxes("acme/spec", "1", body, tasks, {"first"})
+            published = github.state()
+        edited = published["master"]["body"]
         self.assertIn("- [x] <!-- tally:campaign-task:v1 id=first -->", edited)
         self.assertIn("- [ ] <!-- tally:campaign-task:v1 id=second -->", edited)
         self.assertTrue(edited.startswith("operator prose\n"))
+        self.assertEqual(len(published["bodyFiles"]), 1)
+        body_file = published["bodyFiles"][0]
+        self.assertNotEqual(body_file["argument"], "-")
+        self.assertEqual(body_file["body"], edited)
+        self.assertFalse(Path(body_file["argument"]).exists())
 
+        completed = subprocess.CompletedProcess([], 0, "", "")
         with mock.patch.object(
             DRIVER,
             "github_json",
@@ -2003,11 +2037,11 @@ class NativeSubIssueTests(unittest.TestCase):
         },
     ]
 
-    def manifest(self, checkout: Path) -> dict[str, object]:
+    def manifest(self, checkout: Path, forge: str = "github") -> dict[str, object]:
         return {
             "schemaVersion": 1,
             "name": "fixture",
-            "repository": repository_config(checkout, "github"),
+            "repository": repository_config(checkout, forge),
             "maxTasks": 2,
             "maxParallel": 2,
             "driverRuntimeMaxSec": 900,
@@ -2052,8 +2086,10 @@ class NativeSubIssueTests(unittest.TestCase):
             for index, number in enumerate((8, 9))
         ]
 
-    def fixture(self, checkout: Path) -> tuple[dict[str, object], dict[str, object]]:
-        manifest = self.manifest(checkout)
+    def fixture(
+        self, checkout: Path, forge: str = "github"
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        manifest = self.manifest(checkout, forge)
         subissues = self.subissues()
         master_body = (
             f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
@@ -2183,6 +2219,134 @@ class NativeSubIssueTests(unittest.TestCase):
                 call for call in published["calls"] if call[:2] == ["issue", "close"]
             ]
             self.assertEqual(close_calls, [["issue", "close", "7", "--repo", "acme/spec"]])
+
+    def test_degraded_terminal_closeout_uses_a_real_body_file(self) -> None:
+        """A recorder may treat --body-file's value strictly as a path."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+            digest = brief["campaignGraph"]["executableDigest"]
+            base_revision = git(checkout, "rev-parse", "origin/main")
+            brief["capabilities"] = {"subIssueWalk": False}
+            state["merged"] = []
+            for task in self.MANIFEST_TASKS:
+                revision = DRIVER.canonical_sha256(
+                    {"source": digest, "task": task["id"]}
+                )
+                branch = DRIVER.stable_publish_branch(
+                    "fixture", "7", task["id"], revision
+                )
+                state["merged"].append(
+                    {
+                        "url": f"https://github.com/acme/spec/pull/{task['issue']}",
+                        "body": DRIVER.pull_request_marker(
+                            "fixture", "7", task["id"], revision
+                        ),
+                        "baseRefName": "main",
+                        "headRefName": branch,
+                        "headRefOid": base_revision,
+                        "mergeCommit": {"oid": base_revision},
+                        "state": "MERGED",
+                    }
+                )
+
+            with FakeGitHub(root, state) as github:
+                result = DRIVER.action_reconcile(brief)
+
+            self.assertTrue(result["complete"])
+            published = github.state()
+            self.assertEqual(published["master"]["state"], "closed")
+            self.assertEqual(len(published["comments"]), 1)
+            self.assertIn("tally:campaign-complete:v1", published["comments"][0])
+            self.assertEqual(len(published["bodyFiles"]), 1)
+            body_file = published["bodyFiles"][0]
+            self.assertNotEqual(body_file["argument"], "-")
+            self.assertFalse(Path(body_file["argument"]).exists())
+            self.assertIn("- [x]", body_file["body"])
+            close_calls = [
+                call for call in published["calls"] if call[:2] == ["issue", "close"]
+            ]
+            self.assertEqual(
+                close_calls,
+                [
+                    ["issue", "close", "8", "--repo", "acme/spec"],
+                    ["issue", "close", "9", "--repo", "acme/spec"],
+                    ["issue", "close", "7", "--repo", "acme/spec"],
+                ],
+            )
+
+    def test_native_local_code_forge_posts_digest_on_github_master(self) -> None:
+        """The code merge backend does not own the forge-native campaign thread."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout, "local")
+            digest = brief["campaignGraph"]["executableDigest"]
+            base_revision = git(checkout, "rev-parse", "origin/main")
+            for task in self.MANIFEST_TASKS:
+                revision = DRIVER.canonical_sha256(
+                    {"source": digest, "task": task["id"]}
+                )
+                branch = DRIVER.stable_publish_branch(
+                    "fixture", "7", task["id"], revision
+                )
+                git(
+                    checkout,
+                    "push",
+                    "--quiet",
+                    "origin",
+                    f"{base_revision}:refs/heads/{branch}",
+                )
+
+            with FakeGitHub(root, state) as github:
+                result = DRIVER.action_reconcile(brief)
+
+            self.assertTrue(result["complete"])
+            self.assertEqual(
+                result["closingSummary"],
+                "https://github.com/acme/spec/issues/7#issuecomment-test-1",
+            )
+            published = github.state()
+            self.assertEqual(published["master"]["state"], "closed")
+            self.assertEqual(len(published["comments"]), 1)
+            comment = published["comments"][0]
+            self.assertIn("tally:campaign-complete:v1", comment)
+            self.assertIn(f"source={digest}", comment)
+            self.assertRegex(comment, r"sha256:[0-9a-f]{64}")
+            comment_calls = [
+                call for call in published["calls"] if call[:2] == ["issue", "comment"]
+            ]
+            comment_reads = [
+                call
+                for call in published["calls"]
+                if any("/comments?per_page=100" in argument for argument in call)
+            ]
+            self.assertEqual(
+                comment_reads,
+                [
+                    [
+                        "api",
+                        "--paginate",
+                        "--slurp",
+                        "repos/acme/spec/issues/7/comments?per_page=100",
+                    ]
+                ],
+            )
+            self.assertEqual(len(comment_calls), 1)
+            self.assertEqual(comment_calls[0][2], "7")
+            self.assertIn("--body", comment_calls[0])
+            self.assertNotIn("--body-file", comment_calls[0])
+            master_close = ["issue", "close", "7", "--repo", "acme/spec"]
+            self.assertLess(
+                published["calls"].index(comment_calls[0]),
+                published["calls"].index(master_close),
+            )
+            local_summaries = DRIVER.local_remote_refs(
+                DRIVER.repo_config(repository_config(checkout)),
+                f"{DRIVER.local_state_prefix('fixture', '7')}/summary/*",
+            )
+            self.assertEqual(local_summaries, {})
 
     def test_a_hand_closed_sub_issue_is_an_anomaly_not_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2900,7 +3064,7 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertEqual(digest["blocked"][0]["attempts"], 2)
             self.assertEqual(digest["outstanding"], [])
             receipt = DRIVER.publish_closing_summary(
-                "acme/spec", config, "fixture", "7", digest
+                "acme/spec", config, "fixture", "7", digest, issue_forge="local"
             )
             self.assertTrue(receipt.endswith("/summary/quiescent"))
             ref = receipt.split("acme/spec/", 1)[1]
@@ -2912,7 +3076,14 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertIn("the gate stayed red", stored["body"])
             # A second terminal pass writes no second summary.
             self.assertEqual(
-                DRIVER.publish_closing_summary("acme/spec", config, "fixture", "7", digest),
+                DRIVER.publish_closing_summary(
+                    "acme/spec",
+                    config,
+                    "fixture",
+                    "7",
+                    digest,
+                    issue_forge="local",
+                ),
                 receipt,
             )
             self.assertEqual(DRIVER.read_local_blob(config, ref), stored)

@@ -299,6 +299,450 @@
             exit 23
           '';
         };
+        campaignHostTerminalCloseoutSource = pkgs.writeText "tally-campaign-host-closeout.py" ''
+          import importlib.util
+          from pathlib import Path
+          import subprocess
+
+          source = Path("${campaignDrivers}/spec_build_driver.py")
+          spec = importlib.util.spec_from_file_location("spec_build_driver", source)
+          if spec is None or spec.loader is None:
+              raise RuntimeError("cannot load the packaged spec-build driver")
+          driver = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(driver)
+
+          root = Path("/srv/tally/campaign-host")
+          repository = "acme/sentinel"
+          campaign = "sentinel-config"
+          issue_number = "1"
+          task_id = "sentinel-checkpoint"
+          task = {
+              "id": task_id,
+              "title": "Sentinel checkpoint",
+              "brief": {
+                  "issue": {
+                      "number": "2",
+                      "url": "https://github.com/acme/sentinel/issues/2",
+                  }
+              },
+          }
+          body = (root / "master-body").read_text(encoding="utf-8")
+          driver.sync_issue_checkboxes(
+              repository, issue_number, body, [task], {task_id}
+          )
+
+          base_revision = subprocess.run(
+              ["git", "-C", str(root / "checkout"), "rev-parse", "origin/main"],
+              check=True,
+              text=True,
+              stdout=subprocess.PIPE,
+          ).stdout.strip()
+          reconciliation = {
+              "campaign": campaign,
+              "repository": repository,
+              "source": {
+                  "sha256": "sha256:" + "a" * 64,
+                  "revision": base_revision,
+              },
+              "baseRevision": base_revision,
+              "tasks": [{"id": task_id, "title": task["title"]}],
+              "merged": [],
+              "checkpoints": [{"taskId": task_id, "revision": base_revision}],
+              "remaining": [],
+              "diagnoses": [],
+              "retries": [],
+              "deferrals": [],
+              "blocked": [],
+              "anomalies": [],
+              "warnings": [],
+          }
+          driver.publish_closing_summary(
+              repository,
+              # Match --allow-test-local-forge: code settles through local
+              # Git state, while the forge-native campaign thread is GitHub.
+              {"forge": "local"},
+              campaign,
+              issue_number,
+              driver.campaign_digest(reconciliation, "complete"),
+              issue_forge="github",
+          )
+          driver.close_completed_issue_campaign(
+              repository, issue_number, [task]
+          )
+        '';
+        campaignHostTerminalCloseout = pkgs.writeShellApplication {
+          name = "tally-campaign-host-closeout";
+          runtimeInputs = [
+            pkgs.git
+            pkgs.python3
+          ];
+          text = ''
+            exec python3 ${campaignHostTerminalCloseoutSource}
+          '';
+        };
+        # Producer-through-consumer fixture for #442. The flow is deliberately
+        # tiny, but it is executed by the packaged tally binary as a real
+        # daemon-launched transient. Its first node puts a brief just below the
+        # 16 MiB brief ceiling inside queue.enqueue; the surrounding RPC frame
+        # is therefore over the default frame limit and succeeds only when the
+        # child read the system host's non-default maxFrameBytes.
+        campaignHostProbe = pkgs.writeShellApplication {
+          name = "tally-campaign-host-probe";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.git
+          ];
+          text = ''
+            set -euo pipefail
+            printf '%s\n' "$TALLY_TASK_UUID" >> /srv/tally/campaign-host/frame-probes
+            passes="$(${pkgs.coreutils}/bin/wc -l < /srv/tally/campaign-host/frame-probes)"
+            if test "$passes" -eq 1; then
+              # Model the first real driver's local merge without touching the
+              # fake forge: only the remote base moves between public polls.
+              printf 'merged\n' >> /srv/tally/campaign-host/checkout/README.md
+              git -C /srv/tally/campaign-host/checkout add README.md
+              git -C /srv/tally/campaign-host/checkout commit --quiet -m 'campaign local merge'
+              git -C /srv/tally/campaign-host/checkout push --quiet origin main
+            elif test "$passes" -eq 2 && test ! -e /srv/tally/campaign-host/master-closed; then
+              # Exercise the packaged driver's terminal mutations in their
+              # production order: checkbox edit, final digest, task close,
+              # master close. The fake forge below accepts only real paths for
+              # --body-file, matching the recorded public grammar.
+              ${campaignHostTerminalCloseout}/bin/tally-campaign-host-closeout
+            fi
+          '';
+        };
+        campaignHostContinuationEvent = pkgs.writeShellApplication {
+          name = "tally-campaign-host-continuation-event";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.jq
+          ];
+          text = ''
+            set -euo pipefail
+            # A real terminal reconcile emits no successor. Keep this tiny
+            # mechanism fixture faithful: the first pass advances local state
+            # and requests one continuation; the second pass is terminal.
+            test "$(${pkgs.coreutils}/bin/wc -l < /srv/tally/campaign-host/frame-probes)" -eq 1 \
+              || exit 0
+            events_dir="$(${pkgs.jq}/bin/jq -er '.continuation.eventsDir' "$TALLY_BRIEF")"
+            name="campaign-host-continuation-$TALLY_TASK_UUID.json"
+            temporary="$(${pkgs.coreutils}/bin/mktemp "$events_dir/.campaign-host.XXXXXX")"
+            ${pkgs.jq}/bin/jq -c \
+              --arg dedup "campaign-host-continuation:$TALLY_TASK_UUID" \
+              '{
+                argv: .continuation.argv,
+                adapter: "shell",
+                pool: .continuation.pool,
+                priority: .continuation.priority,
+                source: "events-dir",
+                dedupKey: $dedup,
+                submission: {mode: "full"},
+                evidence: ["exit:0"],
+                noEnqueue: false,
+                runtimeMaxSec: .continuation.runtimeMaxSec
+              }' "$TALLY_BRIEF" > "$temporary"
+            ${pkgs.coreutils}/bin/mv "$temporary" "$events_dir/$name"
+          '';
+        };
+        campaignHostProbeFlow = pkgs.writeText "tally-campaign-host-probe.js" ''
+          export const meta = {
+            name: "campaign-host-probe",
+            description: "exercise the inherited campaign config and continuation argv",
+            pools: ["campaign-control"],
+            argsSchema: {
+              type: "object",
+              required: ["continuation"],
+              properties: {
+                continuation: {
+                  type: "object",
+                  required: ["argv", "pool", "priority"],
+                  properties: {
+                    argv: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+                    pool: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+                    priority: { enum: ["interrupt", "high", "medium", "low"] },
+                    runtimeMaxSec: { type: ["integer", "null"], minimum: 1 }
+                  },
+                  additionalProperties: true
+                }
+              },
+              additionalProperties: true
+            },
+            maxNodes: 2,
+            selectors: []
+          };
+
+          (async () => {
+            // Build the near-limit value with a fixed number of deterministic
+            // concatenations. A single 16 MiB String.repeat would spend the
+            // engine's loop budget before the queue RPC can exercise its
+            // configured frame bound.
+            let padding = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding += padding;
+            padding = padding.slice(0, 16776700);
+            // {"padding":"..."} is 16,776,714 canonical bytes: admitted by
+            // the 16 MiB brief ceiling, while its queue.enqueue RPC envelope
+            // is necessarily larger than the 16,777,216-byte default frame.
+            await job({
+              argv: ["${campaignHostProbe}/bin/tally-campaign-host-probe"],
+              adapter: "shell",
+              pools: ["campaign-control"],
+              brief: { padding },
+              priority: "low",
+              runtimeMaxSec: 60,
+              evidence: ["exit:0"],
+              key: "configured-frame",
+              label: "configured-frame"
+            });
+            return job({
+              argv: ["${campaignHostContinuationEvent}/bin/tally-campaign-host-continuation-event"],
+              adapter: "shell",
+              pools: ["campaign-control"],
+              brief: { continuation: args.continuation },
+              priority: "low",
+              runtimeMaxSec: 60,
+              evidence: ["exit:0"],
+              key: "continuation-event",
+              label: "continuation-event"
+            });
+          })();
+        '';
+        campaignHostManifest = {
+          schemaVersion = 1;
+          name = "sentinel-config";
+          repository = {
+            checkout = "/srv/tally/campaign-host/checkout";
+            forge = "local";
+          };
+          maxTasks = 1;
+          maxParallel = 1;
+          pool = "sentinel-campaign";
+          agent = {
+            adapter = "shell";
+            argv = [ "${pkgs.coreutils}/bin/true" ];
+            approvalPolicy = null;
+            sandboxPolicy = null;
+            diagnosisSandboxPolicy = null;
+          };
+          gates = [
+            {
+              kind = "forbidPaths";
+              id = "sentinel-gate";
+              forbidPaths = [ "*.sentinel-forbidden" ];
+              runtimeMaxSec = 30;
+            }
+          ];
+          tasks = [
+            {
+              id = "sentinel-checkpoint";
+              kind = "checkpoint";
+              issue = 2;
+              dependencies = [ ];
+              argv = [ "${pkgs.coreutils}/bin/true" ];
+              runtimeMaxSec = 30;
+            }
+          ];
+        };
+        campaignHostBody = ''
+          <!-- tally:campaign:v1 -->
+          ```json
+          ${builtins.toJSON campaignHostManifest}
+          ```
+          <!-- tally:campaign:v1:end -->
+          <!-- tally:campaign-worklist:v1 -->
+          - [ ] <!-- tally:campaign-task:v1 id=sentinel-checkpoint --> #2 — Sentinel checkpoint
+          <!-- tally:campaign-worklist:v1:end -->
+        '';
+        campaignHostMaster = pkgs.writeText "tally-campaign-host-master.json" (
+          builtins.toJSON {
+            number = 1;
+            title = "Sentinel config campaign";
+            body = campaignHostBody;
+            state = "open";
+            html_url = "https://github.com/acme/sentinel/issues/1";
+            updated_at = "2026-08-08T08:00:00Z";
+            user.login = "operator";
+          }
+        );
+        campaignHostSubIssues = pkgs.writeText "tally-campaign-host-sub-issues.json" (
+          builtins.toJSON [
+            {
+              number = 2;
+              title = "Sentinel checkpoint";
+              body = "Run the sentinel checkpoint.";
+              state = "open";
+              html_url = "https://github.com/acme/sentinel/issues/2";
+              updated_at = "2026-08-08T08:00:00Z";
+              user.login = "operator";
+            }
+          ]
+        );
+        campaignHostFakeGh = pkgs.writeTextFile {
+          name = "tally-campaign-host-fake-gh";
+          destination = "/bin/gh";
+          executable = true;
+          text = ''
+            #!${pkgs.python3}/bin/python3
+            import json
+            import os
+            from pathlib import Path
+            import sys
+
+            root = Path("/srv/tally/campaign-host")
+            arguments = sys.argv[1:]
+            caller = Path(f"/proc/{os.getppid()}/cmdline").read_bytes().replace(
+                b"\0", b" "
+            ).decode("utf-8", errors="replace")
+            with (root / "gh-callers").open("a", encoding="utf-8") as handle:
+                handle.write(caller + "\t" + json.dumps(arguments) + "\n")
+
+            def emit(value):
+                print(json.dumps(value, separators=(",", ":")))
+
+            def comments():
+                path = root / "final-digests"
+                if not path.exists():
+                    return []
+                return [
+                    json.loads(line)
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line
+                ]
+
+            def issue(number):
+                if number == 1:
+                    value = json.loads(Path("${campaignHostMaster}").read_text(encoding="utf-8"))
+                    value["body"] = (root / "master-body").read_text(encoding="utf-8")
+                    if (root / "master-closed").exists():
+                        value["state"] = "closed"
+                    return value
+                if number == 2:
+                    value = json.loads(
+                        Path("${campaignHostSubIssues}").read_text(encoding="utf-8")
+                    )[0]
+                    if (root / "subissue-closed").exists():
+                        value["state"] = "closed"
+                    return value
+                raise SystemExit(f"unexpected fake gh issue: {number}")
+
+            def body_file():
+                if "--body-file" not in arguments:
+                    raise SystemExit("fake gh requires --body-file")
+                argument = arguments[arguments.index("--body-file") + 1]
+                path = Path(argument)
+                if argument == "-" or not path.is_file():
+                    raise SystemExit(
+                        f"fake gh requires a real --body-file path, got {argument!r}"
+                    )
+                body = path.read_text(encoding="utf-8")
+                with (root / "body-file-records").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"argument": argument, "body": body}) + "\n")
+                return body
+
+            if arguments[:2] == ["api", "user"]:
+                if arguments not in (
+                    ["api", "user"],
+                    ["api", "user", "--jq", ".login"],
+                ):
+                    raise SystemExit(f"unexpected fake gh actor lookup: {arguments!r}")
+                if "--jq" in arguments:
+                    print("operator")
+                else:
+                    emit({"login": "operator"})
+            elif arguments[:2] == ["api", "graphql"]:
+                emit(
+                    {
+                        "errors": [
+                            {
+                                "type": "UNDEFINED_FIELD",
+                                "message": "fixture has no subIssues field",
+                            }
+                        ]
+                    }
+                )
+                raise SystemExit(1)
+            elif arguments and arguments[0] == "api":
+                endpoint = next(
+                    (item for item in arguments[1:] if item.startswith("repos/")), ""
+                )
+                if endpoint == "repos/acme/sentinel/issues/1":
+                    emit(issue(1))
+                elif endpoint == "repos/acme/sentinel/issues/2":
+                    emit(issue(2))
+                elif endpoint == "repos/acme/sentinel/issues/1/sub_issues?per_page=100":
+                    emit([issue(2)])
+                elif endpoint == "repos/acme/sentinel/issues/1/comments?per_page=100":
+                    expected = ["api", "--paginate", "--slurp", endpoint]
+                    if arguments != expected:
+                        raise SystemExit(
+                            "fake gh requires recorded comment-list grammar, "
+                            f"got {arguments!r}"
+                        )
+                    emit([comments()])
+                else:
+                    raise SystemExit(f"unexpected fake gh api invocation: {arguments!r}")
+            elif arguments[:2] == ["issue", "edit"]:
+                if arguments[:5] != [
+                    "issue", "edit", "1", "--repo", "acme/sentinel"
+                ] or len(arguments) != 7:
+                    raise SystemExit(f"unexpected fake gh edit: {arguments!r}")
+                (root / "master-body").write_text(body_file(), encoding="utf-8")
+                print("https://github.com/acme/sentinel/issues/1")
+            elif arguments[:2] == ["issue", "comment"]:
+                if arguments[:6] != [
+                    "issue", "comment", "1", "--repo", "acme/sentinel", "--body"
+                ] or len(arguments) != 7:
+                    raise SystemExit(f"unexpected fake gh comment: {arguments!r}")
+                body = arguments[6]
+                recorded = comments()
+                comment_id = len(recorded) + 1
+                comment = {
+                    "id": comment_id,
+                    "body": body,
+                    "html_url": (
+                        "https://github.com/acme/sentinel/issues/1"
+                        f"#issuecomment-{comment_id}"
+                    ),
+                    "created_at": "2026-08-08T08:00:00Z",
+                    "updated_at": "2026-08-08T08:00:00Z",
+                    "user": {"login": "operator"},
+                }
+                with (root / "final-digests").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(comment, separators=(",", ":")) + "\n")
+                print(comment["html_url"])
+            elif arguments[:2] == ["issue", "close"]:
+                if len(arguments) != 5 or arguments[3:] != [
+                    "--repo", "acme/sentinel"
+                ]:
+                    raise SystemExit(f"unexpected fake gh close: {arguments!r}")
+                if arguments[2] == "1":
+                    (root / "master-closed").touch()
+                elif arguments[2] == "2":
+                    (root / "subissue-closed").touch()
+                else:
+                    raise SystemExit(f"unexpected fake gh close: {arguments!r}")
+                print(f"https://github.com/acme/sentinel/issues/{arguments[2]}")
+            else:
+                raise SystemExit(f"unexpected fake gh invocation: {arguments!r}")
+          '';
+        };
         mkCargoCheck =
           {
             pname,
@@ -2398,9 +2842,22 @@
             {
               imports = [ self.nixosModules.tally ];
               system.stateVersion = "26.11";
+              system.extraDependencies = [ campaignHostProbeFlow ];
+              virtualisation.memorySize = 2048;
 
               systemd.tmpfiles.rules = [
                 "d /srv/tally/production-agent 0700 tally tally -"
+                "d /srv/tally/campaign-host 0700 tally tally -"
+              ];
+              system.activationScripts.campaignHostToken = {
+                deps = [ "users" ];
+                text = ''
+                  printf 'fixture-token\n' > /run/tally-campaign-host-token
+                  chmod 0600 /run/tally-campaign-host-token
+                '';
+              };
+              system.activationScripts.tallyCampaignForgeIdentity.deps = pkgs.lib.mkAfter [
+                "campaignHostToken"
               ];
 
               services.tally = {
@@ -2409,11 +2866,30 @@
                 stateDir = "/srv/tally/state";
                 retention.enable = false;
                 storage = vmStorageBudget;
+                transport.maxFrameBytes = 20971520;
+                campaignForge = {
+                  enable = true;
+                  login = "operator";
+                  tokenFile = "/run/tally-campaign-host-token";
+                };
+                campaignPoll.enable = false;
                 pools.stock = {
                   resource = "build-slot";
                   capacity = 1;
                   enforce = "cooperative";
                 };
+                pools.sentinel-campaign = {
+                  resource = "mutex";
+                  capacity = 1;
+                  enforce = "cooperative";
+                  predicate.co-residency = { };
+                };
+                adapters.shell.env.PATH = pkgs.lib.makeBinPath [
+                  campaignHostFakeGh
+                  pkgs.coreutils
+                  pkgs.git
+                  pkgs.nix
+                ];
                 adapters.production-probe = {
                   hardening = "production";
                   extraWritablePaths = [ "/srv/tally/production-agent" ];
@@ -2422,6 +2898,8 @@
             };
           testScript = ''
             import json
+            import re
+            import shlex
 
             machine.start()
             machine.wait_for_unit("multi-user.target")
@@ -2529,6 +3007,279 @@
               " 'select(.payload.taskUuid == $task and .payload.adapter == \"production-probe\")' "
               "/srv/tally/state/exec-attestations.jsonl"
             )
+
+            # #442: the system module has one config, at /etc/tally. Both the
+            # initial campaign flow and its continuation must inherit that
+            # exact locator; the service account deliberately has no XDG copy.
+            campaign_root = "/srv/tally/campaign-host"
+            campaign_state = "/srv/tally/state"
+            campaign_socket = "/run/tally/tally.sock"
+            issue = "https://github.com/acme/sentinel/issues/1"
+            git = "${pkgs.git}/bin/git"
+            machine.succeed(
+              "${pkgs.coreutils}/bin/install -o tally -g tally -m 0600 /dev/null "
+              + campaign_root + "/master-body"
+            )
+            machine.succeed(
+              "${pkgs.jq}/bin/jq -r .body ${campaignHostMaster} > "
+              + campaign_root + "/master-body"
+            )
+            campaign_user = (
+              "runuser -u tally -- env HOME=/var/lib/tally/forge "
+              f"XDG_RUNTIME_DIR=/run/user/{uid} "
+              "TALLY_GH_PROGRAM=${campaignHostFakeGh}/bin/gh"
+            )
+            campaign_cli = (
+              campaign_user + " ${tally}/bin/tally"
+              " --config /etc/tally/config.json"
+              " --socket " + campaign_socket +
+              " --rpc-timeout-sec 240"
+            )
+
+            machine.succeed(
+              "${pkgs.jq}/bin/jq -e '"
+              ".maxFrameBytes == 20971520 and "
+              ".pools[\"sentinel-campaign\"].resource == \"mutex\" and "
+              ".pools[\"sentinel-campaign\"].capacity == 1' "
+              "/etc/tally/config.json"
+            )
+            machine.succeed("test ! -e /var/lib/tally/forge/.config/tally/config.json")
+
+            checkout = campaign_root + "/checkout"
+            remote = campaign_root + "/remote.git"
+            machine.succeed(
+              "runuser -u tally -- " + git + " init --bare --quiet --initial-branch=main " + remote
+            )
+            machine.succeed(
+              "runuser -u tally -- " + git + " init --quiet --initial-branch=main " + checkout
+            )
+            machine.succeed(
+              "runuser -u tally -- " + git + " -C " + checkout +
+              " config user.name 'Campaign Host Test'"
+            )
+            machine.succeed(
+              "runuser -u tally -- " + git + " -C " + checkout +
+              " config user.email campaign-host@example.invalid"
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.bash}/bin/bash -c " +
+              shlex.quote("printf 'base\\n' > " + checkout + "/README.md")
+            )
+            machine.succeed("runuser -u tally -- " + git + " -C " + checkout + " add README.md")
+            machine.succeed(
+              "runuser -u tally -- " + git + " -C " + checkout +
+              " commit --quiet -m 'campaign host fixture'"
+            )
+            machine.succeed(
+              "runuser -u tally -- " + git + " -C " + checkout + " remote add origin " + remote
+            )
+            machine.succeed(
+              "runuser -u tally -- " + git + " -C " + checkout +
+              " push --quiet --set-upstream origin main"
+            )
+            base_before = machine.succeed(
+              "runuser -u tally -- " + git + " --git-dir=" + remote +
+              " rev-parse refs/heads/main"
+            ).strip()
+            # Hold the flow-authored event so the successor has to enter
+            # through the same plain public poll an operator runs.
+            machine.succeed("systemctl stop tally-drain.timer tally-drain.service")
+
+            arm = (
+              campaign_cli + " campaign arm " + issue +
+              " --allow-test-local-forge"
+              " --flow ${campaignHostProbeFlow}"
+              " --state-dir " + campaign_state +
+              " --workspace-root " + campaign_root + "/workspaces"
+              " --wait"
+            )
+            armed = json.loads(machine.succeed(arm))
+            assert armed["verdict"] == "pass", armed
+            assert armed["projection"] == "degraded-checkboxes", armed
+            assert machine.succeed(
+              "wc -l < " + campaign_root + "/frame-probes"
+            ).strip() == "1"
+            base_after = machine.succeed(
+              "runuser -u tally -- " + git + " --git-dir=" + remote +
+              " rev-parse refs/heads/main"
+            ).strip()
+            assert base_after != base_before, (base_before, base_after)
+            machine.succeed("test ! -e " + campaign_root + "/master-closed")
+            machine.succeed("test ! -e " + campaign_root + "/final-digests")
+            machine.succeed("test ! -e " + campaign_root + "/body-file-records")
+
+            # Exact public convergence boundary: no token argument and no
+            # daemon-drained event. The forge remains unchanged until the
+            # Git-derived successor performs terminal closeout.
+            plain_poll = (
+              campaign_cli + " campaign poll --once --wait --state-dir " + campaign_state
+            )
+            poll_results = []
+            for _ in range(8):
+              poll_results.append(json.loads(machine.succeed(plain_poll)))
+              if machine.execute("test -e " + campaign_root + "/master-closed")[0] == 0:
+                break
+            else:
+              raise AssertionError(("plain campaign polls did not reach closeout", poll_results))
+            assert any(result["dispatched"] == 1 for result in poll_results), poll_results
+            assert machine.succeed(
+              "wc -l < " + campaign_root + "/frame-probes"
+            ).strip() == "2"
+            assert machine.succeed(
+              "wc -l < " + campaign_root + "/final-digests"
+            ).strip() == "1"
+            fake_gh = campaign_user + " ${campaignHostFakeGh}/bin/gh"
+            closed_master = json.loads(machine.succeed(
+              fake_gh + " api repos/acme/sentinel/issues/1"
+            ))
+            digest_pages = json.loads(machine.succeed(
+              fake_gh + " api --paginate --slurp "
+              "repos/acme/sentinel/issues/1/comments?per_page=100"
+            ))
+            digests = [comment for page in digest_pages for comment in page]
+            assert closed_master["state"] == "closed", closed_master
+            assert len(digests) == 1, digests
+            assert "tally:campaign-complete:v1" in digests[0]["body"], digests
+            assert re.search(
+              r"\bsha256:[0-9a-f]{64}\b", digests[0]["body"]
+            ), digests
+            assert "### Campaign complete" in digests[0]["body"], digests
+            assert "- [x] <!-- tally:campaign-task:v1 id=sentinel-checkpoint -->" in (
+              closed_master["body"]
+            ), closed_master
+            body_files = [
+              json.loads(line)
+              for line in machine.succeed(
+                "cat " + campaign_root + "/body-file-records"
+              ).splitlines()
+            ]
+            assert len(body_files) == 1, body_files
+            assert body_files[0]["argument"] != "-", body_files
+            assert "- [x]" in body_files[0]["body"], body_files
+
+            # Now drain the held event. It still exercises the packaged
+            # continuation child and host argv, but the closed master makes it
+            # a no-op rather than the source of convergence.
+            machine.succeed("systemctl start tally-drain.service")
+
+            def jobs():
+              return json.loads(machine.succeed(campaign_cli + " query jobs"))["items"]
+
+            machine.wait_until_succeeds(
+              campaign_cli + " query jobs | ${pkgs.jq}/bin/jq -e '"
+              "[.items[] | select(.argv[5:7] == [\"flow\",\"run\"] and "
+              ".argv[7] == \"${campaignHostProbeFlow}\" and .terminalVerdict == \"pass\")] "
+              "| length == 2'"
+            )
+            machine.wait_until_succeeds(
+              campaign_cli + " query jobs | ${pkgs.jq}/bin/jq -e '"
+              "[.items[] | select(.argv[5:7] == [\"campaign\",\"poll\"] and "
+              ".argv[-2:] == [\"--state-dir\",\"" + campaign_state + "\"] and "
+              ".terminalVerdict == \"pass\")] | length == 1'"
+            )
+            observed = jobs()
+            flow_argvs = [
+              item for item in observed
+              if item["argv"][5:7] == ["flow", "run"]
+              and item["argv"][7] == "${campaignHostProbeFlow}"
+            ]
+            continuation_argvs = [
+              item for item in observed
+              if item["argv"][5:7] == ["campaign", "poll"]
+              and item["argv"][-2:] == ["--state-dir", campaign_state]
+            ]
+            frame_jobs = [
+              item for item in observed
+              if item["argv"] == ["${campaignHostProbe}/bin/tally-campaign-host-probe"]
+            ]
+            assert len(flow_argvs) == 2, flow_argvs
+            assert len(continuation_argvs) == 1, continuation_argvs
+            assert len(frame_jobs) == 2, frame_jobs
+            for item in flow_argvs + continuation_argvs:
+              assert item["argv"][1:5] == [
+                "--config", "/etc/tally/config.json", "--socket", campaign_socket
+              ], item
+              assert item["terminalVerdict"] == "pass", item
+            continuation = continuation_argvs[0]
+            assert continuation["argv"][5:] == [
+              "campaign", "poll", "--once", "--state-dir", campaign_state
+            ], continuation
+            for item in flow_argvs:
+              assert set(item["pool"]) == {"flow", "sentinel-campaign"}, item
+            assert all(item["terminalVerdict"] == "pass" for item in frame_jobs), frame_jobs
+            assert len({item["briefHash"] for item in frame_jobs}) == 1, frame_jobs
+            frame_digest = frame_jobs[0]["briefHash"].removeprefix("sha256:")
+            machine.succeed(
+              "test \"$(stat -c %s /srv/tally/data/briefs/" + frame_digest +
+              ".json)\" -eq 16776714"
+            )
+            machine.succeed(
+              "grep -F -- '--config /etc/tally/config.json --socket " + campaign_socket +
+              " campaign poll --once --state-dir " + campaign_state + "' " +
+              campaign_root + "/gh-callers"
+            )
+
+            # Mutation one: replay the real initial argv and real campaign
+            # brief after deleting only its serialized --config/path pair.
+            # The XDG lookup must fail before configured-frame can be admitted.
+            probes_before = machine.succeed("wc -l < " + campaign_root + "/frame-probes").strip()
+            initial = flow_argvs[0]
+            assert initial["argv"][1:3] == ["--config", "/etc/tally/config.json"], initial
+            initial_without_config = initial["argv"][:1] + initial["argv"][3:]
+            initial_brief = (
+              "/srv/tally/data/briefs/" + initial["briefHash"].removeprefix("sha256:") + ".json"
+            )
+            status, output = machine.execute(
+              campaign_cli +
+              " enqueue --pool flow --pool sentinel-campaign --adapter shell"
+              " --brief-path " + initial_brief + " --wait -- " +
+              shlex.join(initial_without_config)
+            )
+            assert status != 0, output
+            assert machine.succeed("wc -l < " + campaign_root + "/frame-probes").strip() == probes_before
+            mutated_initial = next(item for item in jobs() if item["argv"] == initial_without_config)
+            assert mutated_initial["terminalVerdict"] == "failed", mutated_initial
+            machine.succeed(
+              "grep -F 'cannot read config /var/lib/tally/forge/.config/tally/config.json' "
+              "/srv/tally/state/capture/" + mutated_initial["taskUuid"] + ".adapter.err"
+            )
+
+            # Mutation two: arm a fresh no-enqueue registry, then replay the
+            # real continuation argv against it with only the same pair
+            # removed. Poll must fail validation before dispatching a flow.
+            # Re-open the fixture after the closeout assertions so this poll
+            # reaches host validation instead of pruning a closed campaign.
+            machine.succeed("rm " + campaign_root + "/master-closed")
+            mutation_state = campaign_root + "/mutation-state"
+            no_enqueue = (
+              campaign_cli + " campaign arm " + issue +
+              " --allow-test-local-forge --no-enqueue"
+              " --flow ${campaignHostProbeFlow}"
+              " --state-dir " + mutation_state +
+              " --workspace-root " + campaign_root + "/mutation-workspaces"
+            )
+            registered = json.loads(machine.succeed(no_enqueue))
+            assert registered["status"] == "armed" and not registered["enqueued"], registered
+            assert continuation["argv"][1:3] == ["--config", "/etc/tally/config.json"], continuation
+            continuation_without_config = continuation["argv"][:1] + continuation["argv"][3:]
+            continuation_without_config[-1] = mutation_state
+            status, output = machine.execute(
+              campaign_cli + " enqueue --pool campaign-control --adapter shell --wait -- " +
+              shlex.join(continuation_without_config)
+            )
+            assert status != 0, output
+            assert machine.succeed("wc -l < " + campaign_root + "/frame-probes").strip() == probes_before
+            mutated_continuation = next(
+              item for item in jobs() if item["argv"] == continuation_without_config
+            )
+            assert mutated_continuation["terminalVerdict"] == "failed", mutated_continuation
+            # Poll keeps each registration's cause in its bounded JSON summary
+            # while stderr carries only the aggregate non-zero diagnosis.
+            machine.succeed(
+              "grep -F 'cannot read config /var/lib/tally/forge/.config/tally/config.json' "
+              "/srv/tally/state/capture/" + mutated_continuation["taskUuid"] + ".out"
+            )
+            machine.succeed("touch " + campaign_root + "/master-closed")
           '';
         };
         retentionTest = pkgs.testers.runNixOSTest {

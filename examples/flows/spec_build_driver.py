@@ -470,6 +470,22 @@ def run(
     return result
 
 
+def run_gh_body_file(
+    command: list[str], body: str
+) -> subprocess.CompletedProcess[str]:
+    """Invoke a gh body-file mutation with a real, private temporary file.
+
+    GitHub CLI accepts `-` as an instruction to read stdin, but record/replay
+    adapters resolve the value of `--body-file` as the filename it advertises.
+    A named file is valid for both surfaces and keeps the mutation independent
+    of a CLI-specific stdin convention.
+    """
+    with tempfile.TemporaryDirectory(prefix="tally-gh-body-") as temporary:
+        body_file = Path(temporary) / "body.md"
+        body_file.write_text(body, encoding="utf-8")
+        return run([*command, "--body-file", str(body_file)])
+
+
 def run_bytes(
     command: list[str],
     *,
@@ -1905,8 +1921,8 @@ def machine_authored(comments: list[Any], actor: str) -> list[dict[str, Any]]:
     ]
 
 
-def github_machine_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
-    actor = github_actor()
+def github_issue_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
+    """Read one issue's comments through the recorder-stable paginated grammar."""
     viewed = run(
         [
             "gh",
@@ -1922,7 +1938,17 @@ def github_machine_comments(repository: str, issue_number: str) -> list[dict[str
         fail(f"gh issue comments returned invalid JSON: {error}")
     if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
         fail("gh issue comments pagination must return arrays")
-    return machine_authored([candidate for page in pages for candidate in page], actor)
+    return [
+        candidate
+        for page in pages
+        for candidate in page
+        if isinstance(candidate, dict)
+    ]
+
+
+def github_machine_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
+    actor = github_actor()
+    return machine_authored(github_issue_comments(repository, issue_number), actor)
 
 
 def state_scope(campaign: str, issue_number: str) -> str:
@@ -2921,7 +2947,7 @@ def sync_issue_checkboxes(
     content = "\n".join(lines)
     updated = body[:content_start] + content + body[end_index:]
     if updated != body:
-        run(
+        run_gh_body_file(
             [
                 "gh",
                 "issue",
@@ -2929,10 +2955,8 @@ def sync_issue_checkboxes(
                 issue_number,
                 "--repo",
                 repository,
-                "--body-file",
-                "-",
             ],
-            input_text=updated,
+            updated,
         )
 
 
@@ -3229,13 +3253,18 @@ def publish_closing_summary(
     campaign: str,
     issue_number: str,
     digest: dict[str, Any],
+    *,
+    issue_forge: str,
 ) -> str:
     """Post one closing summary on the terminal path that produced this digest.
 
     Always a fresh comment, never an upsert: a summary the operator does not
     get notified about is not a summary. The marker makes a repeated terminal
-    pass idempotent rather than chatty.
+    pass idempotent rather than chatty. The issue forge is explicit because a
+    forge-native GitHub campaign may merge code through the local forge.
     """
+    if issue_forge not in {"github", "local"}:
+        fail("campaign closing summary issue forge must be github or local")
     outcome = digest["outcome"]
     marker = closing_summary_marker(
         campaign, issue_number, outcome, digest["source"]["sha256"]
@@ -3243,18 +3272,13 @@ def publish_closing_summary(
     body = f"{marker}\n\n{render_campaign_summary(digest)}"
     if len(body) > 60_000:
         fail("campaign closing summary exceeds the bounded GitHub comment size")
-    if config["forge"] == "github":
-        comments = run(
-            [
-                "gh",
-                "api",
-                "--paginate",
-                f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
-                "--jq",
-                ".[] | .body",
-            ]
-        ).stdout
-        if marker in comments:
+    if issue_forge == "github":
+        comments = github_issue_comments(repository, issue_number)
+        if any(
+            marker in comment["body"]
+            for comment in comments
+            if isinstance(comment.get("body"), str)
+        ):
             return f"https://github.com/{repository}/issues/{issue_number}"
         posted = run(
             [
@@ -3674,6 +3698,12 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             campaign,
             issue["number"],
             campaign_digest(result, "complete"),
+            # The forge-native worklist selector is itself a GitHub issue
+            # boundary. Its code repository may still use the local merge
+            # backend under --allow-test-local-forge.
+            issue_forge=(
+                "github" if forge_native else issue_target["config"]["forge"]
+            ),
         )
         if forge_native:
             close_completed_issue_campaign(
@@ -4373,6 +4403,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         campaign,
         issue["number"],
         campaign_digest(reconciliation, "quiescent"),
+        issue_forge=config["forge"],
     )
     if config["forge"] == "github":
         posted = run(
@@ -7465,17 +7496,12 @@ def github_checkpoint_progress_comment(
         f"campaign={campaign} issue={issue['number']} checkpoint={task_id} "
         f"source={source_sha256} revision={revision} passed -->"
     )
-    comments = run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            f"repos/{repository}/issues/{issue['number']}/comments?per_page=100",
-            "--jq",
-            ".[].body",
-        ]
-    ).stdout
-    if marker not in comments:
+    comments = github_issue_comments(repository, issue["number"])
+    if not any(
+        marker in comment["body"]
+        for comment in comments
+        if isinstance(comment.get("body"), str)
+    ):
         body = (
             f"{marker}\n"
             f"Automated checkpoint `{task_id}` ({task['title']}) passed at `{revision}`.\n\n"
@@ -7515,7 +7541,7 @@ def github_checkpoint_progress_comment(
         fail(f"campaign worklist lacks task marker {task_id!r}")
     updated_body = "".join(updated_lines)
     if updated_body != issue_body:
-        run(
+        run_gh_body_file(
             [
                 "gh",
                 "issue",
@@ -7523,10 +7549,8 @@ def github_checkpoint_progress_comment(
                 issue["number"],
                 "--repo",
                 repository,
-                "--body-file",
-                "-",
             ],
-            input_text=updated_body,
+            updated_body,
         )
 
 
@@ -7748,7 +7772,7 @@ def github_merge_checkbox_repair(data: dict[str, Any]) -> None:
         fail(f"campaign worklist lacks task marker {task_id!r}")
     updated_body = "".join(updated_lines)
     if updated_body != issue_body:
-        run(
+        run_gh_body_file(
             [
                 "gh",
                 "issue",
@@ -7756,10 +7780,8 @@ def github_merge_checkbox_repair(data: dict[str, Any]) -> None:
                 issue_number,
                 "--repo",
                 repository,
-                "--body-file",
-                "-",
             ],
-            input_text=updated_body,
+            updated_body,
         )
 
 
