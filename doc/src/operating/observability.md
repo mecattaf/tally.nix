@@ -171,7 +171,13 @@ from each row's durable attempt counter, falling back to the canonical witness o
 absent; the advisory ledger cannot manufacture expected attempts. Read the coverage beside the
 number: it says how many attempts were expected, attested, reported, and missing, includes a
 bounded list of missing identities, and names unknown ceilings, duplicate leases, and
-over-ceiling attestations as partial. `query standup` carries
+over-ceiling attestations as partial. Its `fieldCoverage` map then grades every logical usage key
+against only the attempts whose durable `declaredFields` promised it. For each key,
+`attemptsDeclared` is the denominator; `attemptsReported`, `attemptsUnreadable`, and
+`attemptsAccountingUnavailable` distinguish an exact value from absence, an unusable provider
+value, and a failed per-attempt reduction. Undeclared fields do not make strict-subset,
+total-only, cost-only, or mixed-adapter runs permanently partial. A legacy record with no usable
+declaration is excluded and caveated rather than inferred from its reported shape. `query standup` carries
 the same rollup for every run its window touched and reader-state did not hide (see
 [Archive a run](#archive-a-run) below, and `archivedRunsHidden` for how many were withheld),
 with the three fixed statements every entry would repeat stated once instead in a digest-level

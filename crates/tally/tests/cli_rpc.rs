@@ -236,6 +236,38 @@ impl RpcHandler for CliHandler {
 #[derive(Clone, Copy)]
 struct HumanQueryHandler;
 
+/// Keep fake query responses on the same fixed eight-key coverage wire as the
+/// daemon without making the surrounding `json!` fixtures hit macro recursion.
+fn usage_field_coverage(entries: &[(&str, u64, u64, u64, u64)]) -> Value {
+    let mut coverage = serde_json::Map::new();
+    for field in [
+        "inputTokens",
+        "inputTokensWithCacheRead",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "totalTokens",
+        "costUsd",
+    ] {
+        let (_, declared, reported, unreadable, unavailable) = entries
+            .iter()
+            .find(|(candidate, ..)| *candidate == field)
+            .copied()
+            .unwrap_or((field, 0, 0, 0, 0));
+        coverage.insert(
+            field.to_owned(),
+            serde_json::json!({
+                "attemptsDeclared": declared,
+                "attemptsReported": reported,
+                "attemptsUnreadable": unreadable,
+                "attemptsAccountingUnavailable": unavailable,
+            }),
+        );
+    }
+    Value::Object(coverage)
+}
+
 impl RpcHandler for HumanQueryHandler {
     fn handle<'a>(
         &'a self,
@@ -338,6 +370,17 @@ impl RpcHandler for HumanQueryHandler {
                             "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 2,
                             "attemptsNotReported": 1,
                             "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                            "attemptsLegacyUsage": 0, "attemptsAccountingUnavailable": 0,
+                            "fieldCoverage": usage_field_coverage(&[
+                                ("inputTokens", 1, 1, 0, 0),
+                                ("inputTokensWithCacheRead", 1, 1, 0, 0),
+                                ("cacheReadTokens", 2, 2, 0, 0),
+                                ("cacheWriteTokens", 2, 2, 0, 0),
+                                ("outputTokens", 2, 2, 0, 0),
+                                ("reasoningTokens", 1, 1, 0, 0),
+                                ("totalTokens", 1, 1, 0, 0),
+                                ("costUsd", 1, 1, 0, 0),
+                            ]),
                             "ledgerVerified": true
                         },
                         "tokens": {
@@ -352,9 +395,9 @@ impl RpcHandler for HumanQueryHandler {
                         "cost": {
                             "amountUsd": 8.755705,
                             "attempts": 1,
-                            "basis": "harness-reported costUsd only, summed over the attempts that reported it. Tally's cgroup charge is a distinct quantity, is not summed here, and is a floor: it includes tally's own exit-recorder overhead and is not pure job cost"
+                            "basis": "harness-reported costUsd only, summed over attempts that declared and exactly reported it. Tally's cgroup charge is a distinct quantity, is not summed here, and is a floor: it includes tally's own exit-recorder overhead and is not pure job cost"
                         },
-                        "caveats": ["attempts-missing-attestation", "members-without-attestation", "attempts-without-usage", "mixed-total-authority", "partial-cost"],
+                        "caveats": ["attempts-missing-attestation", "members-without-attestation", "attempts-without-usage", "mixed-total-authority"],
                         "isComplete": false
                     },
                     "tasks": [
@@ -1435,9 +1478,9 @@ async fn query_run_status_filter_narrows_the_board_but_not_the_counts() {
         .await;
 }
 
-/// Three usage shapes the run header must not flatten into each other, keyed
-/// by run ID: an attempt that reported usage no declared mapping could read, a
-/// run where nothing reported, and a component absence beside a measured zero.
+/// Four usage cases the run header must not flatten into each other, keyed by
+/// run ID: an attempt whose declared mapping read nothing, a measured zero, a
+/// run where nothing reported, and one declared component that drifted.
 #[derive(Clone, Copy)]
 struct UsageEdgeQueryHandler;
 
@@ -1452,6 +1495,12 @@ impl RpcHandler for UsageEdgeQueryHandler {
             // An attempt that reported usage the adapter's mapping resolved
             // nothing out of: reported == 1, every component over 0 attempts,
             // no total.
+            let unmapped_fields = usage_field_coverage(&[
+                ("inputTokens", 1, 0, 0, 0),
+                ("cacheReadTokens", 1, 0, 0, 0),
+                ("cacheWriteTokens", 1, 0, 0, 0),
+                ("outputTokens", 1, 0, 0, 0),
+            ]);
             let unmapped = serde_json::json!({
                 "authority": "advisory-provider-capture",
                 "provenance": "attestations", "composition": "composition",
@@ -1461,6 +1510,7 @@ impl RpcHandler for UsageEdgeQueryHandler {
                     "attemptsReportedWithoutFigures": 1, "attemptsReportedWithComponents": 1,
                     "attemptsNotReported": 0,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "fieldCoverage": unmapped_fields,
                     "ledgerVerified": true
                 },
                 "tokens": {
@@ -1472,9 +1522,15 @@ impl RpcHandler for UsageEdgeQueryHandler {
                     "freshInputTokens": {"value": 0, "attemptsComplete": 0, "attemptsPartial": 0}
                 },
                 "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
-                "caveats": ["reported-without-figures"]
+                "caveats": ["reported-without-figures", "partial-components", "partial-fresh-input"]
             });
             // A measured zero (attempts 1) beside an absence (attempts 0).
+            let measured_zero_fields = usage_field_coverage(&[
+                ("inputTokensWithCacheRead", 1, 1, 0, 0),
+                ("cacheReadTokens", 1, 1, 0, 0),
+                ("cacheWriteTokens", 1, 1, 0, 0),
+                ("outputTokens", 1, 1, 0, 0),
+            ]);
             let measured_zero = serde_json::json!({
                 "authority": "advisory-provider-capture",
                 "provenance": "attestations", "composition": "composition",
@@ -1484,6 +1540,7 @@ impl RpcHandler for UsageEdgeQueryHandler {
                     "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 1,
                     "attemptsNotReported": 0,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "fieldCoverage": measured_zero_fields,
                     "ledgerVerified": true
                 },
                 "tokens": {
@@ -1499,6 +1556,8 @@ impl RpcHandler for UsageEdgeQueryHandler {
                 "caveats": []
             });
             // Nothing reported at all: both attempts are typed absences.
+            let nothing_fields =
+                usage_field_coverage(&[("inputTokens", 2, 0, 0, 0), ("outputTokens", 2, 0, 0, 0)]);
             let nothing = serde_json::json!({
                 "authority": "advisory-provider-capture",
                 "provenance": "attestations", "composition": "composition",
@@ -1508,6 +1567,7 @@ impl RpcHandler for UsageEdgeQueryHandler {
                     "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 0,
                     "attemptsNotReported": 2,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "fieldCoverage": nothing_fields,
                     "ledgerVerified": true
                 },
                 "tokens": {
@@ -1519,11 +1579,17 @@ impl RpcHandler for UsageEdgeQueryHandler {
                     "freshInputTokens": {"value": 0, "attemptsComplete": 0, "attemptsPartial": 0}
                 },
                 "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
-                "caveats": ["attempts-without-usage"]
+                "caveats": ["attempts-without-usage", "partial-components", "partial-fresh-input"]
             });
             // One declared key drifted: the attempt reported usage and
             // contributed, the component left the total, and the run is not
             // complete. Real claude-code numbers minus the cache-read half.
+            let one_key_drifted_fields = usage_field_coverage(&[
+                ("inputTokens", 1, 1, 0, 0),
+                ("cacheReadTokens", 1, 0, 0, 0),
+                ("cacheWriteTokens", 1, 1, 0, 0),
+                ("outputTokens", 1, 1, 0, 0),
+            ]);
             let one_key_drifted = serde_json::json!({
                 "authority": "advisory-provider-capture",
                 "provenance": "attestations", "composition": "composition",
@@ -1533,6 +1599,7 @@ impl RpcHandler for UsageEdgeQueryHandler {
                     "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 1,
                     "attemptsNotReported": 0,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "fieldCoverage": one_key_drifted_fields,
                     "ledgerVerified": true
                 },
                 "tokens": {
@@ -1579,7 +1646,7 @@ async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
     local
         .run_until(async {
             let server = tokio::task::spawn_local(async move {
-                for _ in 0..4 {
+                for _ in 0..5 {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_connection(stream, UsageEdgeQueryHandler)
                         .await
@@ -1667,6 +1734,35 @@ async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
             ] {
                 assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
             }
+
+            // The JSON path names the one declared key that drifted instead
+            // of inferring every token key from the attempt's reported shape.
+            let drifted_json = run_tally(
+                &socket,
+                &[
+                    "query",
+                    "run",
+                    "00000000-0000-4000-8000-000000000384",
+                    "--json",
+                ],
+            )
+            .await;
+            assert!(drifted_json.status.success(), "{drifted_json:?}");
+            let value: Value = serde_json::from_slice(&drifted_json.stdout).unwrap();
+            assert_eq!(
+                value["usage"]["coverage"]["fieldCoverage"]["cacheReadTokens"],
+                serde_json::json!({
+                    "attemptsDeclared": 1,
+                    "attemptsReported": 0,
+                    "attemptsUnreadable": 0,
+                    "attemptsAccountingUnavailable": 0
+                })
+            );
+            assert_eq!(
+                value["usage"]["coverage"]["fieldCoverage"]["inputTokens"]
+                    ["attemptsReported"],
+                1
+            );
             server.await.unwrap();
         })
         .await;

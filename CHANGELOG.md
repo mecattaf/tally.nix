@@ -6,6 +6,29 @@ authorized.
 
 ## [Unreleased]
 
+### Declaration-aware usage completeness (#408)
+
+- Run and standup rollups now use each attempt's durable `declaredFields` as
+  the only completeness denominator. Strict-subset, input-only, total-only,
+  cost-only, and mixed-adapter runs are graded against what each adapter
+  promised rather than against whichever shape happened to arrive.
+- Coverage now publishes per-field declared, exact-reported, unreadable, and
+  accounting-unavailable attempt counts. Missing declared token fields raise
+  `partial-components`; declared total and cost gaps raise `partial-total` and
+  `partial-cost`. Legacy declarationless records remain caveated and are never
+  guessed into a contract.
+- Sparse `declaredByField` and `reportedByField` projections now expose the
+  public field census directly, including zero reports for a field that was
+  declared but drifted away. `missingDeclaredFields` names every strict
+  declared/reported gap directly in logical schema order.
+- Fresh input includes cache write only where that field was declared, and
+  adapter validation now requires `cacheReadTokens` beside the cache-inclusive
+  input convention. `partial-fresh-input` identifies a partly reported
+  formula; an entirely absent formula is already diagnosed by its missing
+  declared component fields. The CLI diagnosis recipe therefore names only
+  declared missing keys instead of accusing cost-only or cache-less adapters
+  of token drift.
+
 ### Independent usage coverage denominator (#402)
 
 - Run and standup rollups now derive expected attempts from each member's

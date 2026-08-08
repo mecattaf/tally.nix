@@ -455,7 +455,15 @@ pub fn observe(adapter: &AdapterConfig, captures: &ScrapeResult) -> UsageObserva
     // field stays unknown rather than becoming a plausible zero.
     let input_tokens = match (input_exclusive, input_inclusive) {
         (Some(value), _) => Some(value),
-        (None, Some(value)) => value.checked_sub(cache_read.unwrap_or(0)),
+        (None, Some(value)) => {
+            cache_read.and_then(|cache_read| match value.checked_sub(cache_read) {
+                Some(exclusive) => Some(exclusive),
+                None => {
+                    unreadable.push(FIELD_INPUT_TOKENS_WITH_CACHE_READ.to_owned());
+                    None
+                }
+            })
+        }
         (None, None) => None,
     };
 
@@ -542,6 +550,54 @@ pub fn declared_usage_fields(adapter: &AdapterConfig) -> Vec<String> {
         );
     }
     declared.into_iter().collect()
+}
+
+/// Validate relationships between logical usage-field declarations.
+///
+/// An inclusive input counter cannot be normalized to tally's exclusive
+/// `inputTokens` figure without the cache-read counter that must be subtracted
+/// from it. Keeping this as a declaration rule prevents every observation from
+/// an invalid adapter from becoming a plausible but overstated input value.
+pub(crate) fn validate_usage_declaration(adapter: &AdapterConfig) -> Result<(), &'static str> {
+    let declared = declared_usage_fields(adapter);
+    if declared
+        .iter()
+        .any(|field| field == FIELD_INPUT_TOKENS_WITH_CACHE_READ)
+        && !declared
+            .iter()
+            .any(|field| field == FIELD_CACHE_READ_TOKENS)
+    {
+        return Err(
+            "usage field inputTokensWithCacheRead requires cacheReadTokens so exclusive input can be normalized",
+        );
+    }
+    Ok(())
+}
+
+/// Whether one normalized breakdown contains an exact accounted value for a
+/// declared logical field.
+///
+/// `totalTokens` counts only a harness-stated total. A derived total is a
+/// projection of component declarations, not evidence that a declared total
+/// mapping reported. The inclusive input spelling counts the harness's exact
+/// as-reported value even when a missing cache-read value prevents tally from
+/// normalizing it to exclusive input; the cache-read field's own coverage
+/// names that missing dependency.
+#[must_use]
+pub(crate) fn breakdown_reports_field(breakdown: &UsageBreakdown, field: &str) -> bool {
+    match field {
+        FIELD_INPUT_TOKENS => breakdown.input_tokens.is_some(),
+        FIELD_INPUT_TOKENS_WITH_CACHE_READ => breakdown.input_tokens_as_reported.is_some(),
+        FIELD_CACHE_READ_TOKENS => breakdown.cache_read_tokens.is_some(),
+        FIELD_CACHE_WRITE_TOKENS => breakdown.cache_write_tokens.is_some(),
+        FIELD_OUTPUT_TOKENS => breakdown.output_tokens.is_some(),
+        FIELD_REASONING_TOKENS => breakdown.reasoning_tokens.is_some(),
+        FIELD_TOTAL_TOKENS => breakdown
+            .total_tokens
+            .is_some_and(|total| total.source == UsageTotalSource::HarnessReported),
+        FIELD_COST_USD => breakdown.cost.is_some(),
+        _ => false,
+    }
 }
 
 /// Build the durable raw/accounted record for one completed scrape.
@@ -798,8 +854,11 @@ fn account_delta(
         .copied();
     let mut input_tokens = counts.get(FIELD_INPUT_TOKENS).copied();
     if input_tokens.is_none() {
-        if let Some(inclusive) = counts.get(FIELD_INPUT_TOKENS_WITH_CACHE_READ).copied() {
-            match inclusive.checked_sub(counts.get(FIELD_CACHE_READ_TOKENS).copied().unwrap_or(0)) {
+        if let (Some(inclusive), Some(cache_read)) = (
+            counts.get(FIELD_INPUT_TOKENS_WITH_CACHE_READ).copied(),
+            counts.get(FIELD_CACHE_READ_TOKENS).copied(),
+        ) {
+            match inclusive.checked_sub(cache_read) {
                 Some(exclusive) => input_tokens = Some(exclusive),
                 None => {
                     counts.remove(FIELD_INPUT_TOKENS_WITH_CACHE_READ);
@@ -1750,8 +1809,9 @@ mod tests {
         let breakdown = observation.breakdown().unwrap();
         assert_eq!(breakdown.input_tokens, None, "no plausible zero");
         assert_eq!(breakdown.input_tokens_as_reported, Some(5));
-        // The meter still charges what the harness billed.
-        assert_eq!(observation.meter_amount(), Some(6));
+        // The declared inclusive input cannot be normalized exactly, so the
+        // attempt is accounting-unavailable rather than silently under-billed.
+        assert_eq!(observation.meter_amount(), None);
     }
 
     #[test]

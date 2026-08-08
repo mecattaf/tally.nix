@@ -464,16 +464,17 @@ contribution is admitted only when its sequence/hash predecessor reference is
 bound to the matching earlier record in the verified ledger.
 
 `tokens` carries `inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`, and
-`reasoningTokens`, each as a `{value, attempts}` pair so a component no harness in the run reports
-is visibly summed over fewer attempts than the rest. Three compositions are fixed and must not be
-re-derived by a consumer:
+`reasoningTokens`, each as a `{value, attempts}` pair so the size of each exact sum remains visible.
+Completeness uses that logical key's declaration-aware `fieldCoverage` entry, not another token
+sum's attempt count. Three compositions are fixed and must not be re-derived by a consumer:
 
 - `freshInputTokens` is `inputTokens + cacheWriteTokens`, and it is the cross-harness uncached
   prompt volume. `inputTokens` alone is not: claude-code's `cache_creation_input_tokens` are
   fresh, uncached prompt tokens its `input_tokens` excludes, so summing `inputTokens` alone
   understates a cache-writing harness by its entire cache-write volume while producing a figure
   that looks directly comparable to codex's. Its `attemptsComplete`/`attemptsPartial` split marks
-  attempts that reported only one of the two halves, whose share of the value is a floor.
+  whether every field in each attempt's declared fresh-input formula arrived. Cache write is part
+  of that formula only for adapters that declared it, so an input-only adapter is complete.
 - `reasoningTokens` is nested inside `outputTokens` and is never added to any total.
 - `inputTokensAsReported` is not summed at all: each harness's own input convention means a
   different thing, and the two are not commensurable.
@@ -512,11 +513,11 @@ they raise `unexpected-attestation` and do not enlarge either the denominator or
 counter and must not be used as a completeness denominator.
 
 The selected attempts are then split into `attemptsReported`, `attemptsReportedWithoutFigures`,
-`attemptsReportedWithComponents`, `attemptsNotReported` (a usage scrape was declared and the
-stream carried none), `attemptsNotDeclared` (the adapter declared no usage scrape), and
+`attemptsNotReported` (a usage scrape was declared and the stream carried none),
+`attemptsNotDeclared` (the adapter declared no usage scrape), and
 `attemptsWithoutUsageRecord` (an attestation predating the usage record), plus
-`attemptsLegacyUsage` and `attemptsAccountingUnavailable` for raw-only legacy
-records and per-attempt reductions that were not wholly exact.
+`attemptsLegacyUsage` and `attemptsAccountingUnavailable` for raw-only legacy records and
+per-attempt reductions that were not wholly exact.
 `attemptsReportedWithoutFigures` is the subset of `attemptsReported` that contributed
 nothing: the harness reported usage and **no** declared field path resolved — absence is not
 unreadability, so nothing lands in `unreadableFields` and the observation is still `reported`.
@@ -524,45 +525,53 @@ Those attempts raise `reported-without-figures` rather than being counted as cov
 is **total** drift only; a harness that renames one key is at least as likely, and it lands
 elsewhere, because the attempt still contributes.
 
-Drift in one key is what the per-component `attempts` counts are for, and the rollup now reads
-them: when any of the four components the total is a sum of — `inputTokens`, `cacheReadTokens`,
-`cacheWriteTokens`, `outputTokens` — was reported by fewer attempts than
-`attemptsReportedWithComponents`, that component's sum is over a subset of those attempts and the
-rollup raises `partial-components`. On a real claude-code capture, one renamed
-`cache_read_input_tokens` takes 97% of the run's tokens out of the total while every other figure
-still resolves, so this is the difference between a partial sum that says so and one that does
-not. A consumer diagnosing the caveat compares the per-component `attempts` against
-`attemptsReportedWithComponents`; the drifted component is the one below it.
+`fieldCoverage` is the completeness authority. It has one entry for each logical usage key:
+`inputTokens`, `inputTokensWithCacheRead`, `cacheReadTokens`, `cacheWriteTokens`,
+`outputTokens`, `reasoningTokens`, `totalTokens`, and `costUsd`. Each entry publishes
+`attemptsDeclared`, `attemptsReported`, `attemptsUnreadable`, and
+`attemptsAccountingUnavailable`. The declaration persisted in `usageEvidence.declaredFields` is
+the denominator; observed shape is never used to reconstruct it. An absent declared value changes
+only the first two counts, while the latter two distinguish a provider value with an unusable
+shape from a value tally could not reduce to exact fresh/delta accounting.
 
-Two exclusions from that check, both deliberate. `reasoningTokens` is not in it: claude-code
-reports no reasoning figure and it enters no total, so checking it would fire on every claude run.
-And the denominator is `attemptsReportedWithComponents` rather than `attemptsReported`, which
-excludes attempts whose harness stated a total of its own and reported no component beside it —
-the shape an adapter declaring only a `totalTokens` mapping produces. Such an attempt declared no
-components to be missing, so judging it against a component threshold would mark a run that
-reported everything it intended to as permanently incomplete.
+`declaredByField` and `reportedByField` are sparse public projections of that same table. Both
+contain exactly the fields declared by at least one selected attempt; a declared field that never
+arrived therefore remains visible in `reportedByField` with value zero. Comparing the two maps
+names drift without requiring a consumer to understand the richer diagnostic counters.
+`missingDeclaredFields` performs that comparison on the producer side and lists every field whose
+exact-report count is below its declaration count, in logical schema order.
 
-That exemption is one **reported** shape wide, which is not the same promise as "an adapter that
-declared components is always judged", and the difference matters. Schema-1
-`usageEvidence` carries the declaration, but this compatibility counter still
-projects only the reported shape: an adapter that declared components *and* a total,
-whose harness renamed every component key at once, reports exactly the exempted shape and leaves
-the denominator. `total-only-attempts` is what stops that passing silently. It is raised whenever
-an exempted attempt sits beside attempts that did report components — `attemptsReported -
-attemptsReportedWithComponents > 0` and `attemptsReportedWithComponents > 0` — because then the
-component sums demonstrably cover fewer attempts than the total does, whichever kind of adapter
-produced them. An attempt that reported any component is judged by the component threshold as
-usual, even when its harness also stated a total. The one case reported evidence cannot separate
-is a run in which *every* attempt is total-only: this shape-based compatibility
-projection does not use the declaration to distinguish a legal total-only
-adapter from a wholly drifted component adapter.
+A declared logical token key with `attemptsReported < attemptsDeclared` raises
+`partial-components`. A declared `totalTokens` or `costUsd` key with the same strict subset raises
+`partial-total` or `partial-cost`. Undeclared keys have a zero denominator: a cache-less
+input/output adapter, a total-only adapter, and a cost-only adapter are therefore complete when
+their own declared surface arrives. `reasoningTokens` participates for adapters that declare it
+and does not penalize an adapter that does not. An inclusive input declaration also requires a
+declared, exact cache-read value before tally can put the normalized exclusive input into a sum.
+
+Fresh input uses the declared input convention plus `cacheWriteTokens` only where that key was
+declared. Reporting some but not all of a declared formula raises `partial-fresh-input`; an
+input-only declaration is a complete one-field fresh-input formula. When none of an attempt's
+fresh-input formula arrives, it contributes no fresh-input floor and the missing keys are already
+named by `partial-components` and `missingDeclaredFields`. A legacy record with no usable
+declaration raises `legacy-usage-contract` and `declared-surface-unknown`, and contributes no
+confident sum rather than being guessed into either a component or total-only contract. Its
+reported-shape is retained only as a legacy diagnostic: when an ambiguous total-only legacy
+observation sits beside an observation that reported components, `total-only-attempts` names that
+ambiguity. This reported-shape rule never supplies a denominator, never excuses a declared field,
+and never changes a sum.
+
+`attemptsReportedWithComponents` remains a deprecated declaration-aware compatibility projection
+for this wire generation. It is not a denominator and must not drive completeness; use
+`fieldCoverage`. During the transition, `total-only-attempts` can appear only beside the
+authoritative `partial-components` diagnosis and adds no separate incompleteness meaning.
 
 `ledgerVerified` is false when the advisory chain did not verify or could not be read, and then
 nothing is summed at all rather than answered as a zero. Every reason the sums are partial also
 appears as a named entry in `caveats`; an empty `caveats` array claims only that every
-independently expected attempt has exact per-attempt accounting.
+independently expected attempt supplied every field it declared with exact per-attempt accounting.
 
-`cost` is the harness's own `costUsd`, summed over the attempts that reported one. Its `basis`
+`cost` is the harness's own `costUsd`, summed over the attempts that declared and reported one. Its `basis`
 field states what it is not: tally's cgroup `charge` is a distinct quantity, is not summed here,
 and is a floor that includes tally's own exit-recorder overhead.
 

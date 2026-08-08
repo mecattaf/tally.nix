@@ -94,6 +94,15 @@ cache read, plus `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`,
 table and computes no dollar figure. A total the harness did not state is
 derived from the components and labelled as derived.
 
+The field map is also the adapter's usage contract. `usageEvidence.declaredFields`
+persists its logical keys on every attempt, and run completeness is graded only
+against attempts that declared each key. An undeclared cache or cost field is
+outside the denominator, not a missing report. A declared key that is absent,
+unreadable, or cannot be reduced to exact per-attempt accounting remains in its
+denominator and is reported separately. `inputTokensWithCacheRead` requires a
+declared `cacheReadTokens` mapping; adapter validation rejects the inclusive
+input convention when tally could not normalize it to exclusive input.
+
 `usageCounterScope` declares the lifetime of those primitive counters. The
 provider-facing `scrape.usage.counterScope` repeats that fact beside the
 capture whose values it describes; when present, adapter validation requires
@@ -139,6 +148,12 @@ advisory meter event and emits a typed diagnostic; the durable admission debit
 remains the conservative floor. Pre-schema raw observations stay visible on an
 individual job but are excluded from exact rollups and meter updates rather
 than assumed fresh.
+
+Run coverage publishes `fieldCoverage` for all eight logical keys. Each entry
+contains `attemptsDeclared`, `attemptsReported`, `attemptsUnreadable`, and
+`attemptsAccountingUnavailable`. A strict-subset, total-only, or cost-only
+adapter is complete when every field it declared arrived exactly; tally never
+reconstructs a missing declaration from the shape that happened to arrive.
 
 An adapter may additionally declare a JSON-lines trace stream. Trace queries
 preserve event order and malformed/unknown payloads as advisory observations;

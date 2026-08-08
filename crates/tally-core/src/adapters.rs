@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::executor::ExecutionPaths;
 use crate::taskdb::RecordedLaunchCwd;
-use crate::usage::{UsageAccountingMode, UsagePredecessor};
+use crate::usage::{validate_usage_declaration, UsageAccountingMode, UsagePredecessor};
 
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -1069,6 +1069,9 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
             }
         }
     }
+    if let Err(detail) = validate_usage_declaration(adapter) {
+        return invalid_config(name, detail.to_owned());
+    }
     if let Some(template) = &adapter.resume {
         for argument in template {
             for capture in placeholders(argument).map_err(|detail| AdapterError::InvalidConfig {
@@ -1556,6 +1559,28 @@ mod tests {
 
     fn engine(adapters: &BTreeMap<String, AdapterConfig>) -> AdapterEngine<'_> {
         AdapterEngine::new(adapters)
+    }
+
+    #[test]
+    fn cache_inclusive_input_requires_a_declared_cache_read_counter() {
+        let mut invalid = adapter();
+        invalid.scrape.get_mut("usage").unwrap().fields = BTreeMap::from([(
+            "inputTokensWithCacheRead".to_owned(),
+            vec!["input_tokens".to_owned()],
+        )]);
+        let adapters = BTreeMap::from([("inclusive".to_owned(), invalid.clone())]);
+        assert!(matches!(
+            engine(&adapters).validate_all(),
+            Err(AdapterError::InvalidConfig { detail, .. })
+                if detail == "usage field inputTokensWithCacheRead requires cacheReadTokens so exclusive input can be normalized"
+        ));
+
+        invalid.scrape.get_mut("usage").unwrap().fields.insert(
+            "cacheReadTokens".to_owned(),
+            vec!["cached_input_tokens".to_owned()],
+        );
+        let adapters = BTreeMap::from([("inclusive".to_owned(), invalid)]);
+        engine(&adapters).validate_all().unwrap();
     }
 
     #[test]

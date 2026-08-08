@@ -4858,7 +4858,7 @@ mod tests {
             declared_fields: vec![
                 "cacheReadTokens".to_owned(),
                 "cacheWriteTokens".to_owned(),
-                "inputTokensAsReported".to_owned(),
+                "inputTokensWithCacheRead".to_owned(),
                 "outputTokens".to_owned(),
                 "reasoningTokens".to_owned(),
             ],
@@ -4935,6 +4935,20 @@ mod tests {
         assert_eq!(view.usage.coverage.tasks, 1);
         assert_eq!(view.usage.coverage.attempts_reported, 1);
         assert_eq!(view.usage.coverage.tasks_without_attestation, 0);
+        assert_eq!(
+            view.usage.coverage.field_coverage[crate::usage::FIELD_OUTPUT_TOKENS],
+            crate::usage_rollup::UsageFieldCoverage {
+                attempts_declared: 1,
+                attempts_reported: 1,
+                attempts_unreadable: 0,
+                attempts_accounting_unavailable: 0,
+            }
+        );
+        assert_eq!(
+            view.usage.coverage.field_coverage[crate::usage::FIELD_COST_USD].attempts_declared,
+            0,
+            "an undeclared field stays outside the query denominator"
+        );
         assert_eq!(view.usage.tokens.output_tokens.value, 32_842);
         assert_eq!(
             view.usage.authority,

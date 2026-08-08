@@ -519,21 +519,28 @@ line spells out `fresh input N (= input N + cache write N)` — `inputTokens` al
 harness that writes to a prompt cache — and marks reasoning tokens as nested inside the output
 figure rather than beside it. A component **no attempt reported** prints `--`, never `0`: a
 measured zero is a measurement and keeps printing `0`, and the two must not read alike. A cost
-line appears only where a harness reported cost, and carries the daemon's own basis sentence,
+line appears only where an adapter declared cost and its harness reported it exactly, and carries
+the daemon's own basis sentence,
 which states that tally's cgroup `charge` is a separate figure that is not summed there and is a
 floor. A final `partial:` line names every reason the sums are incomplete: member tasks the
 attestation ledger holds nothing about, independently expected attempts that are missing, unknown
 attempt ceilings, duplicate leases, over-ceiling attestations, attempts that reported no usage,
-attempts whose reported usage no declared mapping could read, a component some reporting attempt did not report
-(`partial-components` — this is what one renamed harness key looks like), an attempt that
-reported only a harness total beside attempts that reported components, so the component lines
-cover fewer attempts than the total does (`total-only-attempts`), a total mixing harness-stated
-and derived figures. To find which component drifted, read the per-component
-`attempts` counts in `--json`: it is the one whose `attempts` is below
-`coverage.attemptsReportedWithComponents`. Do **not** look for the `--` on the line above — that
-only appears when *no* attempt reported the component, so on any multi-attempt run the drifted
-component prints a real-looking partial number instead. No `partial:` line means the rollup covers
-every independently expected attempt. `query standup` carries the same rollup per run
+attempts whose reported usage no declared mapping could read, and declared token, total, or cost
+keys that fewer attempts supplied exactly (`partial-components`, `partial-total`, or
+`partial-cost`). A total mixing harness-stated and derived figures is named separately.
+
+Diagnose a field caveat from its declaration-aware denominator, not by comparing all token keys
+with one reported-attempt count. This recipe prints only keys an adapter actually declared and
+that are missing at least one exact report. Consult the same keys in `fieldCoverage` when the
+separate unreadable-provider and accounting-unavailable counts are needed:
+
+```console
+$ tally query run RUN-UUID --json | jq -r '.usage.coverage.missingDeclaredFields[]'
+```
+
+A cost-only adapter therefore names no token drift, and an adapter declaring only input and output
+does not claim its undeclared cache keys disappeared. No `partial:` line means the rollup covers
+every independently expected attempt and every field each attempt declared. `query standup` carries the same rollup per run
 its window touched, under `runs`. See the [RPC protocol
 reference](../reference/rpc-protocol.md#usage-rollups) for the full field set. A run retired by `tally flow supersede` reads `superseded` whatever its own
 node verdicts say, and names its successor above the board — a reader who misses that would wait
