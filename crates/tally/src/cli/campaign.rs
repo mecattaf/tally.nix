@@ -32,7 +32,7 @@ struct ProjectTask {
     body: String,
     issue: Option<u64>,
     dependencies: Vec<String>,
-    conflict_domains: Vec<String>,
+    conflict_domains: Option<Vec<String>>,
     argv: Option<Vec<String>>,
     runtime_max_sec: Option<u64>,
 }
@@ -1889,12 +1889,13 @@ fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
             }
         }
         let conflict_domains = if kind == "implementation" {
-            project_string_list(
-                item.get("conflictDomains"),
-                &format!("{context}.conflictDomains"),
-            )?
+            item.get("conflictDomains")
+                .map(|value| {
+                    project_string_list(Some(value), &format!("{context}.conflictDomains"))
+                })
+                .transpose()?
         } else {
-            Vec::new()
+            None
         };
         let argv = if kind == "checkpoint" {
             let values = project_string_list(item.get("argv"), &format!("{context}.argv"))?;
@@ -1965,11 +1966,13 @@ fn task_references(tasks: &[ProjectTask]) -> Result<Value> {
                     "kind": task.kind,
                     "issue": task.issue.ok_or_else(|| invalid(format!("task {} has no projected issue", task.id)))?,
                     "dependencies": task.dependencies,
-                    "conflictDomains": task.conflict_domains,
                 });
-                if task.kind == "checkpoint" {
-                    let object = reference.as_object_mut().expect("reference is an object");
-                    object.remove("conflictDomains");
+                let object = reference.as_object_mut().expect("reference is an object");
+                if task.kind == "implementation" {
+                    if let Some(domains) = &task.conflict_domains {
+                        object.insert("conflictDomains".to_owned(), json!(domains));
+                    }
+                } else {
                     object.insert("argv".to_owned(), json!(task.argv));
                     object.insert("runtimeMaxSec".to_owned(), json!(task.runtime_max_sec));
                 }
@@ -3486,6 +3489,76 @@ mod tests {
     }
 
     #[test]
+    fn project_and_admission_preserve_omitted_conflict_domains() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let document = json!({
+            "schemaVersion": 1,
+            "tasks": [{
+                "id": "serial",
+                "kind": "implementation",
+                "title": "Serial task",
+                "body": "Make the bounded change.",
+                "issue": 43,
+                "dependencies": []
+            }]
+        });
+        let tasks = project_tasks(&document).unwrap();
+        assert_eq!(tasks[0].conflict_domains, None);
+        let references = task_references(&tasks).unwrap();
+        assert!(!references[0]
+            .as_object()
+            .unwrap()
+            .contains_key("conflictDomains"));
+
+        let mut config = manifest_value_for_test(json!([]));
+        config["repository"]["checkout"] = json!(checkout);
+        let admitted = admit_manifest_value(manifest_value(&config, &tasks).unwrap()).unwrap();
+        assert_eq!(admitted.tasks[0].conflict_domains, None);
+        let canonical = serde_json::to_value(&admitted).unwrap();
+        assert!(!canonical["tasks"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("conflictDomains"));
+
+        let explicit = json!({
+            "schemaVersion": 1,
+            "tasks": [{
+                "id": "serial",
+                "kind": "implementation",
+                "title": "Serial task",
+                "body": "Make no change.",
+                "issue": 43,
+                "dependencies": [],
+                "conflictDomains": []
+            }]
+        });
+        let explicit_tasks = project_tasks(&explicit).unwrap();
+        assert_eq!(explicit_tasks[0].conflict_domains, Some(Vec::new()));
+        assert_eq!(
+            task_references(&explicit_tasks).unwrap()[0]["conflictDomains"],
+            json!([])
+        );
+
+        config["maxParallel"] = json!(2);
+        let error = admit_manifest_value(manifest_value(&config, &tasks).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("conflictDomains: must be non-empty when campaign maxParallel"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn project_rejects_an_oversized_issue_brief_before_projection() {
         let document = json!({
             "schemaVersion": 1,
@@ -3885,6 +3958,25 @@ mod tests {
         ]));
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
         validate_manifest(&manifest).unwrap();
+        let checkpoint_with_domains = manifest_value_for_test(json!([
+            {
+                "id": "build",
+                "kind": "implementation",
+                "issue": 43,
+                "dependencies": []
+            },
+            {
+                "id": "verify",
+                "kind": "checkpoint",
+                "issue": 44,
+                "dependencies": ["build"],
+                "conflictDomains": [],
+                "argv": ["true"],
+                "runtimeMaxSec": 30
+            }
+        ]));
+        let manifest: CampaignManifest = serde_json::from_value(checkpoint_with_domains).unwrap();
+        assert!(validate_manifest(&manifest).is_err());
         let mut invalid = manifest_value_for_test(json!([{
             "id": "mystery",
             "kind": "approval",

@@ -487,44 +487,64 @@ fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure_case() 
     assert_eq!(steer["attempt"], json!(1), "{steer}");
 }
 
-/// One arm of the pin below: a frontier carrying `task` must be refused by the
-/// flow's own reconcile result schema, before any lane starts.
-fn assert_keyless_task_is_refused(arm: &str, task: Value) {
+/// One arm of the pin below: a serial frontier carrying `task` must preserve
+/// the omitted key through the live task, agent brief, and failed-agent gate.
+fn assert_keyless_task_reaches_ungated_gate(arm: &str, task: Value) {
     let client = TestClient::new(replies(
         task,
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "checkedPaths": 0,
-            "allowlistBasis": "declared",
-            "allowlist": [],
-            "ownershipRan": false
-        })),
+        Reply::failed(
+            "driver-failed",
+            "tree-delta gate refuses to judge: ownership never ran and the task declares no conflictDomains",
+        ),
     ));
-    let error = *run(client.clone()).expect_err(&format!(
-        "the {arm} frontier task must be refused for carrying no conflictDomains"
-    ));
+    let report = run(client.clone()).unwrap_or_else(|error| {
+        panic!("the {arm} frontier task must reach its fail-closed gate: {error:?}")
+    });
 
-    assert_eq!(error.code, "result-schema-mismatch", "{arm} arm: {error:?}");
     assert!(
-        !client.submitted(&format!("prep-{TASK_ID}")),
-        "{arm} arm: the refusal must land before any lane starts; submissions were {:?}",
+        client.submitted(&format!("prep-{TASK_ID}")),
+        "{arm} arm: the admitted serial task must start a lane; submissions were {:?}",
         client.labels()
+    );
+    let agent = client.brief(&format!("agent-{TASK_ID}"));
+    assert!(
+        agent["task"].get("conflictDomains").is_none(),
+        "{arm} arm: the implementation brief must preserve omission: {agent}"
+    );
+    let gate = client.brief(&format!("tree-delta-{TASK_ID}"));
+    assert!(
+        gate["task"].get("conflictDomains").is_none(),
+        "{arm} arm: the failed-agent gate must receive omission, not []: {gate}"
+    );
+    assert_eq!(gate["ownershipRan"], json!(false), "{arm} arm: {gate}");
+    let diagnosis = client.brief(&format!("diagnose-{TASK_ID}"));
+    assert!(
+        diagnosis["task"].get("conflictDomains").is_none(),
+        "{arm} arm: retry/diagnosis payloads must preserve omission: {diagnosis}"
+    );
+    let steer = client.brief(&format!("steer-{TASK_ID}"));
+    assert_eq!(steer["breach"], json!(true), "{arm} arm: {steer}");
+    assert_eq!(
+        steer["abortReason"],
+        json!("tree-delta-ungated"),
+        "{arm} arm: {steer}"
+    );
+    assert_eq!(
+        report.final_value.as_ref().unwrap()["state"],
+        "steered",
+        "{arm} arm"
     );
 }
 
-/// Why `treeDelta:ungated` cannot be reached through this flow, pinned rather
-/// than asserted in prose — on BOTH implementation arms of `taskSchema`.
+/// The optional wire shape is pinned on both implementation arms of
+/// `taskSchema`.
 ///
 /// The refusal branch of `action_tree_delta` — #424 ruling 3, "no allowlist, no
-/// pass" — fires when the task declares no `conflictDomains` at all. The flow
-/// cannot produce that call, because its own `reconcileSchema` requires
-/// `conflictDomains` on every implementation task in the frontier: a reconcile
-/// result missing it is refused before any lane starts. The driver's refusal is
-/// therefore a fail-closed guard on the driver's own contract (it is directly
-/// invocable, and `object_exact` admits a brief without the key), not a state
-/// this flow can hand it. Every task the flow CAN send carries the key, so the
-/// reachable failed-agent paths are `declared` and `declared-empty` — both of
-/// which judge, and neither of which can silently pass.
+/// pass" — is the required failed-agent outcome when an admitted serial task
+/// declares no `conflictDomains`: no ownership receipt exists to supply the
+/// passing path's owned-path fallback. The flow must accept that task and keep
+/// the key absent all the way to the gate; inserting `[]` would turn an
+/// unjudgeable pass into a false declared-empty breach.
 ///
 /// `taskSchema` is a `oneOf` over four arms and two of them are implementation
 /// arms: `implementationTaskSchema`, which a file-based worklist produces, and
@@ -537,15 +557,14 @@ fn assert_keyless_task_is_refused(arm: &str, task: Value) {
 /// do not need to: a checkpoint lane returns before the agent node and can
 /// reach neither treeDelta call.)
 ///
-/// If a future change relaxes either arm, this test goes red and the doc and
-/// CHANGELOG sentences that depend on it have to be revisited rather than
-/// quietly becoming false.
-fn the_flow_cannot_send_an_implementation_task_without_conflict_domains_case() {
-    assert_keyless_task_is_refused(
+/// If either arm makes the field required again or a composition step inserts
+/// `[]`, this test fails at the exact boundary that lost the third state.
+fn both_implementation_arms_preserve_an_omitted_conflict_domain_case() {
+    assert_keyless_task_reaches_ungated_gate(
         "file-based implementationTaskSchema",
         implementation_task(None),
     );
-    assert_keyless_task_is_refused("forge-native issueTaskSchema", issue_task(None));
+    assert_keyless_task_reaches_ungated_gate("forge-native issueTaskSchema", issue_task(None));
 }
 
 #[test]
@@ -559,6 +578,6 @@ fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure() {
 }
 
 #[test]
-fn the_flow_cannot_send_an_implementation_task_without_conflict_domains() {
-    on_flow_test_stack(the_flow_cannot_send_an_implementation_task_without_conflict_domains_case);
+fn both_implementation_arms_preserve_an_omitted_conflict_domain() {
+    on_flow_test_stack(both_implementation_arms_preserve_an_omitted_conflict_domain_case);
 }

@@ -60,6 +60,42 @@ def task(task_id: str, conflict_domains: object = MISSING) -> dict[str, Any]:
 
 
 class ConflictDomainSemanticsTests(unittest.TestCase):
+    def test_omission_and_explicit_empty_are_distinct_normalized_states(self) -> None:
+        self.assertIsNone(
+            driver.normalize_conflict_domains(
+                driver.MISSING, "task.conflictDomains", required=False
+            )
+        )
+        self.assertEqual(
+            driver.normalize_conflict_domains(
+                [], "task.conflictDomains", required=False
+            ),
+            [],
+        )
+        with self.assertRaisesRegex(driver.DriverError, "must be an array"):
+            driver.normalize_conflict_domains(
+                None, "task.conflictDomains", required=False
+            )
+
+    def test_file_worklist_normalization_preserves_omission(self) -> None:
+        candidate = task("serial")
+        candidate["kind"] = "implementation"
+        normalized = driver.normalize_task(
+            candidate, 0, set(), require_conflict_domains=False
+        )
+        self.assertNotIn("conflictDomains", normalized)
+
+        candidate["conflictDomains"] = []
+        explicit = driver.normalize_task(
+            candidate, 0, set(), require_conflict_domains=False
+        )
+        self.assertIn("conflictDomains", explicit)
+        self.assertEqual(explicit["conflictDomains"], [])
+
+        candidate.pop("conflictDomains")
+        with self.assertRaisesRegex(driver.DriverError, "must be a non-empty array"):
+            driver.normalize_task(candidate, 0, set(), require_conflict_domains=True)
+
     def test_equal_and_ancestor_domains_overlap_at_path_component_boundaries(self) -> None:
         self.assertTrue(driver.domains_overlap("src/domain", "src/domain"))
         self.assertTrue(driver.domains_overlap("src/domain", "src/domain/customer.rs"))
@@ -334,6 +370,21 @@ class PublicationConflictDomainTests(PublicationHarness):
             driver.DriverError, r"task\.conflictDomains must be a non-empty array"
         ):
             driver.action_publish(self.publish_brief([]))
+        self.assert_not_published()
+
+    def test_serial_explicit_empty_declaration_denies_every_changed_path(self) -> None:
+        (self.checkout / "internal/cli/root.go").write_text(
+            "package cli\n// changed\n", encoding="utf-8"
+        )
+        self.commit("fixture: serial empty declaration")
+
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            r'outside its declared conflictDomains: "internal/cli/root\.go"',
+        ):
+            driver.action_publish(
+                self.publish_brief([], domains_required=False)
+            )
         self.assert_not_published()
 
     def test_deletion_outside_the_domain_is_rejected_before_push(self) -> None:
@@ -782,7 +833,7 @@ class PublicationConflictDomainTests(PublicationHarness):
             self.base_rev,
         )
 
-    def test_serial_task_without_domains_preserves_the_existing_contract(self) -> None:
+    def test_serial_task_without_domains_preserves_omission_in_ownership(self) -> None:
         (self.checkout / "internal/cli/root.go").write_text(
             "package cli\n// serial campaign\n", encoding="utf-8"
         )
@@ -792,7 +843,7 @@ class PublicationConflictDomainTests(PublicationHarness):
 
         self.assertEqual(published["head"], head)
         self.assertFalse(published["ownership"]["domainsRequired"])
-        self.assertEqual(published["ownership"]["conflictDomains"], [])
+        self.assertNotIn("conflictDomains", published["ownership"])
         self.assertEqual(published["ownership"]["ownedPaths"], ["internal/cli/root.go"])
 
 
@@ -1020,15 +1071,23 @@ class TreeDeltaGateTests(PublicationHarness):
         # was judged, so the next one takes a fresh baseline.
         self.assertIsNone(driver.worktrees.read_change_set_snapshot(self.checkout))
 
-    def test_the_ordinary_post_ownership_verdict_records_that_ownership_ran(self) -> None:
+    def test_serial_omission_flows_from_ownership_to_the_owned_paths_fallback(self) -> None:
         self.snapshot()
         (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
         self.commit("fixture: deliver the feature")
 
+        ownership = driver.action_ownership(
+            self.ownership_brief(domains_required=False)
+        )
+        self.assertNotIn("conflictDomains", ownership)
+        self.assertEqual(ownership["ownedPaths"], ["README.md"])
         result = driver.action_tree_delta(
-            self.workspace_brief(task("conflict-domain"), owned_paths=["README.md"])
+            self.workspace_brief(
+                task("conflict-domain"), owned_paths=ownership["ownedPaths"]
+            )
         )
         self.assertEqual(result["allowlistBasis"], "owned-paths-fallback")
+        self.assertEqual(result["allowlist"], ["README.md"])
         self.assertTrue(result["ownershipRan"])
 
     def test_no_allowlist_no_pass_when_ownership_never_ran(self) -> None:

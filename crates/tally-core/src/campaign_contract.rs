@@ -115,12 +115,27 @@ pub struct CampaignTaskReference {
     pub issue: u64,
     #[serde(default)]
     pub dependencies: Vec<String>,
-    #[serde(default)]
-    pub conflict_domains: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_conflict_domains"
+    )]
+    pub conflict_domains: Option<Vec<String>>,
     #[serde(default)]
     pub argv: Option<Vec<String>>,
     #[serde(default)]
     pub runtime_max_sec: Option<u64>,
+}
+
+fn deserialize_present_conflict_domains<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("conflictDomains must be an array when present"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,16 +420,19 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
                         task.id
                     )));
                 }
-                validate_conflict_domains(&task.conflict_domains, manifest.max_parallel > 1)
-                    .map_err(|error| {
-                        invalid(format!(
-                            "campaign task {} conflictDomains: {error}",
-                            task.id
-                        ))
-                    })?;
+                validate_conflict_domains(
+                    task.conflict_domains.as_deref(),
+                    manifest.max_parallel > 1,
+                )
+                .map_err(|error| {
+                    invalid(format!(
+                        "campaign task {} conflictDomains: {error}",
+                        task.id
+                    ))
+                })?;
             }
             "checkpoint" => {
-                if !task.conflict_domains.is_empty() {
+                if task.conflict_domains.is_some() {
                     return Err(invalid(format!(
                         "checkpoint task {} must not carry conflictDomains",
                         task.id
@@ -655,9 +673,17 @@ pub fn validate_steward_pattern(pattern: &str) -> Result<(), CampaignContractErr
 }
 
 pub fn validate_conflict_domains(
-    domains: &[String],
+    domains: Option<&[String]>,
     required: bool,
 ) -> Result<(), CampaignContractError> {
+    let Some(domains) = domains else {
+        if required {
+            return Err(invalid(
+                "must be non-empty when campaign maxParallel is greater than one",
+            ));
+        }
+        return Ok(());
+    };
     if required && domains.is_empty() {
         return Err(invalid(
             "must be non-empty when campaign maxParallel is greater than one",
@@ -900,6 +926,65 @@ mod tests {
             steward.runtime_max_sec,
             Some(DEFAULT_STEWARD_RUNTIME_MAX_SEC)
         );
+    }
+
+    #[test]
+    fn task_reference_json_preserves_all_three_conflict_domain_states() {
+        let omitted: CampaignTaskReference = serde_json::from_value(json!({
+            "id": "serial",
+            "kind": "implementation",
+            "issue": 1,
+            "dependencies": []
+        }))
+        .unwrap();
+        assert_eq!(omitted.conflict_domains, None);
+        assert!(
+            serde_json::to_value(&omitted).unwrap()["conflictDomains"].is_null(),
+            "indexing a missing object key yields null; the key itself is checked below"
+        );
+        assert!(!serde_json::to_value(&omitted)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("conflictDomains"));
+
+        let empty: CampaignTaskReference = serde_json::from_value(json!({
+            "id": "empty",
+            "kind": "implementation",
+            "issue": 2,
+            "conflictDomains": []
+        }))
+        .unwrap();
+        assert_eq!(empty.conflict_domains, Some(Vec::new()));
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["conflictDomains"],
+            json!([])
+        );
+
+        let declared: CampaignTaskReference = serde_json::from_value(json!({
+            "id": "declared",
+            "kind": "implementation",
+            "issue": 3,
+            "conflictDomains": ["src"]
+        }))
+        .unwrap();
+        assert_eq!(declared.conflict_domains, Some(vec!["src".to_owned()]));
+        assert!(serde_json::from_value::<CampaignTaskReference>(json!({
+            "id": "null",
+            "kind": "implementation",
+            "issue": 4,
+            "conflictDomains": null
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn parallelism_requires_a_present_nonempty_conflict_domain() {
+        validate_conflict_domains(None, false).unwrap();
+        validate_conflict_domains(Some(&[]), false).unwrap();
+        assert!(validate_conflict_domains(None, true).is_err());
+        assert!(validate_conflict_domains(Some(&[]), true).is_err());
+        validate_conflict_domains(Some(&["src".to_owned()]), true).unwrap();
     }
 
     #[test]

@@ -1683,7 +1683,6 @@ class GitHubForgeTests(unittest.TestCase):
                         "kind": "implementation",
                         "issue": 8,
                         "dependencies": [],
-                        "conflictDomains": [],
                         "argv": None,
                         "runtimeMaxSec": None,
                     },
@@ -1692,7 +1691,6 @@ class GitHubForgeTests(unittest.TestCase):
                         "kind": "checkpoint",
                         "issue": 9,
                         "dependencies": ["build"],
-                        "conflictDomains": [],
                         "argv": ["true"],
                         "runtimeMaxSec": 30,
                     },
@@ -1735,6 +1733,9 @@ class GitHubForgeTests(unittest.TestCase):
             with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
                 worklist = DRIVER.issue_graph_worklist(brief)
             self.assertEqual([task["kind"] for task in worklist["tasks"]], ["implementation", "checkpoint"])
+            self.assertNotIn("conflictDomains", graph["manifest"]["tasks"][0])
+            self.assertNotIn("conflictDomains", worklist["tasks"][0])
+            self.assertNotIn("conflictDomains", worklist["tasks"][1])
             self.assertEqual(worklist["tasks"][1]["argv"], ["true"])
             self.assertRegex(worklist["tasks"][0]["revision"], r"^sha256:[0-9a-f]{64}$")
             self.assertEqual(
@@ -1752,6 +1753,36 @@ class GitHubForgeTests(unittest.TestCase):
                 recovered = DRIVER.issue_graph_worklist(manifest_only)
             self.assertEqual(recovered["config"], worklist["config"])
             self.assertEqual(recovered["tasks"], worklist["tasks"])
+            self.assertNotIn("conflictDomains", recovered["tasks"][0])
+
+            for present, domains in (
+                (False, None),
+                (True, []),
+                (True, ["src"]),
+            ):
+                variant_manifest = json.loads(json.dumps(manifest))
+                if present:
+                    variant_manifest["tasks"][0]["conflictDomains"] = domains
+                else:
+                    variant_manifest["tasks"][0].pop("conflictDomains", None)
+                variant_graph = canonical_graph(variant_manifest, issues)
+                variant_brief = {
+                    "repository": "acme/spec",
+                    "issue": issue(),
+                    "worklist": {
+                        "kind": "github-issue",
+                        "graphDigest": variant_graph["executableDigest"],
+                    },
+                    "armedManifest": variant_graph["manifest"],
+                }
+                with mock.patch.object(
+                    DRIVER, "github_json", side_effect=[master, issues]
+                ):
+                    projected = DRIVER.issue_graph_worklist(variant_brief)
+                if present:
+                    self.assertEqual(projected["tasks"][0]["conflictDomains"], domains)
+                else:
+                    self.assertNotIn("conflictDomains", projected["tasks"][0])
 
             # Rust refetched and normalized immediately before dispatch. A
             # forge edit racing after that point is mutable state, not a second

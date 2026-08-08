@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import campaign_worktrees as worktrees  # noqa: E402
 
 
+MISSING = object()
 TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 REPOSITORY = re.compile(r"^[^/ \t]+/[^/ \t]+$")
@@ -793,9 +794,13 @@ def normalize_acceptance(value: Any, context: str) -> list[dict[str, Any]]:
     return result
 
 
-def normalize_conflict_domains(value: Any, context: str, *, required: bool) -> list[str]:
-    if value is None and not required:
-        return []
+def normalize_conflict_domains(
+    value: Any, context: str, *, required: bool
+) -> list[str] | None:
+    if value is MISSING:
+        if required:
+            fail(f"{context} must be a non-empty array")
+        return None
     domains = string_list(value, context, nonempty=required)
     if len(domains) != len({domain.casefold() for domain in domains}):
         fail(f"{context} contains duplicates")
@@ -888,7 +893,7 @@ def normalize_task(
     read_first = object_exact(
         task.get("readFirst"), {"specSections", "styleReferences"}, f"{context}.readFirst"
     )
-    return {
+    normalized = {
         "id": identifier,
         "kind": "implementation",
         "title": required_string(task.get("title"), f"{context}.title", 300),
@@ -908,12 +913,15 @@ def normalize_task(
             task.get("acceptanceCriteria"), f"{context}.acceptanceCriteria"
         ),
         "dependencies": normalize_dependencies(task.get("dependencies"), context, prior_ids),
-        "conflictDomains": normalize_conflict_domains(
-            task.get("conflictDomains"),
-            f"{context}.conflictDomains",
-            required=require_conflict_domains,
-        ),
     }
+    domains = normalize_conflict_domains(
+        task["conflictDomains"] if "conflictDomains" in task else MISSING,
+        f"{context}.conflictDomains",
+        required=require_conflict_domains,
+    )
+    if domains is not None:
+        normalized["conflictDomains"] = domains
+    return normalized
 
 
 def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
@@ -1314,30 +1322,47 @@ def canonical_agent(value: Any, context: str) -> dict[str, Any]:
     return agent
 
 
-def canonical_task_references(value: Any, context: str) -> list[dict[str, Any]]:
+def canonical_task_references(
+    value: Any, context: str, *, require_conflict_domains: bool
+) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         fail(f"{context} must be a non-empty array")
-    fields = {
+    common_fields = {
         "id",
         "kind",
         "issue",
         "dependencies",
-        "conflictDomains",
         "argv",
         "runtimeMaxSec",
     }
     for index, candidate in enumerate(value):
         task_context = f"{context}[{index}]"
-        task = object_complete(candidate, fields, task_context)
-        required_string(task["id"], f"{task_context}.id", 80)
-        if task["kind"] not in {"implementation", "checkpoint"}:
+        if not isinstance(candidate, dict):
+            fail(f"{task_context} must be an object")
+        kind = candidate.get("kind")
+        if kind == "implementation":
+            task = object_exact(candidate, common_fields | {"conflictDomains"}, task_context)
+        elif kind == "checkpoint":
+            task = object_exact(candidate, common_fields, task_context)
+        else:
             fail(f"{task_context}.kind must be implementation or checkpoint")
+        missing = sorted(common_fields - set(task))
+        if missing:
+            fail(f"{task_context} is missing canonical fields: {', '.join(missing)}")
+        required_string(task["id"], f"{task_context}.id", 80)
         positive_integer(task["issue"], f"{task_context}.issue")
         string_list(task["dependencies"], f"{task_context}.dependencies")
-        string_list(task["conflictDomains"], f"{task_context}.conflictDomains")
-        if task["argv"] is not None:
+        if kind == "implementation":
+            normalize_conflict_domains(
+                task["conflictDomains"] if "conflictDomains" in task else MISSING,
+                f"{task_context}.conflictDomains",
+                required=require_conflict_domains,
+            )
+            if task["argv"] is not None or task["runtimeMaxSec"] is not None:
+                fail(f"{task_context} implementation argv and runtimeMaxSec must be null")
+        else:
             argv(task["argv"], f"{task_context}.argv")
-        canonical_nullable_positive_integer(task["runtimeMaxSec"], f"{task_context}.runtimeMaxSec")
+            positive_integer(task["runtimeMaxSec"], f"{task_context}.runtimeMaxSec")
     return value
 
 
@@ -1380,7 +1405,9 @@ def canonical_manifest(value: Any) -> dict[str, Any]:
     required_string(repository["remote"], "canonical campaign manifest v1.repository.remote")
     required_string(repository["forge"], "canonical campaign manifest v1.repository.forge")
     max_tasks = positive_integer(manifest["maxTasks"], "canonical campaign manifest v1.maxTasks")
-    positive_integer(manifest["maxParallel"], "canonical campaign manifest v1.maxParallel")
+    max_parallel = positive_integer(
+        manifest["maxParallel"], "canonical campaign manifest v1.maxParallel"
+    )
     positive_integer(
         manifest["driverRuntimeMaxSec"], "canonical campaign manifest v1.driverRuntimeMaxSec"
     )
@@ -1397,7 +1424,9 @@ def canonical_manifest(value: Any) -> dict[str, Any]:
     steward_role(manifest["steward"], "canonical campaign manifest v1.steward")
     canonical_gate_list(manifest["gates"], "canonical campaign manifest v1.gates")
     references = canonical_task_references(
-        manifest["tasks"], "canonical campaign manifest v1.tasks"
+        manifest["tasks"],
+        "canonical campaign manifest v1.tasks",
+        require_conflict_domains=max_parallel > 1,
     )
     if len(references) > max_tasks:
         fail("canonical campaign manifest v1.tasks exceeds maxTasks")
@@ -1632,7 +1661,8 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
             "dependencies": reference["dependencies"],
         }
         if reference["kind"] == "implementation":
-            common["conflictDomains"] = reference["conflictDomains"]
+            if "conflictDomains" in reference:
+                common["conflictDomains"] = reference["conflictDomains"]
         else:
             common["argv"] = reference["argv"]
             common["runtimeMaxSec"] = reference["runtimeMaxSec"]
@@ -2846,11 +2876,18 @@ def domains_overlap(left: str, right: str) -> bool:
 
 
 def task_conflicts(task: dict[str, Any], selected: list[dict[str, Any]]) -> bool:
+    task_domains = task.get("conflictDomains")
+    if not isinstance(task_domains, list):
+        task_domains = []
     return any(
         domains_overlap(left, right)
         for other in selected
-        for left in task.get("conflictDomains", [])
-        for right in other.get("conflictDomains", [])
+        for left in task_domains
+        for right in (
+            other["conflictDomains"]
+            if isinstance(other.get("conflictDomains"), list)
+            else []
+        )
     )
 
 
@@ -3262,9 +3299,15 @@ def parallelism_warnings(
     examples: list[str] = []
     for task in blocked:
         found = False
+        task_domains = task.get("conflictDomains")
+        if not isinstance(task_domains, list):
+            task_domains = []
         for other in frontier:
-            for left in task.get("conflictDomains", []):
-                for right in other.get("conflictDomains", []):
+            other_domains = other.get("conflictDomains")
+            if not isinstance(other_domains, list):
+                other_domains = []
+            for left in task_domains:
+                for right in other_domains:
                     if domains_overlap(left, right):
                         examples.append(
                             f"{task['id']}:{json.dumps(left)} overlaps "
@@ -5732,21 +5775,23 @@ def normalize_ownership_receipt(value: Any, context: str) -> dict[str, Any]:
         receipt.get("domainsRequired"), f"{context}.domainsRequired"
     )
     domains = normalize_conflict_domains(
-        receipt.get("conflictDomains"),
+        receipt["conflictDomains"] if "conflictDomains" in receipt else MISSING,
         f"{context}.conflictDomains",
         required=domains_required,
     )
     owned_paths = normalize_owned_paths(receipt.get("ownedPaths"), f"{context}.ownedPaths")
     if owned_paths != sorted(owned_paths):
         fail(f"{context}.ownedPaths must be sorted")
-    return {
+    normalized = {
         "taskId": task_id,
         "domainsRequired": domains_required,
-        "conflictDomains": domains,
         "ownedPaths": owned_paths,
         "baseRev": full_git_oid(receipt.get("baseRev"), f"{context}.baseRev"),
         "head": full_git_oid(receipt.get("head"), f"{context}.head"),
     }
+    if domains is not None:
+        normalized["conflictDomains"] = domains
+    return normalized
 
 
 def enforce_conflict_domains(
@@ -5767,7 +5812,7 @@ def enforce_conflict_domains(
         fail("task.id does not match workspace.taskId")
     domains_required = required_bool(domains_required, "domainsRequired")
     domains = normalize_conflict_domains(
-        task.get("conflictDomains"),
+        task["conflictDomains"] if "conflictDomains" in task else MISSING,
         "task.conflictDomains",
         required=domains_required,
     )
@@ -5783,31 +5828,33 @@ def enforce_conflict_domains(
         include_deletions=True,
     )
     outside = (
-        [
+        []
+        if domains is None
+        else [
             path
             for path in changed_paths
             if not any(domains_overlap(path, domain) for domain in domains)
         ]
-        if domains
-        else []
     )
     if outside:
         preview = ", ".join(json.dumps(path) for path in outside[:20])
         if len(outside) > 20:
             preview += f", and {len(outside) - 20} more"
-        declared = ", ".join(json.dumps(domain) for domain in domains)
+        declared = ", ".join(json.dumps(domain) for domain in domains or [])
         fail(
             f"task {task_id!r} changed {len(outside)} path(s) outside its declared "
             f"conflictDomains: {preview}; declared domains: {declared}"
         )
-    return {
+    receipt = {
         "taskId": task_id,
         "domainsRequired": domains_required,
-        "conflictDomains": domains,
         "ownedPaths": changed_paths,
         "baseRev": base_rev,
         "head": head,
     }
+    if domains is not None:
+        receipt["conflictDomains"] = domains
+    return receipt
 
 
 def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
@@ -5927,15 +5974,12 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     # The allowlist is settled before the snapshot is touched. A pass this gate
     # cannot judge must leave the baseline exactly as it found it, and reading
     # it here then refusing below would put the clear() between the two.
-    raw_domains = task.get("conflictDomains")
-    if isinstance(raw_domains, list) and raw_domains:
+    if "conflictDomains" in task:
         allowlist = normalize_conflict_domains(
-            raw_domains, "task.conflictDomains", required=True
+            task["conflictDomains"], "task.conflictDomains", required=False
         )
-        basis = "declared"
-    elif isinstance(raw_domains, list):
-        allowlist = []
-        basis = "declared-empty"
+        assert allowlist is not None
+        basis = "declared" if allowlist else "declared-empty"
     elif ownership_ran:
         owned = data.get("ownedPaths")
         allowlist = list(string_list(owned, "ownedPaths")) if owned is not None else []
@@ -6406,6 +6450,16 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
     # here and the squash commit message at the merge node.
     task = data["task"]
     steward = steward_role(data.get("steward"))
+    narration_task = {
+        "id": task["id"],
+        "title": task["title"],
+        "goal": task.get("goal"),
+        "brief": (task.get("brief") or {}).get("body")
+        if isinstance(task.get("brief"), dict)
+        else None,
+    }
+    if "conflictDomains" in task:
+        narration_task["conflictDomains"] = task["conflictDomains"]
     request = (
         {}
         if steward is None
@@ -6418,15 +6472,7 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
                 "type, scope, subject, and body. Text only: you are not running git."
             ),
             "campaign": required_string(data.get("campaign"), "campaign"),
-            "task": {
-                "id": task["id"],
-                "title": task["title"],
-                "goal": task.get("goal"),
-                "brief": (task.get("brief") or {}).get("body")
-                if isinstance(task.get("brief"), dict)
-                else None,
-                "conflictDomains": task.get("conflictDomains", []),
-            },
+            "task": narration_task,
             "diffStat": git(
                 worktree, "diff", "--stat", f"{base_rev}..{head}"
             ).stdout[:MAX_RETRY_CHARS],

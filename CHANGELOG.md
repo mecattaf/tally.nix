@@ -6,6 +6,22 @@ authorized.
 
 ## [Unreleased]
 
+### Preserved conflict-domain states (#439)
+
+- Project conversion, canonical Rust admission, the packaged driver, and both
+  flow task arms now preserve an omitted serial-task `conflictDomains` key
+  instead of materializing `[]`. Parallel campaigns still require a present,
+  non-empty declaration before dispatch.
+- The three states now retain their distinct enforcement meanings end to end:
+  omitted uses the ownership receipt's exact `ownedPaths` after ownership ran,
+  explicit `[]` denies every changed path, and a non-empty array permits only
+  its declared prefixes. Omission on a failed-agent path remains unjudgeable
+  and aborts because ownership produced no certified fallback.
+- Ownership, publication, rebase, narration, diagnosis, and tree-delta payloads
+  omit the key when the task omitted it. Schemas keep arrays strict when the
+  key is present, and receipts expose presence rather than making readers infer
+  it from an empty value.
+
 ### Single campaign manifest grammar (#446)
 
 - Campaign admission now closes both gate variants, rejects trailing-slash
@@ -503,25 +519,12 @@ gate was silent in.
   `conflictDomains`, the gate refuses with a receipt naming exactly why and
   leaves the baseline in place, so the writes it could not judge stay judgeable
   once an allowlist exists. An explicitly empty `conflictDomains: []` is a
-  declaration, not an absence, and still judges (any delta is a breach). The
-  refusal is a fail-closed guard on the driver's own contract rather than a
-  state a campaign reaches: `spec-build.js`'s reconcile result schema requires
-  `conflictDomains` on every implementation task in the frontier — on the
-  file-based arm and on the forge-native arm alike — so the bases reachable on a
-  failed pass are `declared` and `declared-empty`, and both judge. That
-  reachability is pinned by a test on both arms, not asserted in prose:
-  relaxing `required` on either arm makes
-  `the_flow_cannot_send_an_implementation_task_without_conflict_domains` red,
-  naming the arm that was relaxed.
-- The same is true of the passing path, and `doc/src/flows/campaigns.md` now
-  says so: through the flow the gate is governed by `declared` or
-  `declared-empty` on BOTH agent outcomes. The `owned-paths-fallback` derivation
-  needs a task whose `conflictDomains` key is absent rather than empty, and both
-  worklist producers normalize an omitted field to `[]`, so like the ungated
-  refusal it is reachable only through the directly-invoked driver. Whether the
-  producers should instead preserve absence is an open design question tracked
-  in #439; the doc describes the shipped behaviour and does not promise either
-  resolution.
+  declaration, not an absence, and still judges (any delta is a breach).
+- #439 subsequently made both implementation schema arms preserve an omitted
+  serial-task key. The failed-agent refusal is therefore a reachable,
+  fail-closed campaign path, while a passing agent reaches the exact
+  `ownedPaths` fallback after ownership. Flow tests pin both arms and assert
+  key presence through the gate and diagnosis payloads.
 - The refusal is priced as a gate verdict (`failureClass` → `"ungated"`), never
   as the agent's work being wrong: it spends none of the task's two steering
   attempts. It aborts the lane through the same both-receipts-at-once path a

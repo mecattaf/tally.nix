@@ -213,7 +213,6 @@ export const meta = {
                     "kind",
                     "issue",
                     "dependencies",
-                    "conflictDomains",
                     "argv",
                     "runtimeMaxSec"
                   ],
@@ -487,8 +486,7 @@ const implementationTaskSchema = {
     "deliveredBehaviors",
     "readFirst",
     "acceptanceCriteria",
-    "dependencies",
-    "conflictDomains"
+    "dependencies"
   ],
   properties: {
     id: taskIdSchema,
@@ -563,7 +561,7 @@ const checkpointTaskSchema = {
 
 const issueTaskSchema = {
   type: "object",
-  required: ["id", "kind", "title", "brief", "dependencies", "conflictDomains", "revision"],
+  required: ["id", "kind", "title", "brief", "dependencies", "revision"],
   properties: {
     id: taskIdSchema,
     kind: { const: "implementation" },
@@ -926,7 +924,6 @@ const ownershipSchema = {
   required: [
     "taskId",
     "domainsRequired",
-    "conflictDomains",
     "ownedPaths",
     "baseRev",
     "head"
@@ -1451,11 +1448,16 @@ function failureClass(reconciliation, failure) {
 }
 
 function implementationBrief(task, prepared, reconciliation) {
+  const ownershipBoundary = !Array.isArray(task.conflictDomains)
+    ? "This serial task omits conflictDomains. Ownership will certify its committed paths, and the tree-delta gate will allow exactly those owned paths after ownership runs."
+    : task.conflictDomains.length === 0
+      ? "The declared conflictDomains list is explicitly empty, so the task may change no path."
+      : "The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them.";
   return {
     schemaVersion: 1,
     mission: task.brief
-      ? `Implement only forge task ${task.id}: ${task.title}. The exact admitted task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, read another task issue, or fetch issue comments; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Treat only steering.authorizedComments and steering.machineDiagnoses below as steering. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
-      : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Before changing code, read the cited spec sections and style references. Read the campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
+      ? `Implement only forge task ${task.id}: ${task.title}. The exact admitted task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, read another task issue, or fetch issue comments; deterministic campaign nodes own those operations. ${ownershipBoundary} Treat only steering.authorizedComments and steering.machineDiagnoses below as steering. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
+      : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. ${ownershipBoundary} Before changing code, read the cited spec sections and style references. Read the campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
     campaign: {
       name: effective.campaign,
       repository: codeRepository,
@@ -2136,16 +2138,9 @@ function sweepDeferral(sweepNode) {
       //
       // The stage is chosen from what this lane already knows, so the receipt
       // it produces is true either way: a task that declares conflictDomains
-      // can only fail this node by breaching them, and a task that declares
-      // none can only fail it by being unjudgeable. In practice only the first
-      // arm is reachable from here -- `reconcileSchema` requires
-      // `conflictDomains` on every implementation task in the frontier, on both
-      // the file-based and the forge-native task arm, so a task without it
-      // never reaches a lane at all (both arms pinned by
-      // `the_flow_cannot_send_an_implementation_task_without_conflict_domains`).
-      // The second arm is kept as the honest label for the driver's own
-      // fail-closed refusal, so that if the schema ever relaxes, the receipt
-      // does not start calling an unjudgeable pass a breach.
+      // can only fail this node by breaching them, and an admitted serial task
+      // that omits them is unjudgeable because ownership did not run. Both
+      // implementation schema arms preserve that omission into this call.
       const declaresDomains = Array.isArray(task.conflictDomains);
       const strayStage = declaresDomains ? "treeDelta" : "treeDelta:ungated";
       const strayDelta = await driverNode(
@@ -2243,13 +2238,9 @@ function sweepDeferral(sweepNode) {
     // `ownership.result.ownedPaths`, the paths the ownership node just
     // certified as this task's own committed change-set.
     //
-    // That fallback is not reachable from here today: `taskSchema` requires
-    // `conflictDomains` on both implementation arms and both worklist producers
-    // normalize an omitted field to `[]`, so the gate sees a declared-empty
-    // allowlist rather than an absent one and every delta breaches. The
-    // certified paths are still sent, because whether the producers should
-    // preserve absence and make this fallback live is the open question in
-    // #439; nothing here decides it.
+    // Both implementation schema arms and both worklist producers preserve an
+    // omitted `conflictDomains`, so this fallback is the reachable serial-task
+    // path rather than a driver-only guard.
     const treeDelta = await driverNode(
       "treeDelta",
       {

@@ -135,11 +135,12 @@ accepts the campaign object in a separate file.
 
 The embedded manifest owns configuration and typed task references. An
 `implementation` reference carries `id`, `kind`, issue number, dependencies,
-and conflict domains. A `checkpoint` reference carries `id`, `kind`, issue
-number, dependencies, direct `argv`, and a positive `runtimeMaxSec`; unsupported
-kinds fail closed rather than becoming implementation work. The full human
-brief or checkpoint description is always the sub-issue body. The manifest task
-set must exactly equal GitHub's native
+and, when declared, `conflictDomains`. A `checkpoint` reference carries `id`,
+`kind`, issue number, dependencies, direct `argv`, and a positive
+`runtimeMaxSec`; it never carries `conflictDomains`. Unsupported kinds fail
+closed rather than becoming implementation work. The full human brief or
+checkpoint description is always the sub-issue body. The manifest task set must
+exactly equal GitHub's native
 sub-issue set, task IDs form a topological order, and forge-native campaigns are
 bounded to 100 tasks by the native sub-issue API. Drift fails closed before
 admission. Directly authored sub-issues need no tally marker: their native
@@ -1031,17 +1032,23 @@ implementation domains disjoint. Comparisons fold case for portable behavior:
 with `docs/guide.md`, even when the coordinator's checkout is case-sensitive.
 Case-only duplicate declarations are rejected.
 
-A non-empty declaration is also an enforced ownership boundary. Immediately
-after the agent exits, before project gates run, a dedicated driver node compares
-the union of paths touched by every task commit with the task's domains using
-that same case-folded component-prefix rule. A later deletion cannot hide a
-transient unowned path. Adds, edits, deletions, type changes, and both sides of a
-rename are included. Publication repeats the check against the clean exact head
-before the remote branch or pull request can move, and a base-changing rebase
-repeats it before force-push. The flow carries whether domains are required into
-each enforcing node, so an empty parallel declaration cannot turn enforcement
-off. Serial tasks that omit the optional field keep their unrestricted existing
-behavior.
+The three wire states stay distinct from project input through the canonical
+manifest, live task, briefs, and receipts. A non-empty declaration is an
+enforced ownership boundary. An explicitly empty declaration allows no changed
+path. An omitted declaration is valid only in a serial campaign; the ownership
+node accepts its committed change set, certifies every touched path in
+`ownedPaths`, and omits `conflictDomains` from its receipt rather than inserting
+`[]`.
+
+Immediately after the agent exits, before project gates run, the ownership node
+compares the union of paths touched by every task commit with any declared
+domains using the same case-folded component-prefix rule. A later deletion
+cannot hide a transient unowned path. Adds, edits, deletions, type changes, and
+both sides of a rename are included. Publication repeats the check against the
+clean exact head before the remote branch or pull request can move, and a
+base-changing rebase repeats it before force-push. The flow carries whether
+domains are required into each enforcing node, so absence or an empty
+declaration cannot turn off the parallel-campaign requirement.
 
 A second, separate node — the tree-delta permission gate — covers what the
 ownership gate structurally cannot: content that never reached a commit. `prep`
@@ -1052,33 +1059,16 @@ whether or not any commit records it.
 
 It runs on both outcomes of the agent node. After a passing agent it runs after
 `ownership`; after a *failing* agent — the single most likely context for a
-rogue write — it runs in place of `ownership`, since ownership never ran. What
-governs is the same on both outcomes: the task's declared `conflictDomains`. A
-non-empty declaration allows exactly those prefixes. A declaration that is
-explicitly empty allows nothing, so every delta is a breach. A failed pass is
-therefore judged either way and cannot quietly pass.
-
-Those two are the only bases a campaign reaches. The driver knows two further
-allowlist derivations, and both require a task whose `conflictDomains` key is
-*absent* rather than empty — a shape the flow cannot produce, because its
-reconcile result schema requires the key on every implementation task in the
-frontier (on both the file-based and the forge-native arm), so such a task is
-refused before any lane starts. With the key absent the driver would, on the
-passing path, fall back to the paths `ownership` certified as the task's own
-committed change-set; and on the failing path, where there is nothing certified
-to fall back to, refuse outright rather than report a clean gate — aborting the
-lane with a receipt naming exactly why, priced as a gate verdict rather than as
-the agent's work being wrong, so it spends none of the task's steering attempts.
-Both are fail-closed guards on the driver's own contract, which is directly
-invocable; neither is a state a campaign reaches today.
-
-That has a consequence worth stating plainly: a serial campaign whose tasks omit
-`conflictDomains` is judged by this gate as *declared-empty*, not by the
-owned-paths fallback, because both worklist producers normalize an omitted field
-to `[]`. Whether that is the right answer — or whether the producers should
-preserve absence so the fallback becomes reachable — is an open design question
-tracked in #439; this page describes what the shipped code does, not which way
-that question will be resolved.
+rogue write — it runs in place of `ownership`, since ownership never ran. A
+non-empty declaration allows exactly those prefixes, and an explicitly empty
+declaration allows nothing, so every delta is a breach. When a serial task omits
+the key and ownership ran, the allowlist falls back to exactly the receipt's
+`ownedPaths`: the agent's certified committed work is self-authorizing and
+nothing else is. When the same omitted task's agent fails, ownership never ran
+and there are no certified paths to use. The gate refuses to guess, aborts the
+lane as unjudgeable, and preserves the baseline for a later pass with a declared
+allowlist. Both implementation schema arms preserve omission into these live
+paths; neither producer rewrites it to an empty declaration.
 
 The pre-agent fingerprint is never replaced until a gate has judged the pass it
 belongs to. A pass that ends without the gate running — a machinery fault, a
@@ -1087,18 +1077,20 @@ preserves it rather than re-fingerprinting a worktree that already contains the
 previous attempt's writes. Re-fingerprinting there would have made those writes
 permanently invisible to every gate that ever ran afterwards.
 
-Ownership results witness the requirement flag, declared domains, full sorted
-owned-path set, base revision, and head. The tree-delta result witnesses the
-task, how many paths it compared, which allowlist derivation governed, that
-allowlist, and whether the ownership node had run — so a reader of a receipt can
-tell which of the gate's two call sites produced it. This makes both under-declaration and
-unused broad declarations visible in receipts. When enough tasks are ready but
-overlapping declarations underfill `maxParallel`, reconciliation emits a
-diagnostic naming the blocked tasks and representative overlaps. Shared files
-such as changelogs and lockfiles therefore serialize their declaring tasks by
-design. There is no append-only exemption: Git still has to reconcile concurrent
-content edits, so campaigns that need parallelism should assign those updates to
-a dependent consolidation task instead of declaring unsafe sharing.
+Ownership results witness the requirement flag, full sorted owned-path set,
+base revision, and head. They carry `conflictDomains` only when the task
+declared it, preserving both `[]` and non-empty arrays exactly. The tree-delta
+result witnesses the task, how many paths it compared, which allowlist
+derivation governed, that allowlist, and whether the ownership node had run —
+so a reader of a receipt can tell which of the gate's two call sites produced
+it. This makes both under-declaration and unused broad declarations visible in
+receipts. When enough tasks are ready but overlapping declarations underfill
+`maxParallel`, reconciliation emits a diagnostic naming the blocked tasks and
+representative overlaps. Shared files such as changelogs and lockfiles
+therefore serialize their declaring tasks by design. There is no append-only
+exemption: Git still has to reconcile concurrent content edits, so campaigns
+that need parallelism should assign those updates to a dependent consolidation
+task instead of declaring unsafe sharing.
 
 A `checkpoint` node has exactly `id`, `kind`, `title`, `argv`,
 `runtimeMaxSec`, and `dependencies`. Its direct argv is the deeper validation:
@@ -1342,7 +1334,8 @@ parallel(implementation frontier):
       -> each configured gate -> recheck ownership -> push stable task branch
       -> open/reuse PR
     if the agent failed:
-      -> tree-delta permission gate against the declared conflictDomains
+      -> tree-delta permission gate against declared conflictDomains
+         (an omitted serial task aborts unjudgeable because ownership did not run)
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
 parallel(checkpoint frontier, after this pass's merges):
