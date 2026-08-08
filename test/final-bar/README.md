@@ -11,6 +11,12 @@ Run the whole bar with:
 test/final-bar/run /absolute/path/to/tally.nix
 ```
 
+The same parameterized runner is packaged by the flake:
+
+```console
+nix run path:/path/to/bar-checkout#final-conformance-bar -- /absolute/path/to/tally.nix
+```
+
 Use `--list` to print the stable case IDs and issue mapping.  `--case` may be
 repeated for focused diagnosis.  A complete run writes `report.json` beneath
 the directory named by `--artifacts`; without that option it uses a temporary
@@ -22,7 +28,7 @@ Exit status is deliberately tri-state:
 - `1`: the harness completed, but one or more desired-state assertions failed;
 - `2`: at least one probe could not run or the harness/fixture was broken.
 
-The long `parallel-population` case is part of the default bar.  It prebuilds
+The long `parallel-population-wave` case is part of the default bar.  It prebuilds
 the exact `tally_core` test binary from the target, runs the focused race
 regressions, and then invokes `test/flake-probe.sh <binary> 480 3`.
 
@@ -34,7 +40,7 @@ regressions, and then invokes `test/flake-probe.sh <binary> 480 3`.
 - `fixtures/manifest/`: arm/driver campaign grammar corpus.
 - `fixtures/adapters/`: evaluated-preset/rendered-argv corpus.
 - `fixtures/usage/`: cumulative and declared-surface evidence corpus.
-- `fixtures/registry/`: literal rollback records and N-1 provenance.
+- `fixtures/registry/`: fake store-root boundary and generated literal N-1 records.
 - `fixtures/pipeline/`: hermetic forge, agent, and flow helpers.
 
 All expected values come from the normative specification or recorded tool

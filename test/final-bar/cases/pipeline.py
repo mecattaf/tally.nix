@@ -192,6 +192,10 @@ def campaign_config_locator(context: Context) -> None:
 
 def pipeline_manifest(checkout: Path, agent: Path) -> dict[str, Any]:
     value = base_manifest(checkout)
+    # This is the serial omission form from #439.  A conforming driver must
+    # distinguish it from an explicitly empty declaration and derive the
+    # owned-paths fallback from the task's committed diff.
+    value["tasks"][0].pop("conflictDomains")
     value["runtimeMaxSec"] = 900
     value["driverRuntimeMaxSec"] = 180
     value["agent"] = {
@@ -319,7 +323,13 @@ def campaign_full_pipeline(context: Context) -> None:
             for path in base.rglob("*")
             if path.is_file() and path.stat().st_size < 8 * 1024 * 1024
         )
-        for stage in ("reconcile", "sweep", "ownership-task-one", "tree-delta-task-one"):
+        for stage in (
+            "reconcile",
+            "sweep",
+            "ownership-task-one",
+            "tree-delta-task-one",
+            "owned-paths-fallback",
+        ):
             if stage not in durable_text:
                 failures.append(f"durable flow/witness surfaces never recorded {stage!r}")
         if "\"verdict\":\"pass\"" not in durable_text.replace(" ", ""):

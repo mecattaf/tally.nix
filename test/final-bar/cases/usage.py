@@ -381,6 +381,52 @@ def usage_codex_cumulative_delta(context: Context) -> None:
         input_reported = input_reported.get("value")
     if input_reported == raw_wrong:
         failures.append("rollup summed the two cumulative input checkpoints and double-charged")
+
+    missing_flow = str(uuid.UUID("019f1000-0000-7000-8000-000000004003"))
+    missing_state, missing_data, missing_identities = create_rows(
+        context,
+        root / "missing-predecessor",
+        missing_flow,
+        [1],
+    )
+    missing_ledger = reset_attestations(missing_data)
+    missing_raw = observation(
+        input_tokens=42,
+        input_reported=142,
+        cache_read=100,
+        cache_write=0,
+        output=8,
+        reasoning=0,
+        total=150,
+    )
+    missing_payload = identity_payload(missing_identities[0], 0)
+    missing_payload["adapter"] = "codex"
+    missing_payload["usage"] = missing_raw
+    missing_payload["usageEvidence"] = evidence(
+        DECLARED_CODEX,
+        "session-cumulative",
+        "baseline-missing",
+        None,
+        lineage={"adapter": "codex", "sessionRef": "missing-predecessor-fixture"},
+    )
+    append(context, missing_ledger, missing_payload)
+    missing_view = query_run(context, missing_state, missing_data, missing_flow)
+    missing_usage = missing_view.get("usage", {})
+    if "cumulative-baseline-missing" not in caveats(missing_usage):
+        failures.append(
+            "missing-predecessor cumulative evidence omitted cumulative-baseline-missing caveat"
+        )
+    if missing_usage.get("isComplete") is not False:
+        failures.append("missing-predecessor cumulative evidence was graded complete")
+    missing_tokens = missing_usage.get("tokens", {})
+    for field in ("inputTokensAsReported", "inputTokens", "cacheReadTokens", "outputTokens"):
+        amount = missing_tokens.get(field, 0)
+        if isinstance(amount, dict):
+            amount = amount.get("value", 0)
+        if amount not in (None, 0):
+            failures.append(
+                f"missing-predecessor cumulative checkpoint charged tokens.{field}={amount!r}"
+            )
     require(not failures, "Codex cumulative evidence failures:\n- " + "\n- ".join(failures))
 
 

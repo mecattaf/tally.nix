@@ -100,9 +100,6 @@
             ./test/fixtures/spec-build
             ./test/fixtures/traces
             ./test/fixtures/usage
-            # The final desired-state bar is packaged as a standalone runner;
-            # its checked-in corpora must survive pure flake evaluation.
-            ./test/final-bar
           ];
         };
         adapterConfig = pkgs.writeText "tally-adapter-config.json" (
