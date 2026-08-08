@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "recordedToolGrammar": {
+    "codexVersion": "codex-cli 0.145.0",
+    "codexResumeModelOptional": true,
+    "piVersion": "0.82.1",
+    "piOptionLookingPayloadOpaqueAfterDoubleDash": false
+  },
+  "streams": {
+    "codexNoModel": {
+      "path": "test/fixtures/usage/codex.jsonl",
+      "sha256": "0dd1e51570ca8a7cd5b3d917195f85362e0b23f5647622cd76977a5f1de90ae4",
+      "sessionRef": "codex-usage-thread",
+      "finalMessage": "<redacted text>",
+      "usage": {
+        "input_tokens": 7060166,
+        "cached_input_tokens": 6798080,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 32842,
+        "reasoning_output_tokens": 15163
+      }
+    },
+    "piNormal": {
+      "path": "test/fixtures/traces/pi.jsonl",
+      "sha256": "3bcb7210bad13cc951d12d4ccf495d53c626e5a592cabee59cfa8f40d7bcfc7d",
+      "sessionRef": "019f0000-0000-7000-8000-000000000001",
+      "model": "qwen3.6-35b-a3b",
+      "finalMessage": "The file notes.txt contains 42."
+    }
+  },
+  "refusedPiWorkloads": ["--version", "-p"]
+}
