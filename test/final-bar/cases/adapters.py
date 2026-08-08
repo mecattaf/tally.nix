@@ -259,10 +259,11 @@ def codex_model_recovery(context: Context) -> None:
         lane.mkdir()
         adapter, log = fake_adapter(context, lane, context.presets["codex"], "codex")
         # The explicit-model half exercises the public job-option mechanism.
-        # Empty allowedValues means any non-empty exact value is authorized.
+        # The config boundary requires a non-empty allow-list when the option
+        # is declared; the default-model half simply does not request it.
         adapter.setdefault("launch", {})["model"] = {
             "argv": ["--model", "%<value>%"],
-            "allowedValues": [],
+            "allowedValues": ["pinned-model"],
         }
         program = Path(adapter["argv"][0])
         with context.daemon(lane / "daemon", daemon_config(adapter)) as daemon:

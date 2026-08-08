@@ -385,7 +385,7 @@ def usage_codex_cumulative_delta(context: Context) -> None:
     missing_flow = str(uuid.UUID("019f1000-0000-7000-8000-000000004003"))
     missing_state, missing_data, missing_identities = create_rows(
         context,
-        root / "missing-predecessor",
+        make_case_directory(context, "usage-codex-missing"),
         missing_flow,
         [1],
     )
