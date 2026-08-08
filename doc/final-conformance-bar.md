@@ -641,9 +641,18 @@ the existing measured-cwd mismatch. `UnrecordedLaunchCwd` is reserved for a
 genuinely legacy or corrupt pointer that arrived without a launch record; a
 current recovery path may not manufacture that state.
 
-Each path has its own black-box restart/recovery case. Deleting that path's
-session-cwd binding makes only its case fail while the other four remain
-green. A source scan that merely counts calls does not satisfy this contract.
+Each path has its own end-to-end restart/recovery case. There is one necessary
+verification exception to the otherwise black-box bar: `session_cwd` is not
+serialized, and the public continuation lookup deliberately re-derives it
+from the retired row after every one of these producer seams. A public
+continuation therefore proves the final safety behavior but cannot, by itself,
+distinguish a deleted producer binding from that downstream fallback. Each
+path must also have one focused target regression that observes the recovered
+row at the producer seam, before fallback re-derivation. Deleting that path's
+session-cwd binding makes its focused regression fail while the other four
+remain green. The conformance case requires both the focused regression and
+the public continuation behavior. A source scan that merely counts calls does
+not satisfy this contract.
 
 ## 8. Full-pipeline consequence
 
@@ -678,7 +687,7 @@ diagnosis of the responsible contract.
 | #419 | Focused causal race cases pass, followed by a 480-second/three-concurrent-suite zero-failure wave. | Delete a synchronization edge or serialize the whole test binary. |
 | #426 | All-declared-failed and all-reused fixtures exit 4; a mixed fixture with one covered declaration exits 0. | Collapse 4 into 0 or classify from undeclared extra entries. |
 | #439 | A serial task omitting domains commits an owned file and passes via `owned-paths-fallback`; explicit `[]` breaches. | Normalize absence to `[]` at either producer/schema seam. |
-| #440 | Same-cwd resume succeeds after each of the five session-ref producer paths. | Delete any one cwd binding. |
+| #440 | Same-cwd resume succeeds after each of the five session-ref producer paths, and a focused pre-fallback regression observes each producer binding. | Delete any one cwd binding. |
 | #441 | A task-ref campaign node executes with the exact seven-key closed contract; validation rejection is immediate and structured on flow/witness/query surfaces. | Remove `taskRef` from producer or validator, or route rejection through projection waiting. |
 | #442 | Initial and continuation packaged children read the only config at `/etc/tally/config.json` and its non-default sentinels. | Remove either serialized `--config <path>` pair. |
 | #443 | Real no-model Codex capture resumes without `--model`; explicit model remains pinned. | Require `%<model>%` or inject a synthetic model into captured data. |
