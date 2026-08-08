@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "probe": {
+    "verdict": "REHYDRATES",
+    "capturedAt": "2026-08-08T09:27:33Z",
+    "codexVersion": "codex-cli 0.145.0",
+    "lineage": "019fe045-1c06-7380-a482-7f5460eac579",
+    "fresh": {
+      "input_tokens": 16050,
+      "cached_input_tokens": 11008,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 5,
+      "reasoning_output_tokens": 0
+    },
+    "resumed": {
+      "input_tokens": 32117,
+      "cached_input_tokens": 22016,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 11,
+      "reasoning_output_tokens": 0
+    },
+    "delta": {
+      "input_tokens": 16067,
+      "cached_input_tokens": 11008,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 6,
+      "reasoning_output_tokens": 0
+    },
+    "normalizedRun": {
+      "inputTokens": 10101,
+      "cacheReadTokens": 22016,
+      "cacheWriteTokens": 0,
+      "outputTokens": 11,
+      "reasoningTokens": 0,
+      "totalTokens": 32128
+    }
+  },
+  "declaredSurface": {
+    "declaredByField": {
+      "cacheReadTokens": 1,
+      "cacheWriteTokens": 1,
+      "costUsd": 1,
+      "inputTokens": 2,
+      "outputTokens": 2,
+      "totalTokens": 2
+    },
+    "reportedByField": {
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "costUsd": 1,
+      "inputTokens": 1,
+      "outputTokens": 1,
+      "totalTokens": 2
+    }
+  }
+}

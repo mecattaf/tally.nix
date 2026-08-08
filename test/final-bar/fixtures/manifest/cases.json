@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {"name": "valid-maximal", "expect": "accept"},
+    {"name": "valid-minimal-steward", "expect": "accept", "ops": [
+      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"]}}
+    ]},
+    {"name": "valid-checkout-symlink", "expect": "accept", "checkout": "symlink"},
+    {"name": "valid-checkout-dotdot", "expect": "accept", "checkout": "dotdot"},
+    {"name": "valid-serial-domains-omitted", "expect": "accept", "ops": [
+      {"op": "delete", "path": ["tasks", 0, "conflictDomains"]}
+    ]},
+    {"name": "valid-serial-domains-empty", "expect": "accept", "ops": [
+      {"op": "set", "path": ["tasks", 0, "conflictDomains"], "value": []}
+    ]},
+    {"name": "valid-serial-domains-nonempty", "expect": "accept", "ops": [
+      {"op": "set", "path": ["tasks", 0, "conflictDomains"], "value": ["result.txt"]}
+    ]},
+    {"name": "valid-model-127", "expect": "accept", "modelLength": 127},
+    {"name": "valid-model-128", "expect": "accept", "modelLength": 128},
+
+    {"name": "reject-manifest-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["typo"], "value": true}
+    ]},
+    {"name": "reject-repository-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["repository", "typo"], "value": true}
+    ]},
+    {"name": "reject-agent-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["agent", "typo"], "value": true}
+    ]},
+    {"name": "reject-steward-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "typo": true}}
+    ]},
+    {"name": "reject-command-gate-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["gates", 0, "typo"], "value": true}
+    ]},
+    {"name": "reject-forbid-gate-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["gates", 0], "value": {"kind": "forbidPaths", "id": "paths", "forbidPaths": ["*.tmp"], "runtimeMaxSec": 30, "typo": true}}
+    ]},
+    {"name": "reject-task-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["tasks", 0, "typo"], "value": true}
+    ]},
+    {"name": "reject-gate-enum", "expect": "reject", "ops": [
+      {"op": "set", "path": ["gates", 0, "kind"], "value": "futureGate"}
+    ]},
+    {"name": "reject-task-enum", "expect": "reject", "ops": [
+      {"op": "set", "path": ["tasks", 0, "kind"], "value": "futureTask"}
+    ]},
+    {"name": "reject-merge-enum", "expect": "reject", "ops": [
+      {"op": "set", "path": ["mergeMethod"], "value": "rebase"}
+    ]},
+    {"name": "reject-git-ai-enum", "expect": "reject", "ops": [
+      {"op": "set", "path": ["gitAiBinding"], "value": "silent"}
+    ]},
+    {"name": "reject-priority-enum", "expect": "reject", "ops": [
+      {"op": "set", "path": ["agent", "priority"], "value": "background"}
+    ]},
+    {"name": "reject-parallel-domains-omitted", "expect": "reject", "ops": [
+      {"op": "set", "path": ["maxParallel"], "value": 2},
+      {"op": "set", "path": ["maxTasks"], "value": 2},
+      {"op": "set", "path": ["tasks"], "value": [
+        {"id": "task-one", "kind": "implementation", "issue": 8, "dependencies": []},
+        {"id": "task-two", "kind": "implementation", "issue": 9, "dependencies": [], "conflictDomains": ["second.txt"]}
+      ]}
+    ]},
+    {"name": "reject-forbid-trailing-slash", "expect": "reject", "ops": [
+      {"op": "set", "path": ["gates", 0], "value": {"kind": "forbidPaths", "id": "paths", "forbidPaths": ["build/"], "runtimeMaxSec": 30}}
+    ]},
+    {"name": "reject-regex-syntax", "expect": "reject", "ops": [
+      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "("}}
+    ]},
+    {"name": "reject-regex-zero-groups", "expect": "reject", "ops": [
+      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "message"}}
+    ]},
+    {"name": "valid-regex-one-group", "expect": "accept", "ops": [
+      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "^message=(.*)$", "runtimeMaxSec": 120, "env": {}}}
+    ]},
+    {"name": "reject-regex-two-groups", "expect": "reject", "ops": [
+      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "(a)(b)"}}
+    ]},
+    {"name": "reject-regex-null", "expect": "reject", "ops": [
+      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": null}}
+    ]},
+    {"name": "reject-model-129", "expect": "reject", "modelLength": 129}
+  ]
+}

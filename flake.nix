@@ -100,6 +100,9 @@
             ./test/fixtures/spec-build
             ./test/fixtures/traces
             ./test/fixtures/usage
+            # The final desired-state bar is packaged as a standalone runner;
+            # its checked-in corpora must survive pure flake evaluation.
+            ./test/final-bar
           ];
         };
         adapterConfig = pkgs.writeText "tally-adapter-config.json" (
@@ -267,6 +270,31 @@
             ln -s tally $out/bin/tallyd
           '';
           meta.mainProgram = "tally";
+        };
+        finalConformanceBar = pkgs.stdenvNoCC.mkDerivation {
+          pname = "tally-final-conformance-bar";
+          version = "1";
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/share/tally-final-conformance-bar" "$out/bin"
+            cp -R ${./test/final-bar}/. "$out/share/tally-final-conformance-bar/"
+            makeWrapper ${pkgs.python3}/bin/python3 "$out/bin/tally-final-conformance-bar" \
+              --add-flags "$out/share/tally-final-conformance-bar/run.py" \
+              --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.bash
+                  pkgs.coreutils
+                  pkgs.git
+                  pkgs.nix
+                  pkgs.python3
+                  pkgs.systemd
+                ]
+              }
+            runHook postInstall
+          '';
+          meta.mainProgram = "tally-final-conformance-bar";
         };
         hardeningProbe = pkgs.writeShellApplication {
           name = "tally-hardening-probe";
@@ -4852,6 +4880,7 @@
       {
         packages = {
           inherit tally;
+          final-conformance-bar = finalConformanceBar;
           doc = documentation;
           agency-nightly-driver = agencyNightlyDriver;
           spec-build-driver = specBuildDriver;
@@ -4870,6 +4899,7 @@
               exec ${tally}/bin/tally daemon run --mock
             ''}";
           };
+          final-conformance-bar = flake-utils.lib.mkApp { drv = finalConformanceBar; };
         };
         checks = {
           inherit tally;
@@ -4880,6 +4910,13 @@
           hardening-doc-drift = hardeningDocDrift;
           stock-home-activation = stockHome.activationPackage;
           module-layer = moduleContract;
+          final-conformance-bar-harness = pkgs.runCommand "tally-final-conformance-bar-harness" { } ''
+            ${finalConformanceBar}/bin/tally-final-conformance-bar --list > cases.txt
+            grep -Fq 'campaign-full-pipeline' cases.txt
+            grep -Fq 'parallel-population-wave' cases.txt
+            grep -Fq 'usage-codex-cumulative-delta' cases.txt
+            cp cases.txt "$out"
+          '';
           spec-build-driver-tests =
             pkgs.runCommand "tally-spec-build-driver-tests"
               {
