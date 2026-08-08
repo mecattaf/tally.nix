@@ -3,7 +3,7 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use tempfile::tempdir;
@@ -39,6 +39,40 @@ mod tests {
         verify_attestations, Authorship, AuthorshipSession, AuthorshipStatus,
     };
     use tally_client::RpcClient;
+
+    /// Positive test progress is never a latency assertion (#419). The suite
+    /// can be sharing a loaded host with other full suites, so every event,
+    /// count, and state-publication wait gets the same generous ceiling. The
+    /// deadline only distinguishes a wedged test from a slow one.
+    const POSITIVE_PROGRESS_BACKSTOP: Duration = Duration::from_secs(60);
+
+    async fn await_positive_progress<T>(
+        description: &str,
+        progress: impl std::future::Future<Output = T>,
+    ) -> T {
+        tokio::time::timeout(POSITIVE_PROGRESS_BACKSTOP, progress)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{description} made no progress within the test liveness backstop of {:?}",
+                    POSITIVE_PROGRESS_BACKSTOP
+                )
+            })
+    }
+
+    /// Short waits are retained only where *absence* during the window is the
+    /// semantic fact under test. Callers continue using the future afterwards,
+    /// so a late positive result is not discarded or retried.
+    async fn assert_no_progress_within<T>(
+        description: &str,
+        window: Duration,
+        progress: impl std::future::Future<Output = T>,
+    ) {
+        assert!(
+            tokio::time::timeout(window, progress).await.is_err(),
+            "{description} unexpectedly made progress within {window:?}"
+        );
+    }
 
     fn direct_executor(state_dir: &Path) -> Executor {
         Executor::new(state_dir, std::env::current_exe().unwrap()).with_direct_fallback()
@@ -253,7 +287,8 @@ mod tests {
     #[derive(Clone)]
     struct RecoveringRemoteTransport {
         calls: Arc<AtomicUsize>,
-        release: Arc<AtomicBool>,
+        published: mpsc::UnboundedSender<usize>,
+        release: watch::Receiver<bool>,
     }
 
     impl RemoteTransport for RecoveringRemoteTransport {
@@ -265,16 +300,23 @@ mod tests {
             Box<dyn Future<Output = Result<RemoteExecutorReply, RemoteTransportError>> + Send + 'a>,
         > {
             let calls = self.calls.clone();
-            let release = self.release.clone();
+            let published = self.published.clone();
+            let mut release = self.release.clone();
             Box::pin(async move {
                 let call = calls.fetch_add(1, Ordering::SeqCst);
+                published
+                    .send(call + 1)
+                    .expect("remote invocation observer must remain open");
                 if call == 0 {
                     return Err(RemoteTransportError {
                         detail: "simulated SSH interruption after launch".to_owned(),
                     });
                 }
-                while !release.load(Ordering::Acquire) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                while !*release.borrow_and_update() {
+                    release
+                        .changed()
+                        .await
+                        .expect("remote completion release must remain open");
                 }
                 let RemoteExecutorRequest::Ensure {
                     request, evidence, ..
@@ -684,18 +726,16 @@ mod tests {
     /// ceiling two orders of magnitude above the interval still fails loudly on
     /// it while no amount of host load reaches it.
     async fn await_next_storage_sample(handler: &DaemonHandler, previous: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let sampled_at = handler.cached_storage().sampled_at;
-            if sampled_at != previous {
-                return sampled_at;
+        await_positive_progress("storage-timer sample publication", async {
+            loop {
+                let sampled_at = handler.cached_storage().sampled_at;
+                if sampled_at != previous {
+                    return sampled_at;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the configured storage tick never sampled again after {previous}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        })
+        .await
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1050,11 +1090,12 @@ mod tests {
                     .resume(Some(json!({"all": true})))
                     .await
                     .unwrap();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(3), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "campaign task completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 assert!(matches!(
                     &finished.outcome,
                     Some(Ok(outcome)) if matches!(
@@ -1116,11 +1157,12 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(1), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "executor validation completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 assert!(matches!(
                     &finished.outcome,
                     Some(Err(ExecutorError::InvalidRequest(message)))
@@ -1662,19 +1704,21 @@ mod tests {
         counts: &mut mpsc::UnboundedReceiver<usize>,
         expected: usize,
     ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let count = counts
-                    .recv()
-                    .await
-                    .expect("connection count hook must remain open");
-                if count == expected {
-                    break;
+        await_positive_progress(
+            "connection-count publication",
+            async {
+                loop {
+                    let count = counts
+                        .recv()
+                        .await
+                        .expect("connection count hook must remain open");
+                    if count == expected {
+                        break;
+                    }
                 }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("connection count did not reach {expected}"));
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -1792,17 +1836,16 @@ mod tests {
                 let mut third_call = tokio::task::spawn_local(async move {
                     third.call("query.status", Some(json!({}))).await
                 });
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(50), &mut third_call)
-                        .await
-                        .is_err(),
-                    "a connection beyond the cap was served before a slot opened"
-                );
+                assert_no_progress_within(
+                    "connection beyond the cap",
+                    Duration::from_millis(50),
+                    &mut third_call,
+                )
+                .await;
 
                 drop(first);
-                tokio::time::timeout(Duration::from_secs(1), &mut third_call)
+                await_positive_progress("deferred connection", &mut third_call)
                     .await
-                    .expect("the deferred connection must be served after a slot opens")
                     .unwrap()
                     .unwrap();
 
@@ -3543,13 +3586,12 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                tokio::time::timeout(Duration::from_secs(2), async {
+                await_positive_progress("initial invocation publication", async {
                     while !started.exists() {
                         tokio::task::yield_now().await;
                     }
                 })
-                .await
-                .unwrap();
+                .await;
                 let parent_task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
                 let child = daemon
                     .handler
@@ -3567,9 +3609,8 @@ mod tests {
                     .unwrap();
                 let child_task_uuid = child["task_uuid"].as_str().unwrap().to_owned();
                 let child_finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                    await_positive_progress("child completion", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 assert_eq!(
                     child_finished.job_id.to_string(),
@@ -3649,7 +3690,7 @@ mod tests {
                     .acknowledge_reachability_transition("health", returned.generation)
                     .unwrap();
 
-                tokio::time::timeout(Duration::from_secs(2), async {
+                await_positive_progress("resumed attempt completion", async {
                     loop {
                         let finished = daemon.completion_rx.recv().await.unwrap();
                         daemon.finish_job(finished).await.unwrap();
@@ -3665,8 +3706,7 @@ mod tests {
                         drop(context);
                     }
                 })
-                .await
-                .unwrap();
+                .await;
                 assert_eq!(fs::read_to_string(&resumed).unwrap(), "durable-session");
                 let terminal = daemon
                     .handler
@@ -4292,14 +4332,13 @@ mod tests {
                 daemon
                     .handler
                     .complete_gh_post_ack(row.clone(), result.clone());
-                // The bounded wait is the whole assertion: before the terminal
-                // outcome this worker never finished, so draining it hung.
-                tokio::time::timeout(
-                    Duration::from_secs(30),
+                // Completion is the assertion: before the terminal outcome
+                // this worker never finished, so draining it hung.
+                await_positive_progress(
+                    "removed-producer projection terminal state",
                     daemon.handler.drain_post_ack_tasks(),
                 )
-                .await
-                .expect("a projection whose producer is gone must reach a terminal state");
+                .await;
 
                 let recorded = read_orphaned_projections(&paths.state_dir).unwrap();
                 assert_eq!(recorded.records.len(), 1);
@@ -4325,12 +4364,11 @@ mod tests {
                 // Re-driving the same projection re-derives the same terminal
                 // outcome without a second record or a second witness.
                 daemon.handler.complete_gh_post_ack(row, result);
-                tokio::time::timeout(
-                    Duration::from_secs(30),
+                await_positive_progress(
+                    "repeated removed-producer projection terminal state",
                     daemon.handler.drain_post_ack_tasks(),
                 )
-                .await
-                .expect("the repeat observation is terminal too");
+                .await;
                 assert_eq!(read_orphaned_projections(&paths.state_dir).unwrap(), recorded);
                 assert_eq!(orphan_attestations(&paths).len(), 1);
             })
@@ -4496,12 +4534,11 @@ mod tests {
                     stderr_excerpt: None,
                 };
                 daemon.handler.complete_gh_post_ack(delivered.clone(), result);
-                tokio::time::timeout(
-                    Duration::from_secs(30),
+                await_positive_progress(
+                    "configured projection settlement",
                     daemon.handler.drain_post_ack_tasks(),
                 )
-                .await
-                .expect("the configured projection settles");
+                .await;
                 drop(daemon);
                 let markers = fs::read_dir(paths.state_dir.join("producers/gh-completed"))
                     .unwrap()
@@ -5925,9 +5962,8 @@ mod tests {
                     .await
                     .unwrap();
                 let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                    await_positive_progress("initial continuation source", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 daemon.handler.drain_post_ack_tasks().await;
@@ -5978,9 +6014,8 @@ mod tests {
                 assert_eq!(continued_job.row.session_ref.as_deref(), Some("session-28"));
 
                 let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                    await_positive_progress("continued job completion", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let terminal = daemon
@@ -6065,9 +6100,8 @@ mod tests {
                     .await
                     .unwrap();
                 let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                    await_positive_progress("cwd-keyed source completion", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 daemon.handler.drain_post_ack_tasks().await;
@@ -6223,9 +6257,8 @@ mod tests {
                     .await
                     .unwrap();
                 let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                    await_positive_progress("default-cwd source completion", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 daemon.handler.drain_post_ack_tasks().await;
@@ -6322,11 +6355,12 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "restart source completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 daemon.handler.drain_post_ack_tasks().await;
                 let first_id = first["job_id"].as_str().unwrap().to_owned();
@@ -6412,13 +6446,10 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let finished = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    daemon.completion_rx.recv(),
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                let finished =
+                    await_positive_progress("gate verdict completion", daemon.completion_rx.recv())
+                        .await
+                        .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let terminal = daemon
                     .handler
@@ -6545,9 +6576,8 @@ mod tests {
                     .unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
                 let mut finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                    await_positive_progress("GPU job completion", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 // The direct-fallback backend never probes systemd, so this
                 // stands in for what a real `ExecStopPost` accounting probe
@@ -6662,11 +6692,12 @@ mod tests {
                     .await
                     .unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
-                let mut finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let mut finished = await_positive_progress(
+                    "unclassified-pool job completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 if let Some(Ok(outcome)) = finished.outcome.as_mut() {
                     outcome.record.accounting = Some(UnitAccounting {
                         cpu_usage_nsec: Some(1_000_000_000),
@@ -6743,11 +6774,12 @@ mod tests {
                     .await
                     .unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
-                let mut finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let mut finished = await_positive_progress(
+                    "non-GPU job completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 if let Some(Ok(outcome)) = finished.outcome.as_mut() {
                     outcome.record.accounting = Some(UnitAccounting {
                         cpu_usage_nsec: Some(1_000_000_000),
@@ -6826,11 +6858,12 @@ mod tests {
                     .await
                     .unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "unmeasured-accounting completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 // Left as the direct-fallback backend produced it:
                 // `accounting: None`, exactly like a failed probe.
                 daemon.finish_job(finished).await.unwrap();
@@ -6903,11 +6936,12 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "absent-manifest completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let absent_result = daemon
                     .handler
@@ -6949,11 +6983,12 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "passed-gates completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let passed_result = daemon
                     .handler
@@ -7065,9 +7100,8 @@ mod tests {
                     .unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
                 let finished =
-                    tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
+                    await_positive_progress("usage-bearing completion", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let terminal = daemon
@@ -7080,7 +7114,7 @@ mod tests {
                 // happen post-ack, so wait for the ledger to actually hold this
                 // attempt rather than for the file to merely exist -- the
                 // daemon creates it empty at startup.
-                tokio::time::timeout(Duration::from_secs(5), async {
+                await_positive_progress("usage attestation publication", async {
                     loop {
                         let attested = fs::read_to_string(paths.attestations_path())
                             .unwrap_or_default()
@@ -7097,8 +7131,7 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
-                .await
-                .unwrap();
+                .await;
 
                 let view = daemon
                     .handler
@@ -7192,18 +7225,19 @@ mod tests {
                     .await
                     .unwrap();
                 let drifted_task = drifted["task_uuid"].as_str().unwrap().to_owned();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "drifted-usage completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 daemon
                     .handler
                     .await_job(Some(json!({"task_uuid": drifted_task})))
                     .await
                     .unwrap();
-                tokio::time::timeout(Duration::from_secs(5), async {
+                await_positive_progress("drifted-usage attestation publication", async {
                     loop {
                         let attested = fs::read_to_string(paths.attestations_path())
                             .unwrap_or_default()
@@ -7218,8 +7252,7 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
-                .await
-                .unwrap();
+                .await;
 
                 let view = daemon
                     .handler
@@ -7340,12 +7373,11 @@ mod tests {
                     .unwrap();
                 assert_eq!(hook_status["held"], true);
 
-                let finished = tokio::time::timeout(
-                    Duration::from_secs(2),
+                let finished = await_positive_progress(
+                    "trace-bearing completion",
                     daemon.completion_rx.recv(),
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let terminal = daemon
@@ -7355,7 +7387,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(terminal["verdict"], "pass");
 
-                tokio::time::timeout(Duration::from_secs(2), async {
+                await_positive_progress("adapter metadata publication", async {
                     loop {
                         // Read from the query fact, not `context.jobs`: the
                         // job is terminal by now and terminal jobs are retired
@@ -7376,8 +7408,7 @@ mod tests {
                         tokio::task::yield_now().await;
                     }
                 })
-                .await
-                .unwrap();
+                .await;
 
                 let attestation_line = fs::read_to_string(paths.attestations_path()).unwrap();
                 let attestation: crate::witness::AttestationRecord =
@@ -7852,23 +7883,24 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let terminal = tokio::time::timeout(
-                    Duration::from_secs(2),
+                let terminal = await_positive_progress(
+                    "terminal witness acknowledgement",
                     handler.await_job(Some(json!({"task_uuid": admitted["task_uuid"]}))),
                 )
                 .await
-                .expect("terminal witness acknowledgement waited on scrape")
                 .unwrap();
                 assert_eq!(terminal["verdict"], "pass");
 
                 shutdown.send(true).unwrap();
-                assert!(tokio::time::timeout(Duration::from_millis(50), &mut daemon_task)
-                    .await
-                    .is_err());
+                assert_no_progress_within(
+                    "shutdown while the attestation writer is locked",
+                    Duration::from_millis(50),
+                    &mut daemon_task,
+                )
+                .await;
                 fs2::FileExt::unlock(&lock).unwrap();
-                tokio::time::timeout(Duration::from_secs(2), daemon_task)
+                await_positive_progress("post-ack writer join", daemon_task)
                     .await
-                    .expect("daemon did not join the post-ack writer")
                     .unwrap()
                     .unwrap();
                 assert!(verify_attestations(&attestation_path).unwrap().ok);
@@ -8564,7 +8596,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(low_result["verdict"], "preempted");
-                tokio::time::timeout(Duration::from_secs(2), async {
+                await_positive_progress("urgent job retirement", async {
                     loop {
                         // Terminal now means retired from the live map
                         // (#395), not present-and-`Completed`.
@@ -8584,16 +8616,14 @@ mod tests {
                         daemon.finish_job(finished).await.unwrap();
                     }
                 })
-                .await
-                .unwrap();
-                let urgent_result = tokio::time::timeout(
-                    Duration::from_secs(2),
+                .await;
+                let urgent_result = await_positive_progress(
+                    "urgent job terminal publication",
                     daemon
                         .handler
                         .await_job(Some(json!({"task_uuid": urgent["task_uuid"]}))),
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(urgent_result["verdict"], "pass");
                 let (report, records) = read_verified_records(&paths.witness_path()).unwrap();
@@ -8707,10 +8737,12 @@ mod tests {
                     data_dir: temp.path().join("data"),
                 };
                 let calls = Arc::new(AtomicUsize::new(0));
-                let release = Arc::new(AtomicBool::new(false));
+                let (published_tx, mut published_rx) = mpsc::unbounded_channel();
+                let (release_tx, release_rx) = watch::channel(false);
                 let transport = RecoveringRemoteTransport {
                     calls: calls.clone(),
-                    release: release.clone(),
+                    published: published_tx,
+                    release: release_rx,
                 };
                 let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
                     .with_remote_transport(transport);
@@ -8742,13 +8774,18 @@ mod tests {
                 assert_eq!(admitted["state"], "running");
                 assert_eq!(admitted["taskRef"], "crm/t07");
 
-                tokio::time::timeout(Duration::from_secs(1), async {
-                    while calls.load(Ordering::SeqCst) < 2 {
-                        tokio::task::yield_now().await;
+                await_positive_progress("second remote invocation publication", async {
+                    loop {
+                        let count = published_rx
+                            .recv()
+                            .await
+                            .expect("remote invocation observer must remain open");
+                        if count == 2 {
+                            break;
+                        }
                     }
                 })
-                .await
-                .unwrap();
+                .await;
                 {
                     let context = daemon.handler.context.read().await;
                     assert_eq!(context.lease.engine().held_in_pool("slot").unwrap(), 1);
@@ -8759,11 +8796,10 @@ mod tests {
                 let (_, witness_before) = read_verified_records(&paths.witness_path()).unwrap();
                 assert!(witness_before.is_empty());
 
-                release.store(true, Ordering::Release);
+                release_tx.send(true).unwrap();
                 let finished =
-                    tokio::time::timeout(Duration::from_secs(1), daemon.completion_rx.recv())
+                    await_positive_progress("remote completion", daemon.completion_rx.recv())
                         .await
-                        .unwrap()
                         .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let result = daemon
@@ -8861,15 +8897,14 @@ mod tests {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 let client = RpcClient::connect(&paths.socket).await.unwrap();
-                let result = tokio::time::timeout(
-                    Duration::from_secs(1),
+                let result = await_positive_progress(
+                    "re-adopted remote completion",
                     client.call(
                         "queue.await_job",
                         Some(json!({"task_uuid": task_uuid.to_string()})),
                     ),
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(result["verdict"], "pass");
                 assert_eq!(result["taskRef"], "crm/t07");
@@ -8940,7 +8975,7 @@ mod tests {
                 let notify_path = temp.path().join("notify.sock");
                 let notify_socket = UnixDatagram::bind(&notify_path).unwrap();
                 notify_socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .set_read_timeout(Some(POSITIVE_PROGRESS_BACKSTOP))
                     .unwrap();
                 daemon.notifier = SystemdNotifier::with_socket(notify_path, None);
                 let (tick_started_tx, mut tick_started_rx) = mpsc::unbounded_channel();
@@ -8952,17 +8987,16 @@ mod tests {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let mut daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
 
-                tokio::time::timeout(Duration::from_secs(1), tick_started_rx.recv())
+                await_positive_progress("lease tick start", tick_started_rx.recv())
                     .await
-                    .expect("lease tick must start")
                     .expect("lease tick hook must remain open");
                 shutdown_tx.send(true).unwrap();
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(50), &mut daemon_task)
-                        .await
-                        .is_err(),
-                    "shutdown must join, not detach or abort, the in-flight lease tick"
-                );
+                assert_no_progress_within(
+                    "shutdown while an in-flight lease tick is held",
+                    Duration::from_millis(50),
+                    &mut daemon_task,
+                )
+                .await;
                 assert!(
                     acquire_daemon_lock(&paths.state_dir).is_err(),
                     "the daemon lock must fence a replacement until the tick finishes"
@@ -8980,9 +9014,8 @@ mod tests {
                 );
 
                 release_tick_tx.send(true).unwrap();
-                tokio::time::timeout(Duration::from_secs(2), &mut daemon_task)
+                await_positive_progress("daemon shutdown after lease tick", &mut daemon_task)
                     .await
-                    .expect("shutdown must finish after the tick")
                     .expect("daemon task must not panic")
                     .expect("daemon shutdown must succeed");
                 drop(acquire_daemon_lock(&paths.state_dir).unwrap());
@@ -9144,12 +9177,11 @@ mod tests {
                 let (second_shutdown, second_shutdown_rx) = watch::channel(false);
                 let second_task = tokio::task::spawn_local(second.run_until(second_shutdown_rx));
                 let restarted_client = RpcClient::connect(&paths.socket).await.unwrap();
-                let late = tokio::time::timeout(
-                    Duration::from_millis(100),
+                let late = await_positive_progress(
+                    "restarted terminal waiter",
                     restarted_client.call("queue.await_job", Some(json!({"task_uuid": task_uuid}))),
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(late["verdict"], "pass");
                 let late_barrier = restarted_client
@@ -9856,7 +9888,7 @@ mod tests {
                     shutdown_rx,
                     events_tx,
                 );
-                tokio::time::timeout(Duration::from_secs(1), async {
+                await_positive_progress("supervisor restart events", async {
                     loop {
                         let _ = events_rx.recv().await;
                         if panics.get() >= 2 && peer_runs.get() == 1 {
@@ -9864,8 +9896,7 @@ mod tests {
                         }
                     }
                 })
-                .await
-                .unwrap();
+                .await;
                 shutdown_tx.send(true).unwrap();
                 first.await.unwrap();
                 second.await.unwrap();
@@ -9881,7 +9912,7 @@ mod tests {
         let path = temp.path().join("notify.sock");
         let socket = UnixDatagram::bind(&path).unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(POSITIVE_PROGRESS_BACKSTOP))
             .unwrap();
         let notifier = SystemdNotifier::with_socket(path, Some(Duration::from_secs(2)));
         for (send, expected) in [
@@ -9909,6 +9940,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("notify.sock");
         let socket = UnixDatagram::bind(&path).unwrap();
+        // This short socket timeout serves the final no-more-datagrams
+        // assertion below. The positive datagrams are synchronously queued
+        // before any receive, so they do not use elapsed time as progress.
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .unwrap();
@@ -9969,6 +10003,9 @@ mod tests {
 
         let notify_path = temp.path().join("notify.sock");
         let socket = UnixDatagram::bind(&notify_path).unwrap();
+        // This short socket timeout serves the final no-more-datagrams
+        // assertion below. Collection has finished before these queued
+        // positive datagrams are read.
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .unwrap();
@@ -10185,6 +10222,8 @@ mod tests {
                 .unwrap();
                 let notify_path = temp.path().join("notify.sock");
                 let notify_socket = UnixDatagram::bind(&notify_path).unwrap();
+                // This is an empty-queue polling interval. The collector's
+                // positive-progress bound is the shared deadline below.
                 notify_socket
                     .set_read_timeout(Some(Duration::from_millis(50)))
                     .unwrap();
@@ -10212,7 +10251,7 @@ mod tests {
                     // scheduling. The loop still ends the instant STOPPING is
                     // seen, so a generous ceiling costs nothing and only bounds
                     // a daemon that never stops at all.
-                    let deadline = Instant::now() + Duration::from_secs(120);
+                    let deadline = Instant::now() + POSITIVE_PROGRESS_BACKSTOP;
                     let mut seen = Vec::new();
                     while Instant::now() < deadline {
                         seen.extend(drain_notifications(&notify_socket));
@@ -10227,19 +10266,22 @@ mod tests {
                 let entered_at = Instant::now();
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 if shape == StallShape::BlockingTheThread {
-                    // This wakes only once the runtime thread is released, which
-                    // is what makes the blocked interval measurable from here.
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    // The hook publishes immediately before blocking this
+                    // single runtime thread. The receiver can only be polled
+                    // once that block ends, so observing the publication both
+                    // proves entry and measures the completed blocked interval
+                    // without guessing that 10 ms was enough time to enter.
+                    await_positive_progress("blocking dispatch stall publication", entered_rx.recv())
+                        .await
+                        .expect("dispatch stall hook must remain open");
                     assert!(
                         entered_at.elapsed() >= stall,
                         "the runtime thread was released after {:?}, so it never held for {stall:?}",
                         entered_at.elapsed()
                     );
-                    entered_rx.try_recv().expect("a dispatch arm must be entered");
                 } else {
-                    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+                    await_positive_progress("dispatch stall-hook entry", entered_rx.recv())
                         .await
-                        .expect("a dispatch arm must take the stall hook")
                         .expect("the stall hook must remain open");
                     tokio::time::sleep(stall).await;
                 }
@@ -10303,6 +10345,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("notify.sock");
         let socket = UnixDatagram::bind(&path).unwrap();
+        // `drain_notifications` uses this short interval to observe an empty
+        // queue, which is the semantic fact asserted by this test.
         socket
             .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
@@ -10778,11 +10822,12 @@ mod tests {
                     .await
                     .unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "finish-job race completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 let attempt = finished.attempt;
                 let lease_epoch = finished.lease_epoch;
 
@@ -10790,14 +10835,17 @@ mod tests {
                 // after this point in `finish_job` is the window.
                 let finishing = daemon.finish_job(finished);
                 tokio::pin!(finishing);
-                tokio::select! {
-                    result = &mut finishing => {
-                        panic!("finish_job must stall in its own window, returned {result:?}")
+                await_positive_progress("finish-job race-window entry", async {
+                    tokio::select! {
+                        result = &mut finishing => {
+                            panic!("finish_job must stall in its own window, returned {result:?}")
+                        }
+                        entered = entered_rx.recv() => {
+                            entered.expect("finish_job must reach the window");
+                        }
                     }
-                    entered = entered_rx.recv() => {
-                        entered.expect("finish_job must reach the window");
-                    }
-                }
+                })
+                .await;
 
                 // Retire it inside the window, through the real path that does
                 // it: a forced cancel. This is the shape the guard exists for.
@@ -11411,11 +11459,12 @@ mod tests {
                     .await
                     .unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "retry source completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let terminal = daemon
                     .handler
@@ -14110,11 +14159,12 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(10), daemon.completion_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "capture-lock source completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
 
@@ -14156,7 +14206,9 @@ mod tests {
                     "the dispatch parked the runtime thread for {worst_stall:?}"
                 );
 
-                // And the daemon is still answering, mid-deadline.
+                // And the daemon is still answering, mid-deadline. This short
+                // bound is semantic: response latency is the fact under test,
+                // unlike the positive-progress waits above and below.
                 let answered = tokio::time::timeout(
                     Duration::from_secs(2),
                     daemon.handler.query("query.jobs", Some(json!({"limit": 1}))),
@@ -14166,11 +14218,12 @@ mod tests {
                 .unwrap();
                 assert_eq!(answered["items"].as_array().unwrap().len(), 1);
 
-                let finished =
-                    tokio::time::timeout(Duration::from_secs(60), daemon.completion_rx.recv())
-                        .await
-                        .expect("the dispatch must give up on the lock, not block forever")
-                        .unwrap();
+                let finished = await_positive_progress(
+                    "capture-lock deadline completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
                 daemon.finish_job(finished).await.unwrap();
                 drop(holder);
 
@@ -14691,7 +14744,12 @@ mod tests {
                 let archived_task = enqueue_node(ARCHIVED_RUN, "agent-archived").await;
                 let live_task = enqueue_node(LIVE_RUN, "agent-live").await;
                 for _ in 0..2 {
-                    let finished = daemon.completion_rx.recv().await.unwrap();
+                    let finished = await_positive_progress(
+                        "archived-run fixture completion",
+                        daemon.completion_rx.recv(),
+                    )
+                    .await
+                    .unwrap();
                     daemon.finish_job(finished).await.unwrap();
                 }
                 daemon
@@ -15081,6 +15139,17 @@ mod tests {
                     }
                 });
 
+                // Bracket the wall-clock storm with the loop's own samples.
+                // Without a sample before the client threads start, shutting
+                // down immediately after they finish can leave the observed
+                // span one tick short even though the loop stayed live.
+                await_positive_progress("initial lease tick before query storm", async {
+                    while ticks.borrow().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+
                 // Query storm: corpus-scale reads back to back for the whole
                 // period, from a dedicated OS thread.
                 let storm_socket = paths.socket.clone();
@@ -15182,6 +15251,24 @@ mod tests {
                 let probe_elapsed = tokio::task::spawn_blocking(move || probe.join().unwrap())
                     .await
                     .unwrap();
+
+                // Likewise retain the daemon until its samples cover the full
+                // interval. The max-gap assertion below remains the liveness
+                // verdict; this wait only makes its measurement window real.
+                await_positive_progress("lease ticks covering the query storm", async {
+                    loop {
+                        let covers_storm = {
+                            let ticks = ticks.borrow();
+                            ticks.len() >= 2
+                                && *ticks.last().unwrap() - *ticks.first().unwrap() >= STORM
+                        };
+                        if covers_storm {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
 
                 shutdown_tx.send(true).unwrap();
                 daemon_task.await.unwrap().unwrap();
@@ -15354,12 +15441,11 @@ mod tests {
                         })))
                         .await
                         .unwrap();
-                    let finished = tokio::time::timeout(
-                        Duration::from_secs(5),
+                    let finished = await_positive_progress(
+                        "trace-index fixture completion",
                         daemon.completion_rx.recv(),
                     )
                     .await
-                    .unwrap()
                     .unwrap();
                     daemon.finish_job(finished).await.unwrap();
                     let terminal = daemon

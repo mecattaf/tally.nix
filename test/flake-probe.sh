@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Measure the parallel-execution flake rate of one cargo test binary (#419).
+# Measure the parallel-execution flake rate of tally-core's lib test binary
+# (#419).
 #
 # #419's exit criterion is a measured rate over a wave of runs under load, not a
 # green run of the tests that were last seen failing. Every increment to that
@@ -13,18 +14,27 @@
 # stress tool: those change the shape of the contention and, on a host running
 # other work, corrupt somebody else's measurement.
 #
-#   test/flake-probe.sh <test-binary> [seconds] [concurrent-suites]
+#   test/flake-probe.sh [seconds] [concurrent-suites]
+#   test/flake-probe.sh <test-binary> <seconds> <concurrent-suites>
 #
-# Build the binary first, and reuse it across every run of the wave, so the
-# measurement is of the suite and not of rustc competing with it:
+# The probe builds the package-scoped lib target itself, extracts the exact
+# executable from that Cargo invocation's JSON, and reuses it across every run
+# of the wave. This keeps rustc out of the measurement and prevents a caller
+# from silently selecting a stale hash left by `--workspace` or another build:
 #
-#   env -u TALLY_TEST_REMOTE_HOST cargo test -p tally-core --lib --no-run
-#   test/flake-probe.sh target/debug/deps/tally_core-<hash> 480 2
+#   test/flake-probe.sh 480 3
+#
+# A caller that has already identified the exact artifact under test may pass
+# that executable explicitly. The duration and concurrency are required in
+# this form so it remains unambiguous with the self-building form above:
+#
+#   test/flake-probe.sh target/debug/deps/tally_core-<hash> 480 3
 #
 # It prints one summary line per concurrent suite and a total, and appends the
 # WHOLE OUTPUT of every failing run to <binary>.flake-probe.failures in the
-# working directory. The whole output, not a grep for the test name: the
-# expensive part of a wave is catching a failure, and a name without its
+# working directory. Each lane writes separately until the wave ends, so whole
+# failing runs cannot interleave. The whole output, not a grep for the test
+# name: the expensive part of a wave is catching a failure, and a name without its
 # `panicked at` line and its left/right values costs the next wave a full
 # re-reproduction to learn the mechanism -- which it did cost one. Exit status
 # is 0 when the wave completed, whatever the rate was: this measures, it does
@@ -37,24 +47,79 @@
 # about the tree.
 set -uo pipefail
 
-binary="${1:?usage: flake-probe.sh <test-binary> [seconds] [concurrent-suites]}"
-budget="${2:-480}"
-suites="${3:-2}"
+usage() {
+  echo "usage: flake-probe.sh [positive-seconds] [positive-concurrent-suites]" >&2
+  echo "       flake-probe.sh <test-binary> <positive-seconds> <positive-concurrent-suites>" >&2
+  exit 2
+}
 
+binary=""
+case "$#" in
+  0 | 1 | 2)
+    budget="${1:-480}"
+    suites="${2:-3}"
+    ;;
+  3)
+    binary="$1"
+    budget="$2"
+    suites="$3"
+    ;;
+  *) usage ;;
+esac
+
+if ! [[ "$budget" =~ ^[1-9][0-9]*$ ]]; then
+  usage
+fi
+if ! [[ "$suites" =~ ^[1-9][0-9]*$ ]]; then
+  usage
+fi
+
+scratch_dir="$(mktemp -d)"
+tally_file="$scratch_dir/tally"
+failures_dir="$scratch_dir/failures"
+mkdir "$failures_dir"
+trap 'rm -rf -- "$scratch_dir"' EXIT
+
+if [ -z "$binary" ]; then
+  build_json="$scratch_dir/cargo-build.json"
+  echo "flake-probe: building fresh tally-core lib test executable"
+  if ! env -u TALLY_TEST_REMOTE_HOST cargo test -p tally-core --lib --no-run \
+    --message-format=json >"$build_json"; then
+    echo "flake-probe: cargo test --no-run failed" >&2
+    jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' \
+      "$build_json" >&2 || true
+    exit 2
+  fi
+
+  mapfile -t binaries < <(
+    jq -r '
+      select(.reason == "compiler-artifact")
+      | select(.target.name == "tally_core")
+      | select(.profile.test == true)
+      | select((.target.kind | index("lib")) != null)
+      | .executable // empty
+    ' "$build_json" | sort -u
+  )
+  if [ "${#binaries[@]}" -ne 1 ]; then
+    echo "flake-probe: expected one fresh tally_core lib test executable, found ${#binaries[@]}" >&2
+    printf 'flake-probe: candidate %s\n' "${binaries[@]}" >&2
+    exit 2
+  fi
+  binary="${binaries[0]}"
+fi
 if [ ! -x "$binary" ]; then
-  echo "flake-probe: $binary is not an executable test binary" >&2
+  echo "flake-probe: test binary is not executable: $binary" >&2
   exit 2
 fi
 
 failures_file="$(basename "$binary").flake-probe.failures"
 : >"$failures_file"
-tally_file="$(mktemp)"
-trap 'rm -f "$tally_file"' EXIT
 
 run_suite() {
   local lane="$1"
   local runs=0 fails=0 output
-  local end=$(($(date +%s) + budget))
+  local end
+  end=$(($(date +%s) + budget))
   while [ "$(date +%s)" -lt "$end" ]; do
     runs=$((runs + 1))
     if ! output=$(env -u TALLY_TEST_REMOTE_HOST "$binary" 2>&1); then
@@ -63,7 +128,7 @@ run_suite() {
         echo "=== suite $lane run $runs failed ==="
         printf '%s\n' "$output"
         echo "=== end suite $lane run $runs ==="
-      } >>"$failures_file"
+      } >>"$failures_dir/$lane"
     fi
   done
   echo "$lane $runs $fails" >>"$tally_file"
@@ -74,6 +139,12 @@ for lane in $(seq 1 "$suites"); do
   run_suite "$lane" &
 done
 wait
+
+for lane in $(seq 1 "$suites"); do
+  if [ -s "$failures_dir/$lane" ]; then
+    cat "$failures_dir/$lane" >>"$failures_file"
+  fi
+done
 
 total_runs=0
 total_fails=0

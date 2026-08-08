@@ -64,9 +64,15 @@ tracked how hard anyone looked. Measure it with `test/flake-probe.sh`, so succes
 comparable:
 
 ```console
-$ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test -p tally-core --lib --no-run
-$ test/flake-probe.sh target/debug/deps/tally_core-<hash> 480 3
+$ nix develop --command test/flake-probe.sh 480 3
 ```
+
+The probe runs the package-scoped Cargo test build itself, with `--lib`, `--no-run`, and
+`--message-format=json`, and selects the exact executable reported by that invocation. Do not hand
+it a path from `target/debug/deps`: Cargo gives `--workspace` and `-p` builds different metadata
+hashes, and reusing a caller-selected path can measure an old binary while appearing current. The
+first argument is the wave duration in seconds and the second is the number of concurrent suites;
+three suites is the default.
 
 The load condition is the concurrent suites themselves — never a spinner or a stress tool, which
 change the shape of the contention and corrupt any measurement sharing the host. Quote the run
