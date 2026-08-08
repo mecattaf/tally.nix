@@ -11,6 +11,15 @@ from typing import Any, Callable
 from support import SUITE_ROOT, Context, case, copy_executable, make_case_directory, require
 
 
+SEAM_REGRESSIONS = {
+    "ordinary": "daemon::tests::completion_scrape_records_launch_cwd_beside_the_pointer",
+    "restart": "daemon::tests::a_restarted_daemon_re_derives_the_launch_record_beside_the_pointer",
+    "represent": "daemon::tests::represent_hydration_records_launch_cwd_beside_the_pointer",
+    "adopted": "daemon::tests::adopted_metadata_records_launch_cwd_beside_the_pointer",
+    "recovered": "daemon::tests::recovered_job_install_records_launch_cwd_beside_the_pointer",
+}
+
+
 def recovery_config(context: Context, root: Path) -> tuple[dict[str, Any], Path]:
     program = root / "cwd-agent"
     copy_executable(SUITE_ROOT / "fixtures/recovery/cwd-agent.py", program)
@@ -83,6 +92,20 @@ def require_resume(log: Path, cwd: Path) -> None:
     )
 
 
+def require_seam_regression(context: Context, seam: str) -> None:
+    name = SEAM_REGRESSIONS[seam]
+    require(
+        name in context.core_test_names(),
+        f"target omits the focused {seam} launch-cwd producer regression {name}",
+    )
+    result = context.run_core_test(name, timeout=240)
+    require(
+        result.returncode == 0,
+        f"focused {seam} launch-cwd producer regression failed:\n"
+        + (result.stdout + result.stderr)[-5000:],
+    )
+
+
 @case(
     "launch-cwd-ordinary-completion",
     (440,),
@@ -98,6 +121,7 @@ def launch_cwd_ordinary_completion(context: Context) -> None:
         resumed = continue_job(daemon, task, "review")
         require(resumed.returncode == 0, f"same-cwd continuation failed: {(resumed.stderr or resumed.stdout)[-1800:]}")
     require_resume(log, cwd)
+    require_seam_regression(context, "ordinary")
 
 
 @case(
@@ -116,6 +140,7 @@ def launch_cwd_restarted_capture(context: Context) -> None:
         resumed = continue_job(restarted, task, "review")
         require(resumed.returncode == 0, f"post-restart continuation failed: {(resumed.stderr or resumed.stdout)[-2000:]}")
     require_resume(log, cwd)
+    require_seam_regression(context, "restart")
 
 
 @case(
@@ -143,6 +168,7 @@ def launch_cwd_recovered_install(context: Context) -> None:
         settled = restarted.tally("queue", "await-job", continued, timeout=60)
         require(settled.returncode == 0, f"recovered continuation failed: {(settled.stderr or settled.stdout)[-2000:]}")
     require_resume(log, cwd)
+    require_seam_regression(context, "recovered")
 
 
 @case(
@@ -170,6 +196,7 @@ def launch_cwd_adopted_metadata(context: Context) -> None:
         settled = restarted.tally("queue", "await-job", continued, timeout=60)
         require(settled.returncode == 0, f"adopted continuation failed: {(settled.stderr or settled.stdout)[-2400:]}")
     require_resume(log, cwd)
+    require_seam_regression(context, "adopted")
 
 
 @case(
@@ -190,9 +217,4 @@ def launch_cwd_representation_hydration(context: Context) -> None:
         "confirmed pool return could not re-present its durable row:\n"
         + (result.stdout + result.stderr)[-5000:],
     )
-    # Also require the recovery capture binding: together these two process
-    # probes catch deleting either re-presentation or cwd hydration.
-    restart = "daemon::tests::a_restarted_daemon_re_derives_the_launch_record_beside_the_pointer"
-    require(restart in context.core_test_names(), f"target omits launch-cwd recovery case {restart}")
-    bound = context.run_core_test(restart, timeout=180)
-    require(bound.returncode == 0, (bound.stdout + bound.stderr)[-5000:])
+    require_seam_regression(context, "represent")
