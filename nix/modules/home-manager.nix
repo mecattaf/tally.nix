@@ -348,6 +348,7 @@ let
     runtimeInputs = [
       pkgs.gh
       pkgs.git
+      pkgs.nix
     ];
     text = ''
       socket="''${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}/tally/tally.sock"

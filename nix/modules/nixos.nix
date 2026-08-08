@@ -162,6 +162,7 @@ let
     runtimeInputs = [
       pkgs.gh
       pkgs.git
+      pkgs.nix
     ];
     text = ''
       exec ${

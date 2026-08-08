@@ -499,6 +499,19 @@ profile is switched forward again, tally recovers an explicit override from a
 retained sidecar while preserving registration ID, approved digest, observation
 fields, and executable paths.
 
+That same current-generation `campaign list` reconciles executable ownership
+before rollback. Store-backed flow and driver subfiles retain their exact
+authority paths and have separate indirect roots under
+`campaigns/assets/<registration-id>/<arm-serial>/roots/`; non-store overrides
+have verified read-only snapshots in that generation instead. Leave the whole
+`campaigns/assets/` tree in place. The roots keep the armed package output alive
+through profile deletion and Nix GC even while N-1 is polling, and the snapshots
+need no external source. If reconciliation reports a typed missing flow or
+driver asset, the old unrooted object was already lost: inspect the approved
+campaign and restore the exact object if possible. If it is irretrievable,
+explicitly disarm and re-arm with reviewed assets before continuing the
+rollback; tally will not substitute them under the old approval.
+
 This guarantee is for the adjacent schema-2 generations. If a rollback crosses
 an authority-schema migration, follow that release's explicit registry
 migration procedure instead of assuming the state is interchangeable.

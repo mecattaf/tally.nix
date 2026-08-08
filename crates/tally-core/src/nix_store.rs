@@ -17,8 +17,86 @@ pub trait StoreValidity {
 }
 
 pub trait GcRootBackend {
+    /// Return the containing store output for an asset path, if the backend
+    /// owns that path. The production implementation recognizes
+    /// `/nix/store/<hash-name>` and preserves any subpath only in the caller's
+    /// authority record.
+    fn containing_store_output(&self, path: &Path) -> Option<PathBuf> {
+        containing_nix_store_output(path)
+    }
+
     fn add_root(&self, link: &Path, target: &Path) -> Result<(), String>;
+
+    /// Remove an indirect root. Missing roots are already reconciled.
+    fn remove_root(&self, link: &Path) -> Result<(), String> {
+        remove_gc_root(link).map_err(|error| error.to_string())
+    }
+
     fn collect_garbage(&self) -> Result<(), String>;
+}
+
+/// Identify the complete Nix store output containing `path`.
+///
+/// Store subfiles are deliberately not collapsed by campaign authority: this
+/// helper is only for choosing the GC-root target. Requiring the canonical
+/// 32-character Nix base32 hash keeps a coincidental `/nix/store/...` prefix
+/// from acquiring store semantics.
+pub fn containing_nix_store_output(path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix("/nix/store").ok()?;
+    let mut components = relative.components();
+    let std::path::Component::Normal(name) = components.next()? else {
+        return None;
+    };
+    if components.any(|component| !matches!(component, std::path::Component::Normal(_))) {
+        return None;
+    }
+    let name = name.to_str()?;
+    let bytes = name.as_bytes();
+    if bytes.len() < 34
+        || bytes[32] != b'-'
+        || !bytes[..32].iter().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'
+                    | b'b'
+                    | b'c'
+                    | b'd'
+                    | b'f'
+                    | b'g'
+                    | b'h'
+                    | b'i'
+                    | b'j'
+                    | b'k'
+                    | b'l'
+                    | b'm'
+                    | b'n'
+                    | b'p'
+                    | b'q'
+                    | b'r'
+                    | b's'
+                    | b'v'
+                    | b'w'
+                    | b'x'
+                    | b'y'
+                    | b'z'
+            )
+        })
+    {
+        return None;
+    }
+    Some(Path::new("/nix/store").join(name))
+}
+
+/// Unlink one indirect GC root without treating an already-missing link as an
+/// error. Removing the link is the supported lifetime boundary for roots made
+/// with `nix-store --add-root`.
+pub fn remove_gc_root(link: &Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_file(link) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(source),
+    }
 }
 
 pub trait DerivationAvailability: Send + Sync {
@@ -145,6 +223,13 @@ impl NixStore {
         )?;
         require_success(&self.nix_program, &output)
     }
+
+    fn remove_root_result(&self, link: &Path) -> Result<(), NixStoreError> {
+        remove_gc_root(link).map_err(|source| NixStoreError::RootIo {
+            path: link.to_owned(),
+            source,
+        })
+    }
 }
 
 impl StoreValidity for NixStore {
@@ -163,6 +248,11 @@ impl DerivationAvailability for NixStore {
 impl GcRootBackend for NixStore {
     fn add_root(&self, link: &Path, target: &Path) -> Result<(), String> {
         self.add_root_result(link, target)
+            .map_err(|error| error.to_string())
+    }
+
+    fn remove_root(&self, link: &Path) -> Result<(), String> {
+        self.remove_root_result(link)
             .map_err(|error| error.to_string())
     }
 
@@ -340,5 +430,35 @@ mod tests {
             )),
             Err(NixStoreError::Spawn { .. })
         ));
+    }
+
+    #[test]
+    fn containing_output_keeps_store_subfiles_out_of_the_root_target() {
+        let output = Path::new("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-tally-1.0");
+        assert_eq!(
+            containing_nix_store_output(&output.join("share/tally/spec-build.js")),
+            Some(output.to_owned())
+        );
+        assert_eq!(containing_nix_store_output(output), Some(output.to_owned()));
+        assert_eq!(
+            containing_nix_store_output(Path::new("/nix/store/not-a-store-output/bin/tool")),
+            None
+        );
+        assert_eq!(
+            containing_nix_store_output(Path::new(
+                "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-tally/../other"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn removing_a_gc_root_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("root");
+        std::os::unix::fs::symlink("/nix/store/target", &link).unwrap();
+        remove_gc_root(&link).unwrap();
+        remove_gc_root(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
     }
 }

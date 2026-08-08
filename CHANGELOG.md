@@ -38,6 +38,21 @@ authorized.
   restores only immutable native task content, and requires the resulting
   envelope to reproduce `worklist.graphDigest` without applying defaults.
 
+### Campaign executable ownership (#448)
+
+- Armed flow and driver paths now have registry-owned lifetime. Exact Nix-store
+  subfiles remain in frozen schema-2 authority while two stable indirect roots
+  retain their containing outputs; non-store overrides are copied to hashed,
+  owner-immutable snapshots that preserve executable bits.
+- Asset generations are derived from `(registrationId, armSerial)` and publish
+  before authority. Re-arm removes the prior serial only after the new
+  authority rename; disarm and closed-issue pruning remove authority first.
+  Registry entry reconciles missing roots plus safe pre/post-publication
+  leftovers and reports a typed error when an old unrooted asset is already
+  gone.
+- Both campaign-poll module wrappers now include Nix in their runtime PATH, so
+  scheduled reconciliation and interactive CLI arms use the same lifecycle.
+
 ### Campaign registry rollback compatibility (#447)
 
 - Campaign schema-2 authority is frozen to the closed field set understood by

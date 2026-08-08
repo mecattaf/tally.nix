@@ -1500,7 +1500,7 @@ async fn run_campaign_arm(
         &registration.driver,
         registration.allow_test_local_forge,
     )?;
-    registry.write(&registration)?;
+    registry.write(&mut registration)?;
     if args.no_enqueue {
         outln!(
             "{}",
@@ -1530,7 +1530,7 @@ async fn run_campaign_arm(
         args.wait,
     )
     .await?;
-    registry.write(&registration)?;
+    registry.write(&mut registration)?;
     outln!(
         "{}",
         serde_json::to_string(&armed_projection(&result, registration.sub_issue_walk))?
@@ -1599,7 +1599,7 @@ async fn run_campaign_poll(
             let observation = campaign_observation(&graph, &steering, registration.arm_serial)?;
             if registration.last_observation.as_deref() == Some(&observation) {
                 registration.last_forge_observation = Some(forge);
-                registry.write(&registration)?;
+                registry.write(&mut registration)?;
                 return Ok((false, false));
             }
             registration.last_forge_observation = Some(forge);
@@ -1616,7 +1616,7 @@ async fn run_campaign_poll(
                 args.wait,
             )
             .await?;
-            registry.write(&registration)?;
+            registry.write(&mut registration)?;
             if args.wait {
                 let code = waited_exit_code(&result);
                 if code != 0 {
@@ -4577,7 +4577,11 @@ print(json.dumps({
         let root = tempfile::tempdir().unwrap();
         let state_dir = root.path();
         let authenticated = "operator".to_owned();
-        let registration = CampaignRegistration::new(
+        let flow = root.path().join("flow.js");
+        let driver = root.path().join("driver");
+        fs::write(&flow, "flow fixture\n").unwrap();
+        fs::write(&driver, "driver fixture\n").unwrap();
+        let mut registration = CampaignRegistration::new(
             CampaignRegistrationV2 {
                 schema_version: REGISTRY_SCHEMA_VERSION,
                 registration_id: uuid::Uuid::now_v7().to_string(),
@@ -4594,14 +4598,14 @@ print(json.dumps({
                 sub_issue_walk: true,
                 last_observation: None,
                 last_forge_observation: None,
-                flow: PathBuf::from("/nix/store/flow.js"),
-                driver: PathBuf::from("/nix/store/driver"),
+                flow,
+                driver,
                 workspace_root: PathBuf::from("/srv/tally-campaigns"),
             },
             Some(240_000),
         );
         let registry = CampaignRegistry::open(state_dir).unwrap();
-        registry.write(&registration).unwrap();
+        registry.write(&mut registration).unwrap();
         let loaded = registry
             .read_issue(&registration.issue_url)
             .unwrap()

@@ -305,6 +305,33 @@ explicit value to the sidecar, treats `null` as the absent/default
 representation, and rewrites the authority record. No other unknown authority
 member is admitted by that migration.
 
+Each successful arm also owns the exact flow and driver it admitted. Ownership
+lives under
+`$XDG_STATE_HOME/tally/campaigns/assets/<registration-id>/<arm-serial>/`, outside
+the frozen authority schema:
+
+- An asset below `/nix/store/<hash-name>/...` keeps its exact subfile path in
+  authority, while `roots/flow` or `roots/driver` is a separate indirect GC root
+  for the containing store output. Thus a profile upgrade and Nix garbage
+  collection cannot collect the older campaign generation.
+- Any other override is copied into `snapshots/flow` or `snapshots/driver` before
+  authority is published. The registry removes write bits, preserves read and
+  execute bits (including the driver's executable mode), records a SHA-256, and
+  verifies both mode and content on later entries. The source may disappear
+  after a successful arm; the immutable snapshot is the authority path.
+
+There is no unmanaged asset-lifetime mode. Asset directories and both roots are
+prepared and synced before the authority rename. Re-arm publishes the next
+serial before removing the prior one; disarm and closed-issue pruning remove
+authority before assets. Consequently, an interrupted pre-publication arm can
+only leave an orphan generation, while an interruption after publication can
+only retain an extra old generation. Registry entry recreates a missing root
+while its output still exists and deletes only unreferenced registry-owned
+generations. If a legacy unrooted path has already disappeared, `arm`, `list`,
+and `poll` fail with a typed missing-asset error instead of silently substituting
+the current package. Explicit `disarm` can still abandon that broken authority;
+it removes authority first and reconciles every registration that remains live.
+
 The poller may refetch projection state and allowed-actor comments, but it
 refuses any changed executable graph until the operator inspects it and runs
 `arm` again. The reconciler independently refetches and recomputes that digest
@@ -353,7 +380,9 @@ finds its own marker and stays quiet. Both render inside nodes the campaign
 already had, so neither adds a flow node. On a local forge the summary is a
 durable blob at `refs/tally/spec-build/v1/<scope>/summary/<outcome>`. Operators can remove an open registration
 without changing forge state with `tally campaign disarm ISSUE-URL`; registry
-read/modify/write operations are file-locked against timer and re-arm races.
+read/modify/write and asset ownership operations are file-locked against timer
+and re-arm races. Disarm removes that registration's sidecar, snapshots, and
+both indirect roots after removing its authority record.
 `tally campaign list` inspects registrations, while `tally campaign poll --once`
 is the timer's bounded scan and `--wait` waits for newly admitted passes.
 

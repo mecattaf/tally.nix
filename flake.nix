@@ -4165,6 +4165,10 @@
                 for script in "$pollScript" "$systemPollScript"; do
                   test -x "$script"
                   grep -Fq -- "campaign poll --once" "$script"
+                  # Poll reconciles indirect roots in exactly the same registry
+                  # lifecycle as interactive arm, so both module wrappers must
+                  # make nix-store available through their generated PATH.
+                  grep -Fq -- "${pkgs.nix}/bin" "$script"
                   if grep -Fq -- "--wait" "$script"; then
                     echo "campaign-render: poll timer must not pass --wait: $script" >&2
                     exit 1
