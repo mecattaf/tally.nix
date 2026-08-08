@@ -561,10 +561,9 @@ observation sits beside an observation that reported components, `total-only-att
 ambiguity. This reported-shape rule never supplies a denominator, never excuses a declared field,
 and never changes a sum.
 
-`attemptsReportedWithComponents` remains a deprecated declaration-aware compatibility projection
-for this wire generation. It is not a denominator and must not drive completeness; use
-`fieldCoverage`. During the transition, `total-only-attempts` can appear only beside the
-authoritative `partial-components` diagnosis and adds no separate incompleteness meaning.
+`attemptsReportedWithComponents` remains a deprecated compatibility projection for older wire
+consumers. It is computed from durable declarations on reported attempts, never from observed
+shape. It is not a denominator and does not drive a caveat or completeness; use `fieldCoverage`.
 
 `ledgerVerified` is false when the advisory chain did not verify or could not be read, and then
 nothing is summed at all rather than answered as a zero. Every reason the sums are partial also

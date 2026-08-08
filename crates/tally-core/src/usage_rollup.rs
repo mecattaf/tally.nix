@@ -19,7 +19,9 @@
 //! `accounting.usage`, never a raw cumulative observation. Missing,
 //! over-ceiling, and unknown-ceiling evidence is caveated. Pre-schema raw-only
 //! records are visible on job detail but are excluded here rather than guessed
-//! fresh.
+//! fresh. Their **reported-shape** remains diagnostic only: because the
+//! declared surface is unknown, it can explain an ambiguous total-only record
+//! but can never become a completeness denominator.
 //!
 //! **2. `inputTokens` alone is not the cross-harness fresh-input figure.**
 //! claude-code's `cache_creation_input_tokens` are fresh, uncached prompt
@@ -91,7 +93,7 @@ pub const MAX_MISSING_ATTEMPT_IDENTITIES: usize = 64;
 
 /// Where the rollup's numbers came from.
 pub const ROLLUP_PROVENANCE: &str =
-    "expected attempts from durable row counters with canonical-witness fallback; last adapter-scrape usageEvidence.accounting per taskUuid/attempt, selected leaseEpoch retained; legacy raw observations excluded";
+    "expected attempts from durable row counters with canonical-witness fallback; last adapter-scrape usageEvidence.accounting per taskUuid/attempt, selected leaseEpoch retained; legacy raw observations excluded, with reported-shape ambiguity retained only as declared-surface-unknown diagnosis";
 
 /// Exactly what the run total is a sum over. Stated on the wire because the
 /// defect this rollup exists to avoid is a figure computed from the wrong one
@@ -448,9 +450,10 @@ pub struct UsageCoverage {
     /// one that catches a single renamed key silently deleting a component from
     /// the run total.
     pub attempts_reported_without_figures: usize,
-    /// Deprecated compatibility projection: reported attempts whose durable
-    /// evidence declared at least one token component. It no longer drives
-    /// completeness; use `fieldCoverage` and each field's
+    /// Deprecated wire-compatibility projection: reported attempts whose
+    /// durable evidence declared at least one token component. It is computed
+    /// only from declarations and never drives completeness or caveats; use
+    /// `fieldCoverage` and each field's
     /// `attemptsDeclared`/`attemptsReported` counts.
     pub attempts_reported_with_components: usize,
     /// Attempts whose attestation states `not-reported`: a usage scrape was
@@ -531,15 +534,18 @@ pub enum UsageRollupCaveat {
     /// attempts than declared it. A derived total may remain visible as a
     /// floor, but it is not evidence that the promised total arrived.
     PartialTotal,
-    /// Deprecated compatibility caveat retained through U408's wire change.
-    /// Declaration-aware [`UsageRollupCaveat::PartialComponents`] is the
-    /// authoritative diagnosis and this caveat can add no new incompleteness.
-    TotalOnlyAttempts,
     /// Some attestation carries no readable usage record.
     UnreadableUsageRecord,
     /// Some attestation predates `usageEvidence`; its raw observation is not
     /// assumed fresh and is excluded from the sums.
     LegacyUsageContract,
+    /// A legacy usage record has no durable declaration, so its reported
+    /// shape cannot establish which fields the adapter promised.
+    DeclaredSurfaceUnknown,
+    /// At least one legacy reported-shape is an ambiguous total-only record
+    /// beside an observation that reported components. This diagnoses the
+    /// legacy ambiguity only and never exempts declared-field grading.
+    TotalOnlyAttempts,
     /// Some declared field could not be reduced to an exact per-attempt value.
     AccountingUnavailable,
     /// A session-cumulative checkpoint could not be reduced because its exact
@@ -606,7 +612,7 @@ enum LedgerUsage {
     /// A pre-schema raw observation, or a schema record with no usable field
     /// declaration. It stays visible on job detail but has no trustworthy
     /// declaration/accounting meaning for a run sum.
-    Legacy,
+    Legacy(Box<UsageObservation>),
     /// The payload predates the usage record, or carries one this build cannot
     /// read.
     NoRecord,
@@ -656,10 +662,27 @@ fn field_is_partial(coverage: &UsageCoverage, field: &str) -> bool {
         .is_some_and(|field| field.attempts_reported < field.attempts_declared)
 }
 
-fn has_readable_legacy_usage(payload: &Value) -> bool {
+fn readable_legacy_usage(payload: &Value) -> Option<UsageObservation> {
     payload
         .get("usage")
-        .is_some_and(|value| serde_json::from_value::<UsageObservation>(value.clone()).is_ok())
+        .and_then(|value| serde_json::from_value::<UsageObservation>(value.clone()).ok())
+}
+
+fn reports_component_shape(observation: &UsageObservation) -> bool {
+    observation.breakdown().is_some_and(|breakdown| {
+        COMPONENT_FIELDS
+            .iter()
+            .any(|field| breakdown_reports_field(breakdown, field))
+    })
+}
+
+fn reports_legacy_total_only_shape(observation: &UsageObservation) -> bool {
+    observation.breakdown().is_some_and(|breakdown| {
+        !reports_component_shape(observation)
+            && breakdown
+                .total_tokens
+                .is_some_and(|total| total.source == UsageTotalSource::HarnessReported)
+    })
 }
 
 /// Lineage carried by the public checkpoint projection. It is deliberately
@@ -968,8 +991,8 @@ pub fn roll_up(roster: &ExpectedUsageRoster, evidence: &AttestationEvidence<'_>)
                 .map(Box::new)
                 .map_or_else(
                     || {
-                        if has_readable_legacy_usage(payload) {
-                            LedgerUsage::Legacy
+                        if let Some(observed) = readable_legacy_usage(payload) {
+                            LedgerUsage::Legacy(Box::new(observed))
                         } else {
                             LedgerUsage::NoRecord
                         }
@@ -1045,6 +1068,8 @@ pub fn roll_up(roster: &ExpectedUsageRoster, evidence: &AttestationEvidence<'_>)
     let mut total_attempts = 0_usize;
     let mut saw_harness_total = false;
     let mut saw_derived_total = false;
+    let mut legacy_total_only_shapes = 0_usize;
+    let mut reported_component_shapes = 0_usize;
     let mut saturated = false;
 
     for ((task, _), selected) in &attempts {
@@ -1058,9 +1083,16 @@ pub fn roll_up(roster: &ExpectedUsageRoster, evidence: &AttestationEvidence<'_>)
                 caveats.insert(UsageRollupCaveat::UnreadableUsageRecord);
                 continue;
             }
-            LedgerUsage::Legacy => {
+            LedgerUsage::Legacy(observed) => {
                 coverage.attempts_legacy_usage += 1;
                 caveats.insert(UsageRollupCaveat::LegacyUsageContract);
+                caveats.insert(UsageRollupCaveat::DeclaredSurfaceUnknown);
+                if reports_legacy_total_only_shape(observed) {
+                    legacy_total_only_shapes += 1;
+                }
+                if reports_component_shape(observed) {
+                    reported_component_shapes += 1;
+                }
                 continue;
             }
             LedgerUsage::Accounted(evidence) => evidence,
@@ -1129,6 +1161,9 @@ pub fn roll_up(roster: &ExpectedUsageRoster, evidence: &AttestationEvidence<'_>)
             UsageObservation::Reported(breakdown) => breakdown,
         };
         coverage.attempts_reported += 1;
+        if reports_component_shape(observation) {
+            reported_component_shapes += 1;
+        }
 
         let exact = |field: &str| {
             declarations.contains(field)
@@ -1170,9 +1205,8 @@ pub fn roll_up(roster: &ExpectedUsageRoster, evidence: &AttestationEvidence<'_>)
             caveats.insert(UsageRollupCaveat::ReportedWithoutFigures);
         }
 
-        // Deprecated compatibility projection: U409 removes the historical
-        // reported-shape exemption around this count. It is already computed
-        // from declarations here and does not drive the field thresholds.
+        // Deprecated wire projection, computed once from declarations. It is
+        // never a threshold or caveat input.
         if COMPONENT_FIELDS
             .iter()
             .any(|field| declarations.contains(field))
@@ -1349,17 +1383,7 @@ pub fn roll_up(roster: &ExpectedUsageRoster, evidence: &AttestationEvidence<'_>)
     if field_is_partial(&coverage, FIELD_COST_USD) {
         caveats.insert(UsageRollupCaveat::PartialCost);
     }
-    // Transitional compatibility arithmetic retained only until U409. The
-    // declaration-aware component caveat above is authoritative; this older
-    // caveat can add no new incompleteness and therefore cannot penalize a
-    // legitimate mixed run containing total-only and component adapters.
-    let attempts_reported_without_components = coverage
-        .attempts_reported
-        .saturating_sub(coverage.attempts_reported_with_components);
-    if components_partial
-        && attempts_reported_without_components > 0
-        && coverage.attempts_reported_with_components > 0
-    {
+    if legacy_total_only_shapes > 0 && reported_component_shapes > 0 {
         caveats.insert(UsageRollupCaveat::TotalOnlyAttempts);
     }
     if saw_harness_total && saw_derived_total {
@@ -1559,6 +1583,25 @@ mod tests {
                     "derivation": "attempt",
                     "contribution": usage,
                 },
+                "usageAuthority": "advisory-only",
+            }),
+            seq,
+            prev_hash: "sha256:prev".to_owned(),
+            hash: "sha256:hash".to_owned(),
+        }
+    }
+
+    fn legacy_attestation(seq: u64, task: &str, usage: Value) -> AttestationRecord {
+        AttestationRecord {
+            observed_at: "2026-08-09T00:00:00.000Z".to_owned(),
+            payload: json!({
+                "kind": "adapter-scrape",
+                "taskUuid": task,
+                "jobId": task,
+                "adapter": "legacy-adapter",
+                "attempt": 1,
+                "leaseEpoch": 1,
+                "usage": usage,
                 "usageAuthority": "advisory-only",
             }),
             seq,
@@ -1943,6 +1986,45 @@ mod tests {
         assert!(rollup
             .caveats
             .contains(&UsageRollupCaveat::LegacyUsageContract));
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::DeclaredSurfaceUnknown));
+    }
+
+    #[test]
+    fn two_ambiguous_legacy_total_only_attempts_retain_the_reported_shape_diagnosis() {
+        let records = [
+            legacy_attestation(1, "component", codex_usage()),
+            legacy_attestation(2, "total-a", declared_total_usage()),
+            legacy_attestation(3, "total-b", declared_total_usage()),
+        ];
+        let rollup = roll_up(
+            &roster(["component", "total-a", "total-b"]),
+            &AttestationEvidence::new(true, &records),
+        );
+
+        assert_eq!(rollup.coverage.attempts_legacy_usage, 3);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::LegacyUsageContract));
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::DeclaredSurfaceUnknown));
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::TotalOnlyAttempts));
+        assert!(!rollup.is_complete());
+        assert!(rollup.provenance.contains("reported-shape"));
+        assert!(rollup.provenance.contains("declared-surface-unknown"));
+        let public = serde_json::to_value(&rollup).unwrap();
+        let caveats = public["caveats"].as_array().unwrap();
+        for expected in [
+            "legacy-usage-contract",
+            "declared-surface-unknown",
+            "total-only-attempts",
+        ] {
+            assert!(caveats.contains(&json!(expected)), "missing {expected}");
+        }
     }
 
     /// The real codex `turn.completed` shape from `test/fixtures/usage`:
@@ -2488,16 +2570,9 @@ mod tests {
         assert_eq!(harness.coverage.attempts_reported, 1);
         assert_eq!(harness.coverage.attempts_reported_with_components, 0);
         assert!(harness.is_complete(), "{:?}", harness.caveats);
-        // No attempt of this run reported components, so no component sum
-        // covers a subset of anything: the beside-ness the total-only caveat
-        // needs does not exist here.
-        assert!(!harness
-            .caveats
-            .contains(&UsageRollupCaveat::TotalOnlyAttempts));
-
         // A run mixing that adapter with a preset reaches the mixed total grade.
-        // Each field still covers every attempt that declared it, so the old
-        // total-only shape caveat is no longer a completeness diagnosis.
+        // Each field still covers every attempt that declared it, so neither
+        // adapter's observed shape invents a missing component.
         let records = [
             attestation_for_adapter(
                 1,
@@ -2523,12 +2598,8 @@ mod tests {
         assert!(!mixed
             .caveats
             .contains(&UsageRollupCaveat::PartialComponents));
-        assert!(!mixed
-            .caveats
-            .contains(&UsageRollupCaveat::TotalOnlyAttempts));
-
-        // But an exempted attempt hides nothing from the threshold either: a
-        // drifted preset attempt beside the total-only one is still caught.
+        // A total-only neighbor hides nothing from the declared threshold: a
+        // drifted preset attempt beside it is still caught.
         let drifted = CODEX_STREAM.replace("cached_input_tokens", "cached_input_tokens_v2");
         let records = [
             attestation_for_adapter(
@@ -2606,20 +2677,21 @@ mod tests {
 
         let records = [
             attestation_for_adapter(1, "task", 1, &adapter, honest),
-            attestation_for_adapter(2, "task", 2, &adapter, after),
+            attestation_for_adapter(2, "task", 2, &adapter, after.clone()),
+            attestation_for_adapter(3, "task", 3, &adapter, after),
         ];
         let rollup = roll_up(
-            &roster_with_attempts([("task", 2)]),
+            &roster_with_attempts([("task", 3)]),
             &AttestationEvidence::new(true, &records),
         );
 
-        assert_eq!(rollup.coverage.attempts_reported, 2);
+        assert_eq!(rollup.coverage.attempts_reported, 3);
         assert_eq!(
-            rollup.coverage.attempts_reported_with_components, 2,
-            "both attempts declared components whatever shape they reported"
+            rollup.coverage.attempts_reported_with_components, 3,
+            "all three attempts declared components whatever shape they reported"
         );
         assert_eq!(rollup.coverage.attempts_reported_without_figures, 0);
-        // Half the run's tokens are absent from every component sum...
+        // Two thirds of the run's tokens are absent from every component sum...
         assert_eq!(
             rollup.tokens.input_tokens,
             UsageSum {
@@ -2634,19 +2706,17 @@ mod tests {
                 attempts: 1
             }
         );
-        assert_eq!(rollup.tokens.total_tokens.unwrap().value, 905_120 * 2);
+        assert_eq!(rollup.tokens.total_tokens.unwrap().value, 905_120 * 3);
         // ...and each component's declared denominator exposes that strict
-        // subset directly. The retired total-only shape caveat is unnecessary.
+        // subset directly, including when more than one drifted observation
+        // has the same lump shape as a legal total-only adapter.
         assert!(rollup
             .caveats
             .contains(&UsageRollupCaveat::PartialComponents));
-        assert!(!rollup
-            .caveats
-            .contains(&UsageRollupCaveat::TotalOnlyAttempts));
         assert_eq!(
             rollup.coverage.field_coverage[FIELD_INPUT_TOKENS],
             UsageFieldCoverage {
-                attempts_declared: 2,
+                attempts_declared: 3,
                 attempts_reported: 1,
                 attempts_unreadable: 0,
                 attempts_accounting_unavailable: 0,

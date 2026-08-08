@@ -55,7 +55,9 @@ exactly to this attempt, while `unavailableFields` and the optional typed
 `declaration-mismatch`, `counter-underflow`, or `unreadable-current`) explain
 what could not be charged. The raw cumulative observation remains evidence,
 not an attempt amount. A payload with only the legacy `usage` member is never
-reclassified as fresh accounting.
+reclassified as fresh accounting. Its reported-shape can remain visible for a
+`declared-surface-unknown` diagnosis, but cannot establish a declaration or
+contribute to an accounted sum.
 
 ## Canonical verdict record
 

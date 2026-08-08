@@ -6,6 +6,23 @@ authorized.
 
 ## [Unreleased]
 
+### Retired usage shape exemptions (#409)
+
+- Removed `total-only-attempts` from declared-field grading and deleted the
+  arithmetic that inferred a component-less subset from two aggregate
+  coverage counts. Declared per-field coverage is now the sole completeness
+  authority for mixed and uniform-drift runs.
+- Declarationless legacy records now raise `declared-surface-unknown`. Their
+  reported-shape is retained only for diagnosis: ambiguous legacy total-only
+  attempts beside a component-shaped observation also raise
+  `total-only-attempts`, without entering sums or declared-field thresholds.
+- `attemptsReportedWithComponents` remains as a deprecated wire projection for
+  older consumers, but is computed only from durable declarations and never
+  drives completeness or caveats.
+- The uniform-drift regression now covers one honest attempt beside two
+  total-surviving drifted observations and pins three declarations against one
+  exact component report, so shape-based exemption thresholds cannot return.
+
 ### Declaration-aware usage completeness (#408)
 
 - Run and standup rollups now use each attempt's durable `declaredFields` as
