@@ -636,6 +636,7 @@ pub(crate) async fn reconcile_pool_loss_intents(
                 hardening: Default::default(),
                 extra_writable_paths: Vec::new(),
                 yield_hook: None,
+                usage_accounting: UsageAccountingMode::Fresh,
             },
             labor_class: intent.labor_class,
             state: JobState::Running,

@@ -24,6 +24,39 @@ bytes have not changed relative to the chain head you trusted; it does not authe
 wrote them. Execution attestations exist to expose agreement or divergence with coordinator
 canon, not to create another canonical writer.
 
+### Adapter scrape usage evidence
+
+Every completed adapter scrape appends one advisory `adapter-scrape` payload,
+including empty captures and the `not-declared` / `not-reported` usage states.
+It is keyed by `taskUuid`, `attempt`, and `leaseEpoch`, and carries the raw
+`captures` plus two usage projections:
+
+- `usage` is the legacy top-level raw observation kept for old readers;
+- `usageEvidence` schema 1 carries `declaredFields`, `counterScope`, the same
+  raw `observed` value, and a separate `accounting` result.
+
+At the public ledger boundary, independently produced records may project the
+same contract in either of two ways. They may use sibling
+`usageDeclaredFields`, `usageCounterScope`, and `usageAccounting` members
+beside `usage`, or keep `declaredFields` and `counterScope` in `usageEvidence`
+and state a `derivation`. `attempt` and `fresh-zero` carry the exact
+`contribution`; `delta` additionally binds its baseline by
+`{taskUuid,attempt,leaseEpoch,sequence,hash}`; `baseline-missing` records that
+no contribution can be made. A delta reference is accepted only when it names
+the matching earlier record in the verified ledger with the same adapter,
+declaration, counter scope, and session lineage. Raw cumulative `usage` by
+itself is still legacy evidence, never a charge.
+
+`accounting.basis` is `fresh` or `delta`; its state is `exact`, `partial`, or
+`unavailable`. A cumulative delta names the exact predecessor
+`{taskUuid,attempt,leaseEpoch}`. `accounting.usage` contains only values reduced
+exactly to this attempt, while `unavailableFields` and the optional typed
+`reason` (`missing-predecessor`, `legacy-predecessor`, `session-mismatch`,
+`declaration-mismatch`, `counter-underflow`, or `unreadable-current`) explain
+what could not be charged. The raw cumulative observation remains evidence,
+not an attempt amount. A payload with only the legacy `usage` member is never
+reclassified as fresh accounting.
+
 ## Canonical verdict record
 
 Each physical line is exactly one compact UTF-8 JSON object followed by LF. Blank lines,

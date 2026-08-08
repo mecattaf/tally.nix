@@ -131,6 +131,8 @@ impl DaemonHandler {
                 ))
             })?;
         }
+        let previous_attempt = row.attempt;
+        let previous_lease_epoch = row.lease_epoch;
         let next_attempt = row
             .attempt
             .checked_add(1)
@@ -138,6 +140,10 @@ impl DaemonHandler {
         row.attempt = next_attempt;
         row.lease_epoch = context.epoch;
         row.job_token_hash = None;
+        row.usage_predecessor = row
+            .resumed_from
+            .is_some()
+            .then(|| UsagePredecessor::new(task_uuid, previous_attempt, previous_lease_epoch));
         // A usage record belongs to the attempt that produced it. Carrying one
         // into a retry would render attempt N−1's tokens under attempt N with
         // provider-capture authority — a measurement claimed for work that has
@@ -148,6 +154,7 @@ impl DaemonHandler {
         // execution. So this line is currently redundant; it is here so the
         // discipline survives anyone making completion write rows back.
         row.usage = None;
+        row.usage_accounting = None;
 
         let engine = AdapterEngine::new(&context.config.adapters);
         let invocation = if row.resumed_from.is_some() {
@@ -161,12 +168,13 @@ impl DaemonHandler {
             if let Some(model) = &row.model {
                 captures.insert("model".to_owned(), Value::String(model.clone()));
             }
-            engine.resume_with_options(
+            engine.resume_with_options_from(
                 &row.adapter,
                 &row.argv,
                 &ScrapeResult { captures },
                 &row.adapter_options,
                 row.effective_cwd(),
+                row.usage_predecessor.clone(),
             )
         } else {
             engine.launch_with_options(
@@ -709,12 +717,17 @@ impl DaemonHandler {
                 if let Some(model) = &previous.model {
                     captures.insert("model".to_owned(), Value::String(model.clone()));
                 }
-                engine.resume_with_options(
+                engine.resume_with_options_from(
                     &resolved.adapter,
                     &resolved.argv,
                     &ScrapeResult { captures },
                     &resolved.adapter_options,
                     resolved.effective_cwd(),
+                    Some(UsagePredecessor::new(
+                        previous.uuid,
+                        previous.attempt,
+                        previous.lease_epoch,
+                    )),
                 )
             }
         } else {
@@ -788,6 +801,9 @@ impl DaemonHandler {
             .map_err(|_| WireError::invalid("parent must be a UUID"))?;
         // Read before the struct literal below moves `resolved.cwd` into it.
         let inherited_session_cwd = RecordedLaunchCwd::of(resolved.effective_cwd());
+        let usage_predecessor = resumed_row.as_ref().map(|previous| {
+            UsagePredecessor::new(previous.uuid, previous.attempt, previous.lease_epoch)
+        });
         let row = RowSeed {
             row_version: crate::taskdb::CURRENT_ROW_VERSION,
             uuid: row_uuid,
@@ -808,6 +824,7 @@ impl DaemonHandler {
             brief_hash: resolved.brief_hash.clone(),
             orchestration: resolved.orchestration.clone(),
             session_ref: resumed_row.as_ref().and_then(|row| row.session_ref.clone()),
+            usage_predecessor,
             // Inherited beside the pointer, and it is this row's own cwd rather
             // than the continued row's: the guard above already established
             // that the two name one directory for any adapter that cares, and
@@ -818,6 +835,7 @@ impl DaemonHandler {
             // the prior attempt's record stays on the prior row and in the
             // attestation ledger.
             usage: None,
+            usage_accounting: None,
             context_tokens: None,
             context_window: None,
             job_token_hash: None,

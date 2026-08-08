@@ -94,9 +94,18 @@ cache read, plus `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`,
 table and computes no dollar figure. A total the harness did not state is
 derived from the components and labelled as derived.
 
-The provider-facing `scrape.usage.counterScope` repeats the adapter's
-`usageCounterScope` declaration beside the capture whose values it describes;
-when present, adapter validation requires the two declarations to agree.
+`usageCounterScope` declares the lifetime of those primitive counters. The
+provider-facing `scrape.usage.counterScope` repeats that fact beside the
+capture whose values it describes; when present, adapter validation requires
+the two declarations to agree. Its
+backward-compatible default, `attempt`, means a fresh or resumed invocation
+reports only that invocation. `session-cumulative` means a resume inherits the
+session's earlier counters. tally then binds the rendered resume to an exact
+`taskUuid`/`attempt`/`leaseEpoch` predecessor, checks the adapter, declaration,
+counter scope, and captured session, and subtracts every declared primitive
+with checked arithmetic. `costUsd` uses exact decimal subtraction. The stock
+Codex preset declares `session-cumulative`; the 2026-08-08 resume probe showed
+that `codex exec resume` rehydrates its thread counters.
 
 `inputTokens` alone is not the cross-harness "fresh input" figure. claude-code's
 cache-write tokens are fresh, uncached prompt tokens its `input_tokens`
@@ -111,22 +120,25 @@ Three states are kept apart, and none of them is a zero:
 - `not-reported` — a usage scrape was declared and the stream carried none;
 - `reported` — the harness reported usage, including when it reported zero.
 
-Only `reported` has a durable seat: it is persisted in the advisory attestation
-ledger beside the raw capture, keyed by task, attempt, and lease epoch. The two
-absences are recorded on the live row, so after a daemon restart they read back
-as a missing field rather than as a stated absence — both are recomputable from
-the adapter configuration, but a consumer counting coverage should treat a
-missing record and a `not-declared` record as the same answer.
+Every completed scrape has a durable `adapter-scrape` attestation, including an
+empty capture and either typed absence. Its `usageEvidence.observed` preserves
+the raw statement, while `usageEvidence.accounting` is the distinct
+per-attempt result: `fresh` for a new counter lifetime or `delta` for a bound
+cumulative resume. Accounting is `exact`, `partial`, or `unavailable` and
+names unavailable fields plus a typed reason. A missing, legacy, mismatched, or
+underflowing predecessor never turns the current cumulative reading into fresh
+usage.
 
-`tally query job` renders the record as a `SourcedValue` with
-`advisory-provider-capture` authority and `adapter-scrape` provenance. The
-built-in pool meter reads the same record and charges what it always charged: a
-harness-stated total, else the harness's own input figure plus its output
-figure. A capture with no declared `fields` keeps exactly that legacy reading.
-Two shapes no harness emits — a key present with a JSON `null`, and a
-whole-valued float — now charge a number where the old reader charged nothing;
-both diverge upward, which for a windowed-consumption pool is the conservative
-direction.
+`tally query job` renders the raw `usage` as a `SourcedValue` with
+`advisory-provider-capture` authority and exposes `usageAccounting` separately
+with advisory-attestation authority. Run rollups and the built-in pool meter
+consume only per-attempt accounting. The meter keeps its established formula —
+a harness-stated total, else the harness's own input figure plus output — but
+applies it after delta reduction. If that amount is unavailable it writes no
+advisory meter event and emits a typed diagnostic; the durable admission debit
+remains the conservative floor. Pre-schema raw observations stay visible on an
+individual job but are excluded from exact rollups and meter updates rather
+than assumed fresh.
 
 An adapter may additionally declare a JSON-lines trace stream. Trace queries
 preserve event order and malformed/unknown payloads as advisory observations;

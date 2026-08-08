@@ -444,8 +444,9 @@ let
     shell = mkAdapter { };
 
     codex = mkAdapter {
-      # `codex exec resume` rehydrates the thread's cumulative counters. The
-      # executable delta accounting for this declaration arrives in #403.
+      # `codex exec resume` rehydrates the thread's cumulative counters. Tally
+      # therefore binds every resume to an exact predecessor and accounts only
+      # the checked field-wise delta.
       usageCounterScope = "session-cumulative";
       trace = {
         stream = "stdout";

@@ -8,15 +8,14 @@
 //! wrong in the reassuring direction, and nothing about its shape says so.
 //! Four rules follow, and every field below exists to keep one of them.
 //!
-//! **1. Read per attempt, from the attestation ledger.** The durable row holds
-//! only the most recently scraped attempt — exactly as `sessionRef` and
+//! **1. Read accounted attempts from the attestation ledger.** The durable row
+//! holds only the most recently scraped attempt — exactly as `sessionRef` and
 //! `finalMessage` do — so summing rows would charge a three-attempt task once.
-//! Only the `reported` state has a durable per-attempt seat: the advisory
-//! attestation ledger, keyed by `taskUuid`/`attempt`/`leaseEpoch`. The two
-//! typed absences live in daemon memory and degrade to plain absence across a
-//! restart, which is why coverage counts *what the ledger holds*, and counts
-//! members it holds nothing about ([`UsageCoverage::tasks_without_attestation`])
-//! rather than quietly excluding them from the denominator.
+//! Every completed scrape, including both typed absences, has a durable
+//! `usageEvidence` seat keyed by `taskUuid`/`attempt`/`leaseEpoch`. The rollup
+//! sums its exact per-attempt `accounting.usage`, never a raw cumulative
+//! observation. Pre-schema raw-only records are visible on job detail but are
+//! excluded here and caveated rather than guessed fresh.
 //!
 //! **2. `inputTokens` alone is not the cross-harness fresh-input figure.**
 //! claude-code's `cache_creation_input_tokens` are fresh, uncached prompt
@@ -64,8 +63,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::adapters::UsageCounterScope;
 use crate::query_v2::FactAuthority;
-use crate::usage::{UsageObservation, UsageReconciliation, UsageShape, UsageTotalSource};
+use crate::usage::{
+    account_fresh, unavailable_delta, UsageAccounting, UsageAccountingBasis, UsageAccountingReason,
+    UsageAccountingState, UsageEvidence, UsageObservation, UsagePredecessor, UsageReconciliation,
+    UsageShape, UsageTotalSource, USAGE_EVIDENCE_SCHEMA_VERSION,
+};
 use crate::witness::AttestationRecord;
 
 /// Payload kind the exit recorder writes one of per scraped attempt.
@@ -73,7 +77,7 @@ const ADAPTER_SCRAPE_KIND: &str = "adapter-scrape";
 
 /// Where the rollup's numbers came from.
 pub const ROLLUP_PROVENANCE: &str =
-    "adapter-scrape attestations, per attempt, keyed by taskUuid/attempt/leaseEpoch";
+    "adapter-scrape usageEvidence.accounting, per attempt, keyed by taskUuid/attempt/leaseEpoch; legacy raw observations excluded";
 
 /// Exactly what the run total is a sum over. Stated on the wire because the
 /// defect this rollup exists to avoid is a figure computed from the wrong one
@@ -267,10 +271,11 @@ pub struct UsageCoverage {
     /// read nothing out of does not make its task one of these — see
     /// [`UsageCoverage::attempts_reported_without_figures`].
     pub tasks_with_reported_usage: usize,
-    /// Member tasks the ledger holds no attempt for at all. An attempt whose
-    /// adapter captured nothing writes no attestation, and a task whose
-    /// attestations aged out of retention reads the same way; either way these
-    /// tasks are invisible to the sums and are counted rather than dropped.
+    /// Member tasks the ledger holds no attempt for at all. Every successfully
+    /// completed scrape writes an attestation even for empty captures, but an
+    /// append can fail and old attestations can age out of retention. Either
+    /// way these tasks are invisible to the sums and are counted rather than
+    /// dropped.
     pub tasks_without_attestation: usize,
     /// Distinct `(task, attempt, leaseEpoch)` triples found for member tasks.
     pub attempts_observed: usize,
@@ -310,18 +315,19 @@ pub struct UsageCoverage {
     ///
     /// The exemption is one *reported* shape wide, and that is **not** the
     /// same promise as "an adapter that declared components is always judged".
-    /// It cannot be: `roll_up` receives attestations, never the adapter's
-    /// declared field map, so an adapter that declared components *and* a
-    /// total, whose harness renamed every component key while keeping the
-    /// total, reports exactly this shape and leaves this denominator. What
+    /// It is not: although schema-1 evidence carries `declaredFields`, this
+    /// compatibility counter is still a projection of reported shape. An
+    /// adapter that declared components *and* a total, whose harness renamed
+    /// every component key while keeping the total, reports exactly this shape
+    /// and leaves this denominator. What
     /// stops that passing silently is
     /// [`UsageRollupCaveat::TotalOnlyAttempts`], which fires whenever such an
     /// attempt sits beside attempts that did report components — then the
     /// component sums provably cover a strict subset of the run and the rollup
     /// says so. The one case reported evidence cannot separate at all is a run
     /// where *every* attempt is total-only: a legal total-only adapter and a
-    /// wholly drifted component adapter are indistinguishable without the
-    /// declared field set, which is not on the attestation.
+    /// wholly drifted component adapter are indistinguishable to this
+    /// shape-based compatibility projection.
     ///
     /// An attempt that reported *any* component is in this denominator even
     /// when its harness also stated a total, and an attempt that stated no
@@ -338,6 +344,15 @@ pub struct UsageCoverage {
     /// this build cannot read. Counted as absence, exactly as `not-declared`
     /// is.
     pub attempts_without_usage_record: usize,
+    /// Attempts carrying the pre-schema raw-only contract. Their observation
+    /// remains visible on an individual job, but is not a per-attempt charge
+    /// and contributes nothing to confident sums.
+    pub attempts_legacy_usage: usize,
+    /// Attempts whose declared values could not all be reduced to exact
+    /// per-attempt accounting. Exact fields inside a partial record still
+    /// contribute; the count and caveat keep that floor from reading as a
+    /// complete bill.
+    pub attempts_accounting_unavailable: usize,
     /// Whether the advisory attestation chain verified. When false nothing was
     /// summed.
     pub ledger_verified: bool,
@@ -388,8 +403,8 @@ pub enum UsageRollupCaveat {
     /// Computed from published coverage counts only:
     /// `attemptsReported - attemptsReportedWithComponents > 0` **and**
     /// `attemptsReportedWithComponents > 0`. The evidence is what each attempt
-    /// *reported*, never what its adapter declared — `roll_up` never sees the
-    /// declared field map — which is exactly why the second conjunct is there.
+    /// *reported*, not the schema-1 `declaredFields` carried beside it — which
+    /// is exactly why the second conjunct is there.
     /// A total-only attempt is either a legal total-only adapter or an adapter
     /// whose component keys all drifted at once, and those two are
     /// indistinguishable in isolation; beside an attempt that did report
@@ -403,6 +418,14 @@ pub enum UsageRollupCaveat {
     TotalOnlyAttempts,
     /// Some attestation carries no readable usage record.
     UnreadableUsageRecord,
+    /// Some attestation predates `usageEvidence`; its raw observation is not
+    /// assumed fresh and is excluded from the sums.
+    LegacyUsageContract,
+    /// Some declared field could not be reduced to an exact per-attempt value.
+    AccountingUnavailable,
+    /// A session-cumulative checkpoint could not be reduced because its exact
+    /// predecessor baseline was absent or was a legacy record.
+    CumulativeBaselineMissing,
     /// An attempt named a declared field its harness emitted in an unusable
     /// shape, so that field's sum is missing that attempt's share.
     UnreadableFields,
@@ -451,10 +474,238 @@ impl UsageRollup {
 
 /// One attestation's usage, as the ledger holds it.
 enum LedgerUsage {
-    Observed(UsageObservation),
+    Accounted(Box<UsageEvidence>),
+    /// A pre-schema raw observation. It stays visible on job detail but has no
+    /// trustworthy attempt accounting meaning for a run sum.
+    Legacy,
     /// The payload predates the usage record, or carries one this build cannot
     /// read.
     NoRecord,
+}
+
+fn has_readable_legacy_usage(payload: &Value) -> bool {
+    payload
+        .get("usage")
+        .is_some_and(|value| serde_json::from_value::<UsageObservation>(value.clone()).is_ok())
+}
+
+/// Lineage carried by the public checkpoint projection. It is deliberately
+/// checked against the payload adapter rather than used as an adapter-name
+/// heuristic: the declaration and derivation remain the accounting contract.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PublicUsageLineage {
+    adapter: String,
+    session_ref: String,
+}
+
+/// An exact public-ledger reference to the cumulative checkpoint used as a
+/// baseline. Sequence and hash bind the logical attempt identity to one
+/// verified ledger record instead of merely naming an attempt that may have
+/// been re-scraped.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PublicUsagePredecessor {
+    task_uuid: String,
+    attempt: u32,
+    lease_epoch: u64,
+    sequence: u64,
+    hash: String,
+}
+
+fn public_usage_lineage(
+    payload: &Value,
+    evidence: &serde_json::Map<String, Value>,
+) -> Option<PublicUsageLineage> {
+    let lineage =
+        serde_json::from_value::<PublicUsageLineage>(evidence.get("lineage")?.clone()).ok()?;
+    (payload.get("adapter").and_then(Value::as_str) == Some(lineage.adapter.as_str())
+        && !lineage.session_ref.is_empty())
+    .then_some(lineage)
+}
+
+fn public_predecessor_is_bound(
+    current: &AttestationRecord,
+    predecessor: &PublicUsagePredecessor,
+    lineage: &PublicUsageLineage,
+    declared_fields: &[String],
+    counter_scope: UsageCounterScope,
+    records_by_sequence: &BTreeMap<u64, &AttestationRecord>,
+) -> bool {
+    if predecessor.sequence >= current.seq {
+        return false;
+    }
+    let Some(previous) = records_by_sequence.get(&predecessor.sequence) else {
+        return false;
+    };
+    if previous.hash != predecessor.hash {
+        return false;
+    }
+    let payload = &previous.payload;
+    if payload.get("taskUuid").and_then(Value::as_str) != Some(predecessor.task_uuid.as_str())
+        || payload.get("attempt").and_then(Value::as_u64) != Some(u64::from(predecessor.attempt))
+        || payload.get("leaseEpoch").and_then(Value::as_u64) != Some(predecessor.lease_epoch)
+        || payload.get("adapter").and_then(Value::as_str) != Some(lineage.adapter.as_str())
+    {
+        return false;
+    }
+
+    let Some(evidence) = payload.get("usageEvidence").and_then(Value::as_object) else {
+        return false;
+    };
+    let previous_declarations = evidence
+        .get("declaredFields")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok());
+    let previous_scope = evidence
+        .get("counterScope")
+        .and_then(|value| serde_json::from_value::<UsageCounterScope>(value.clone()).ok());
+    let previous_lineage = public_usage_lineage(payload, evidence);
+    let has_exact_contribution = matches!(
+        evidence.get("derivation").and_then(Value::as_str),
+        Some("fresh-zero" | "delta")
+    ) && evidence
+        .get("contribution")
+        .is_some_and(|value| serde_json::from_value::<UsageObservation>(value.clone()).is_ok());
+
+    previous_declarations.as_deref() == Some(declared_fields)
+        && previous_scope == Some(counter_scope)
+        && previous_lineage.as_ref() == Some(lineage)
+        && has_exact_contribution
+}
+
+/// Decode the durable schema-1 object and its public projections. Those keep
+/// independently produced attestations usable at the rollup boundary without
+/// weakening cumulative accounting: declarations and an explicit accounting
+/// result are still required, and a public delta's sequence/hash predecessor
+/// must resolve inside the verified ledger.
+fn accounted_usage(
+    record: &AttestationRecord,
+    records_by_sequence: &BTreeMap<u64, &AttestationRecord>,
+) -> Option<UsageEvidence> {
+    let payload = &record.payload;
+    if let Some(value) = payload.get("usageEvidence") {
+        if let Ok(evidence) = serde_json::from_value::<UsageEvidence>(value.clone()) {
+            if evidence.schema_version == USAGE_EVIDENCE_SCHEMA_VERSION {
+                return Some(evidence);
+            }
+        }
+    }
+
+    let nested = payload.get("usageEvidence").and_then(Value::as_object);
+    let schema_version = nested
+        .and_then(|evidence| evidence.get("schemaVersion"))
+        .and_then(Value::as_u64)
+        .map(u32::try_from)
+        .transpose()
+        .ok()?
+        .unwrap_or(USAGE_EVIDENCE_SCHEMA_VERSION);
+    if schema_version != USAGE_EVIDENCE_SCHEMA_VERSION {
+        return None;
+    }
+
+    let declarations = nested
+        .and_then(|evidence| evidence.get("declaredFields"))
+        .or_else(|| payload.get("usageDeclaredFields"))
+        .or_else(|| payload.get("declaredUsageFields"))
+        .or_else(|| payload.get("declaredFields"))?;
+    let declared_fields = serde_json::from_value::<Vec<String>>(declarations.clone()).ok()?;
+    let observed = nested
+        .and_then(|evidence| evidence.get("observed"))
+        .or_else(|| payload.get("usage"))
+        .and_then(|value| serde_json::from_value::<UsageObservation>(value.clone()).ok())?;
+    let counter_scope = nested
+        .and_then(|evidence| evidence.get("counterScope"))
+        .or_else(|| payload.get("usageCounterScope"))
+        .map_or(Some(UsageCounterScope::Attempt), |value| {
+            serde_json::from_value::<UsageCounterScope>(value.clone()).ok()
+        })?;
+
+    let accounting = if let Some(derivation) = nested
+        .and_then(|evidence| evidence.get("derivation"))
+        .and_then(Value::as_str)
+    {
+        let evidence = nested?;
+        match derivation {
+            "attempt" if counter_scope == UsageCounterScope::Attempt => {
+                let contribution = evidence.get("contribution").and_then(|value| {
+                    serde_json::from_value::<UsageObservation>(value.clone()).ok()
+                })?;
+                account_fresh(&declared_fields, &contribution)
+            }
+            "fresh-zero" if counter_scope == UsageCounterScope::SessionCumulative => {
+                public_usage_lineage(payload, evidence)?;
+                if evidence.get("predecessor").is_some() {
+                    return None;
+                }
+                let contribution = evidence.get("contribution").and_then(|value| {
+                    serde_json::from_value::<UsageObservation>(value.clone()).ok()
+                })?;
+                account_fresh(&declared_fields, &contribution)
+            }
+            "delta" if counter_scope == UsageCounterScope::SessionCumulative => {
+                let lineage = public_usage_lineage(payload, evidence)?;
+                let predecessor = evidence.get("predecessor").and_then(|value| {
+                    serde_json::from_value::<PublicUsagePredecessor>(value.clone()).ok()
+                })?;
+                if !public_predecessor_is_bound(
+                    record,
+                    &predecessor,
+                    &lineage,
+                    &declared_fields,
+                    counter_scope,
+                    records_by_sequence,
+                ) {
+                    return None;
+                }
+                let contribution = evidence.get("contribution").and_then(|value| {
+                    serde_json::from_value::<UsageObservation>(value.clone()).ok()
+                })?;
+                let mut accounting = account_fresh(&declared_fields, &contribution);
+                accounting.basis = UsageAccountingBasis::Delta;
+                accounting.predecessor = Some(UsagePredecessor::new(
+                    predecessor.task_uuid,
+                    predecessor.attempt,
+                    predecessor.lease_epoch,
+                ));
+                accounting
+            }
+            "baseline-missing" if counter_scope == UsageCounterScope::SessionCumulative => {
+                public_usage_lineage(payload, evidence)?;
+                if evidence.get("predecessor").is_some() || evidence.get("contribution").is_some() {
+                    return None;
+                }
+                unavailable_delta(
+                    &observed,
+                    None,
+                    &declared_fields,
+                    UsageAccountingReason::MissingPredecessor,
+                )
+            }
+            _ => return None,
+        }
+    } else {
+        nested
+            .and_then(|evidence| evidence.get("accounting"))
+            .or_else(|| payload.get("usageAccounting"))
+            .and_then(|value| serde_json::from_value::<UsageAccounting>(value.clone()).ok())
+            .or_else(|| {
+                let basis = nested
+                    .and_then(|evidence| evidence.get("basis"))
+                    .or_else(|| payload.get("usageAccountingBasis"))
+                    .and_then(Value::as_str);
+                (counter_scope == UsageCounterScope::Attempt
+                    || matches!(basis, Some("fresh" | "zero-baseline")))
+                .then(|| account_fresh(&declared_fields, &observed))
+            })?
+    };
+
+    Some(UsageEvidence {
+        schema_version,
+        declared_fields,
+        counter_scope,
+        observed,
+        accounting,
+    })
 }
 
 /// Sum the usage of every attempt the ledger holds for `members`.
@@ -481,6 +732,11 @@ pub fn roll_up<'a>(
     // attempt supersedes the earlier record rather than being charged twice.
     let mut attempts: BTreeMap<(&str, Option<u64>, Option<u64>), LedgerUsage> = BTreeMap::new();
     if evidence.verified {
+        let records_by_sequence = evidence
+            .records
+            .iter()
+            .map(|record| (record.seq, record))
+            .collect::<BTreeMap<_, _>>();
         for record in evidence.records {
             let payload = &record.payload;
             if payload.get("kind").and_then(Value::as_str) != Some(ADAPTER_SCRAPE_KIND) {
@@ -498,13 +754,18 @@ pub fn roll_up<'a>(
                 payload.get("attempt").and_then(Value::as_u64),
                 payload.get("leaseEpoch").and_then(Value::as_u64),
             );
-            let usage = match payload.get("usage") {
-                None => LedgerUsage::NoRecord,
-                Some(value) => match serde_json::from_value::<UsageObservation>(value.clone()) {
-                    Ok(observation) => LedgerUsage::Observed(observation),
-                    Err(_) => LedgerUsage::NoRecord,
-                },
-            };
+            let usage = accounted_usage(record, &records_by_sequence)
+                .map(Box::new)
+                .map_or_else(
+                    || {
+                        if has_readable_legacy_usage(payload) {
+                            LedgerUsage::Legacy
+                        } else {
+                            LedgerUsage::NoRecord
+                        }
+                    },
+                    LedgerUsage::Accounted,
+                );
             attempts.insert(key, usage);
         }
     }
@@ -527,7 +788,29 @@ pub fn roll_up<'a>(
                 caveats.insert(UsageRollupCaveat::UnreadableUsageRecord);
                 continue;
             }
-            LedgerUsage::Observed(observation) => observation,
+            LedgerUsage::Legacy => {
+                coverage.attempts_legacy_usage += 1;
+                caveats.insert(UsageRollupCaveat::LegacyUsageContract);
+                continue;
+            }
+            LedgerUsage::Accounted(evidence) => {
+                if evidence.accounting.state != UsageAccountingState::Exact {
+                    coverage.attempts_accounting_unavailable += 1;
+                    caveats.insert(UsageRollupCaveat::AccountingUnavailable);
+                }
+                if evidence.accounting.basis == UsageAccountingBasis::Delta
+                    && matches!(
+                        evidence.accounting.reason,
+                        Some(
+                            UsageAccountingReason::MissingPredecessor
+                                | UsageAccountingReason::LegacyPredecessor
+                        )
+                    )
+                {
+                    caveats.insert(UsageRollupCaveat::CumulativeBaselineMissing);
+                }
+                &evidence.accounting.usage
+            }
         };
         let breakdown = match observation {
             UsageObservation::NotDeclared => {
@@ -729,7 +1012,11 @@ mod tests {
 
     use super::*;
     use crate::adapters::{AdapterConfig, AdapterEngine, ScrapeCapture, ScrapeMode, ScrapeStream};
-    use crate::usage::{observe, UsageBreakdown, UsageCost, UsageTotalTokens};
+    use crate::usage::{
+        observe, UsageBreakdown, UsageCost, UsageTotalTokens, FIELD_CACHE_READ_TOKENS,
+        FIELD_CACHE_WRITE_TOKENS, FIELD_INPUT_TOKENS_WITH_CACHE_READ, FIELD_OUTPUT_TOKENS,
+        FIELD_REASONING_TOKENS,
+    };
 
     /// The verbatim real claude-code capture `usage::tests` pins the shipped
     /// preset's field map against. Used here so the completeness threshold is
@@ -744,6 +1031,10 @@ mod tests {
     const CLAUDE_COST_FIELDS: &str = r#"{"costUsd":["$"]}"#;
 
     const CODEX_STREAM: &str = include_str!("../../../test/fixtures/usage/codex.jsonl");
+    const CODEX_RESUME_FRESH_STREAM: &str =
+        include_str!("../../../test/fixtures/usage/codex-resume-fresh.jsonl");
+    const CODEX_RESUME_CUMULATIVE_STREAM: &str =
+        include_str!("../../../test/fixtures/usage/codex-resume-cumulative.jsonl");
     const CODEX_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cached_input_tokens"],"cacheWriteTokens":["cache_write_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"],"reasoningTokens":["reasoning_output_tokens"]}"#;
 
     fn scrape_capture(mode: ScrapeMode, pattern: &str, fields: &str) -> ScrapeCapture {
@@ -780,6 +1071,7 @@ mod tests {
     fn codex_preset() -> AdapterConfig {
         AdapterConfig {
             argv: vec!["codex".to_owned()],
+            usage_counter_scope: crate::adapters::UsageCounterScope::SessionCumulative,
             scrape: BTreeMap::from([(
                 "usage".to_owned(),
                 scrape_capture(ScrapeMode::JsonPath, "$..usage", CODEX_USAGE_FIELDS),
@@ -802,6 +1094,22 @@ mod tests {
     }
 
     fn attestation(seq: u64, task: &str, attempt: u64, usage: Value) -> AttestationRecord {
+        let observed: UsageObservation =
+            serde_json::from_value(usage.clone()).expect("test usage is readable");
+        let usage_evidence = UsageEvidence {
+            schema_version: USAGE_EVIDENCE_SCHEMA_VERSION,
+            declared_fields: Vec::new(),
+            counter_scope: crate::adapters::UsageCounterScope::Attempt,
+            observed: observed.clone(),
+            accounting: crate::usage::UsageAccounting {
+                state: UsageAccountingState::Exact,
+                basis: crate::usage::UsageAccountingBasis::Fresh,
+                predecessor: None,
+                usage: observed,
+                unavailable_fields: Vec::new(),
+                reason: None,
+            },
+        };
         AttestationRecord {
             observed_at: "2026-08-05T00:00:00.000Z".to_owned(),
             payload: json!({
@@ -813,12 +1121,308 @@ mod tests {
                 "leaseEpoch": 1,
                 "captures": {},
                 "usage": usage,
+                "usageEvidence": usage_evidence,
                 "usageAuthority": "advisory-only",
             }),
             seq,
             prev_hash: "sha256:prev".to_owned(),
             hash: "sha256:hash".to_owned(),
         }
+    }
+
+    fn accounted_attestation(
+        seq: u64,
+        task: &str,
+        attempt: u64,
+        lease_epoch: u64,
+        captures: &crate::adapters::ScrapeResult,
+        evidence: &UsageEvidence,
+    ) -> AttestationRecord {
+        AttestationRecord {
+            observed_at: "2026-08-08T00:00:00.000Z".to_owned(),
+            payload: json!({
+                "kind": "adapter-scrape",
+                "taskUuid": task,
+                "jobId": task,
+                "adapter": "codex",
+                "attempt": attempt,
+                "leaseEpoch": lease_epoch,
+                "captures": captures.captures,
+                "usage": evidence.observed,
+                "usageEvidence": evidence,
+                "usageAuthority": "advisory-only",
+            }),
+            seq,
+            prev_hash: "sha256:prev".to_owned(),
+            hash: "sha256:hash".to_owned(),
+        }
+    }
+
+    fn checkpoint_usage(input: u64, cache_read: u64, output: u64) -> Value {
+        serde_json::to_value(UsageObservation::Reported(UsageBreakdown {
+            shape: UsageShape::Components,
+            input_tokens: Some(input),
+            input_tokens_as_reported: Some(input + cache_read),
+            cache_read_tokens: Some(cache_read),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(output),
+            reasoning_tokens: Some(0),
+            total_tokens: Some(UsageTotalTokens {
+                value: input + cache_read + output,
+                source: UsageTotalSource::DerivedFromComponents,
+            }),
+            cost: None,
+            unreadable_fields: Vec::new(),
+        }))
+        .expect("checkpoint serializes")
+    }
+
+    fn public_checkpoint_attestation(
+        seq: u64,
+        task: &str,
+        attempt: u64,
+        lease_epoch: u64,
+        observed: Value,
+        usage_evidence: Value,
+    ) -> AttestationRecord {
+        AttestationRecord {
+            observed_at: "2026-08-08T00:00:00.000Z".to_owned(),
+            payload: json!({
+                "kind": "adapter-scrape",
+                "taskUuid": task,
+                "jobId": task,
+                "adapter": "codex",
+                "attempt": attempt,
+                "leaseEpoch": lease_epoch,
+                "captures": {},
+                "usage": observed,
+                "usageEvidence": usage_evidence,
+                "usageAuthority": "advisory-only",
+            }),
+            seq,
+            prev_hash: "sha256:prev".to_owned(),
+            hash: format!("sha256:{seq:064x}"),
+        }
+    }
+
+    #[test]
+    fn real_codex_resume_rolls_up_the_delta_not_the_cumulative_reading() {
+        let mut adapter = codex_preset();
+        adapter.scrape.insert(
+            "sessionRef".to_owned(),
+            scrape_capture(ScrapeMode::JsonPath, "$..thread_id", "{}"),
+        );
+        let adapters = BTreeMap::from([("codex".to_owned(), adapter.clone())]);
+        let engine = AdapterEngine::new(&adapters);
+        let fresh_captures = engine
+            .scrape_text("codex", CODEX_RESUME_FRESH_STREAM, "")
+            .unwrap();
+        let fresh = crate::usage::account_usage(
+            "codex",
+            &adapter,
+            &fresh_captures,
+            &crate::usage::UsageAccountingMode::Fresh,
+            None,
+        );
+        let task = "00000000-0000-4000-8000-000000000403";
+        let fresh_record = accounted_attestation(1, task, 1, 7, &fresh_captures, &fresh);
+        let resumed_captures = engine
+            .scrape_text("codex", CODEX_RESUME_CUMULATIVE_STREAM, "")
+            .unwrap();
+        let resumed = crate::usage::account_usage(
+            "codex",
+            &adapter,
+            &resumed_captures,
+            &crate::usage::UsageAccountingMode::Resume {
+                predecessor: Some(crate::usage::UsagePredecessor::new(task, 1, 7)),
+            },
+            Some(&fresh_record.payload),
+        );
+        let resumed_record = accounted_attestation(2, task, 2, 8, &resumed_captures, &resumed);
+        let rollup = roll_up(
+            [task],
+            &AttestationEvidence::new(true, &[fresh_record, resumed_record]),
+        );
+        assert_eq!(rollup.coverage.attempts_reported, 2);
+        assert_eq!(
+            rollup.tokens.total_tokens.map(|total| total.value),
+            Some(32_845)
+        );
+        assert_eq!(rollup.tokens.input_tokens.value, 6_722);
+        assert_eq!(rollup.tokens.cache_read_tokens.value, 26_112);
+        assert_eq!(rollup.tokens.output_tokens.value, 11);
+        assert!(
+            rollup.is_complete(),
+            "unexpected caveats: {:?}",
+            rollup.caveats
+        );
+    }
+
+    #[test]
+    fn public_codex_checkpoints_roll_up_zero_baseline_plus_verified_delta() {
+        let task = "00000000-0000-4000-8000-000000000403";
+        let fresh = checkpoint_usage(5_042, 11_008, 5);
+        let cumulative = checkpoint_usage(10_101, 22_016, 11);
+        let delta = checkpoint_usage(5_059, 11_008, 6);
+        let declared_fields = json!([
+            FIELD_CACHE_READ_TOKENS,
+            FIELD_CACHE_WRITE_TOKENS,
+            FIELD_INPUT_TOKENS_WITH_CACHE_READ,
+            FIELD_OUTPUT_TOKENS,
+            FIELD_REASONING_TOKENS,
+        ]);
+        let lineage = json!({
+            "adapter": "codex",
+            "sessionRef": "00000000-0000-4000-8000-000000000403",
+        });
+        let records = [
+            public_checkpoint_attestation(
+                1,
+                task,
+                1,
+                1,
+                fresh.clone(),
+                json!({
+                    "schemaVersion": 1,
+                    "declaredFields": declared_fields,
+                    "counterScope": "session-cumulative",
+                    "derivation": "fresh-zero",
+                    "lineage": lineage,
+                    "contribution": fresh,
+                }),
+            ),
+            public_checkpoint_attestation(
+                2,
+                task,
+                2,
+                1,
+                cumulative,
+                json!({
+                    "schemaVersion": 1,
+                    "declaredFields": declared_fields,
+                    "counterScope": "session-cumulative",
+                    "derivation": "delta",
+                    "lineage": lineage,
+                    "predecessor": {
+                        "taskUuid": task,
+                        "attempt": 1,
+                        "leaseEpoch": 1,
+                        "sequence": 1,
+                        "hash": format!("sha256:{:064x}", 1),
+                    },
+                    "contribution": delta,
+                }),
+            ),
+        ];
+        let rollup = roll_up([task], &AttestationEvidence::new(true, &records));
+
+        assert_eq!(rollup.coverage.attempts_legacy_usage, 0);
+        assert_eq!(rollup.tokens.input_tokens.value, 10_101);
+        assert_eq!(rollup.tokens.cache_read_tokens.value, 22_016);
+        assert_eq!(rollup.tokens.output_tokens.value, 11);
+        assert_eq!(
+            rollup.tokens.total_tokens.map(|total| total.value),
+            Some(32_128)
+        );
+        assert!(!rollup
+            .caveats
+            .contains(&UsageRollupCaveat::LegacyUsageContract));
+        assert!(!rollup
+            .caveats
+            .contains(&UsageRollupCaveat::AccountingUnavailable));
+        assert!(!rollup
+            .caveats
+            .contains(&UsageRollupCaveat::CumulativeBaselineMissing));
+        assert!(serde_json::to_value(&rollup).unwrap()["tokens"]["totalTokens"].is_object());
+
+        let records_by_sequence = records
+            .iter()
+            .map(|record| (record.seq, record))
+            .collect::<BTreeMap<_, _>>();
+        let resumed = accounted_usage(&records[1], &records_by_sequence)
+            .expect("the bound public delta is accounted");
+        let resumed = resumed
+            .accounting
+            .usage
+            .breakdown()
+            .expect("the contribution is reported");
+        assert_eq!(resumed.input_tokens_as_reported, Some(16_067));
+        let accounted_sum = 16_050 + resumed.input_tokens_as_reported.unwrap();
+        let forbidden_raw_sum = 16_050 + 32_117;
+        assert_eq!(accounted_sum, 32_117);
+        assert_eq!(forbidden_raw_sum, 48_167);
+        assert_ne!(accounted_sum, forbidden_raw_sum);
+
+        let mut unbound = records.clone();
+        unbound[1].payload["usageEvidence"]["predecessor"]["hash"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let rejected = roll_up([task], &AttestationEvidence::new(true, &unbound));
+        assert_eq!(rejected.coverage.attempts_legacy_usage, 1);
+        assert_eq!(
+            rejected.tokens.total_tokens.map(|total| total.value),
+            Some(16_055),
+            "an unbound raw cumulative checkpoint must not be charged"
+        );
+        assert!(rejected
+            .caveats
+            .contains(&UsageRollupCaveat::LegacyUsageContract));
+    }
+
+    #[test]
+    fn a_cumulative_checkpoint_without_its_predecessor_names_the_missing_baseline() {
+        let task = "00000000-0000-4000-8000-000000000403";
+        let record = public_checkpoint_attestation(
+            1,
+            task,
+            1,
+            1,
+            checkpoint_usage(42, 100, 8),
+            json!({
+                "schemaVersion": 1,
+                "declaredFields": [
+                    FIELD_CACHE_READ_TOKENS,
+                    FIELD_CACHE_WRITE_TOKENS,
+                    FIELD_INPUT_TOKENS_WITH_CACHE_READ,
+                    FIELD_OUTPUT_TOKENS,
+                    FIELD_REASONING_TOKENS,
+                ],
+                "counterScope": "session-cumulative",
+                "derivation": "baseline-missing",
+                "lineage": {
+                    "adapter": "codex",
+                    "sessionRef": "missing-predecessor-fixture",
+                },
+            }),
+        );
+        let rollup = roll_up([task], &AttestationEvidence::new(true, &[record]));
+
+        assert_eq!(rollup.coverage.attempts_legacy_usage, 0);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::CumulativeBaselineMissing));
+        assert!(!rollup.is_complete());
+        let public = serde_json::to_value(&rollup).unwrap();
+        assert!(public["caveats"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("cumulative-baseline-missing")));
+    }
+
+    #[test]
+    fn legacy_raw_usage_is_visible_evidence_but_not_a_confident_rollup_charge() {
+        let mut legacy = attestation(1, "task", 1, codex_usage());
+        legacy
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("usageEvidence");
+        let rollup = roll_up(["task"], &AttestationEvidence::new(true, &[legacy]));
+        assert_eq!(rollup.coverage.attempts_legacy_usage, 1);
+        assert_eq!(rollup.tokens.total_tokens, None);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::LegacyUsageContract));
+        assert!(!rollup.is_complete());
     }
 
     /// The real codex `turn.completed` shape from `test/fixtures/usage`:
@@ -1054,8 +1658,8 @@ mod tests {
     ///
     /// That attempt reports the same shape a legal total-only adapter does —
     /// a lump with a harness-stated total — so it leaves the component
-    /// threshold's denominator, and `roll_up` cannot tell the two apart: it
-    /// never sees the declared field map. What it can see is that the
+    /// threshold's denominator, and this shape-based compatibility projection
+    /// does not use the declaration to tell the two apart. What it can see is that the
     /// component sums now cover strictly fewer attempts than the total does,
     /// which is a fact about this run. Without the total-only caveat this run
     /// graded `complete` with an empty caveat list while half its tokens were
@@ -1453,6 +2057,11 @@ mod tests {
             .as_object_mut()
             .expect("payload is an object")
             .remove("usage");
+        record
+            .payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("usageEvidence");
         let rollup = roll_up(["task"], &AttestationEvidence::new(true, &[record]));
         assert_eq!(rollup.coverage.attempts_observed, 1);
         assert_eq!(rollup.coverage.attempts_reported, 0);

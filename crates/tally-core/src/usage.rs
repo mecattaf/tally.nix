@@ -19,21 +19,23 @@
 //! * [`UsageObservation::Reported`] — the harness reported usage. A reported
 //!   zero is a measurement and lives here, never in the other two.
 //!
-//! Durability differs by state, and a consumer that reads across a daemon
-//! restart must know which. `Reported` has a durable seat: it is written into
-//! the advisory attestation ledger beside the raw captures, keyed by task,
-//! attempt, and lease epoch. The two absences are recorded on the live row
-//! only — no attestation is written for an adapter that scrapes nothing, and
-//! recovery skips such adapters — so after a restart they read back as a
-//! missing field rather than as a stated absence. Both are recomputable from
-//! the adapter configuration, which is why this is a loss of statement rather
-//! than of fact, but a rollup counting coverage should treat a missing record
-//! and a `not-declared` record as the same answer.
+//! Every completed scrape has a durable seat in the advisory attestation
+//! ledger, including empty captures and both typed absences. Its
+//! [`UsageEvidence`] keeps the harness's raw [`UsageObservation`] apart from
+//! tally's exact per-attempt accounting. For an attempt-scoped counter they
+//! coincide. For a session-cumulative resume, accounting is a checked delta
+//! from the exact predecessor identity carried by the rendered invocation;
+//! missing or incompatible predecessor evidence stays unavailable rather than
+//! relabelling the cumulative observation as fresh usage.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
+
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
-use crate::adapters::{AdapterConfig, ScrapeCapture, ScrapeResult};
+use crate::adapters::{AdapterConfig, ScrapeCapture, ScrapeResult, UsageCounterScope};
 
 /// Capture name the adapter contract declares for harness-reported usage.
 /// Its presence is what separates "the adapter never configured a usage
@@ -202,6 +204,101 @@ pub enum UsageObservation {
     NotReported,
     /// The harness reported usage, including when it reported zero.
     Reported(UsageBreakdown),
+}
+
+/// Current durable schema for one scrape's raw and per-attempt usage facts.
+pub const USAGE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Exact identity of the attempt whose session counters a resume continues.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UsagePredecessor {
+    pub task_uuid: String,
+    pub attempt: u32,
+    pub lease_epoch: u64,
+}
+
+impl UsagePredecessor {
+    #[must_use]
+    pub fn new(task_uuid: impl ToString, attempt: u32, lease_epoch: u64) -> Self {
+        Self {
+            task_uuid: task_uuid.to_string(),
+            attempt,
+            lease_epoch,
+        }
+    }
+}
+
+/// Accounting mode bound to the rendered invocation that produced a scrape.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UsageAccountingMode {
+    /// This invocation started a new counter lifetime.
+    #[default]
+    Fresh,
+    /// This invocation resumed a counter lifetime. A missing predecessor is a
+    /// typed inability to account, never permission to call the cumulative
+    /// reading fresh.
+    Resume {
+        predecessor: Option<UsagePredecessor>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageAccountingState {
+    #[serde(alias = "verified")]
+    Exact,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageAccountingBasis {
+    #[serde(alias = "zero-baseline")]
+    Fresh,
+    #[serde(alias = "verified-delta")]
+    Delta,
+}
+
+/// Why one or more declared fields could not be reduced to per-attempt usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageAccountingReason {
+    MissingPredecessor,
+    LegacyPredecessor,
+    SessionMismatch,
+    DeclarationMismatch,
+    CounterUnderflow,
+    UnreadableCurrent,
+}
+
+/// Per-attempt usage derived from one raw observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UsageAccounting {
+    pub state: UsageAccountingState,
+    pub basis: UsageAccountingBasis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<UsagePredecessor>,
+    pub usage: UsageObservation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<UsageAccountingReason>,
+}
+
+/// One scrape's immutable raw statement and tally's separate accounting
+/// reduction. Keeping both prevents a cumulative provider observation from
+/// being presented as an attempt charge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UsageEvidence {
+    pub schema_version: u32,
+    pub declared_fields: Vec<String>,
+    pub counter_scope: UsageCounterScope,
+    pub observed: UsageObservation,
+    pub accounting: UsageAccounting,
 }
 
 impl UsageObservation {
@@ -419,6 +516,511 @@ pub fn observe(adapter: &AdapterConfig, captures: &ScrapeResult) -> UsageObserva
     UsageObservation::Reported(breakdown)
 }
 
+/// The logical usage surface the adapter promised, in stable wire order.
+///
+/// A historical `usage` capture with no explicit field map keeps its old
+/// three-key contract; that is a declaration made by the compatibility
+/// mapping, not an inference from whichever keys happened to arrive.
+#[must_use]
+pub fn declared_usage_fields(adapter: &AdapterConfig) -> Vec<String> {
+    let mut declared = BTreeSet::new();
+    for (capture_name, capture) in &adapter.scrape {
+        if capture.fields.is_empty() && capture_name == USAGE_CAPTURE {
+            declared.extend([
+                FIELD_INPUT_TOKENS.to_owned(),
+                FIELD_OUTPUT_TOKENS.to_owned(),
+                FIELD_TOTAL_TOKENS.to_owned(),
+            ]);
+            continue;
+        }
+        declared.extend(
+            capture
+                .fields
+                .keys()
+                .filter(|field| USAGE_FIELDS.contains(&field.as_str()))
+                .cloned(),
+        );
+    }
+    declared.into_iter().collect()
+}
+
+/// Build the durable raw/accounted record for one completed scrape.
+///
+/// `predecessor_payload` is the last verified attestation matching the exact
+/// predecessor identity bound to `mode`. It stays a payload here so the
+/// constructor can validate the adapter, declaration, scope, captured session,
+/// and evidence schema before trusting any counter from it.
+#[must_use]
+pub fn account_usage(
+    adapter_name: &str,
+    adapter: &AdapterConfig,
+    captures: &ScrapeResult,
+    mode: &UsageAccountingMode,
+    predecessor_payload: Option<&Value>,
+) -> UsageEvidence {
+    let observed = observe(adapter, captures);
+    let declared_fields = declared_usage_fields(adapter);
+    let accounting = match (adapter.usage_counter_scope, mode) {
+        (UsageCounterScope::SessionCumulative, UsageAccountingMode::Resume { predecessor }) => {
+            account_delta(
+                adapter_name,
+                adapter.usage_counter_scope,
+                &declared_fields,
+                captures,
+                &observed,
+                predecessor.clone(),
+                predecessor_payload,
+            )
+        }
+        _ => account_fresh(&declared_fields, &observed),
+    };
+    UsageEvidence {
+        schema_version: USAGE_EVIDENCE_SCHEMA_VERSION,
+        declared_fields,
+        counter_scope: adapter.usage_counter_scope,
+        observed,
+        accounting,
+    }
+}
+
+pub(crate) fn account_fresh(
+    declared_fields: &[String],
+    observed: &UsageObservation,
+) -> UsageAccounting {
+    let unavailable_fields = observed.breakdown().map_or_else(Vec::new, |breakdown| {
+        breakdown
+            .unreadable_fields
+            .iter()
+            .filter(|field| declared_fields.contains(field))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let state = if unavailable_fields.is_empty() {
+        UsageAccountingState::Exact
+    } else if observed
+        .breakdown()
+        .is_some_and(breakdown_has_accounted_figure)
+    {
+        UsageAccountingState::Partial
+    } else {
+        UsageAccountingState::Unavailable
+    };
+    UsageAccounting {
+        state,
+        basis: UsageAccountingBasis::Fresh,
+        predecessor: None,
+        usage: observed.clone(),
+        unavailable_fields,
+        reason: (state != UsageAccountingState::Exact)
+            .then_some(UsageAccountingReason::UnreadableCurrent),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn account_delta(
+    adapter_name: &str,
+    counter_scope: UsageCounterScope,
+    declared_fields: &[String],
+    captures: &ScrapeResult,
+    observed: &UsageObservation,
+    predecessor: Option<UsagePredecessor>,
+    predecessor_payload: Option<&Value>,
+) -> UsageAccounting {
+    // A typed absence is itself an exact per-attempt statement. There is no
+    // cumulative number to subtract and no cumulative value is charged.
+    let UsageObservation::Reported(current) = observed else {
+        return UsageAccounting {
+            state: UsageAccountingState::Exact,
+            basis: UsageAccountingBasis::Delta,
+            predecessor,
+            usage: observed.clone(),
+            unavailable_fields: Vec::new(),
+            reason: None,
+        };
+    };
+
+    let Some(predecessor_identity) = predecessor.clone() else {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::MissingPredecessor,
+        );
+    };
+    let Some(payload) = predecessor_payload else {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::MissingPredecessor,
+        );
+    };
+    if payload.get("taskUuid").and_then(Value::as_str)
+        != Some(predecessor_identity.task_uuid.as_str())
+        || payload.get("attempt").and_then(Value::as_u64)
+            != Some(u64::from(predecessor_identity.attempt))
+        || payload.get("leaseEpoch").and_then(Value::as_u64)
+            != Some(predecessor_identity.lease_epoch)
+    {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::MissingPredecessor,
+        );
+    }
+    let Some(evidence_value) = payload.get("usageEvidence") else {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            if payload.get("usage").is_some() {
+                UsageAccountingReason::LegacyPredecessor
+            } else {
+                UsageAccountingReason::MissingPredecessor
+            },
+        );
+    };
+    let Ok(previous_evidence) = serde_json::from_value::<UsageEvidence>(evidence_value.clone())
+    else {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::LegacyPredecessor,
+        );
+    };
+    if previous_evidence.schema_version != USAGE_EVIDENCE_SCHEMA_VERSION {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::LegacyPredecessor,
+        );
+    }
+    if payload.get("adapter").and_then(Value::as_str) != Some(adapter_name)
+        || previous_evidence.counter_scope != counter_scope
+        || previous_evidence.declared_fields != declared_fields
+    {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::DeclarationMismatch,
+        );
+    }
+    let current_session = captures.session_ref().ok().flatten();
+    let previous_session = payload
+        .get("captures")
+        .and_then(Value::as_object)
+        .and_then(|captures| captures.get("sessionRef"))
+        .and_then(Value::as_str);
+    if current_session.is_none() || current_session != previous_session {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::SessionMismatch,
+        );
+    }
+    let UsageObservation::Reported(previous) = &previous_evidence.observed else {
+        return unavailable_delta(
+            observed,
+            predecessor,
+            declared_fields,
+            UsageAccountingReason::MissingPredecessor,
+        );
+    };
+
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut cost = None;
+    let mut unavailable = BTreeSet::new();
+    let mut reason = None;
+    let mut computed = 0_usize;
+    for field in declared_fields {
+        if field == FIELD_COST_USD {
+            match (
+                current.cost.as_ref().map(|cost| &cost.amount),
+                previous.cost.as_ref().map(|cost| &cost.amount),
+            ) {
+                (Some(current), Some(previous)) => match subtract_amount(current, previous) {
+                    Some(amount) => {
+                        cost = Some(UsageCost {
+                            amount,
+                            currency: "USD".to_owned(),
+                        });
+                        computed += 1;
+                    }
+                    None => {
+                        unavailable.insert(field.clone());
+                        reason.get_or_insert(UsageAccountingReason::CounterUnderflow);
+                    }
+                },
+                (None, _) => {
+                    unavailable.insert(field.clone());
+                    reason.get_or_insert(UsageAccountingReason::UnreadableCurrent);
+                }
+                (_, None) => {
+                    unavailable.insert(field.clone());
+                    reason.get_or_insert(UsageAccountingReason::MissingPredecessor);
+                }
+            }
+            continue;
+        }
+        match (
+            observed_count(current, field),
+            observed_count(previous, field),
+        ) {
+            (Some(current), Some(previous)) => match current.checked_sub(previous) {
+                Some(delta) => {
+                    counts.insert(field.clone(), delta);
+                    computed += 1;
+                }
+                None => {
+                    unavailable.insert(field.clone());
+                    reason.get_or_insert(UsageAccountingReason::CounterUnderflow);
+                }
+            },
+            (None, _) => {
+                unavailable.insert(field.clone());
+                reason.get_or_insert(UsageAccountingReason::UnreadableCurrent);
+            }
+            (_, None) => {
+                unavailable.insert(field.clone());
+                reason.get_or_insert(UsageAccountingReason::MissingPredecessor);
+            }
+        }
+    }
+
+    let input_as_reported = counts
+        .get(FIELD_INPUT_TOKENS)
+        .or_else(|| counts.get(FIELD_INPUT_TOKENS_WITH_CACHE_READ))
+        .copied();
+    let mut input_tokens = counts.get(FIELD_INPUT_TOKENS).copied();
+    if input_tokens.is_none() {
+        if let Some(inclusive) = counts.get(FIELD_INPUT_TOKENS_WITH_CACHE_READ).copied() {
+            match inclusive.checked_sub(counts.get(FIELD_CACHE_READ_TOKENS).copied().unwrap_or(0)) {
+                Some(exclusive) => input_tokens = Some(exclusive),
+                None => {
+                    counts.remove(FIELD_INPUT_TOKENS_WITH_CACHE_READ);
+                    unavailable.insert(FIELD_INPUT_TOKENS_WITH_CACHE_READ.to_owned());
+                    reason = Some(UsageAccountingReason::CounterUnderflow);
+                    computed = computed.saturating_sub(1);
+                }
+            }
+        }
+    }
+    let input_as_reported = if unavailable.contains(FIELD_INPUT_TOKENS_WITH_CACHE_READ) {
+        None
+    } else {
+        input_as_reported
+    };
+    let cache_read_tokens = counts.get(FIELD_CACHE_READ_TOKENS).copied();
+    let cache_write_tokens = counts.get(FIELD_CACHE_WRITE_TOKENS).copied();
+    let output_tokens = counts.get(FIELD_OUTPUT_TOKENS).copied();
+    let reasoning_tokens = counts.get(FIELD_REASONING_TOKENS).copied();
+    let reported_total = counts.get(FIELD_TOTAL_TOKENS).copied();
+    let has_components = input_as_reported.is_some()
+        || cache_read_tokens.is_some()
+        || cache_write_tokens.is_some()
+        || output_tokens.is_some()
+        || reasoning_tokens.is_some();
+    let has_lump = reported_total.is_some() || cost.is_some();
+    let mut breakdown = UsageBreakdown {
+        shape: if has_components {
+            UsageShape::Components
+        } else if has_lump {
+            UsageShape::Lump
+        } else {
+            UsageShape::Unmapped
+        },
+        input_tokens,
+        input_tokens_as_reported: input_as_reported,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens: reported_total.map(|value| UsageTotalTokens {
+            value,
+            source: UsageTotalSource::HarnessReported,
+        }),
+        cost,
+        unreadable_fields: Vec::new(),
+    };
+    if breakdown.total_tokens.is_none() {
+        breakdown.total_tokens = breakdown.component_sum().map(|value| UsageTotalTokens {
+            value,
+            source: UsageTotalSource::DerivedFromComponents,
+        });
+    }
+    let unavailable_fields = unavailable.into_iter().collect::<Vec<_>>();
+    let state = if unavailable_fields.is_empty() {
+        UsageAccountingState::Exact
+    } else if computed == 0 {
+        UsageAccountingState::Unavailable
+    } else {
+        UsageAccountingState::Partial
+    };
+    UsageAccounting {
+        state,
+        basis: UsageAccountingBasis::Delta,
+        predecessor,
+        usage: UsageObservation::Reported(breakdown),
+        unavailable_fields,
+        reason,
+    }
+}
+
+pub(crate) fn unavailable_delta(
+    observed: &UsageObservation,
+    predecessor: Option<UsagePredecessor>,
+    declared_fields: &[String],
+    reason: UsageAccountingReason,
+) -> UsageAccounting {
+    UsageAccounting {
+        state: UsageAccountingState::Unavailable,
+        basis: UsageAccountingBasis::Delta,
+        predecessor,
+        usage: match observed {
+            UsageObservation::Reported(_) => UsageObservation::Reported(UsageBreakdown {
+                shape: UsageShape::Unmapped,
+                input_tokens: None,
+                input_tokens_as_reported: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                output_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                cost: None,
+                unreadable_fields: Vec::new(),
+            }),
+            absence => absence.clone(),
+        },
+        unavailable_fields: declared_fields.to_vec(),
+        reason: Some(reason),
+    }
+}
+
+fn observed_count(breakdown: &UsageBreakdown, field: &str) -> Option<u64> {
+    match field {
+        FIELD_INPUT_TOKENS | FIELD_INPUT_TOKENS_WITH_CACHE_READ => {
+            breakdown.input_tokens_as_reported
+        }
+        FIELD_CACHE_READ_TOKENS => breakdown.cache_read_tokens,
+        FIELD_CACHE_WRITE_TOKENS => breakdown.cache_write_tokens,
+        FIELD_OUTPUT_TOKENS => breakdown.output_tokens,
+        FIELD_REASONING_TOKENS => breakdown.reasoning_tokens,
+        FIELD_TOTAL_TOKENS => breakdown.total_tokens.and_then(|total| {
+            (total.source == UsageTotalSource::HarnessReported).then_some(total.value)
+        }),
+        _ => None,
+    }
+}
+
+fn subtract_amount(current: &Number, previous: &Number) -> Option<Number> {
+    let parse = |number: &Number| {
+        let lexical = number.to_string();
+        Decimal::from_str_exact(&lexical).or_else(|_| Decimal::from_scientific(&lexical))
+    };
+    let current = parse(current).ok()?;
+    let previous = parse(previous).ok()?;
+    let delta = current.checked_sub(previous)?;
+    if delta.is_sign_negative() {
+        return None;
+    }
+    Number::from_str(&delta.normalize().to_string()).ok()
+}
+
+fn breakdown_has_accounted_figure(breakdown: &UsageBreakdown) -> bool {
+    breakdown.input_tokens_as_reported.is_some()
+        || breakdown.cache_read_tokens.is_some()
+        || breakdown.cache_write_tokens.is_some()
+        || breakdown.output_tokens.is_some()
+        || breakdown.reasoning_tokens.is_some()
+        || breakdown.total_tokens.is_some()
+        || breakdown.cost.is_some()
+}
+
+impl UsageEvidence {
+    /// Exact per-attempt amount for the built-in token meter.
+    ///
+    /// Only fields the adapter declared participate. An unavailable field in
+    /// the meter's chosen formula is a diagnostic, not permission to reuse the
+    /// cumulative raw observation or to silently substitute zero.
+    pub fn meter_amount(&self) -> Result<Option<u64>, UsageAccountingReason> {
+        let Some(breakdown) = self.accounting.usage.breakdown() else {
+            return Ok(None);
+        };
+        let unavailable = |field: &str| {
+            self.accounting
+                .unavailable_fields
+                .iter()
+                .any(|unavailable| unavailable == field)
+        };
+        if self
+            .declared_fields
+            .iter()
+            .any(|field| field == FIELD_TOTAL_TOKENS)
+        {
+            if let Some(amount) = breakdown
+                .total_tokens
+                .filter(|total| total.source == UsageTotalSource::HarnessReported)
+                .map(|total| total.value)
+            {
+                return Ok((amount > 0).then_some(amount));
+            }
+        }
+        let input_field = if self
+            .declared_fields
+            .iter()
+            .any(|field| field == FIELD_INPUT_TOKENS)
+        {
+            Some(FIELD_INPUT_TOKENS)
+        } else if self
+            .declared_fields
+            .iter()
+            .any(|field| field == FIELD_INPUT_TOKENS_WITH_CACHE_READ)
+        {
+            Some(FIELD_INPUT_TOKENS_WITH_CACHE_READ)
+        } else {
+            None
+        };
+        let output_declared = self
+            .declared_fields
+            .iter()
+            .any(|field| field == FIELD_OUTPUT_TOKENS);
+        if input_field.is_none() && !output_declared {
+            return Ok(None);
+        }
+        if input_field.is_some_and(unavailable)
+            || (output_declared && unavailable(FIELD_OUTPUT_TOKENS))
+        {
+            return Err(self
+                .accounting
+                .reason
+                .unwrap_or(UsageAccountingReason::UnreadableCurrent));
+        }
+        let input = if input_field.is_some() {
+            breakdown
+                .input_tokens_as_reported
+                .ok_or(UsageAccountingReason::UnreadableCurrent)?
+        } else {
+            0
+        };
+        let output = if output_declared {
+            breakdown
+                .output_tokens
+                .ok_or(UsageAccountingReason::UnreadableCurrent)?
+        } else {
+            0
+        };
+        let amount = input
+            .checked_add(output)
+            .ok_or(UsageAccountingReason::UnreadableCurrent)?;
+        Ok((amount > 0).then_some(amount))
+    }
+}
+
 fn field_paths<'a>(capture_name: &str, capture: &'a ScrapeCapture, logical: &str) -> Vec<&'a str> {
     if capture.fields.is_empty() {
         if capture_name == USAGE_CAPTURE {
@@ -512,6 +1114,10 @@ mod tests {
     const CODEX_STREAM: &str = include_str!("../../../test/fixtures/usage/codex.jsonl");
     const CODEX_QUIET_STREAM: &str =
         include_str!("../../../test/fixtures/usage/codex-no-usage.jsonl");
+    const CODEX_RESUME_FRESH_STREAM: &str =
+        include_str!("../../../test/fixtures/usage/codex-resume-fresh.jsonl");
+    const CODEX_RESUME_CUMULATIVE_STREAM: &str =
+        include_str!("../../../test/fixtures/usage/codex-resume-cumulative.jsonl");
     const CLAUDE_STREAM: &str = include_str!("../../../test/fixtures/usage/claude-code.jsonl");
     const CLAUDE_QUIET_STREAM: &str =
         include_str!("../../../test/fixtures/usage/claude-code-no-usage.jsonl");
@@ -538,6 +1144,7 @@ mod tests {
     fn codex_adapter() -> AdapterConfig {
         AdapterConfig {
             argv: vec!["codex".to_owned()],
+            usage_counter_scope: UsageCounterScope::SessionCumulative,
             scrape: BTreeMap::from([
                 (
                     "sessionRef".to_owned(),
@@ -583,6 +1190,241 @@ mod tests {
             .scrape_text(name, stream, "")
             .expect("fixture stream scrapes");
         observe(adapter, &captures)
+    }
+
+    fn scraped_captures(adapter: &AdapterConfig, name: &str, stream: &str) -> ScrapeResult {
+        let adapters = BTreeMap::from([(name.to_owned(), adapter.clone())]);
+        AdapterEngine::new(&adapters)
+            .scrape_text(name, stream, "")
+            .expect("fixture stream scrapes")
+    }
+
+    #[test]
+    fn resumed_codex_counters_are_charged_as_the_real_checked_delta() {
+        let adapter = codex_adapter();
+        let fresh_captures = scraped_captures(&adapter, "codex", CODEX_RESUME_FRESH_STREAM);
+        let fresh = account_usage(
+            "codex",
+            &adapter,
+            &fresh_captures,
+            &UsageAccountingMode::Fresh,
+            None,
+        );
+        let predecessor = UsagePredecessor::new("00000000-0000-4000-8000-000000000403", 1, 7);
+        let predecessor_payload = json!({
+            "kind": "adapter-scrape",
+            "taskUuid": predecessor.task_uuid,
+            "adapter": "codex",
+            "attempt": predecessor.attempt,
+            "leaseEpoch": predecessor.lease_epoch,
+            "captures": fresh_captures.captures,
+            "usage": fresh.observed,
+            "usageEvidence": fresh,
+        });
+        let resumed_captures = scraped_captures(&adapter, "codex", CODEX_RESUME_CUMULATIVE_STREAM);
+        let resumed = account_usage(
+            "codex",
+            &adapter,
+            &resumed_captures,
+            &UsageAccountingMode::Resume {
+                predecessor: Some(predecessor),
+            },
+            Some(&predecessor_payload),
+        );
+
+        assert_eq!(resumed.accounting.state, UsageAccountingState::Exact);
+        assert_eq!(resumed.accounting.basis, UsageAccountingBasis::Delta);
+        let delta = resumed
+            .accounting
+            .usage
+            .breakdown()
+            .expect("the resumed delta is reported");
+        assert_eq!(delta.input_tokens_as_reported, Some(16_630));
+        assert_eq!(delta.input_tokens, Some(1_526));
+        assert_eq!(delta.cache_read_tokens, Some(15_104));
+        assert_eq!(delta.cache_write_tokens, Some(0));
+        assert_eq!(delta.output_tokens, Some(6));
+        assert_eq!(delta.reasoning_tokens, Some(0));
+        assert_eq!(delta.total_tokens.map(|total| total.value), Some(16_636));
+
+        let fresh_total = predecessor_payload["usageEvidence"]["accounting"]["usage"]["breakdown"]
+            ["totalTokens"]["value"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(fresh_total, 16_209);
+        assert_eq!(fresh_total + delta.total_tokens.unwrap().value, 32_845);
+        let resumed_raw = resumed
+            .observed
+            .breakdown()
+            .expect("the cumulative reading remains visible");
+        let forbidden_old_sum = fresh_total + resumed_raw.total_tokens.unwrap().value;
+        assert_eq!(forbidden_old_sum, 49_054);
+        assert_eq!(resumed.meter_amount(), Ok(Some(16_636)));
+        assert_eq!(resumed.observed.meter_amount(), Some(32_845));
+    }
+
+    #[test]
+    fn cumulative_accounting_refuses_every_unbound_or_incompatible_predecessor() {
+        let adapter = codex_adapter();
+        let fresh_captures = scraped_captures(&adapter, "codex", CODEX_RESUME_FRESH_STREAM);
+        let fresh = account_usage(
+            "codex",
+            &adapter,
+            &fresh_captures,
+            &UsageAccountingMode::Fresh,
+            None,
+        );
+        let predecessor = UsagePredecessor::new("00000000-0000-4000-8000-000000000403", 1, 7);
+        let payload = json!({
+            "kind": "adapter-scrape",
+            "taskUuid": predecessor.task_uuid,
+            "adapter": "codex",
+            "attempt": predecessor.attempt,
+            "leaseEpoch": predecessor.lease_epoch,
+            "captures": fresh_captures.captures,
+            "usage": fresh.observed,
+            "usageEvidence": fresh,
+        });
+        let resumed_captures = scraped_captures(&adapter, "codex", CODEX_RESUME_CUMULATIVE_STREAM);
+        let mode = UsageAccountingMode::Resume {
+            predecessor: Some(predecessor.clone()),
+        };
+        let reason = |captures: &ScrapeResult, payload: Option<&Value>| {
+            account_usage("codex", &adapter, captures, &mode, payload)
+                .accounting
+                .reason
+        };
+
+        assert_eq!(
+            reason(&resumed_captures, None),
+            Some(UsageAccountingReason::MissingPredecessor)
+        );
+        let mut legacy = payload.clone();
+        legacy.as_object_mut().unwrap().remove("usageEvidence");
+        assert_eq!(
+            reason(&resumed_captures, Some(&legacy)),
+            Some(UsageAccountingReason::LegacyPredecessor)
+        );
+        let mut wrong_session = payload.clone();
+        wrong_session["captures"]["sessionRef"] = json!("another-thread");
+        assert_eq!(
+            reason(&resumed_captures, Some(&wrong_session)),
+            Some(UsageAccountingReason::SessionMismatch)
+        );
+        let mut wrong_declaration = payload.clone();
+        wrong_declaration["usageEvidence"]["declaredFields"] = json!(["outputTokens"]);
+        assert_eq!(
+            reason(&resumed_captures, Some(&wrong_declaration)),
+            Some(UsageAccountingReason::DeclarationMismatch)
+        );
+        let mut underflow = resumed_captures.clone();
+        underflow.captures.get_mut("usage").unwrap()["input_tokens"] = json!(100);
+        assert_eq!(
+            reason(&underflow, Some(&payload)),
+            Some(UsageAccountingReason::CounterUnderflow)
+        );
+        let mut unreadable = resumed_captures.clone();
+        unreadable.captures.get_mut("usage").unwrap()["input_tokens"] = json!("32834");
+        assert_eq!(
+            reason(&unreadable, Some(&payload)),
+            Some(UsageAccountingReason::UnreadableCurrent)
+        );
+
+        // Attempt number is deliberately absent from the constructor. A fresh
+        // retry is fresh because its rendered invocation says so, while an
+        // attempt-scoped adapter stays fresh even when its argv is a resume.
+        let fresh_retry = account_usage(
+            "codex",
+            &adapter,
+            &fresh_captures,
+            &UsageAccountingMode::Fresh,
+            None,
+        );
+        assert_eq!(fresh_retry.accounting.basis, UsageAccountingBasis::Fresh);
+        let mut attempt_scoped = adapter.clone();
+        attempt_scoped.usage_counter_scope = UsageCounterScope::Attempt;
+        let attempt_resume = account_usage(
+            "codex",
+            &attempt_scoped,
+            &fresh_captures,
+            &UsageAccountingMode::Resume { predecessor: None },
+            None,
+        );
+        assert_eq!(attempt_resume.accounting.state, UsageAccountingState::Exact);
+        assert_eq!(attempt_resume.accounting.basis, UsageAccountingBasis::Fresh);
+    }
+
+    #[test]
+    fn cumulative_cost_uses_exact_decimal_subtraction() {
+        let adapter = AdapterConfig {
+            argv: vec!["cost-agent".to_owned()],
+            usage_counter_scope: UsageCounterScope::SessionCumulative,
+            scrape: BTreeMap::from([
+                (
+                    "sessionRef".to_owned(),
+                    capture(ScrapeMode::JsonPath, "$", "{}"),
+                ),
+                (
+                    "usageCost".to_owned(),
+                    capture(ScrapeMode::JsonPath, "$", r#"{"costUsd":["$"]}"#),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let predecessor = UsagePredecessor::new("00000000-0000-4000-8000-000000000404", 1, 9);
+        let amount = |lexical: &str| serde_json::from_str::<Value>(lexical).unwrap();
+        let fresh_captures = ScrapeResult {
+            captures: BTreeMap::from([
+                ("sessionRef".to_owned(), json!("cost-session")),
+                ("usageCost".to_owned(), amount("0.100000000000000001")),
+            ]),
+        };
+        let fresh = account_usage(
+            "cost-agent",
+            &adapter,
+            &fresh_captures,
+            &UsageAccountingMode::Fresh,
+            None,
+        );
+        let payload = json!({
+            "kind": "adapter-scrape",
+            "taskUuid": predecessor.task_uuid,
+            "adapter": "cost-agent",
+            "attempt": predecessor.attempt,
+            "leaseEpoch": predecessor.lease_epoch,
+            "captures": fresh_captures.captures,
+            "usage": fresh.observed,
+            "usageEvidence": fresh,
+        });
+        let current = ScrapeResult {
+            captures: BTreeMap::from([
+                ("sessionRef".to_owned(), json!("cost-session")),
+                ("usageCost".to_owned(), amount("0.300000000000000003")),
+            ]),
+        };
+        let delta = account_usage(
+            "cost-agent",
+            &adapter,
+            &current,
+            &UsageAccountingMode::Resume {
+                predecessor: Some(predecessor),
+            },
+            Some(&payload),
+        );
+        assert_eq!(delta.accounting.state, UsageAccountingState::Exact);
+        assert_eq!(
+            delta
+                .accounting
+                .usage
+                .breakdown()
+                .unwrap()
+                .cost
+                .as_ref()
+                .unwrap()
+                .amount
+                .to_string(),
+            "0.200000000000000002"
+        );
     }
 
     #[test]
@@ -1107,6 +1949,14 @@ mod tests {
                 row.usage, None,
                 "{arm}: no attempt was ever scraped for this row"
             );
+            assert_eq!(
+                row.usage_accounting, None,
+                "{arm}: no accounting projection existed for this row"
+            );
+            assert_eq!(
+                row.usage_predecessor, None,
+                "{arm}: no accounting predecessor existed for this row"
+            );
             assert_eq!(row.context_tokens, None, "{arm}: occupancy is N-1 too");
             assert_eq!(row.context_window, None, "{arm}: occupancy is N-1 too");
             let reserialized = serde_json::to_value(&row).unwrap();
@@ -1129,8 +1979,8 @@ mod tests {
         }
         assert_eq!(
             fixture["row"]["rowVersion"],
-            json!(crate::taskdb::CURRENT_ROW_VERSION),
-            "the N-1 arm must track the row version main actually writes"
+            json!(crate::taskdb::CURRENT_ROW_VERSION - 1),
+            "the N-1 arm must remain one row version behind main"
         );
 
         // The attestation payload gains a sibling key, so an N-1 payload keeps

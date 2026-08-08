@@ -30,6 +30,11 @@ pub const ROW_MIGRATIONS: &[RowMigration] = &[
         to: 4,
         migrate: migrate_job_token_hash_v3_to_v4,
     },
+    RowMigration {
+        from: 4,
+        to: 5,
+        migrate: migrate_usage_predecessor_v4_to_v5,
+    },
 ];
 
 pub fn migrate_to_current(row: &RowSeed) -> Result<RowSeed, String> {
@@ -153,6 +158,38 @@ fn migrate_job_token_hash_v3_to_v4(original: &RowSeed) -> Result<RowSeed, String
     if allowed_delta != canonical {
         return Err(
             "rowVersion 3 differs from canonical rowVersion 4 beyond jobTokenHash absence"
+                .to_owned(),
+        );
+    }
+    Ok(canonical)
+}
+
+fn migrate_usage_predecessor_v4_to_v5(original: &RowSeed) -> Result<RowSeed, String> {
+    if original.row_version != 4 {
+        return Err(format!(
+            "usage predecessor migration requires rowVersion 4, got {}",
+            original.row_version
+        ));
+    }
+    original.validate().map_err(|error| error.to_string())?;
+    if original.usage_predecessor.is_some() || original.usage_accounting.is_some() {
+        return Err(
+            "rowVersion 4 usage evidence migration requires the new usagePredecessor and usageAccounting fields to be absent"
+                .to_owned(),
+        );
+    }
+
+    let mut canonical = original.clone();
+    canonical.row_version = 5;
+    canonical
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+
+    let mut allowed_delta = original.clone();
+    allowed_delta.row_version = 5;
+    if allowed_delta != canonical {
+        return Err(
+            "rowVersion 4 differs from canonical rowVersion 5 beyond usage evidence absence"
                 .to_owned(),
         );
     }

@@ -2496,8 +2496,10 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            usage_predecessor: None,
             session_cwd: None,
             final_message: None,
+            usage_accounting: None,
             job_token_hash: None,
             lease_epoch,
             attempt: 1,
@@ -3897,6 +3899,7 @@ mod tests {
                 hardening: Default::default(),
                 extra_writable_paths: Vec::new(),
                 yield_hook: None,
+                usage_accounting: UsageAccountingMode::Fresh,
             },
             labor_class: LaborClass::Fresh,
             state: JobState::Running,
@@ -6092,6 +6095,19 @@ mod tests {
                 );
                 assert_eq!(continued_job.row.resumed_from.as_deref(), Some(first_id));
                 assert_eq!(continued_job.row.session_ref.as_deref(), Some("session-28"));
+                let predecessor = UsagePredecessor::new(first_uuid, 1, 1);
+                assert_eq!(
+                    continued_job.row.usage_predecessor,
+                    Some(predecessor.clone()),
+                    "a cross-task continuation durably names the exact source attempt"
+                );
+                assert_eq!(
+                    continued_job.invocation.usage_accounting,
+                    UsageAccountingMode::Resume {
+                        predecessor: Some(predecessor),
+                    },
+                    "the accounting lineage must travel with the rendered resume"
+                );
 
                 let finished =
                     await_positive_progress("continued job completion", daemon.completion_rx.recv())
@@ -6676,6 +6692,7 @@ mod tests {
             previous_witness_seq: 1,
             previous_attempt: 1,
             previous_lease_epoch: 1,
+            previous_usage_predecessor: None,
         });
 
         hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &mut attestations)
@@ -7932,6 +7949,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_completed_empty_scrape_is_a_durable_typed_absence() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let config = one_pool_config();
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let finished = await_positive_progress(
+                    "empty-scrape completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+
+                let line = fs::read_to_string(paths.attestations_path()).unwrap();
+                let record: crate::witness::AttestationRecord =
+                    serde_json::from_str(line.lines().next().unwrap()).unwrap();
+                assert_eq!(record.payload["taskUuid"], admitted["task_uuid"]);
+                assert_eq!(record.payload["captures"], json!({}));
+                assert_eq!(record.payload["usage"], json!({"state": "not-declared"}));
+                assert_eq!(
+                    record.payload["usageEvidence"],
+                    json!({
+                        "schemaVersion": 1,
+                        "declaredFields": [],
+                        "counterScope": "attempt",
+                        "observed": {"state": "not-declared"},
+                        "accounting": {
+                            "state": "exact",
+                            "basis": "fresh",
+                            "usage": {"state": "not-declared"},
+                        },
+                    })
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn acceptance_24_5_trace_and_scraped_usage_are_advisory_only() {
         let local = LocalSet::new();
         local
@@ -8089,6 +8168,21 @@ mod tests {
                 );
                 assert_eq!(attestation.payload["attempt"], 1);
                 assert_eq!(attestation.payload["leaseEpoch"], 1);
+                assert_eq!(
+                    attestation.payload["usageEvidence"],
+                    json!({
+                        "schemaVersion": 1,
+                        "declaredFields": ["inputTokens", "outputTokens", "totalTokens"],
+                        "counterScope": "attempt",
+                        "observed": attestation.payload["usage"],
+                        "accounting": {
+                            "state": "exact",
+                            "basis": "fresh",
+                            "usage": attestation.payload["usage"],
+                        },
+                    }),
+                    "raw observation and per-attempt accounting are distinct durable fields"
+                );
                 let (report, witness) = read_verified_records(&paths.witness_path()).unwrap();
                 assert!(report.ok);
                 assert_eq!(witness.len(), 1);
@@ -8145,6 +8239,19 @@ mod tests {
                     }),
                     "the breakdown renders as an advisory provider capture, never collapsed \
                      into a canonical authority"
+                );
+                assert_eq!(
+                    before["job"]["usageAccounting"],
+                    json!({
+                        "value": {
+                            "state": "exact",
+                            "basis": "fresh",
+                            "usage": attestation.payload["usage"],
+                        },
+                        "authority": "advisory-attestation",
+                        "provenance": "adapter-scrape usageEvidence.accounting",
+                    }),
+                    "query detail must not present the raw observation as the charge"
                 );
                 // Occupancy rides beside `usage`, but is read through its own
                 // narrower capture, never derived from `usage`'s
@@ -8287,6 +8394,7 @@ mod tests {
                     serde_json::from_str(repaired.lines().next().unwrap()).unwrap();
                 assert_eq!(repaired.payload["reconciledAfterRestart"], true);
                 assert_eq!(repaired.payload["leaseEpoch"], 1);
+                assert_eq!(repaired.payload["usageEvidence"]["accounting"]["basis"], "fresh");
 
                 drop(reopened);
 
@@ -8564,14 +8672,15 @@ mod tests {
         };
         let program = temp.path().join("agent");
         let mut config = one_pool_config();
-        config
-            .adapters
-            .insert("resumable".to_owned(), structured_adapter(&program));
+        let mut adapter = structured_adapter(&program);
+        adapter.usage_counter_scope = crate::adapters::UsageCounterScope::SessionCumulative;
+        config.adapters.insert("resumable".to_owned(), adapter);
         let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap());
         let mut row = durable_row(Uuid::new_v4(), "resume-key", 2);
         row.adapter = "resumable".to_owned();
         row.argv = vec!["continue-work".to_owned()];
         row.attempt = 2;
+        row.usage_predecessor = Some(UsagePredecessor::new(row.uuid, 1, 1));
         let capture_paths = executor.paths(&ExecutionIdentity {
             job_id: row.uuid,
             task_uuid: Some(row.uuid),
@@ -8593,6 +8702,7 @@ mod tests {
             previous_witness_seq: 1,
             previous_attempt: 1,
             previous_lease_epoch: 1,
+            previous_usage_predecessor: None,
         };
         let attestation_path = temp.path().join("attestations.jsonl");
         let mut attestations = SharedAttestations::new(attestation_path.clone());
@@ -8638,6 +8748,13 @@ mod tests {
                 "Exact/Model".to_owned(),
                 "continue-work".to_owned(),
             ]
+        );
+        assert_eq!(
+            invocation.usage_accounting,
+            UsageAccountingMode::Resume {
+                predecessor: row.usage_predecessor.clone(),
+            },
+            "restart re-presentation must preserve the bound predecessor"
         );
         assert_eq!(
             captures.unwrap().captures["branch"],
@@ -8996,7 +9113,7 @@ mod tests {
     /// An adapter shaped exactly like every adapter that existed before the
     /// usage mapping did: a `usage` capture and no declared field paths. What
     /// it normalizes to is what the meter feeder must keep charging.
-    fn legacy_shaped_usage(captures: &ScrapeResult) -> crate::usage::UsageObservation {
+    fn legacy_shaped_usage(captures: &ScrapeResult) -> crate::usage::UsageEvidence {
         let adapter = AdapterConfig {
             argv: vec!["agent".to_owned()],
             scrape: BTreeMap::from([(
@@ -9011,7 +9128,53 @@ mod tests {
             )]),
             ..Default::default()
         };
-        crate::usage::observe(&adapter, captures)
+        crate::usage::account_usage(
+            "legacy",
+            &adapter,
+            captures,
+            &UsageAccountingMode::Fresh,
+            None,
+        )
+    }
+
+    #[test]
+    fn usage_predecessor_lookup_pins_the_exact_lease_and_last_duplicate() {
+        let temp = tempdir().unwrap();
+        let mut attestations =
+            SharedAttestations::new(temp.path().join("usage-predecessor.jsonl"));
+        let task = "00000000-0000-4000-8000-000000000403";
+        for (lease_epoch, marker) in [(7, "lease-7-old"), (8, "lease-8"), (7, "lease-7-new")]
+        {
+            attestations
+                .ledger()
+                .unwrap()
+                .append(json!({
+                    "kind": "adapter-scrape",
+                    "taskUuid": task,
+                    "adapter": "codex",
+                    "attempt": 2,
+                    "leaseEpoch": lease_epoch,
+                    "marker": marker,
+                }))
+                .unwrap();
+        }
+
+        let selected = attestations
+            .usage_predecessor_payload(&UsageAccountingMode::Resume {
+                predecessor: Some(UsagePredecessor::new(task, 2, 7)),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected["marker"], "lease-7-new");
+        assert_eq!(selected["leaseEpoch"], 7);
+
+        let other_lease = attestations
+            .usage_predecessor_payload(&UsageAccountingMode::Resume {
+                predecessor: Some(UsagePredecessor::new(task, 2, 8)),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(other_lease["marker"], "lease-8");
     }
 
     #[test]
@@ -9084,22 +9247,30 @@ mod tests {
         assert_eq!(projection.pools[0].effective_utilization_pct, 40.0);
 
         let valid_bytes = fs::read(&path).unwrap();
-        for malformed in [
-            json!({"usage": {"total_tokens": "80"}}),
-            json!({"usage": {"input_tokens": -1, "output_tokens": 4}}),
-            json!({"usage": {"input_tokens": 0, "output_tokens": 0}}),
+        for (malformed, diagnostic_expected) in [
+            (json!({"usage": {"total_tokens": "80"}}), true),
+            (
+                json!({"usage": {"input_tokens": -1, "output_tokens": 4}}),
+                true,
+            ),
+            (
+                json!({"usage": {"input_tokens": 0, "output_tokens": 0}}),
+                false,
+            ),
         ] {
             let captures = ScrapeResult {
                 captures: malformed.as_object().unwrap().clone().into_iter().collect(),
             };
-            assert!(
-                feed_scraped_usage(
+            let diagnostics = feed_scraped_usage(
                 &state_dir,
                 &config.pools,
                 &["api".to_owned()],
                 &legacy_shaped_usage(&captures),
-            )
-                    .is_empty()
+            );
+            assert_eq!(
+                !diagnostics.is_empty(),
+                diagnostic_expected,
+                "typed accounting failures are surfaced while a genuine zero is a no-op"
             );
             assert_eq!(fs::read(&path).unwrap(), valid_bytes);
         }
@@ -12169,19 +12340,24 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(retried["attempt"], 2);
-                assert_eq!(
-                    daemon
-                        .handler
-                        .context
-                        .read()
-                        .await
-                        .rows
-                        .get(&uuid)
-                        .unwrap()
-                        .usage,
-                    None,
-                    "the retried row must carry no usage of its own"
-                );
+                {
+                    let context = daemon.handler.context.read().await;
+                    let row = context.rows.get(&uuid).unwrap();
+                    assert_eq!(
+                        row.usage, None,
+                        "the retried row must carry no usage of its own"
+                    );
+                    assert_eq!(row.usage_accounting, None);
+                    assert_eq!(
+                        row.usage_predecessor, None,
+                        "a fresh retry is fresh even though its attempt is greater than one"
+                    );
+                    assert_eq!(
+                        context.jobs.get(&uuid).unwrap().invocation.usage_accounting,
+                        UsageAccountingMode::Fresh,
+                        "freshness is bound to the rendered invocation, not inferred from attempt"
+                    );
+                }
                 let after = daemon
                     .handler
                     .query("query.job", Some(json!({"id": task_uuid})))
@@ -12481,6 +12657,32 @@ mod tests {
                         "test -n \"$TALLY_BRIEF\" && test -f \"$TALLY_BRIEF\" && test \"$TALLY_TASK_REF\" = crm/t07"
                     ])
                 );
+                let compact_lifecycle = await_positive_progress(
+                    "journal+witness lifecycle publication",
+                    async {
+                        loop {
+                            let lifecycle = client
+                                .call(
+                                    "query.log",
+                                    Some(json!({
+                                        "task": task_uuid.to_string(),
+                                        "limit": 100,
+                                        "provenance": false,
+                                    })),
+                                )
+                                .await
+                                .unwrap();
+                            if lifecycle["items"].as_array().unwrap().iter().any(|event| {
+                                event["origin"] == "journal+witness"
+                                    && event["terminalVerdict"] == "pass"
+                            }) {
+                                break lifecycle;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    },
+                )
+                .await;
                 let lifecycle = client
                     .call(
                         "query.log",
@@ -12493,17 +12695,6 @@ mod tests {
                     .unwrap()
                     .iter()
                     .all(|event| event["taskRef"] == "crm/t07"));
-                let compact_lifecycle = client
-                    .call(
-                        "query.log",
-                        Some(json!({
-                            "task": task_uuid.to_string(),
-                            "limit": 100,
-                            "provenance": false,
-                        })),
-                    )
-                    .await
-                    .unwrap();
                 assert!(compact_lifecycle["items"].as_array().unwrap().len()
                     < lifecycle["items"].as_array().unwrap().len());
                 assert!(!compact_lifecycle["items"]
@@ -14939,10 +15130,19 @@ mod tests {
                 });
                 let created = client.call("queue.enqueue", Some(payload)).await.unwrap();
                 assert_eq!(fs1_wait(&client, &created).await["verdict"], "pass");
-                let before = client
-                    .call("query.jobs", Some(json!({"flowRun": old_run})))
-                    .await
-                    .unwrap();
+                let before = await_positive_progress("post-ack usage publication", async {
+                    loop {
+                        let jobs = client
+                            .call("query.jobs", Some(json!({"flowRun": old_run})))
+                            .await
+                            .unwrap();
+                        if jobs["items"][0].get("usageAccounting").is_some() {
+                            break jobs;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
 
                 // Nothing is recorded until an operator asks for it.
                 let empty = client

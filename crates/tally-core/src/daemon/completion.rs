@@ -356,38 +356,9 @@ impl DaemonHandler {
                 )
             };
             let attestations = Arc::clone(&handler.attestations);
-            let scrape_configured = adapters
-                .get(&job.row.adapter)
-                .is_some_and(|adapter| !adapter.scrape.is_empty());
-            if !scrape_configured {
-                // An adapter with no captures at all declared no usage scrape.
-                // Record that as a value so a later reader is not left to infer
-                // it from a missing key. A config-declared context window does
-                // not depend on a scrape, so it is still checked here.
-                let mut job = job;
-                job.row.usage = Some(UsageObservation::NotDeclared);
-                job.row.context_window = adapters
-                    .get(&job.row.adapter)
-                    .and_then(|adapter| occupancy::context_window(adapter, None));
-                {
-                    // Post-ack, so the job is terminal and already retired out
-                    // of `context.jobs` (#395); the query fact is the durable
-                    // home of a finished job's observations.
-                    let mut context = handler.context.write().await;
-                    if let Some(detail) = job
-                        .task_uuid
-                        .and_then(|task_uuid| context.query_details.get_mut(&task_uuid))
-                    {
-                        detail.usage.clone_from(&job.row.usage);
-                        detail.context_window = job.row.context_window;
-                    }
-                }
-                handler.emit_post_ack(completed_event(&job, &result, evidence));
-                return;
-            }
-
             let paths = handler.executor.paths(&job.identity());
             let adapter = job.row.adapter.clone();
+            let usage_accounting_mode = job.invocation.usage_accounting.clone();
             let stable_key = job.stable_key();
             let job_id = job.job_id.to_string();
             let attempt = job.row.attempt;
@@ -397,16 +368,9 @@ impl DaemonHandler {
                 let captures = AdapterEngine::new(&adapters)
                     .scrape_paths(&adapter, &paths)
                     .map_err(|error| error.to_string())?;
-                // Normalization runs against the adapter's own declared key
-                // mapping, so a harness the tree has never seen is a config
-                // entry rather than a Rust change. The three states are
-                // decided here, once, and every later reader sees the same
-                // one.
-                let usage = adapters
+                let adapter_config = adapters
                     .get(&adapter)
-                    .map_or(UsageObservation::NotDeclared, |config| {
-                        crate::usage::observe(config, &captures)
-                    });
+                    .ok_or_else(|| format!("adapter {adapter:?} disappeared before scrape"))?;
                 // Occupancy reads the same captures usage was normalized
                 // from, but through its own narrower resolution -- it is not
                 // derived from `usage`, which keeps a session-lifetime
@@ -417,33 +381,46 @@ impl DaemonHandler {
                 let context_window = adapters
                     .get(&adapter)
                     .and_then(|config| occupancy::context_window(config, Some(&captures)));
-                let attestation_error = if captures.captures.is_empty() {
-                    None
-                } else {
-                    attestations
-                        .lock()
-                        .expect("attestation ledger lock poisoned")
-                        .ledger()
-                        .and_then(|ledger| {
-                            ledger.append(json!({
-                                "kind": "adapter-scrape",
-                                "taskUuid": stable_key,
-                                "jobId": job_id,
-                                "adapter": adapter,
-                                "attempt": attempt,
-                                "leaseEpoch": lease_epoch,
-                                "captures": captures.captures.clone(),
-                                "usage": usage.clone(),
-                                "usageAuthority": "advisory-only",
-                            }))
-                        })
-                        .err()
-                        .map(|error| error.to_string())
-                };
-                let meter_errors = feed_scraped_usage(&state_dir, &pools, &leased_pools, &usage);
+                let mut attestations = attestations
+                    .lock()
+                    .expect("attestation ledger lock poisoned");
+                let predecessor = attestations
+                    .usage_predecessor_payload(&usage_accounting_mode)
+                    .map_err(|error| error.to_string())?;
+                let usage_evidence = crate::usage::account_usage(
+                    &adapter,
+                    adapter_config,
+                    &captures,
+                    &usage_accounting_mode,
+                    predecessor.as_ref(),
+                );
+                let usage = usage_evidence.observed.clone();
+                // Every completed scrape gets a durable statement, including
+                // an empty capture and both typed absence states. Otherwise a
+                // restart turns a measured absence into an invisible attempt.
+                let attestation_error = attestations
+                    .ledger()
+                    .and_then(|ledger| {
+                        ledger.append(json!({
+                            "kind": "adapter-scrape",
+                            "taskUuid": stable_key,
+                            "jobId": job_id,
+                            "adapter": adapter,
+                            "attempt": attempt,
+                            "leaseEpoch": lease_epoch,
+                            "captures": captures.captures.clone(),
+                            "usage": usage.clone(),
+                            "usageEvidence": usage_evidence.clone(),
+                            "usageAuthority": "advisory-only",
+                        }))
+                    })
+                    .err()
+                    .map(|error| error.to_string());
+                let meter_errors =
+                    feed_scraped_usage(&state_dir, &pools, &leased_pools, &usage_evidence);
                 Ok::<_, String>((
                     captures,
-                    usage,
+                    usage_evidence,
                     context_tokens,
                     context_window,
                     attestation_error,
@@ -452,26 +429,32 @@ impl DaemonHandler {
             })
             .await;
 
-            let (captures, usage, context_tokens, context_window, attestation_error, meter_errors) =
-                match scraped {
-                    Ok(Ok(scraped)) => scraped,
-                    Ok(Err(error)) => {
-                        eprintln!(
-                            "tally: post-ack adapter scrape failed for {}: {error}",
-                            job.stable_key()
-                        );
-                        handler.emit_post_ack(completed_event(&job, &result, evidence));
-                        return;
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "tally: post-ack adapter scrape worker failed for {}: {error}",
-                            job.stable_key()
-                        );
-                        handler.emit_post_ack(completed_event(&job, &result, evidence));
-                        return;
-                    }
-                };
+            let (
+                captures,
+                usage_evidence,
+                context_tokens,
+                context_window,
+                attestation_error,
+                meter_errors,
+            ) = match scraped {
+                Ok(Ok(scraped)) => scraped,
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "tally: post-ack adapter scrape failed for {}: {error}",
+                        job.stable_key()
+                    );
+                    handler.emit_post_ack(completed_event(&job, &result, evidence));
+                    return;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "tally: post-ack adapter scrape worker failed for {}: {error}",
+                        job.stable_key()
+                    );
+                    handler.emit_post_ack(completed_event(&job, &result, evidence));
+                    return;
+                }
+            };
             for error in meter_errors {
                 eprintln!(
                     "tally: built-in usage meter feeder failed for {}: {error}",
@@ -504,7 +487,8 @@ impl DaemonHandler {
             // recorded even when it is an absence: a scraped attempt that
             // carried no usage is a different fact from an attempt nobody
             // scraped, and only recording the value keeps them apart.
-            enriched.row.usage = Some(usage);
+            enriched.row.usage = Some(usage_evidence.observed);
+            enriched.row.usage_accounting = Some(usage_evidence.accounting);
             enriched.row.context_tokens = context_tokens;
             enriched.row.context_window = context_window;
             {
@@ -525,6 +509,9 @@ impl DaemonHandler {
                         detail.observed_model.clone_from(&enriched.row.model);
                         detail.final_message.clone_from(&enriched.row.final_message);
                         detail.usage.clone_from(&enriched.row.usage);
+                        detail
+                            .usage_accounting
+                            .clone_from(&enriched.row.usage_accounting);
                         detail.context_tokens = enriched.row.context_tokens;
                         detail.context_window = enriched.row.context_window;
                     }
@@ -650,6 +637,29 @@ impl DaemonHandler {
         // carry the token in their fixed systemd environment, so relaunching it
         // here would break identity across a daemon restart.
         if job.row.executor.is_some() || job.adopted {
+            if let Some(task_uuid) = job.task_uuid {
+                let events_dir = context.paths.events_dir();
+                let mut matching_events = read_acknowledged_events(&events_dir)?
+                    .into_iter()
+                    .filter(|event| event.row.uuid == task_uuid)
+                    .collect::<Vec<_>>();
+                if matching_events.len() != 1 {
+                    return Err(DaemonError::Invalid(format!(
+                        "job {task_uuid} has {} acknowledged enqueue events while persisting its usage predecessor",
+                        matching_events.len()
+                    )));
+                }
+                let mut event = matching_events
+                    .pop()
+                    .expect("exactly one matching event was checked");
+                if event.row.usage_predecessor != job.row.usage_predecessor {
+                    event
+                        .row
+                        .usage_predecessor
+                        .clone_from(&job.row.usage_predecessor);
+                    update_enqueue_event_atomic(&events_dir, &event)?;
+                }
+            }
             return Ok(Some(PreparedExecution { job_token: None }));
         }
 
@@ -688,6 +698,10 @@ impl DaemonHandler {
                 .pop()
                 .expect("exactly one matching event was checked");
             event.row.job_token_hash = Some(job_token_hash.clone());
+            event
+                .row
+                .usage_predecessor
+                .clone_from(&job.row.usage_predecessor);
             update_enqueue_event_atomic(&events_dir, &event)?;
         }
 

@@ -20,7 +20,7 @@ use crate::taskdb::{
     related_trigger_from_gh_origin, AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed,
     WorkspaceMetadata,
 };
-use crate::usage::UsageObservation;
+use crate::usage::{UsageAccounting, UsageObservation};
 use crate::usage_rollup::{roll_up, AttestationEvidence, UsageRollup};
 use crate::witness::{
     counts_toward_canonical_gpu_seconds, AttestationRecord, AuthorshipSession, AuthorshipStatus,
@@ -82,6 +82,7 @@ pub struct RowDetailFact {
     pub session_ref: Option<String>,
     pub final_message: Option<String>,
     pub usage: Option<UsageObservation>,
+    pub usage_accounting: Option<UsageAccounting>,
     pub context_tokens: Option<u64>,
     pub context_window: Option<ContextWindow>,
     pub workspace: Option<WorkspaceMetadata>,
@@ -130,6 +131,7 @@ impl RowDetailFact {
             session_ref: row.session_ref.clone(),
             final_message: row.final_message.clone(),
             usage: row.usage.clone(),
+            usage_accounting: row.usage_accounting.clone(),
             context_tokens: row.context_tokens,
             context_window: row.context_window,
             workspace: row.workspace.clone(),
@@ -336,6 +338,11 @@ pub struct JobSummary {
     /// states stay distinct on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SourcedValue<UsageObservation>>,
+    /// Tally's per-attempt reduction of the raw provider observation. Kept
+    /// separate because a session-cumulative `usage` value is evidence to
+    /// subtract, not the amount this attempt is charged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_accounting: Option<SourcedValue<UsageAccounting>>,
     /// Occupancy as of the attempt's last valid assistant turn: the same
     /// total `usage` already normalizes, read under its occupancy meaning.
     /// Independent of `context_window` — a session can report how full it
@@ -2614,6 +2621,15 @@ fn build_summary(
                 )
             })
         }),
+        usage_accounting: detail.and_then(|detail| {
+            detail.usage_accounting.clone().map(|value| {
+                SourcedValue::new(
+                    value,
+                    FactAuthority::AdvisoryAttestation,
+                    "adapter-scrape usageEvidence.accounting",
+                )
+            })
+        }),
         context_tokens: detail.and_then(|detail| {
             detail.context_tokens.map(|value| {
                 SourcedValue::new(
@@ -3432,6 +3448,7 @@ mod tests {
             },
             related_trigger: None,
             usage: None,
+            usage_accounting: None,
             context_tokens: None,
             context_window: None,
         }
@@ -4767,6 +4784,41 @@ mod tests {
         attempt: u32,
         output_tokens: u64,
     ) -> AttestationRecord {
+        let usage = crate::usage::UsageObservation::Reported(crate::usage::UsageBreakdown {
+            shape: crate::usage::UsageShape::Components,
+            input_tokens: Some(262_086),
+            input_tokens_as_reported: Some(7_060_166),
+            cache_read_tokens: Some(6_798_080),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(output_tokens),
+            reasoning_tokens: Some(15_163),
+            total_tokens: Some(crate::usage::UsageTotalTokens {
+                value: 262_086 + 6_798_080 + output_tokens,
+                source: crate::usage::UsageTotalSource::DerivedFromComponents,
+            }),
+            cost: None,
+            unreadable_fields: Vec::new(),
+        });
+        let usage_evidence = crate::usage::UsageEvidence {
+            schema_version: crate::usage::USAGE_EVIDENCE_SCHEMA_VERSION,
+            declared_fields: vec![
+                "cacheReadTokens".to_owned(),
+                "cacheWriteTokens".to_owned(),
+                "inputTokensAsReported".to_owned(),
+                "outputTokens".to_owned(),
+                "reasoningTokens".to_owned(),
+            ],
+            counter_scope: crate::adapters::UsageCounterScope::Attempt,
+            observed: usage.clone(),
+            accounting: crate::usage::UsageAccounting {
+                state: crate::usage::UsageAccountingState::Exact,
+                basis: crate::usage::UsageAccountingBasis::Fresh,
+                predecessor: None,
+                usage: usage.clone(),
+                unavailable_fields: Vec::new(),
+                reason: None,
+            },
+        };
         AttestationRecord {
             observed_at: "2026-08-01T10:00:12.000Z".to_owned(),
             payload: serde_json::json!({
@@ -4777,22 +4829,8 @@ mod tests {
                 "attempt": attempt,
                 "leaseEpoch": 7,
                 "captures": {},
-                "usage": {
-                    "state": "reported",
-                    "breakdown": {
-                        "shape": "components",
-                        "inputTokens": 262_086,
-                        "inputTokensAsReported": 7_060_166,
-                        "cacheReadTokens": 6_798_080,
-                        "cacheWriteTokens": 0,
-                        "outputTokens": output_tokens,
-                        "reasoningTokens": 15_163,
-                        "totalTokens": {
-                            "value": 262_086 + 6_798_080 + output_tokens,
-                            "source": "derived-from-components"
-                        }
-                    }
-                },
+                "usage": usage,
+                "usageEvidence": usage_evidence,
                 "usageAuthority": "advisory-only",
             }),
             seq,

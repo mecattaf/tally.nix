@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"fixture-codex-resume-thread"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"fixture-item-0","type":"agent_message","text":"<redacted resumed reply>"}}
+{"type":"turn.completed","usage":{"input_tokens":32834,"cached_input_tokens":26112,"cache_write_input_tokens":0,"output_tokens":11,"reasoning_output_tokens":0}}

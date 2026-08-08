@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::executor::ExecutionPaths;
 use crate::taskdb::RecordedLaunchCwd;
+use crate::usage::{UsageAccountingMode, UsagePredecessor};
 
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -213,10 +214,10 @@ pub struct AdapterConfig {
     /// Whether the harness resets usage counters for every invocation or
     /// reports counters accumulated by the resumed session.
     ///
-    /// Attempt-scoped is the compatibility default. The accounting behavior
-    /// for cumulative resumes is introduced by #403; this declaration is
-    /// already needed here so a provider-facing usage capture can state and
-    /// validate the same lifetime.
+    /// Attempt-scoped is the compatibility default. A cumulative declaration
+    /// is executable accounting policy: a resumed invocation must be charged
+    /// only the checked delta from the exact predecessor named on that
+    /// invocation.
     #[serde(default)]
     pub usage_counter_scope: UsageCounterScope,
     #[serde(default)]
@@ -264,8 +265,10 @@ pub struct AdapterConfig {
 pub enum UsageCounterScope {
     /// Every invocation starts its counters at zero.
     #[default]
+    #[serde(alias = "per-attempt")]
     Attempt,
     /// A resume continues the counters of the named session.
+    #[serde(alias = "cumulative")]
     SessionCumulative,
 }
 
@@ -291,6 +294,11 @@ pub struct AdapterInvocation {
     /// deliberately does not run it on a timer: the harness owns its safe
     /// checkpoints, and the no-argument preset probe resolves TALLY_JOB_ID.
     pub yield_hook: Option<Vec<String>>,
+    /// How usage from this exact rendered invocation must be accounted. This
+    /// travels with the argv instead of being re-inferred from `attempt > 1`:
+    /// an explicit retry can be fresh, while attempt 1 can resume another
+    /// task's session.
+    pub usage_accounting: UsageAccountingMode,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -426,7 +434,7 @@ impl<'a> AdapterEngine<'a> {
         let adapter = self.adapter(name)?;
         let prefix = render_launch_prefix(name, adapter, &adapter.argv, options, cwd, None)?;
         let argv = compose_argv(name, adapter, &prefix, workload_argv)?;
-        invocation(name, adapter, options, argv)
+        invocation(name, adapter, options, argv, UsageAccountingMode::Fresh)
     }
 
     pub fn resume(
@@ -451,6 +459,22 @@ impl<'a> AdapterEngine<'a> {
         captures: &ScrapeResult,
         options: &AdapterJobOptions,
         cwd: Option<&Path>,
+    ) -> Result<AdapterInvocation, AdapterError> {
+        self.resume_with_options_from(name, workload_argv, captures, options, cwd, None)
+    }
+
+    /// Render a resume and bind it to the exact attempt whose cumulative
+    /// counters it continues. `None` is retained as an explicit unavailable
+    /// predecessor so accounting fails open to "unknown", never to charging
+    /// the cumulative observation as fresh usage.
+    pub fn resume_with_options_from(
+        &self,
+        name: &str,
+        workload_argv: &[String],
+        captures: &ScrapeResult,
+        options: &AdapterJobOptions,
+        cwd: Option<&Path>,
+        predecessor: Option<UsagePredecessor>,
     ) -> Result<AdapterInvocation, AdapterError> {
         let adapter = self.adapter(name)?;
         let template = adapter
@@ -507,7 +531,13 @@ impl<'a> AdapterEngine<'a> {
             resume_options_insertion_index(name, adapter)?,
         )?;
         let argv = compose_argv(name, adapter, &prefix, workload_argv)?;
-        invocation(name, adapter, options, argv)
+        invocation(
+            name,
+            adapter,
+            options,
+            argv,
+            UsageAccountingMode::Resume { predecessor },
+        )
     }
 
     /// Refuse a resume that would run somewhere other than where the session
@@ -659,6 +689,7 @@ fn invocation(
     adapter: &AdapterConfig,
     options: &AdapterJobOptions,
     argv: Vec<String>,
+    usage_accounting: UsageAccountingMode,
 ) -> Result<AdapterInvocation, AdapterError> {
     if argv.is_empty() || argv[0].is_empty() {
         return Err(AdapterError::InvalidConfig {
@@ -697,6 +728,7 @@ fn invocation(
         hardening: adapter.hardening,
         extra_writable_paths: adapter.extra_writable_paths.clone(),
         yield_hook: adapter.yield_hook.clone(),
+        usage_accounting,
     })
 }
 

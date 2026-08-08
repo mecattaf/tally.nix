@@ -1245,21 +1245,30 @@ pub(crate) fn read_usage_meter(
     Some(event)
 }
 
-/// Feed the built-in usage meter from the normalized usage record.
+/// Feed the built-in usage meter from exact per-attempt accounting.
 ///
-/// The number charged to a pool is [`UsageObservation::meter_amount`], which
-/// reproduces the pre-normalization reader exactly: a harness-stated total,
-/// else the harness's own input figure plus its output figure, and never a
-/// zero. Normalization changed where the number is read from, not which number
-/// it is.
+/// A cumulative raw observation is never a meter input. When the declared
+/// formula cannot be reduced exactly, no advisory meter event is written and
+/// the returned typed diagnostic is logged; the durable admission debit
+/// remains the conservative floor.
 pub(crate) fn feed_scraped_usage(
     state_dir: &Path,
     pools: &BTreeMap<String, crate::config::PoolConfig>,
     leased_pools: &[String],
-    usage: &UsageObservation,
+    usage: &crate::usage::UsageEvidence,
 ) -> Vec<String> {
-    let Some(amount) = usage.meter_amount() else {
-        return Vec::new();
+    let amount = match usage.meter_amount() {
+        Ok(Some(amount)) => amount,
+        Ok(None) => return Vec::new(),
+        Err(reason) => {
+            return vec![format!(
+                "usage-accounting-unavailable:{}",
+                serde_json::to_value(reason)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_else(|| "unknown".to_owned())
+            )];
+        }
     };
     let observed_at = Utc::now();
     leased_pools

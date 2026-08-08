@@ -16,7 +16,7 @@ use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::occupancy::ContextWindow;
 use crate::provenance::Orchestration;
-use crate::usage::UsageObservation;
+use crate::usage::{UsageAccounting, UsageObservation, UsagePredecessor};
 use crate::witness::{Derivation, WitnessError};
 
 pub mod migrations;
@@ -27,7 +27,7 @@ pub const MAX_GH_CONTEXT_BYTES: usize = 256 * 1024;
 pub const GH_ORIGIN_SCHEMA_VERSION: u32 = 2;
 pub const GH_CONTEXT_SCHEMA_VERSION: u32 = 2;
 pub const ADMISSION_ORIGIN_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_ROW_VERSION: u32 = 4;
+pub const CURRENT_ROW_VERSION: u32 = 5;
 const MAX_GH_PRODUCER_BYTES: usize = 96;
 const MAX_GH_TITLE_BYTES: usize = 16 * 1024;
 const MAX_GH_BODY_BYTES: usize = 128 * 1024;
@@ -925,6 +925,16 @@ pub struct RowSeed {
     pub orchestration: Option<Orchestration>,
     #[serde(default)]
     pub session_ref: Option<String>,
+    /// Exact attempt whose session counters this row's current invocation
+    /// continues. Absence means the current invocation is fresh; attempt
+    /// number alone is never a resume signal.
+    ///
+    /// Unlike scraped observations this is durable admission/execution
+    /// metadata. Recovery needs it before the next scrape exists, both to
+    /// reconstruct a resumed argv and to refuse cumulative accounting when
+    /// the named predecessor evidence is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_predecessor: Option<UsagePredecessor>,
     /// Where the attempt that yielded `session_ref` ran, recorded beside the
     /// pointer at the moment the pointer was observed.
     ///
@@ -961,14 +971,18 @@ pub struct RowSeed {
     /// daemon sets it on the in-memory row and on the query detail; the
     /// durable seat for a usage record is the advisory attestation ledger,
     /// keyed by task, attempt, and lease epoch. That is what makes it correct
-    /// for this field to arrive without a row migration — `RowSeed` is
-    /// `deny_unknown_fields` and `CURRENT_ROW_VERSION` did not move, so an
-    /// enqueue event carrying `usage` would be rejected outright by an N−1
-    /// daemon at the same row version. Anything that starts persisting it owes
-    /// a versioned migration and an N−1 fixture first
+    /// for this field to remain absent from serialized rows. Row version 5
+    /// exists for the durable `usage_predecessor` beside it, not to make this
+    /// projection durable. Anything that starts persisting `usage` owes a
+    /// later versioned migration and an N−1 fixture first
     /// (`crate::taskdb::migrations`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageObservation>,
+    /// Per-attempt reduction corresponding to `usage`, projected in memory
+    /// from the durable scrape attestation. The attestation is its durable
+    /// seat; enqueue writers always carry `None` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_accounting: Option<UsageAccounting>,
     /// Occupancy computed alongside `usage` at the same scrape, kept
     /// separate because it answers a different question ("can this session
     /// absorb another task", never "what did this attempt cost"). Transport-
@@ -1167,6 +1181,16 @@ impl RowSeed {
             Uuid::parse_str(resumed_from).map_err(|_| {
                 TaskDbError::InvalidSeed("resumedFrom must be a task UUID".to_owned())
             })?;
+        }
+        if let Some(predecessor) = &self.usage_predecessor {
+            Uuid::parse_str(&predecessor.task_uuid).map_err(|_| {
+                TaskDbError::InvalidSeed("usagePredecessor.taskUuid must be a task UUID".to_owned())
+            })?;
+            if predecessor.attempt == 0 || predecessor.lease_epoch == 0 {
+                return Err(TaskDbError::InvalidSeed(
+                    "usagePredecessor attempt and leaseEpoch must be positive".to_owned(),
+                ));
+            }
         }
         for (name, source) in &self.credentials {
             let valid_name = !name.is_empty()
@@ -1845,8 +1869,10 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            usage_predecessor: None,
             session_cwd: None,
             final_message: None,
+            usage_accounting: None,
             job_token_hash: None,
             lease_epoch: 7,
             attempt: 1,
@@ -1955,7 +1981,7 @@ mod tests {
             reversed in any::<bool>(),
             exit_code in any::<u8>(),
             hash_bytes in any::<[u8; 32]>(),
-            legacy_version in 1_u32..=3,
+            legacy_version in 1_u32..=4,
         ) {
             let mut legacy = property_seed(
                 (row_uuid, parent_uuid),
@@ -2205,7 +2231,7 @@ mod tests {
                 .iter()
                 .map(|migration| (migration.from, migration.to))
                 .collect::<Vec<_>>(),
-            [(1, 2), (2, 3), (3, 4)]
+            [(1, 2), (2, 3), (3, 4), (4, 5)]
         );
         let mut legacy = seed(Uuid::new_v4());
         legacy.row_version = 1;

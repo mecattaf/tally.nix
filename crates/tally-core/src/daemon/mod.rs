@@ -165,7 +165,7 @@ use crate::taskdb::{
 use crate::trace::{
     anchor_trace_availability, query_trace, trace_availability, TraceError, TraceLane,
 };
-use crate::usage::UsageObservation;
+use crate::usage::{UsageAccountingMode, UsagePredecessor};
 use crate::usage_rollup::AttestationEvidence;
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
 use crate::wire::{
@@ -201,6 +201,36 @@ impl SharedAttestations {
             self.ledger = Some(AttestationLedger::open(&self.path)?);
         }
         Ok(self.ledger.as_mut().expect("ledger opened above"))
+    }
+
+    /// Last verified scrape payload for the exact predecessor bound to an
+    /// invocation. Duplicate appends are re-scrapes of one attempt, so the
+    /// append-only chain's last matching record is authoritative.
+    pub(crate) fn usage_predecessor_payload(
+        &mut self,
+        mode: &UsageAccountingMode,
+    ) -> Result<Option<Value>, WitnessError> {
+        let UsageAccountingMode::Resume {
+            predecessor: Some(predecessor),
+        } = mode
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .ledger()?
+            .records()?
+            .iter()
+            .rfind(|record| {
+                let payload = &record.payload;
+                payload.get("kind").and_then(Value::as_str) == Some("adapter-scrape")
+                    && payload.get("taskUuid").and_then(Value::as_str)
+                        == Some(predecessor.task_uuid.as_str())
+                    && payload.get("attempt").and_then(Value::as_u64)
+                        == Some(u64::from(predecessor.attempt))
+                    && payload.get("leaseEpoch").and_then(Value::as_u64)
+                        == Some(predecessor.lease_epoch)
+            })
+            .map(|record| record.payload.clone()))
     }
 }
 

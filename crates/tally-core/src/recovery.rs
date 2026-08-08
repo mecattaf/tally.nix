@@ -469,6 +469,7 @@ pub enum RecoveryAction {
         previous_witness_seq: u64,
         previous_attempt: u32,
         previous_lease_epoch: u64,
+        previous_usage_predecessor: Option<crate::usage::UsagePredecessor>,
     },
     AwaitRetry {
         task_uuid: Uuid,
@@ -624,6 +625,13 @@ pub fn recover(
                     RecoveryError::InvalidFacts(format!("attempt overflow for row {}", row.uuid))
                 })?;
                 row.lease_epoch = facts.current_lease_epoch;
+                row.usage_predecessor = row.resumed_from.is_some().then(|| {
+                    crate::usage::UsagePredecessor::new(
+                        row.uuid,
+                        record.attempt,
+                        record.lease_epoch,
+                    )
+                });
                 actions.push(RecoveryAction::QueueExisting {
                     task_uuid: row.uuid,
                     attempt: row.attempt,
@@ -1037,6 +1045,15 @@ fn handle_present_unit(
         }
     };
 
+    if labor_class == LaborClass::Recovered {
+        row.usage_predecessor = if !explicit_retry || row.resumed_from.is_some() {
+            latest.map(|record| {
+                crate::usage::UsagePredecessor::new(row.uuid, record.attempt, record.lease_epoch)
+            })
+        } else {
+            None
+        };
+    }
     row.attempt = attempt;
     row.lease_epoch = lease_epoch;
     match unit.state {
@@ -1153,14 +1170,21 @@ fn plan_witnessed_row(
         return Ok(());
     }
 
+    let previous_usage_predecessor = row.usage_predecessor.clone();
     row.attempt = next_attempt;
     row.lease_epoch = current_epoch;
+    row.usage_predecessor = Some(crate::usage::UsagePredecessor::new(
+        row.uuid,
+        record.attempt,
+        record.lease_epoch,
+    ));
     actions.push(RecoveryAction::RePresent {
         row: Box::new(row.clone()),
         trigger,
         previous_witness_seq: record.seq,
         previous_attempt: record.attempt,
         previous_lease_epoch: record.lease_epoch,
+        previous_usage_predecessor,
     });
     rows.push(RecoveryRow {
         row: row.clone(),
@@ -1226,8 +1250,10 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            usage_predecessor: None,
             session_cwd: None,
             final_message: None,
+            usage_accounting: None,
             job_token_hash: None,
             lease_epoch,
             attempt: 1,
@@ -1810,6 +1836,11 @@ mod tests {
         assert_eq!(plan.rows[0].row.uuid, row.uuid);
         assert_eq!(plan.rows[0].row.attempt, 2);
         assert_eq!(plan.rows[0].row.lease_epoch, 4);
+        assert_eq!(
+            plan.rows[0].row.usage_predecessor,
+            Some(crate::usage::UsagePredecessor::new(row.uuid, 1, 3)),
+            "pool return resumes the exact same-task attempt and lease"
+        );
         assert_eq!(plan.rows[0].labor_class, LaborClass::Recovered);
         assert_eq!(plan.rows[0].state, RecoveryRowState::Pending);
         assert!(matches!(
@@ -1820,7 +1851,11 @@ mod tests {
                 previous_witness_seq: 1,
                 previous_attempt: 1,
                 previous_lease_epoch: 3,
-            }] if represented.uuid == row.uuid && represented.attempt == 2
+                ..
+            }] if represented.uuid == row.uuid
+                && represented.attempt == 2
+                && represented.usage_predecessor
+                    == Some(crate::usage::UsagePredecessor::new(row.uuid, 1, 3))
         ));
         assert_eq!(
             plan.lease_epoch_fences,

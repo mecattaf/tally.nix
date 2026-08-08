@@ -374,10 +374,11 @@ let
           default = "attempt";
           example = "session-cumulative";
           description = ''
-            Lifetime declared by the harness usage counters. The executable
-            cumulative-resume accounting policy is introduced by #403; this
-            declaration is already rendered here so the usage capture can
-            state and validate the same lifetime.
+            Lifetime of the harness usage counters. "attempt" means every
+            invocation starts from zero. "session-cumulative" means a resume
+            inherits the session counters, so tally accounts the exact delta
+            from the bound predecessor attempt and treats a missing or
+            incompatible predecessor as unavailable rather than fresh usage.
           '';
         };
         scrape = mkOption {

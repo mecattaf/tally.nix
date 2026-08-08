@@ -1259,6 +1259,23 @@ pub(super) fn hydrate_completed_adapter_metadata(
             Ok(Some(captures)) => {
                 let adapter = config.adapters.get(&recovery.row.adapter).cloned();
                 apply_adapter_metadata(&mut recovery.row, &captures, adapter.as_ref());
+                match verified_adapter_attestation_usage(
+                    attestations,
+                    recovery.row.uuid,
+                    &recovery.row.adapter,
+                    recovery.row.attempt,
+                    recovery.row.lease_epoch,
+                ) {
+                    Ok(Some((observed, accounting))) => {
+                        recovery.row.usage = Some(observed);
+                        recovery.row.usage_accounting = accounting;
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
+                        "tally: retained adapter usage for {} could not be read: {error}",
+                        recovery.row.uuid
+                    ),
+                }
                 continue;
             }
             Ok(None) => {}
@@ -1327,6 +1344,7 @@ pub(super) fn apply_adapter_metadata(
 ) {
     if let Some(adapter) = adapter {
         row.usage = Some(crate::usage::observe(adapter, captures));
+        row.usage_accounting = None;
     }
     if let Ok(Some(session_ref)) = captures.session_ref() {
         row.session_ref = Some(session_ref.to_owned());
@@ -1466,6 +1484,22 @@ pub(super) fn reconcile_retained_adapter_attestations(
         .iter()
         .map(|recovery| (recovery.row.uuid, &recovery.row))
         .collect::<BTreeMap<_, _>>();
+    let previous_lineage = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            RecoveryAction::RePresent {
+                row,
+                previous_attempt,
+                previous_usage_predecessor,
+                ..
+            } => Some((
+                row.uuid,
+                (*previous_attempt, previous_usage_predecessor.clone()),
+            )),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut latest = BTreeMap::<Uuid, &WitnessRecord>::new();
     for record in witness {
         if let Some(uuid) = record
@@ -1481,14 +1515,12 @@ pub(super) fn reconcile_retained_adapter_attestations(
         let Some(row) = rows.get(&task_uuid) else {
             continue;
         };
-        if existing.contains(&(task_uuid.to_string(), record.attempt, record.lease_epoch))
-            || config
-                .adapters
-                .get(&row.adapter)
-                .is_none_or(|adapter| adapter.scrape.is_empty())
-        {
+        if existing.contains(&(task_uuid.to_string(), record.attempt, record.lease_epoch)) {
             continue;
         }
+        let Some(adapter_config) = config.adapters.get(&row.adapter) else {
+            continue;
+        };
         let identity = ExecutionIdentity {
             job_id: task_uuid,
             task_uuid: Some(task_uuid),
@@ -1505,8 +1537,7 @@ pub(super) fn reconcile_retained_adapter_attestations(
             }
         }
         let captures = match engine.scrape_paths(&row.adapter, &executor.paths(&identity)) {
-            Ok(captures) if !captures.captures.is_empty() => captures,
-            Ok(_) => continue,
+            Ok(captures) => captures,
             Err(error) => {
                 eprintln!(
                     "tally: retained adapter capture for {task_uuid} could not be scraped: {error}"
@@ -1514,12 +1545,42 @@ pub(super) fn reconcile_retained_adapter_attestations(
                 continue;
             }
         };
-        let usage = config
-            .adapters
-            .get(&row.adapter)
-            .map_or(crate::usage::UsageObservation::NotDeclared, |adapter| {
-                crate::usage::observe(adapter, &captures)
-            });
+        let predecessor = previous_lineage
+            .get(&task_uuid)
+            .filter(|(attempt, _)| *attempt == record.attempt)
+            .map(|(_, predecessor)| predecessor.clone())
+            .unwrap_or_else(|| row.usage_predecessor.clone());
+        let mode = if let Some(predecessor) = predecessor {
+            UsageAccountingMode::Resume {
+                predecessor: Some(predecessor),
+            }
+        } else if adapter_config.usage_counter_scope
+            == crate::adapters::UsageCounterScope::SessionCumulative
+            && (record.labor_class == LaborClass::Recovered || row.resumed_from.is_some())
+        {
+            // A pre-schema recovered or cross-task continuation has no bound
+            // predecessor to trust. Preserve that resume as unavailable; a
+            // fresh retry can also have attempt > 1 and must remain fresh.
+            UsageAccountingMode::Resume { predecessor: None }
+        } else {
+            UsageAccountingMode::Fresh
+        };
+        let predecessor_payload = match attestations.usage_predecessor_payload(&mode) {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!(
+                    "tally: retained adapter predecessor for {task_uuid} could not be read: {error}"
+                );
+                None
+            }
+        };
+        let usage_evidence = crate::usage::account_usage(
+            &row.adapter,
+            adapter_config,
+            &captures,
+            &mode,
+            predecessor_payload.as_ref(),
+        );
         if let Err(error) = attestations.ledger().and_then(|ledger| {
             ledger.append(json!({
                 "kind": "adapter-scrape",
@@ -1529,7 +1590,8 @@ pub(super) fn reconcile_retained_adapter_attestations(
                 "attempt": record.attempt,
                 "leaseEpoch": record.lease_epoch,
                 "captures": captures.captures,
-                "usage": usage,
+                "usage": usage_evidence.observed.clone(),
+                "usageEvidence": usage_evidence,
                 "usageAuthority": "advisory-only",
                 "reconciledAfterRestart": true,
             }))
@@ -1599,6 +1661,61 @@ pub(super) fn verified_adapter_attestation_captures(
         result.model()?;
         result.final_message()?;
         selected = Some(result);
+    }
+    Ok(selected)
+}
+
+/// Latest raw observation and accounting result for one exact attempt.
+/// Pre-schema payloads retain their raw `usage` projection and deliberately
+/// return no accounting result; callers must not guess a fresh contract for
+/// them.
+pub(super) fn verified_adapter_attestation_usage(
+    attestations: &mut SharedAttestations,
+    task_uuid: Uuid,
+    adapter: &str,
+    attempt: u32,
+    lease_epoch: u64,
+) -> Result<
+    Option<(
+        crate::usage::UsageObservation,
+        Option<crate::usage::UsageAccounting>,
+    )>,
+    DaemonError,
+> {
+    let task_uuid = task_uuid.to_string();
+    let mut selected = None;
+    for record in attestations.ledger()?.records()? {
+        let payload = &record.payload;
+        if payload.get("kind").and_then(Value::as_str) != Some("adapter-scrape")
+            || payload.get("taskUuid").and_then(Value::as_str) != Some(task_uuid.as_str())
+            || payload.get("adapter").and_then(Value::as_str) != Some(adapter)
+            || payload.get("attempt").and_then(Value::as_u64) != Some(u64::from(attempt))
+            || payload.get("leaseEpoch").and_then(Value::as_u64) != Some(lease_epoch)
+        {
+            continue;
+        }
+        if let Some(value) = payload.get("usageEvidence") {
+            let evidence: crate::usage::UsageEvidence = serde_json::from_value(value.clone())
+                .map_err(|error| {
+                    DaemonError::Invalid(format!(
+                        "adapter scrape attestation for {task_uuid} attempt {attempt} has invalid usageEvidence: {error}"
+                    ))
+                })?;
+            if evidence.schema_version != crate::usage::USAGE_EVIDENCE_SCHEMA_VERSION {
+                return Err(DaemonError::Invalid(format!(
+                    "adapter scrape attestation for {task_uuid} attempt {attempt} has unsupported usageEvidence schema {}",
+                    evidence.schema_version
+                )));
+            }
+            selected = Some((evidence.observed, Some(evidence.accounting)));
+        } else if let Some(value) = payload.get("usage") {
+            let observed = serde_json::from_value(value.clone()).map_err(|error| {
+                DaemonError::Invalid(format!(
+                    "adapter scrape attestation for {task_uuid} attempt {attempt} has invalid legacy usage: {error}"
+                ))
+            })?;
+            selected = Some((observed, None));
+        }
     }
     Ok(selected)
 }
@@ -1673,6 +1790,7 @@ pub(super) fn ensure_verified_resume_attestation(
     adapter: Option<&AdapterConfig>,
     attempt: u32,
     lease_epoch: u64,
+    previous_usage_predecessor: Option<&crate::usage::UsagePredecessor>,
     captures: &ScrapeResult,
 ) -> Result<(), DaemonError> {
     if let Some(stored) = verified_adapter_attestation_captures(
@@ -1690,6 +1808,35 @@ pub(super) fn ensure_verified_resume_attestation(
         }
         return Ok(());
     }
+    let adapter_config = adapter.ok_or_else(|| {
+        DaemonError::Invalid(format!(
+            "adapter {:?} is unavailable while synthesizing its resume checkpoint",
+            row.adapter
+        ))
+    })?;
+    let previous_mode = if let Some(predecessor) = previous_usage_predecessor {
+        UsageAccountingMode::Resume {
+            predecessor: Some(predecessor.clone()),
+        }
+    } else if adapter_config.usage_counter_scope
+        == crate::adapters::UsageCounterScope::SessionCumulative
+        && (attempt > 1 || row.resumed_from.is_some())
+    {
+        // A pre-schema recovered resume may have no durable predecessor. Keep
+        // that unknown as a resume with an unavailable predecessor; calling it
+        // fresh would charge the cumulative observation.
+        UsageAccountingMode::Resume { predecessor: None }
+    } else {
+        UsageAccountingMode::Fresh
+    };
+    let predecessor_payload = attestations.usage_predecessor_payload(&previous_mode)?;
+    let usage_evidence = crate::usage::account_usage(
+        &row.adapter,
+        adapter_config,
+        captures,
+        &previous_mode,
+        predecessor_payload.as_ref(),
+    );
     attestations.ledger()?.append(json!({
         "kind": "adapter-scrape",
         "taskUuid": row.uuid.to_string(),
@@ -1698,9 +1845,8 @@ pub(super) fn ensure_verified_resume_attestation(
         "attempt": attempt,
         "leaseEpoch": lease_epoch,
         "captures": captures.captures,
-        "usage": adapter.map_or(crate::usage::UsageObservation::NotDeclared, |adapter| {
-            crate::usage::observe(adapter, captures)
-        }),
+        "usage": usage_evidence.observed,
+        "usageEvidence": usage_evidence,
         "usageAuthority": "advisory-only",
         "recoveryCheckpoint": true,
     }))?;
@@ -2100,6 +2246,7 @@ pub(super) fn recovery_adapter_invocation(
         RecoveryAction::RePresent {
             previous_attempt,
             previous_lease_epoch,
+            previous_usage_predecessor,
             ..
         } => {
             let identity = ExecutionIdentity {
@@ -2131,6 +2278,7 @@ pub(super) fn recovery_adapter_invocation(
                             config.adapters.get(&row.adapter),
                             *previous_attempt,
                             *previous_lease_epoch,
+                            previous_usage_predecessor.as_ref(),
                             &captures,
                         )?;
                         captures
@@ -2143,12 +2291,13 @@ pub(super) fn recovery_adapter_invocation(
                     }
                 }
             };
-            let invocation = engine.resume_with_options(
+            let invocation = engine.resume_with_options_from(
                 &row.adapter,
                 &row.argv,
                 &captures,
                 &row.adapter_options,
                 row.effective_cwd(),
+                row.usage_predecessor.clone(),
             )?;
             Ok((invocation, Some(captures)))
         }
@@ -2167,12 +2316,13 @@ pub(super) fn recovery_adapter_invocation(
                 }
                 let captures = ScrapeResult { captures };
                 Ok((
-                    engine.resume_with_options(
+                    engine.resume_with_options_from(
                         &row.adapter,
                         &row.argv,
                         &captures,
                         &row.adapter_options,
                         row.effective_cwd(),
+                        row.usage_predecessor.clone(),
                     )?,
                     Some(captures),
                 ))
@@ -2188,16 +2338,37 @@ pub(super) fn recovery_adapter_invocation(
                 ))
             }
         }
-        RecoveryAction::AdoptRunning { .. } | RecoveryAction::ReconcileExit { .. } => Ok((
-            AdapterInvocation {
-                argv: row.argv.clone(),
-                env: BTreeMap::new(),
-                hardening: engine.adapter(&row.adapter)?.hardening,
-                extra_writable_paths: engine.adapter(&row.adapter)?.extra_writable_paths.clone(),
-                yield_hook: None,
-            },
-            None,
-        )),
+        RecoveryAction::AdoptRunning { labor_class, .. }
+        | RecoveryAction::ReconcileExit { labor_class, .. } => {
+            let adapter = engine.adapter(&row.adapter)?;
+            let usage_accounting = if let Some(predecessor) = row.usage_predecessor.clone() {
+                UsageAccountingMode::Resume {
+                    predecessor: Some(predecessor),
+                }
+            } else if adapter.usage_counter_scope
+                == crate::adapters::UsageCounterScope::SessionCumulative
+                && (row.resumed_from.is_some()
+                    || labor_class.as_ref() == Some(&LaborClass::Recovered))
+            {
+                // Old running rows cannot name a predecessor. The recovery
+                // action's labor class and explicit continuation marker are
+                // independent resume facts; attempt number is not.
+                UsageAccountingMode::Resume { predecessor: None }
+            } else {
+                UsageAccountingMode::Fresh
+            };
+            Ok((
+                AdapterInvocation {
+                    argv: row.argv.clone(),
+                    env: BTreeMap::new(),
+                    hardening: adapter.hardening,
+                    extra_writable_paths: adapter.extra_writable_paths.clone(),
+                    yield_hook: None,
+                    usage_accounting,
+                },
+                None,
+            ))
+        }
         _ => Err(DaemonError::Invalid(
             "non-executable recovery action reached adapter rendering".to_owned(),
         )),

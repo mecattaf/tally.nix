@@ -404,14 +404,41 @@ pub fn compute_hash(record: &WitnessRecord) -> Result<String, WitnessError> {
     compute_hash_value(&stable_canonical_value(record)?)
 }
 
-// Normalize producer-side numbers through the same Value parse used by verification.
-// serde_json's default float parser can otherwise shorten a duration-derived f64
-// differently when the persisted bytes are read back.
+// Witness hashes predate serde_json's arbitrary-precision number mode. Preserve their
+// established shortest-f64 spelling while allowing usage attestations elsewhere to
+// retain provider decimal lexemes exactly.
+fn normalize_witness_numbers(value: &mut Value) -> Result<(), serde_json::Error> {
+    match value {
+        Value::Number(number) if number.is_f64() => {
+            // Deserializing directly to f64 deliberately uses serde_json's
+            // long-standing witness rounding path even when Value itself is
+            // configured to preserve arbitrary-precision decimal lexemes.
+            let legacy: f64 = serde_json::from_str(&number.to_string())?;
+            *number = serde_json::Number::from_f64(legacy)
+                .expect("JSON number normalization cannot produce a non-finite f64");
+        }
+        Value::Array(values) => {
+            for value in values {
+                normalize_witness_numbers(value)?;
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                normalize_witness_numbers(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn stable_canonical_value(value: &impl Serialize) -> Result<Value, WitnessError> {
     let encoded = serde_json::to_vec(value)?;
-    let normalized: Value = serde_json::from_slice(&encoded)?;
+    let mut normalized: Value = serde_json::from_slice(&encoded)?;
+    normalize_witness_numbers(&mut normalized)?;
     let canonical = serde_json::to_vec(&normalized)?;
-    let reparsed: Value = serde_json::from_slice(&canonical)?;
+    let mut reparsed: Value = serde_json::from_slice(&canonical)?;
+    normalize_witness_numbers(&mut reparsed)?;
     if serde_json::to_vec(&reparsed)? != canonical {
         return Err(WitnessError::Corrupt(
             "record cannot be encoded as stable compact canonical JSON".to_owned(),

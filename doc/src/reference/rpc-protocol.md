@@ -412,6 +412,13 @@ admission fields are `dedupKey`, the node's submission identity, and `dispositio
 no row — `attached`, and full-mode `reused` and `terminal` — are reported by the flow runner's
 `node-submitted` and `node-terminal` lifecycle events instead.
 
+When a scrape exists, job summaries expose two sourced fields. `usage` is the
+harness's raw normalized observation (`advisory-provider-capture`), which may
+be session-cumulative. `usageAccounting` is tally's separate per-attempt
+reduction (`advisory-attestation`), including its `fresh`/`delta` basis,
+`exact`/`partial`/`unavailable` state, predecessor identity, unavailable fields,
+and typed reason. Consumers must not present raw `usage` as the attempt charge.
+
 `query.run` accepts a flow-run UUID as `id` and returns the compact state needed during an
 operator check. `items` is the exact durable member-identity list and therefore contains every
 resolved `taskUuid`, including a member that has no row, lifecycle event, or witness of its own.
@@ -429,8 +436,9 @@ keeps `items` authoritative for durable membership instead of letting an empty t
 it for consumers that prefer `tasks` when present. For those runs `state` reaches `complete` when
 every admitted node holds a passing terminal verdict on its current attempt.
 
-`query.run` also returns `usage`: what the run cost, summed per attempt from the advisory
-attestation ledger — keyed by `taskUuid`/`attempt`/`leaseEpoch` — over the run's durable
+`query.run` also returns `usage`: what the run cost, summed from the exact
+per-attempt `usageEvidence.accounting` in the advisory attestation ledger —
+keyed by `taskUuid`/`attempt`/`leaseEpoch` — over the run's durable
 membership, so every attempt of a retried task **that the ledger holds** is charged — not only the
 task's latest, which is all its durable row keeps — and a node the run was handed but whose row
 names its creating run is inside the sum. The ledger is the whole of what the rollup can see; it
@@ -439,9 +447,21 @@ rollups](#usage-rollups).
 
 ### Usage rollups
 
-A rollup is `advisory-provider-capture`: harnesses reporting on themselves, never a bill tally
-verified. `provenance` and `composition` state where the numbers came from and exactly what the
-total is a sum over, on the wire rather than only in this document.
+A rollup is `advisory-provider-capture`: harnesses reporting on themselves,
+reduced by tally to per-attempt accounting, never a bill tally independently
+verified. `provenance` and `composition` state where the numbers came from and
+exactly what the total is a sum over, on the wire rather than only in this
+document. A pre-schema attestation carrying only raw `usage` is excluded from
+the sums and raises `legacy-usage-contract`; an accounting record with any
+unavailable declared value raises `accounting-unavailable`. Exact fields in a
+partial accounting record remain a visibly caveated floor.
+When delta accounting cannot read the exact predecessor baseline, the rollup
+also raises `cumulative-baseline-missing`; a cumulative checkpoint is never
+charged as fresh merely because its predecessor is absent.
+The public `usageEvidence` projection expresses the same outcome as
+`derivation: fresh-zero`, `delta`, or `baseline-missing`. A `delta`
+contribution is admitted only when its sequence/hash predecessor reference is
+bound to the matching earlier record in the verified ledger.
 
 `tokens` carries `inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`, and
 `reasoningTokens`, each as a `{value, attempts}` pair so a component no harness in the run reports
@@ -474,7 +494,10 @@ than on which harness it believes ran.
 attempts apart: `attemptsReported`, `attemptsReportedWithoutFigures`,
 `attemptsReportedWithComponents`, `attemptsNotReported` (a usage scrape was declared and the
 stream carried none), `attemptsNotDeclared` (the adapter declared no usage scrape), and
-`attemptsWithoutUsageRecord` (an attestation predating the usage record). `attemptsReportedWithoutFigures` is the subset of `attemptsReported` that contributed
+`attemptsWithoutUsageRecord` (an attestation predating the usage record), plus
+`attemptsLegacyUsage` and `attemptsAccountingUnavailable` for raw-only legacy
+records and per-attempt reductions that were not wholly exact.
+`attemptsReportedWithoutFigures` is the subset of `attemptsReported` that contributed
 nothing: the harness reported usage and **no** declared field path resolved — absence is not
 unreadability, so nothing lands in `unreadableFields` and the observation is still `reported`.
 Those attempts raise `reported-without-figures` rather than being counted as covered. That bucket
@@ -500,8 +523,9 @@ components to be missing, so judging it against a component threshold would mark
 reported everything it intended to as permanently incomplete.
 
 That exemption is one **reported** shape wide, which is not the same promise as "an adapter that
-declared components is always judged", and the difference matters: the rollup reads attestations,
-never the adapter's declared field map, so an adapter that declared components *and* a total,
+declared components is always judged", and the difference matters. Schema-1
+`usageEvidence` carries the declaration, but this compatibility counter still
+projects only the reported shape: an adapter that declared components *and* a total,
 whose harness renamed every component key at once, reports exactly the exempted shape and leaves
 the denominator. `total-only-attempts` is what stops that passing silently. It is raised whenever
 an exempted attempt sits beside attempts that did report components — `attemptsReported -
@@ -509,14 +533,14 @@ attemptsReportedWithComponents > 0` and `attemptsReportedWithComponents > 0` —
 component sums demonstrably cover fewer attempts than the total does, whichever kind of adapter
 produced them. An attempt that reported any component is judged by the component threshold as
 usual, even when its harness also stated a total. The one case reported evidence cannot separate
-is a run in which *every* attempt is total-only: a legal total-only adapter and a wholly drifted
-component adapter are indistinguishable there without the declared field set, which the
-attestation does not carry.
+is a run in which *every* attempt is total-only: this shape-based compatibility
+projection does not use the declaration to distinguish a legal total-only
+adapter from a wholly drifted component adapter.
 
 `ledgerVerified` is false when the advisory chain did not verify or could not be read, and then
 nothing is summed at all rather than answered as a zero. Every reason the sums are partial also
 appears as a named entry in `caveats`; an empty `caveats` array claims only that the rollup covers
-every attempt the ledger could speak for.
+every attempt the ledger could speak for with exact per-attempt accounting.
 
 `cost` is the harness's own `costUsd`, summed over the attempts that reported one. Its `basis`
 field states what it is not: tally's cgroup `charge` is a distinct quantity, is not summed here,

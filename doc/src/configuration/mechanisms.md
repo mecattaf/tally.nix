@@ -241,6 +241,7 @@ adding an operator-specific adapter requires no Rust change.
 | [`argv`](core-options.md#servicestallyadaptersnameargv) | Direct argv prefix for a fresh invocation. An empty prefix is valid for the `shell` pass-through shape. |
 | [`resume`](core-options.md#servicestallyadaptersnameresume) | Optional direct argv template for recovery; `%<sessionRef>%` and other declared placeholders come from captures. |
 | [`resumeRequiresLaunchCwd`](core-options.md#servicestallyadaptersnameresumerequireslaunchcwd) | Declares that the harness resolves a session by the directory it was launched in, so tally refuses a continuation whose working directory differs from the recorded one. |
+| [`usageCounterScope`](core-options.md#servicestallyadaptersnameusagecounterscope) | `attempt` (the default) means each invocation starts its counters at zero. `session-cumulative` makes every resume use a checked delta from its bound predecessor; missing or incompatible predecessor evidence stays unavailable. |
 | [`scrape`](core-options.md#servicestallyadaptersnamescrape) | Named stdout/stderr captures, each with a stream, mode, and non-empty pattern. |
 | [`trace`](core-options.md#servicestallyadaptersnametrace) | Optional advisory provider trace with an explicit stream and JSON-lines framing. |
 | [`yieldHook`](core-options.md#servicestallyadaptersnameyieldhook) | Optional direct argv checkpoint used for cooperative yield. |

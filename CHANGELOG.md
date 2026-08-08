@@ -6,6 +6,30 @@ authorized.
 
 ## [Unreleased]
 
+### Exact resumed usage accounting (#403)
+
+- Adapter contracts now declare `usageCounterScope`; the stock Codex preset is
+  `session-cumulative` because the 2026-08-08 probe confirmed that
+  `codex exec resume` rehydrates its thread counters. Resume lineage names an
+  exact predecessor task, attempt, and lease across continuations, retries,
+  pool returns, and restart recovery.
+- Every completed scrape now records schema-1 `usageEvidence`, keeping the raw
+  provider observation separate from fresh or checked-delta per-attempt
+  accounting. Missing, legacy, mismatched, unreadable, and underflowing
+  predecessors are typed unavailable states; cost deltas use exact decimal
+  arithmetic.
+- Rollups accept equivalent public checkpoint projections when they carry
+  declarations and explicit accounting: either sibling accounting fields or
+  schema-1 `derivation`/`contribution` evidence. Bound `fresh-zero` and `delta`
+  checkpoints contribute exact per-attempt values; `baseline-missing` raises
+  `cumulative-baseline-missing`. Raw cumulative usage alone remains
+  unchargeable legacy evidence.
+- Run rollups and the built-in meter consume accounted usage, never cumulative
+  raw observations. The committed real Codex pair pins fresh 16,209, resumed
+  delta 16,636, combined 32,845, and rejects the old 49,054 double charge;
+  legacy raw-only records remain visible on job detail but are caveated and
+  excluded from confident totals.
+
 ### Campaign child host locators (#442)
 
 - Forge-native initial flow runners and continuation polls now extend one

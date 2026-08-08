@@ -163,8 +163,9 @@ the same compact view as structured data: `items` is the complete durable member
 including members with no row, lifecycle event, or witness of their own. The reconciliation-only
 `tasks` key is omitted when no such board exists, leaving one unambiguous member array.
 
-It also answers "what did this run cost", summed per attempt out of the advisory attestation
-ledger and scoped by the run's durable membership — so a retried task is charged for every
+It also answers "what did this run cost", summed from exact per-attempt
+`usageEvidence.accounting` in the advisory attestation ledger and scoped by the
+run's durable membership — so a retried task is charged for every
 attempt and a node the run attached rather than created is inside the sum. Read the coverage
 beside the number: it is a sum over advisory captures, it says how many attempts reported usage
 against how many it observed, and it names every reason it is partial. `query standup` carries
@@ -172,6 +173,18 @@ the same rollup for every run its window touched and reader-state did not hide (
 [Archive a run](#archive-a-run) below, and `archivedRunsHidden` for how many were withheld),
 with the three fixed statements every entry would repeat stated once instead in a digest-level
 `usageBasis`.
+
+For one job, keep the provider's statement and tally's charge visibly apart:
+
+```console
+$ tally query job <task-uuid> --json | jq '.job | {usage, usageAccounting}'
+```
+
+`usage` may be a session-cumulative raw observation. `usageAccounting` is the
+fresh or checked-delta result used by rollups and the built-in meter. An
+unavailable predecessor produces a typed reason and no fabricated meter update;
+a legacy raw-only record remains inspectable but is excluded from confident
+totals.
 
 ### When the daemon stops answering
 

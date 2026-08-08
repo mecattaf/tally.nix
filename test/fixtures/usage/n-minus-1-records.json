@@ -1,5 +1,5 @@
 {
-  "comment": "Records written by the daemon before the normalized usage record existed. They are here so a pin advance across that commit reads them back unchanged rather than discovering the shape on an operator's estate. Two row arms: rowVersion 4 is the shape main writes today, which is the true N-1 shape; rowVersion 3 is what a pinned-behind estate may still hold, and is kept because older is stricter.",
+  "comment": "Records written before the durable usage-evidence predecessor existed. They are here so a pin advance across that commit reads them back unchanged rather than discovering the shape on an operator's estate. Two row arms: rowVersion 4 is the true N-1 shape; rowVersion 3 is what a pinned-behind estate may still hold, and is kept because older is stricter.",
   "row": {
     "rowVersion": 4,
     "uuid": "b2c40001-0000-4000-8000-0000000000a1",
