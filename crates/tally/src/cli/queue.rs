@@ -811,6 +811,18 @@ fn print_run_usage(usage: &Value) -> Result<()> {
     let count = |key: &str| coverage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let tasks = count("tasks");
     let observed = count("attemptsObserved");
+    // Protocol-5 daemons publish the independent denominator. Fall back to
+    // the pre-#402 physical count only when rendering an older daemon's
+    // payload; a duplicate lease or over-ceiling record must not enlarge the
+    // current headline.
+    let attested = coverage
+        .get("attemptsAttested")
+        .and_then(Value::as_u64)
+        .unwrap_or(observed);
+    let expected = coverage
+        .get("attemptsExpected")
+        .and_then(Value::as_u64)
+        .unwrap_or(attested);
     let reported = count("attemptsReported");
     if coverage.get("ledgerVerified").and_then(Value::as_bool) != Some(true) {
         outln!("Usage: not summed -- the advisory attestation ledger did not verify");
@@ -823,15 +835,15 @@ fn print_run_usage(usage: &Value) -> Result<()> {
     // zeros underneath contradicting it.
     if reported == 0 {
         outln!(
-            "Usage: no attempt reported usage ({observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)"
+            "Usage: no attempt reported usage ({attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)"
         );
     } else {
         match tokens.get("totalTokens").and_then(Value::as_object) {
             None => outln!(
-                "Usage: no total ({reported} of {observed} scraped attempt(s) reported usage over {tasks} member task(s), advisory adapter captures)"
+                "Usage: no total ({reported} reported; {attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)"
             ),
             Some(total) => outln!(
-                "Usage: {} tokens, {} ({reported} of {observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)",
+                "Usage: {} tokens, {} ({reported} reported; {attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)",
                 total.get("value").and_then(Value::as_u64).unwrap_or(0),
                 compact_text(
                     total

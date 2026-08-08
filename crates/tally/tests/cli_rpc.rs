@@ -327,6 +327,13 @@ impl RpcHandler for HumanQueryHandler {
                         "composition": "freshInputTokens = inputTokens + cacheWriteTokens",
                         "coverage": {
                             "tasks": 3, "tasksWithReportedUsage": 2, "tasksWithoutAttestation": 1,
+                            "attemptsExpected": 5, "attemptsAttested": 3, "attemptsMissingAttestation": 2,
+                            "missingAttempts": [
+                                {"taskUuid": "00000000-0000-4000-8000-000000000263", "attempt": 2},
+                                {"taskUuid": "00000000-0000-4000-8000-000000000265", "attempt": 1}
+                            ],
+                            "tasksWithUnknownAttemptCeiling": 0,
+                            "attemptsWithDuplicateLeases": 0, "attemptsUnexpected": 0,
                             "attemptsObserved": 3, "attemptsReported": 2,
                             "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 2,
                             "attemptsNotReported": 1,
@@ -347,7 +354,8 @@ impl RpcHandler for HumanQueryHandler {
                             "attempts": 1,
                             "basis": "harness-reported costUsd only, summed over the attempts that reported it. Tally's cgroup charge is a distinct quantity, is not summed here, and is a floor: it includes tally's own exit-recorder overhead and is not pure job cost"
                         },
-                        "caveats": ["members-without-attestation", "attempts-without-usage", "mixed-total-authority", "partial-cost"]
+                        "caveats": ["attempts-missing-attestation", "members-without-attestation", "attempts-without-usage", "mixed-total-authority", "partial-cost"],
+                        "isComplete": false
                     },
                     "tasks": [
                         {"taskRef": "crm/t01", "title": "Done task", "status": "done", "blockedBy": [], "pullRequest": "https://example.test/pr/1"},
@@ -1366,7 +1374,7 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
                 "https://example.test/issues/42",
                 // What the run cost, and never a bare total: the sum arrives
                 // with the attempts it is over and the grade of its evidence.
-                "Usage: 18473656 tokens, mixed (2 of 3 scraped attempt(s) over 3 member task(s), advisory adapter captures)",
+                "Usage: 18473656 tokens, mixed (2 reported; 3 attested of 5 expected attempt(s) over 3 member task(s), advisory adapter captures)",
                 // The fresh-input figure states its own addition, because
                 // `inputTokens` alone understates any cache-writing harness.
                 "fresh input 527296 (= input 262169 + cache write 265127)",
@@ -1376,7 +1384,7 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
                 // client could drift from.
                 "cost $8.7557 over 1 attempt(s) -- harness-reported costUsd only",
                 "Tally's cgroup charge is a distinct quantity, is not summed here, and is a floor",
-                "partial: members-without-attestation, attempts-without-usage",
+                "partial: attempts-missing-attestation, members-without-attestation, attempts-without-usage",
             ] {
                 assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
             }
@@ -1594,7 +1602,7 @@ async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
                 "one attempt did report usage:\n{text}"
             );
             for expected in [
-                "Usage: no total (1 of 1 scraped attempt(s) reported usage over 1 member task(s), advisory adapter captures)",
+                "Usage: no total (1 reported; 1 attested of 1 expected attempt(s) over 1 member task(s), advisory adapter captures)",
                 "fresh input -- (= input -- + cache write --)  cache read --  output -- (reasoning -- nested inside)",
                 "partial: reported-without-figures",
             ] {
@@ -1636,7 +1644,7 @@ async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
             assert!(quiet.status.success(), "{quiet:?}");
             let text = String::from_utf8(quiet.stdout).unwrap();
             assert!(
-                text.contains("Usage: no attempt reported usage (2 scraped attempt(s) over 1 member task(s), advisory adapter captures)"),
+                text.contains("Usage: no attempt reported usage (2 attested of 2 expected attempt(s) over 1 member task(s), advisory adapter captures)"),
                 "{text}"
             );
             assert!(!text.contains("fresh input"), "{text}");
@@ -1653,7 +1661,7 @@ async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
             assert!(drifted.status.success(), "{drifted:?}");
             let text = String::from_utf8(drifted.stdout).unwrap();
             for expected in [
-                "Usage: 287508 tokens, derived-from-components (1 of 1 scraped attempt(s) over 1 member task(s), advisory adapter captures)",
+                "Usage: 287508 tokens, derived-from-components (1 reported; 1 attested of 1 expected attempt(s) over 1 member task(s), advisory adapter captures)",
                 "fresh input 265210 (= input 83 + cache write 265127)  cache read --  output 22298 (reasoning -- nested inside)",
                 "partial: partial-components",
             ] {

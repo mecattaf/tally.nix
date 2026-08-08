@@ -3679,6 +3679,15 @@
             )
 
             coordinator.wait_for_unit("home-manager-tally.service")
+            # Home Manager can finish while the user manager is still coming
+            # up and skip its reload. Load and start the newly installed unit
+            # explicitly before asserting daemon liveness.
+            coordinator.succeed(
+              "runuser -u tally -- env HOME=/var/lib/tally-coordinator XDG_RUNTIME_DIR=/run/user/1000 systemctl --user daemon-reload"
+            )
+            coordinator.succeed(
+              "runuser -u tally -- env HOME=/var/lib/tally-coordinator XDG_RUNTIME_DIR=/run/user/1000 systemctl --user start tally-daemon.service"
+            )
             coordinator.wait_until_succeeds(
               "runuser -u tally -- env HOME=/var/lib/tally-coordinator XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
             )

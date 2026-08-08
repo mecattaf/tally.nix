@@ -441,9 +441,9 @@ per-attempt `usageEvidence.accounting` in the advisory attestation ledger —
 keyed by `taskUuid`/`attempt`/`leaseEpoch` — over the run's durable
 membership, so every attempt of a retried task **that the ledger holds** is charged — not only the
 task's latest, which is all its durable row keeps — and a node the run was handed but whose row
-names its creating run is inside the sum. The ledger is the whole of what the rollup can see; it
-covers every attempt the ledger could speak for and no more. See [Usage
-rollups](#usage-rollups).
+names its creating run is inside the sum. The attempt denominator does not come from the advisory
+ledger: each member's durable row attempt counter defines `1..=N`, with the latest canonical
+witness attempt as the fallback when no row detail exists. See [Usage rollups](#usage-rollups).
 
 ### Usage rollups
 
@@ -490,8 +490,28 @@ operator-defined adapter that declares the mapping. A consumer should branch on 
 than on which harness it believes ran.
 
 `coverage` is the statement that keeps a partial sum from reading as a total. It counts member
-`tasks`, `tasksWithReportedUsage`, `tasksWithoutAttestation`, `attemptsObserved`, and then the
-attempts apart: `attemptsReported`, `attemptsReportedWithoutFigures`,
+`tasks`, `tasksWithReportedUsage`, and `tasksWithoutAttestation`. The independent denominator is
+`attemptsExpected`; `attemptsAttested` says how many distinct logical `(taskUuid, attempt)`
+identities have a selected record, and `attemptsMissingAttestation` says how many expected
+identities do not. `missingAttempts` carries the first 64 missing `{taskUuid, attempt}` identities
+in stable order; compare its length with `attemptsMissingAttestation` to see whether that
+diagnostic was truncated.
+`tasksWithUnknownAttemptCeiling` counts members for which neither a row detail nor a canonical
+witness supplied the ceiling and raises `attempt-counter-unavailable` rather than assuming one
+attempt or dropping the task.
+
+`isComplete` is the public completeness verdict. It is false whenever `caveats` is non-empty,
+including `attempts-missing-attestation`; consumers do not need to duplicate tally's caveat policy.
+
+Attestations are selected once per `(taskUuid, attempt)`. A second lease does not create or charge
+a second attempt: the highest verified ledger sequence wins, `attemptsWithDuplicateLeases` counts
+the affected expected identities, and `duplicate-attempt-leases` keeps the rollup partial.
+`attemptsUnexpected` counts identities above a known ceiling (or otherwise outside the roster);
+they raise `unexpected-attestation` and do not enlarge either the denominator or the sums.
+`attemptsObserved` remains the deprecated physical `(taskUuid, attempt, leaseEpoch)` compatibility
+counter and must not be used as a completeness denominator.
+
+The selected attempts are then split into `attemptsReported`, `attemptsReportedWithoutFigures`,
 `attemptsReportedWithComponents`, `attemptsNotReported` (a usage scrape was declared and the
 stream carried none), `attemptsNotDeclared` (the adapter declared no usage scrape), and
 `attemptsWithoutUsageRecord` (an attestation predating the usage record), plus
@@ -539,8 +559,8 @@ adapter from a wholly drifted component adapter.
 
 `ledgerVerified` is false when the advisory chain did not verify or could not be read, and then
 nothing is summed at all rather than answered as a zero. Every reason the sums are partial also
-appears as a named entry in `caveats`; an empty `caveats` array claims only that the rollup covers
-every attempt the ledger could speak for with exact per-attempt accounting.
+appears as a named entry in `caveats`; an empty `caveats` array claims only that every
+independently expected attempt has exact per-attempt accounting.
 
 `cost` is the harness's own `costUsd`, summed over the attempts that reported one. Its `basis`
 field states what it is not: tally's cgroup `charge` is a distinct quantity, is not summed here,

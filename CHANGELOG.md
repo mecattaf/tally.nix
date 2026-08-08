@@ -6,6 +6,23 @@ authorized.
 
 ## [Unreleased]
 
+### Independent usage coverage denominator (#402)
+
+- Run and standup rollups now derive expected attempts from each member's
+  durable row counter, with the latest canonical witness attempt as the
+  fallback only when row detail is absent. A missing independent ceiling is a
+  typed caveat, never an assumed attempt or a dropped task.
+- Coverage now publishes expected, attested, and missing attempt counts plus a
+  bounded list of missing identities. The prior physical
+  `attemptsObserved` count remains a compatibility projection and no longer
+  drives completeness.
+- The public count is `attemptsMissingAttestation`, its caveat is
+  `attempts-missing-attestation`, and every rollup serializes `isComplete` so
+  consumers do not have to reconstruct the completeness policy.
+- Multiple leases for one logical attempt select the last verified ledger
+  record and contribute once. Over-ceiling attestations are caveated and
+  excluded rather than expanding the denominator or the usage sum.
+
 ### Exact resumed usage accounting (#403)
 
 - Adapter contracts now declare `usageCounterScope`; the stock Codex preset is

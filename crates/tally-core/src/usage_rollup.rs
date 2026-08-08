@@ -8,14 +8,18 @@
 //! wrong in the reassuring direction, and nothing about its shape says so.
 //! Four rules follow, and every field below exists to keep one of them.
 //!
-//! **1. Read accounted attempts from the attestation ledger.** The durable row
-//! holds only the most recently scraped attempt — exactly as `sessionRef` and
-//! `finalMessage` do — so summing rows would charge a three-attempt task once.
-//! Every completed scrape, including both typed absences, has a durable
-//! `usageEvidence` seat keyed by `taskUuid`/`attempt`/`leaseEpoch`. The rollup
-//! sums its exact per-attempt `accounting.usage`, never a raw cumulative
-//! observation. Pre-schema raw-only records are visible on job detail but are
-//! excluded here and caveated rather than guessed fresh.
+//! **1. Derive attempts independently, then read their accounting from the
+//! attestation ledger.** A durable row's attempt counter defines the expected
+//! `1..=N` roster; when a member has no row detail, the latest canonical
+//! witness attempt is the fallback. The advisory ledger can satisfy that
+//! roster but cannot enlarge it. Every completed scrape, including both typed
+//! absences, has a durable `usageEvidence` seat keyed by
+//! `taskUuid`/`attempt`/`leaseEpoch`; duplicate leases select the last record
+//! and contribute once. The rollup sums exact per-attempt
+//! `accounting.usage`, never a raw cumulative observation. Missing,
+//! over-ceiling, and unknown-ceiling evidence is caveated. Pre-schema raw-only
+//! records are visible on job detail but are excluded here rather than guessed
+//! fresh.
 //!
 //! **2. `inputTokens` alone is not the cross-harness fresh-input figure.**
 //! claude-code's `cache_creation_input_tokens` are fresh, uncached prompt
@@ -59,6 +63,7 @@
 //! carries that statement onto the wire beside the number.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,9 +80,14 @@ use crate::witness::AttestationRecord;
 /// Payload kind the exit recorder writes one of per scraped attempt.
 const ADAPTER_SCRAPE_KIND: &str = "adapter-scrape";
 
+/// Maximum number of missing expected-attempt identities published beside the
+/// complete count. A run can carry an arbitrarily large durable attempt
+/// counter; diagnostics must not make its query response arbitrarily large.
+pub const MAX_MISSING_ATTEMPT_IDENTITIES: usize = 64;
+
 /// Where the rollup's numbers came from.
 pub const ROLLUP_PROVENANCE: &str =
-    "adapter-scrape usageEvidence.accounting, per attempt, keyed by taskUuid/attempt/leaseEpoch; legacy raw observations excluded";
+    "expected attempts from durable row counters with canonical-witness fallback; last adapter-scrape usageEvidence.accounting per taskUuid/attempt, selected leaseEpoch retained; legacy raw observations excluded";
 
 /// Exactly what the run total is a sum over. Stated on the wire because the
 /// defect this rollup exists to avoid is a figure computed from the wrong one
@@ -108,6 +118,67 @@ pub const ROLLUP_COST_BASIS: &str = concat!(
 pub struct AttestationEvidence<'a> {
     verified: bool,
     records: &'a [AttestationRecord],
+}
+
+/// One task whose independently known attempt history belongs in a rollup.
+///
+/// The ceiling comes from durable row state, or from the canonical witness
+/// chain when no row detail exists. It never comes from the advisory
+/// attestation ledger being measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedUsageTask {
+    task_uuid: String,
+    attempt_ceiling: Option<NonZeroU32>,
+}
+
+impl ExpectedUsageTask {
+    #[must_use]
+    pub fn known(task_uuid: impl Into<String>, attempt_ceiling: NonZeroU32) -> Self {
+        Self {
+            task_uuid: task_uuid.into(),
+            attempt_ceiling: Some(attempt_ceiling),
+        }
+    }
+
+    #[must_use]
+    pub fn unknown(task_uuid: impl Into<String>) -> Self {
+        Self {
+            task_uuid: task_uuid.into(),
+            attempt_ceiling: None,
+        }
+    }
+}
+
+/// The independent denominator for one run's usage rollup.
+///
+/// [`roll_up`] accepts this type rather than task strings so a caller cannot
+/// accidentally derive both membership and attempt count from the attestation
+/// ledger. Duplicate task entries retain the highest independently known
+/// ceiling; a known ceiling always wins over an unknown one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExpectedUsageRoster {
+    tasks: BTreeMap<String, Option<NonZeroU32>>,
+}
+
+impl ExpectedUsageRoster {
+    #[must_use]
+    pub fn new(tasks: impl IntoIterator<Item = ExpectedUsageTask>) -> Self {
+        let mut roster = Self::default();
+        for task in tasks {
+            roster
+                .tasks
+                .entry(task.task_uuid)
+                .and_modify(|ceiling| {
+                    *ceiling = match (*ceiling, task.attempt_ceiling) {
+                        (Some(left), Some(right)) => Some(left.max(right)),
+                        (known @ Some(_), None) | (None, known @ Some(_)) => known,
+                        (None, None) => None,
+                    };
+                })
+                .or_insert(task.attempt_ceiling);
+        }
+        roster
+    }
 }
 
 impl<'a> AttestationEvidence<'a> {
@@ -261,7 +332,7 @@ impl Default for UsageCostRollup {
 /// Every count here is over the run's **durable membership**, so a task a run
 /// was handed but whose row names a different creating run — the W-316 shape —
 /// is inside the denominator and inside the sums.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UsageCoverage {
     /// Tasks the run durably holds.
@@ -277,7 +348,41 @@ pub struct UsageCoverage {
     /// way these tasks are invisible to the sums and are counted rather than
     /// dropped.
     pub tasks_without_attestation: usize,
+    /// Expected logical attempts from independently known task ceilings.
+    /// Tasks whose ceiling is unavailable contribute zero here and are counted
+    /// separately in [`Self::tasks_with_unknown_attempt_ceiling`].
+    pub attempts_expected: usize,
+    /// Distinct logical `(task, attempt)` identities with a selected
+    /// attestation. For a known ceiling this includes only `1..=ceiling`; for
+    /// an unknown ceiling, readable positive attempt numbers remain visible
+    /// while the unknown-ceiling caveat prevents a completeness claim.
+    pub attempts_attested: usize,
+    /// Expected attempts with no selected attestation.
+    ///
+    /// The public name says which evidence is absent. `attemptsMissing` was
+    /// emitted briefly during development and remains an input alias only.
+    #[serde(rename = "attemptsMissingAttestation", alias = "attemptsMissing")]
+    pub attempts_missing: usize,
+    /// The first bounded set of missing identities, ordered by task UUID then
+    /// attempt. Compare its length with `attemptsMissingAttestation` to detect
+    /// truncation.
+    pub missing_attempts: Vec<UsageAttemptIdentity>,
+    /// Member tasks for which neither durable row detail nor the independent
+    /// canonical witness chain supplied an attempt ceiling.
+    pub tasks_with_unknown_attempt_ceiling: usize,
+    /// Expected attempts that appeared under more than one distinct lease.
+    /// They still count and contribute once, using the last verified ledger
+    /// record for the logical attempt.
+    pub attempts_with_duplicate_leases: usize,
+    /// Distinct member `(task, attempt)` identities that cannot belong to the
+    /// independent roster, including positive attempts above a known ceiling.
+    pub attempts_unexpected: usize,
     /// Distinct `(task, attempt, leaseEpoch)` triples found for member tasks.
+    ///
+    /// This is the pre-#402 physical-observation counter retained for wire
+    /// compatibility. It is not a completeness denominator; use
+    /// `attemptsExpected`, `attemptsAttested`, and
+    /// `attemptsMissingAttestation`.
     pub attempts_observed: usize,
     /// Attempts whose attestation carries a `reported` usage record.
     pub attempts_reported: usize,
@@ -358,12 +463,33 @@ pub struct UsageCoverage {
     pub ledger_verified: bool,
 }
 
+/// One expected attempt for which no advisory scrape attestation was found.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UsageAttemptIdentity {
+    pub task_uuid: String,
+    pub attempt: u32,
+}
+
 /// Named reasons a reader must not treat these sums as a complete bill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UsageRollupCaveat {
     /// The advisory attestation chain did not verify. Nothing was summed.
     LedgerUnverified,
+    /// One or more independently expected attempts has no selected scrape
+    /// attestation.
+    AttemptsMissingAttestation,
+    /// At least one member task has no independent durable or canonical
+    /// attempt ceiling, so its denominator is unknown.
+    AttemptCounterUnavailable,
+    /// An expected logical attempt appeared under multiple lease epochs. The
+    /// last verified ledger record was selected and the attempt was summed
+    /// once.
+    DuplicateAttemptLeases,
+    /// An attestation names an attempt outside the independent roster. It is
+    /// retained as a caveat but cannot enlarge the denominator or the sums.
+    UnexpectedAttestation,
     /// Some member task has no attestation at all, so its usage — if any —
     /// is not in these sums.
     MembersWithoutAttestation,
@@ -462,10 +588,14 @@ pub struct UsageRollup {
     /// Empty exactly when every member task's every attempt reported complete,
     /// self-consistent usage over a verified ledger.
     pub caveats: Vec<UsageRollupCaveat>,
+    /// Public completeness projection. This is serialized rather than making
+    /// every wire consumer reconstruct the caveat policy.
+    #[serde(default)]
+    pub is_complete: bool,
 }
 
 impl UsageRollup {
-    /// Whether these sums cover every attempt the ledger could speak for.
+    /// Whether these sums cover every independently expected attempt.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.caveats.is_empty()
@@ -708,18 +838,36 @@ fn accounted_usage(
     })
 }
 
-/// Sum the usage of every attempt the ledger holds for `members`.
+/// The last verified ledger record selected for one logical attempt. Keeping
+/// the lease beside the payload preserves which physical execution supplied
+/// the accounted figures even though duplicate leases contribute only once.
+struct SelectedLedgerUsage {
+    sequence: u64,
+    lease_epoch: Option<u64>,
+    usage: LedgerUsage,
+}
+
+/// Sum usage against an independently derived expected-attempt roster.
 ///
-/// `members` is the run's durable membership. Attestations for any other task
-/// are ignored: a rollup is a run's answer, not the daemon's.
+/// Attestations can satisfy that roster, but can neither create its tasks nor
+/// increase a known attempt ceiling. Records for any other task are ignored:
+/// a rollup is a run's answer, not the daemon's.
 #[must_use]
-pub fn roll_up<'a>(
-    members: impl IntoIterator<Item = &'a str>,
-    evidence: &AttestationEvidence<'_>,
-) -> UsageRollup {
-    let members = members.into_iter().collect::<BTreeSet<_>>();
+pub fn roll_up(roster: &ExpectedUsageRoster, evidence: &AttestationEvidence<'_>) -> UsageRollup {
     let mut coverage = UsageCoverage {
-        tasks: members.len(),
+        tasks: roster.tasks.len(),
+        attempts_expected: roster
+            .tasks
+            .values()
+            .filter_map(|ceiling| *ceiling)
+            .fold(0_usize, |total, ceiling| {
+                total.saturating_add(ceiling.get() as usize)
+            }),
+        tasks_with_unknown_attempt_ceiling: roster
+            .tasks
+            .values()
+            .filter(|ceiling| ceiling.is_none())
+            .count(),
         ledger_verified: evidence.verified,
         ..UsageCoverage::default()
     };
@@ -727,10 +875,19 @@ pub fn roll_up<'a>(
     if !evidence.verified {
         caveats.insert(UsageRollupCaveat::LedgerUnverified);
     }
+    if coverage.tasks_with_unknown_attempt_ceiling > 0 {
+        caveats.insert(UsageRollupCaveat::AttemptCounterUnavailable);
+    }
 
-    // One entry per attempt, last writer winning: a re-scrape of the same
-    // attempt supersedes the earlier record rather than being charged twice.
-    let mut attempts: BTreeMap<(&str, Option<u64>, Option<u64>), LedgerUsage> = BTreeMap::new();
+    // One selected entry per logical attempt, highest sequence winning. A
+    // re-scrape or second lease supersedes the earlier record rather than
+    // being charged twice. Physical triples remain counted separately for the
+    // compatibility `attemptsObserved` projection.
+    let mut attempts: BTreeMap<(String, u32), SelectedLedgerUsage> = BTreeMap::new();
+    let mut physical_attempts = BTreeSet::new();
+    let mut expected_attempt_leases: BTreeMap<(String, u32), BTreeSet<Option<u64>>> =
+        BTreeMap::new();
+    let mut unexpected_attempts = BTreeSet::new();
     if evidence.verified {
         let records_by_sequence = evidence
             .records
@@ -742,18 +899,30 @@ pub fn roll_up<'a>(
             if payload.get("kind").and_then(Value::as_str) != Some(ADAPTER_SCRAPE_KIND) {
                 continue;
             }
-            let Some(task) = payload
-                .get("taskUuid")
-                .and_then(Value::as_str)
-                .and_then(|task| members.get(task).copied())
-            else {
+            let Some(task) = payload.get("taskUuid").and_then(Value::as_str) else {
                 continue;
             };
-            let key = (
-                task,
-                payload.get("attempt").and_then(Value::as_u64),
-                payload.get("leaseEpoch").and_then(Value::as_u64),
-            );
+            let Some(ceiling) = roster.tasks.get(task) else {
+                continue;
+            };
+            let raw_attempt = payload.get("attempt").and_then(Value::as_u64);
+            let lease_epoch = payload.get("leaseEpoch").and_then(Value::as_u64);
+            physical_attempts.insert((task.to_owned(), raw_attempt, lease_epoch));
+            let Some(attempt) = raw_attempt.and_then(|attempt| u32::try_from(attempt).ok()) else {
+                unexpected_attempts.insert((task.to_owned(), raw_attempt));
+                continue;
+            };
+            if attempt == 0 || ceiling.is_some_and(|ceiling| attempt > ceiling.get()) {
+                unexpected_attempts.insert((task.to_owned(), raw_attempt));
+                continue;
+            }
+            let key = (task.to_owned(), attempt);
+            if ceiling.is_some() {
+                expected_attempt_leases
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(lease_epoch);
+            }
             let usage = accounted_usage(record, &records_by_sequence)
                 .map(Box::new)
                 .map_or_else(
@@ -766,8 +935,65 @@ pub fn roll_up<'a>(
                     },
                     LedgerUsage::Accounted,
                 );
-            attempts.insert(key, usage);
+            let selected = SelectedLedgerUsage {
+                sequence: record.seq,
+                lease_epoch,
+                usage,
+            };
+            match attempts.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(selected);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if record.seq >= entry.get().sequence =>
+                {
+                    entry.insert(selected);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
         }
+    }
+    coverage.attempts_observed = physical_attempts.len();
+    coverage.attempts_attested = attempts.len();
+    coverage.attempts_unexpected = unexpected_attempts.len();
+    coverage.attempts_with_duplicate_leases = expected_attempt_leases
+        .values()
+        .filter(|leases| leases.len() > 1)
+        .count();
+
+    for (task, ceiling) in &roster.tasks {
+        let Some(ceiling) = ceiling else {
+            continue;
+        };
+        let attested = attempts
+            .range((task.clone(), 1)..=(task.clone(), ceiling.get()))
+            .count();
+        coverage.attempts_missing = coverage
+            .attempts_missing
+            .saturating_add(ceiling.get() as usize - attested);
+        if coverage.missing_attempts.len() == MAX_MISSING_ATTEMPT_IDENTITIES {
+            continue;
+        }
+        for attempt in 1..=ceiling.get() {
+            if coverage.missing_attempts.len() == MAX_MISSING_ATTEMPT_IDENTITIES {
+                break;
+            }
+            if !attempts.contains_key(&(task.clone(), attempt)) {
+                coverage.missing_attempts.push(UsageAttemptIdentity {
+                    task_uuid: task.clone(),
+                    attempt,
+                });
+            }
+        }
+    }
+    if coverage.attempts_missing > 0 {
+        caveats.insert(UsageRollupCaveat::AttemptsMissingAttestation);
+    }
+    if coverage.attempts_with_duplicate_leases > 0 {
+        caveats.insert(UsageRollupCaveat::DuplicateAttemptLeases);
+    }
+    if coverage.attempts_unexpected > 0 {
+        caveats.insert(UsageRollupCaveat::UnexpectedAttestation);
     }
 
     let mut tokens = UsageTokenRollup::default();
@@ -780,9 +1006,12 @@ pub fn roll_up<'a>(
     let mut saw_derived_total = false;
     let mut saturated = false;
 
-    for ((task, _, _), usage) in &attempts {
-        coverage.attempts_observed += 1;
-        let observation = match usage {
+    for ((task, _), selected) in &attempts {
+        // The selected lease is deliberately retained beside the record as
+        // attempt provenance, even though the aggregate has no per-attempt
+        // evidence array to publish it in.
+        let _selected_lease_epoch = selected.lease_epoch;
+        let observation = match &selected.usage {
             LedgerUsage::NoRecord => {
                 coverage.attempts_without_usage_record += 1;
                 caveats.insert(UsageRollupCaveat::UnreadableUsageRecord);
@@ -838,7 +1067,7 @@ pub fn roll_up<'a>(
             || breakdown.total_tokens.is_some()
             || breakdown.cost.is_some();
         if contributed {
-            tasks_with_usage.insert(*task);
+            tasks_with_usage.insert(task.clone());
         } else {
             coverage.attempts_reported_without_figures += 1;
             caveats.insert(UsageRollupCaveat::ReportedWithoutFigures);
@@ -924,9 +1153,10 @@ pub fn roll_up<'a>(
     }
 
     coverage.tasks_with_reported_usage = tasks_with_usage.len();
-    coverage.tasks_without_attestation = members
-        .iter()
-        .filter(|task| !attempts.keys().any(|(held, _, _)| held == *task))
+    coverage.tasks_without_attestation = roster
+        .tasks
+        .keys()
+        .filter(|task| !attempts.keys().any(|(held, _)| held == *task))
         .count();
 
     if total_attempts > 0 {
@@ -993,6 +1223,7 @@ pub fn roll_up<'a>(
         caveats.insert(UsageRollupCaveat::SumSaturated);
     }
 
+    let caveats = caveats.into_iter().collect::<Vec<_>>();
     UsageRollup {
         authority: FactAuthority::AdvisoryProviderCapture,
         provenance: ROLLUP_PROVENANCE.to_owned(),
@@ -1000,7 +1231,8 @@ pub fn roll_up<'a>(
         coverage,
         tokens,
         cost,
-        caveats: caveats.into_iter().collect(),
+        is_complete: caveats.is_empty(),
+        caveats,
     }
 }
 
@@ -1036,6 +1268,22 @@ mod tests {
     const CODEX_RESUME_CUMULATIVE_STREAM: &str =
         include_str!("../../../test/fixtures/usage/codex-resume-cumulative.jsonl");
     const CODEX_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cached_input_tokens"],"cacheWriteTokens":["cache_write_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"],"reasoningTokens":["reasoning_output_tokens"]}"#;
+
+    fn roster<'a>(tasks: impl IntoIterator<Item = &'a str>) -> ExpectedUsageRoster {
+        roster_with_attempts(tasks.into_iter().map(|task| (task, 1)))
+    }
+
+    fn roster_with_attempts<'a>(
+        tasks: impl IntoIterator<Item = (&'a str, u32)>,
+    ) -> ExpectedUsageRoster {
+        ExpectedUsageRoster::new(tasks.into_iter().map(|(task, attempt)| {
+            ExpectedUsageTask::known(task, NonZeroU32::new(attempt).expect("positive attempt"))
+        }))
+    }
+
+    fn roster_with_unknown(task: &str) -> ExpectedUsageRoster {
+        ExpectedUsageRoster::new([ExpectedUsageTask::unknown(task)])
+    }
 
     fn scrape_capture(mode: ScrapeMode, pattern: &str, fields: &str) -> ScrapeCapture {
         ScrapeCapture {
@@ -1240,7 +1488,7 @@ mod tests {
         );
         let resumed_record = accounted_attestation(2, task, 2, 8, &resumed_captures, &resumed);
         let rollup = roll_up(
-            [task],
+            &roster_with_attempts([(task, 2)]),
             &AttestationEvidence::new(true, &[fresh_record, resumed_record]),
         );
         assert_eq!(rollup.coverage.attempts_reported, 2);
@@ -1314,7 +1562,10 @@ mod tests {
                 }),
             ),
         ];
-        let rollup = roll_up([task], &AttestationEvidence::new(true, &records));
+        let rollup = roll_up(
+            &roster_with_attempts([(task, 2)]),
+            &AttestationEvidence::new(true, &records),
+        );
 
         assert_eq!(rollup.coverage.attempts_legacy_usage, 0);
         assert_eq!(rollup.tokens.input_tokens.value, 10_101);
@@ -1356,7 +1607,10 @@ mod tests {
         let mut unbound = records.clone();
         unbound[1].payload["usageEvidence"]["predecessor"]["hash"] =
             json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        let rejected = roll_up([task], &AttestationEvidence::new(true, &unbound));
+        let rejected = roll_up(
+            &roster_with_attempts([(task, 2)]),
+            &AttestationEvidence::new(true, &unbound),
+        );
         assert_eq!(rejected.coverage.attempts_legacy_usage, 1);
         assert_eq!(
             rejected.tokens.total_tokens.map(|total| total.value),
@@ -1394,7 +1648,7 @@ mod tests {
                 },
             }),
         );
-        let rollup = roll_up([task], &AttestationEvidence::new(true, &[record]));
+        let rollup = roll_up(&roster([task]), &AttestationEvidence::new(true, &[record]));
 
         assert_eq!(rollup.coverage.attempts_legacy_usage, 0);
         assert!(rollup
@@ -1416,7 +1670,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("usageEvidence");
-        let rollup = roll_up(["task"], &AttestationEvidence::new(true, &[legacy]));
+        let rollup = roll_up(
+            &roster(["task"]),
+            &AttestationEvidence::new(true, &[legacy]),
+        );
         assert_eq!(rollup.coverage.attempts_legacy_usage, 1);
         assert_eq!(rollup.tokens.total_tokens, None);
         assert!(rollup
@@ -1512,7 +1769,7 @@ mod tests {
             attestation(2, "task-claude", 1, claude_usage()),
         ];
         let rollup = roll_up(
-            ["task-codex", "task-claude"],
+            &roster(["task-codex", "task-claude"]),
             &AttestationEvidence::new(true, &records),
         );
 
@@ -1583,7 +1840,10 @@ mod tests {
         assert!(observation["breakdown"]["inputTokens"].is_null());
 
         let declared = [attestation(1, "declared", 1, observation)];
-        let harness = roll_up(["declared"], &AttestationEvidence::new(true, &declared));
+        let harness = roll_up(
+            &roster(["declared"]),
+            &AttestationEvidence::new(true, &declared),
+        );
         assert_eq!(
             harness.tokens.total_tokens.unwrap().source,
             UsageRollupTotalSource::HarnessReported
@@ -1613,7 +1873,7 @@ mod tests {
             attestation(2, "preset", 1, codex_usage()),
         ];
         let mixed = roll_up(
-            ["declared", "preset"],
+            &roster(["declared", "preset"]),
             &AttestationEvidence::new(true, &records),
         );
         let total = mixed.tokens.total_tokens.expect("both attempts total");
@@ -1644,7 +1904,7 @@ mod tests {
             ),
         ];
         let hidden = roll_up(
-            ["declared", "preset"],
+            &roster(["declared", "preset"]),
             &AttestationEvidence::new(true, &records),
         );
         assert_eq!(hidden.coverage.attempts_reported_with_components, 1);
@@ -1709,7 +1969,10 @@ mod tests {
             attestation(1, "task", 1, honest),
             attestation(2, "task", 2, after),
         ];
-        let rollup = roll_up(["task"], &AttestationEvidence::new(true, &records));
+        let rollup = roll_up(
+            &roster_with_attempts([("task", 2)]),
+            &AttestationEvidence::new(true, &records),
+        );
 
         assert_eq!(rollup.coverage.attempts_reported, 2);
         assert_eq!(
@@ -1771,7 +2034,7 @@ mod tests {
         }))
         .unwrap();
         let rollup = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(true, &[attestation(1, "task", 1, unmapped)]),
         );
         assert_eq!(rollup.coverage.attempts_reported, 1);
@@ -1802,7 +2065,7 @@ mod tests {
         }))
         .unwrap();
         let partial = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(true, &[attestation(1, "task", 1, reasoning_only)]),
         );
         assert_eq!(partial.coverage.attempts_reported_without_figures, 0);
@@ -1822,7 +2085,7 @@ mod tests {
     #[test]
     fn one_renamed_harness_key_deletes_a_component_and_is_not_a_complete_run() {
         let honest = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(true, &[attestation(1, "task", 1, observed(CLAUDE_STREAM))]),
         );
         // The real capture, unmodified: every component the total sums was
@@ -1841,7 +2104,7 @@ mod tests {
         let drifted =
             CLAUDE_STREAM.replace("cache_read_input_tokens", "cache_read_input_tokens_v2");
         let rollup = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(true, &[attestation(1, "task", 1, observed(&drifted))]),
         );
         assert_eq!(rollup.coverage.attempts_reported, 1);
@@ -1883,7 +2146,7 @@ mod tests {
             let drifted = CLAUDE_STREAM.replace(&format!("\"{key}\""), &format!("\"{key}_v2\""));
             assert_ne!(drifted, CLAUDE_STREAM, "{key} is not in the capture");
             let rollup = roll_up(
-                ["task"],
+                &roster(["task"]),
                 &AttestationEvidence::new(true, &[attestation(1, "task", 1, observed(&drifted))]),
             );
             let tokens = serde_json::to_value(rollup.tokens).unwrap();
@@ -1922,7 +2185,7 @@ mod tests {
     #[test]
     fn a_drifted_codex_key_leaves_the_total_right_and_the_input_figure_wrong() {
         let honest = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(
                 true,
                 &[attestation(
@@ -1939,7 +2202,7 @@ mod tests {
 
         let drifted = CODEX_STREAM.replace("cached_input_tokens", "cached_input_tokens_v2");
         let rollup = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(
                 true,
                 &[attestation(
@@ -1982,7 +2245,7 @@ mod tests {
         assert!(observation["breakdown"]["cost"].is_object());
 
         let rollup = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(true, &[attestation(1, "task", 1, observation)]),
         );
         assert_eq!(rollup.coverage.attempts_reported, 1);
@@ -1996,6 +2259,146 @@ mod tests {
     }
 
     #[test]
+    fn an_independent_three_attempt_ceiling_exposes_two_missing_ledger_records() {
+        // The only attestation may be the latest attempt. Its presence must
+        // not make earlier holes invisible or shift the expected range.
+        let records = [attestation(1, "task", 3, codex_usage())];
+        let rollup = roll_up(
+            &roster_with_attempts([("task", 3)]),
+            &AttestationEvidence::new(true, &records),
+        );
+
+        assert_eq!(rollup.coverage.attempts_expected, 3);
+        assert_eq!(rollup.coverage.attempts_attested, 1);
+        assert_eq!(rollup.coverage.attempts_missing, 2);
+        assert_eq!(
+            rollup.coverage.missing_attempts,
+            vec![
+                UsageAttemptIdentity {
+                    task_uuid: "task".to_owned(),
+                    attempt: 1,
+                },
+                UsageAttemptIdentity {
+                    task_uuid: "task".to_owned(),
+                    attempt: 2,
+                },
+            ]
+        );
+        assert_eq!(rollup.coverage.attempts_reported, 1);
+        assert_eq!(rollup.tokens.output_tokens.attempts, 1);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::AttemptsMissingAttestation));
+        assert!(!rollup.is_complete());
+    }
+
+    #[test]
+    fn a_member_with_no_attestation_remains_an_expected_missing_attempt() {
+        let rollup = roll_up(&roster(["task"]), &AttestationEvidence::new(true, &[]));
+
+        assert_eq!(rollup.coverage.tasks, 1);
+        assert_eq!(rollup.coverage.tasks_without_attestation, 1);
+        assert_eq!(rollup.coverage.attempts_expected, 1);
+        assert_eq!(rollup.coverage.attempts_attested, 0);
+        assert_eq!(rollup.coverage.attempts_missing, 1);
+        assert_eq!(rollup.coverage.missing_attempts[0].attempt, 1);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::MembersWithoutAttestation));
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::AttemptsMissingAttestation));
+    }
+
+    #[test]
+    fn an_unknown_attempt_ceiling_keeps_the_task_and_attestation_but_never_grades_complete() {
+        let records = [attestation(1, "task", 4, codex_usage())];
+        let rollup = roll_up(
+            &roster_with_unknown("task"),
+            &AttestationEvidence::new(true, &records),
+        );
+
+        assert_eq!(rollup.coverage.tasks, 1);
+        assert_eq!(rollup.coverage.tasks_with_unknown_attempt_ceiling, 1);
+        assert_eq!(rollup.coverage.attempts_expected, 0);
+        assert_eq!(rollup.coverage.attempts_attested, 1);
+        assert_eq!(rollup.coverage.attempts_missing, 0);
+        assert_eq!(rollup.coverage.attempts_reported, 1);
+        assert_eq!(rollup.tokens.output_tokens.attempts, 1);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::AttemptCounterUnavailable));
+        assert!(!rollup.is_complete());
+    }
+
+    #[test]
+    fn duplicate_leases_select_the_last_verified_record_and_charge_one_attempt() {
+        let first = attestation(1, "task", 1, codex_usage());
+        let mut last = attestation(
+            2,
+            "task",
+            1,
+            serde_json::to_value(UsageObservation::NotReported).unwrap(),
+        );
+        last.payload["leaseEpoch"] = json!(2);
+        // Deliberately present the higher sequence first: selection follows
+        // verified ledger sequence, not slice or lease ordering.
+        let records = [last, first];
+        let rollup = roll_up(&roster(["task"]), &AttestationEvidence::new(true, &records));
+
+        assert_eq!(rollup.coverage.attempts_observed, 2);
+        assert_eq!(rollup.coverage.attempts_attested, 1);
+        assert_eq!(rollup.coverage.attempts_with_duplicate_leases, 1);
+        assert_eq!(rollup.coverage.attempts_reported, 0);
+        assert_eq!(rollup.coverage.attempts_not_reported, 1);
+        assert_eq!(rollup.tokens, UsageTokenRollup::default());
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::DuplicateAttemptLeases));
+        assert!(!rollup.is_complete());
+    }
+
+    #[test]
+    fn an_over_ceiling_attestation_is_caveated_and_cannot_enlarge_or_charge_the_roster() {
+        let records = [
+            attestation(1, "task", 1, codex_usage()),
+            attestation(2, "task", 2, codex_usage()),
+        ];
+        let rollup = roll_up(&roster(["task"]), &AttestationEvidence::new(true, &records));
+
+        assert_eq!(rollup.coverage.attempts_expected, 1);
+        assert_eq!(rollup.coverage.attempts_attested, 1);
+        assert_eq!(rollup.coverage.attempts_missing, 0);
+        assert_eq!(rollup.coverage.attempts_unexpected, 1);
+        assert_eq!(rollup.coverage.attempts_observed, 2);
+        assert_eq!(rollup.coverage.attempts_reported, 1);
+        assert_eq!(rollup.tokens.output_tokens.value, 32_842);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::UnexpectedAttestation));
+        assert!(!rollup.is_complete());
+    }
+
+    #[test]
+    fn missing_attempt_identities_are_bounded_without_shrinking_the_count() {
+        let ceiling = u32::try_from(MAX_MISSING_ATTEMPT_IDENTITIES + 3).unwrap();
+        let rollup = roll_up(
+            &roster_with_attempts([("task", ceiling)]),
+            &AttestationEvidence::new(true, &[]),
+        );
+
+        assert_eq!(rollup.coverage.attempts_missing, ceiling as usize);
+        assert_eq!(
+            rollup.coverage.missing_attempts.len(),
+            MAX_MISSING_ATTEMPT_IDENTITIES
+        );
+        assert_eq!(
+            rollup.coverage.missing_attempts.last().unwrap().attempt,
+            u32::try_from(MAX_MISSING_ATTEMPT_IDENTITIES).unwrap()
+        );
+    }
+
+    #[test]
     fn every_attempt_of_a_retried_task_is_charged_once_and_only_once() {
         // The row holds only the last attempt; the ledger holds all three, and
         // a re-scrape of attempt 2 supersedes rather than double-charges.
@@ -2005,11 +2408,18 @@ mod tests {
             attestation(3, "task", 2, codex_usage()),
             attestation(4, "task", 3, codex_usage()),
         ];
-        let rollup = roll_up(["task"], &AttestationEvidence::new(true, &records));
+        let rollup = roll_up(
+            &roster_with_attempts([("task", 3)]),
+            &AttestationEvidence::new(true, &records),
+        );
+        assert_eq!(rollup.coverage.attempts_expected, 3);
+        assert_eq!(rollup.coverage.attempts_attested, 3);
+        assert_eq!(rollup.coverage.attempts_missing, 0);
         assert_eq!(rollup.coverage.attempts_observed, 3);
         assert_eq!(rollup.coverage.attempts_reported, 3);
         assert_eq!(rollup.tokens.output_tokens.value, 32_842 * 3);
         assert_eq!(rollup.tokens.output_tokens.attempts, 3);
+        assert!(rollup.is_complete(), "unexpected: {:?}", rollup.caveats);
     }
 
     #[test]
@@ -2030,7 +2440,7 @@ mod tests {
             ),
         ];
         let rollup = roll_up(
-            ["reported", "quiet", "silent", "never-scraped"],
+            &roster(["reported", "quiet", "silent", "never-scraped"]),
             &AttestationEvidence::new(true, &records),
         );
         assert_eq!(rollup.coverage.tasks, 4);
@@ -2062,7 +2472,10 @@ mod tests {
             .as_object_mut()
             .expect("payload is an object")
             .remove("usageEvidence");
-        let rollup = roll_up(["task"], &AttestationEvidence::new(true, &[record]));
+        let rollup = roll_up(
+            &roster(["task"]),
+            &AttestationEvidence::new(true, &[record]),
+        );
         assert_eq!(rollup.coverage.attempts_observed, 1);
         assert_eq!(rollup.coverage.attempts_reported, 0);
         assert_eq!(rollup.coverage.attempts_without_usage_record, 1);
@@ -2075,7 +2488,10 @@ mod tests {
     #[test]
     fn an_unverified_ledger_sums_nothing_and_says_why() {
         let records = [attestation(1, "task", 1, codex_usage())];
-        let rollup = roll_up(["task"], &AttestationEvidence::new(false, &records));
+        let rollup = roll_up(
+            &roster(["task"]),
+            &AttestationEvidence::new(false, &records),
+        );
         assert!(!rollup.coverage.ledger_verified);
         assert_eq!(rollup.coverage.attempts_observed, 0);
         assert_eq!(rollup.tokens, UsageTokenRollup::default());
@@ -2084,7 +2500,7 @@ mod tests {
             .caveats
             .contains(&UsageRollupCaveat::LedgerUnverified));
         assert_eq!(
-            roll_up(["task"], &AttestationEvidence::unavailable()).coverage,
+            roll_up(&roster(["task"]), &AttestationEvidence::unavailable()).coverage,
             rollup.coverage
         );
     }
@@ -2095,7 +2511,7 @@ mod tests {
             attestation(1, "mine", 1, codex_usage()),
             attestation(2, "someone-elses", 1, codex_usage()),
         ];
-        let rollup = roll_up(["mine"], &AttestationEvidence::new(true, &records));
+        let rollup = roll_up(&roster(["mine"]), &AttestationEvidence::new(true, &records));
         assert_eq!(rollup.coverage.attempts_reported, 1);
         assert_eq!(rollup.tokens.output_tokens.value, 32_842);
     }
@@ -2103,7 +2519,7 @@ mod tests {
     #[test]
     fn a_complete_single_harness_run_carries_no_caveats() {
         let records = [attestation(1, "task", 1, claude_usage())];
-        let rollup = roll_up(["task"], &AttestationEvidence::new(true, &records));
+        let rollup = roll_up(&roster(["task"]), &AttestationEvidence::new(true, &records));
         assert!(
             rollup.is_complete(),
             "unexpected caveats: {:?}",
@@ -2136,7 +2552,7 @@ mod tests {
         }))
         .unwrap();
         let rollup = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(true, &[attestation(1, "task", 1, usage)]),
         );
         assert_eq!(rollup.tokens.fresh_input_tokens.value, 100);
@@ -2168,7 +2584,7 @@ mod tests {
         }))
         .unwrap();
         let rollup = roll_up(
-            ["task"],
+            &roster(["task"]),
             &AttestationEvidence::new(true, &[attestation(1, "task", 1, usage)]),
         );
         // The attempt's own total is what is summed; neither number is fixed.
@@ -2188,7 +2604,7 @@ mod tests {
             attestation(2, "task-claude", 1, claude_usage()),
         ];
         let rollup = roll_up(
-            ["task-codex", "task-claude"],
+            &roster(["task-codex", "task-claude"]),
             &AttestationEvidence::new(true, &records),
         );
         let encoded = serde_json::to_string(&rollup).unwrap();
@@ -2196,6 +2612,17 @@ mod tests {
         assert_eq!(decoded, rollup);
         let value: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["authority"], json!("advisory-provider-capture"));
+        assert_eq!(value["coverage"]["attemptsExpected"], json!(2));
+        assert_eq!(value["coverage"]["attemptsAttested"], json!(2));
+        assert_eq!(value["coverage"]["attemptsMissingAttestation"], json!(0));
+        assert_eq!(value["isComplete"], json!(rollup.is_complete()));
+        assert_eq!(value["coverage"]["missingAttempts"], json!([]));
+        assert_eq!(
+            value["coverage"]["tasksWithUnknownAttemptCeiling"],
+            json!(0)
+        );
+        assert_eq!(value["coverage"]["attemptsWithDuplicateLeases"], json!(0));
+        assert_eq!(value["coverage"]["attemptsUnexpected"], json!(0));
         // The composition statement is on the wire, not only in the doc: a
         // consumer must not have to guess which token fields the total is over.
         assert!(value["composition"]

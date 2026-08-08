@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,9 @@ use crate::taskdb::{
     WorkspaceMetadata,
 };
 use crate::usage::{UsageAccounting, UsageObservation};
-use crate::usage_rollup::{roll_up, AttestationEvidence, UsageRollup};
+use crate::usage_rollup::{
+    roll_up, AttestationEvidence, ExpectedUsageRoster, ExpectedUsageTask, UsageRollup,
+};
 use crate::witness::{
     counts_toward_canonical_gpu_seconds, AttestationRecord, AuthorshipSession, AuthorshipStatus,
     Charge, LaborClass, TerminalError, Verdict, VerifyReport, WitnessRecord,
@@ -1282,8 +1285,9 @@ pub fn flow_run_exists(
 /// the schema-validated reconciliation result is the task-state source; live
 /// rows and canonical terminal witnesses only advance or block that view.
 ///
-/// `attestations` is the advisory ledger the usage rollup sums, per attempt,
-/// over the run's durable membership. A caller with no ledger to offer passes
+/// `attestations` is the advisory ledger the usage rollup reads against the
+/// independent attempt roster derived from `details`, `witness`, and durable
+/// membership. A caller with no ledger to offer passes
 /// [`AttestationEvidence::unavailable`] and gets a rollup that says it summed
 /// nothing, never one that reads as a zero-cost run.
 #[allow(clippy::too_many_arguments)]
@@ -1682,7 +1686,10 @@ pub fn query_run(
         // Over `flow_tasks`, which is durable membership unioned with the rows
         // and witnesses that name the run — so a node this run was handed but
         // whose row names its creating run (the W-316 shape) is inside the sum.
-        usage: roll_up(flow_tasks.iter().map(String::as_str), attestations),
+        usage: roll_up(
+            &expected_usage_roster(&flow_tasks, details, witness),
+            attestations,
+        ),
         items,
         tasks,
         anomalies,
@@ -1776,7 +1783,10 @@ pub fn apply_standup_usage(
         .map(|flow_run| {
             let tasks = flow_run_tasks(&flow_run, details, witness, membership);
             StandupRunUsage {
-                usage: roll_up(tasks.iter().map(String::as_str), attestations),
+                usage: roll_up(
+                    &expected_usage_roster(&tasks, details, witness),
+                    attestations,
+                ),
                 flow_run_id: flow_run,
             }
         })
@@ -3129,6 +3139,50 @@ fn flow_run_tasks(
     }
     tasks.extend(membership.tasks(flow_run).map(ToOwned::to_owned));
     tasks
+}
+
+/// Build the rollup denominator from canonical facts that are independent of
+/// the advisory attestation ledger. Durable row detail wins; only a task with
+/// no detail falls back to its latest canonical witness attempt. Membership
+/// with neither source remains present with an unknown ceiling.
+fn expected_usage_roster(
+    tasks: &BTreeSet<String>,
+    details: &[RowDetailFact],
+    witness: &[WitnessRecord],
+) -> ExpectedUsageRoster {
+    let detail_attempts = details
+        .iter()
+        .map(|detail| (detail.task_uuid.as_str(), detail.attempt))
+        .collect::<BTreeMap<_, _>>();
+    let mut witness_attempts = BTreeMap::<&str, (u32, u64, u64)>::new();
+    for record in witness {
+        let Some(task_uuid) = record.task_uuid.as_deref() else {
+            continue;
+        };
+        let candidate = (record.attempt, record.lease_epoch, record.seq);
+        witness_attempts
+            .entry(task_uuid)
+            .and_modify(|current| *current = (*current).max(candidate))
+            .or_insert(candidate);
+    }
+
+    ExpectedUsageRoster::new(tasks.iter().map(|task_uuid| {
+        if let Some(attempt) = detail_attempts.get(task_uuid.as_str()) {
+            return NonZeroU32::new(*attempt).map_or_else(
+                || ExpectedUsageTask::unknown(task_uuid.clone()),
+                |ceiling| ExpectedUsageTask::known(task_uuid.clone(), ceiling),
+            );
+        }
+        witness_attempts.get(task_uuid.as_str()).map_or_else(
+            || ExpectedUsageTask::unknown(task_uuid.clone()),
+            |(attempt, _, _)| {
+                NonZeroU32::new(*attempt).map_or_else(
+                    || ExpectedUsageTask::unknown(task_uuid.clone()),
+                    |ceiling| ExpectedUsageTask::known(task_uuid.clone(), ceiling),
+                )
+            },
+        )
+    }))
 }
 
 fn lifecycle_matches(
@@ -4954,7 +5008,8 @@ mod tests {
     #[test]
     fn a_run_rollup_counts_every_attempt_and_names_the_members_it_cannot_see() {
         let flow_run = "00000000-0000-4000-8000-000000000249";
-        let node = flow_node_detail(flow_run, RowStatus::Completed);
+        let mut node = flow_node_detail(flow_run, RowStatus::Completed);
+        node.attempt = 2;
         let reconciliation = reconciliation_detail(flow_run);
         let unscraped = reconciliation.task_uuid.clone();
         let records = [
@@ -4975,6 +5030,9 @@ mod tests {
 
         // Two members, two attempts of one of them, and the retry is charged.
         assert_eq!(view.usage.coverage.tasks, 2);
+        assert_eq!(view.usage.coverage.attempts_expected, 3);
+        assert_eq!(view.usage.coverage.attempts_attested, 2);
+        assert_eq!(view.usage.coverage.attempts_missing, 1);
         assert_eq!(view.usage.coverage.attempts_observed, 2);
         assert_eq!(view.usage.coverage.attempts_reported, 2);
         assert_eq!(view.usage.tokens.output_tokens.value, 300);
@@ -4986,6 +5044,53 @@ mod tests {
             .contains(&crate::usage_rollup::UsageRollupCaveat::MembersWithoutAttestation));
         assert!(!view.usage.is_complete());
         assert!(!unscraped.is_empty());
+    }
+
+    #[test]
+    fn acceptance_402_run_coverage_uses_the_durable_attempt_counter_not_ledger_keys() {
+        let flow_run = "00000000-0000-4000-8000-000000000402";
+        let mut node = flow_node_detail(flow_run, RowStatus::Completed);
+        node.attempt = 3;
+        let records = [scrape_attestation(1, &node.task_uuid, 3, 100)];
+        let view = query_run(
+            flow_run,
+            &[node],
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
+            &AttestationEvidence::new(true, &records),
+        )
+        .unwrap();
+
+        assert_eq!(view.usage.coverage.attempts_expected, 3);
+        assert_eq!(view.usage.coverage.attempts_attested, 1);
+        assert_eq!(view.usage.coverage.attempts_missing, 2);
+        assert_eq!(
+            view.usage
+                .coverage
+                .missing_attempts
+                .iter()
+                .map(|identity| identity.attempt)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(view
+            .usage
+            .caveats
+            .contains(&crate::usage_rollup::UsageRollupCaveat::AttemptsMissingAttestation));
+        assert!(!view.usage.is_complete());
+        let public = serde_json::to_value(&view).expect("run view serializes");
+        assert_eq!(
+            public["usage"]["coverage"]["attemptsMissingAttestation"],
+            serde_json::json!(2)
+        );
+        assert_eq!(public["usage"]["isComplete"], serde_json::json!(false));
+        assert!(public["usage"]["caveats"]
+            .as_array()
+            .expect("caveats are an array")
+            .contains(&serde_json::json!("attempts-missing-attestation")));
     }
 
     #[test]
@@ -5151,6 +5256,47 @@ mod tests {
         // lets `query.standup` skip the chain read entirely (#404).
         assert!(orphan.usage_basis.is_none());
         assert!(standup_touched_runs(&orphan, &details, &ledger).is_empty());
+    }
+
+    #[test]
+    fn acceptance_402_standup_uses_a_canonical_witness_ceiling_when_detail_is_absent() {
+        let flow_run = "00000000-0000-4000-8000-0000000004a2";
+        let task = "00000000-0000-4000-8000-0000000004a3";
+        let mut membership = FlowMembership::default();
+        membership.insert(crate::flow_membership::FlowMembershipRecord::new(
+            flow_run.to_owned(),
+            task.to_owned(),
+            crate::flow_membership::MembershipDisposition::Terminal,
+            Some(1),
+            Some("witness-only".to_owned()),
+        ));
+        let mut head = ChainHead::default();
+        let witness = [standup_aggregate_witness(
+            &mut head,
+            task,
+            flow_run,
+            3,
+            LaborClass::Fresh,
+            0.0,
+        )];
+        let records = [scrape_attestation(1, task, 1, 100)];
+        let mut digest = standup_fixture(task);
+
+        apply_standup_usage(
+            &mut digest,
+            &[],
+            &witness,
+            &membership,
+            &AttestationEvidence::new(true, &records),
+        );
+
+        assert_eq!(digest.runs.len(), 1);
+        let coverage = &digest.runs[0].usage.coverage;
+        assert_eq!(coverage.attempts_expected, 3);
+        assert_eq!(coverage.attempts_attested, 1);
+        assert_eq!(coverage.attempts_missing, 2);
+        assert_eq!(coverage.tasks_with_unknown_attempt_ceiling, 0);
+        assert!(!digest.runs[0].usage.is_complete());
     }
 
     /// Issue #404: the predicate that lets the RPC layer skip the attestation
@@ -5644,7 +5790,7 @@ mod tests {
 
         let empty_usage = || {
             roll_up(
-                std::iter::empty::<&str>(),
+                &ExpectedUsageRoster::default(),
                 &AttestationEvidence::unavailable(),
             )
         };
@@ -5910,7 +6056,7 @@ mod tests {
 
         let empty_usage = || {
             roll_up(
-                std::iter::empty::<&str>(),
+                &ExpectedUsageRoster::default(),
                 &AttestationEvidence::unavailable(),
             )
         };
@@ -6009,7 +6155,7 @@ mod tests {
         let archived_run = "00000000-0000-4000-8000-0000000002a0";
         let empty_usage = || {
             roll_up(
-                std::iter::empty::<&str>(),
+                &ExpectedUsageRoster::default(),
                 &AttestationEvidence::unavailable(),
             )
         };
@@ -6107,7 +6253,7 @@ mod tests {
         let reader_state = reader_state_fixture(&[(archived_run, Some("needs-followup"))]);
         let empty_usage = || {
             roll_up(
-                std::iter::empty::<&str>(),
+                &ExpectedUsageRoster::default(),
                 &AttestationEvidence::unavailable(),
             )
         };

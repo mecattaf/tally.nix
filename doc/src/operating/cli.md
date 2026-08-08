@@ -511,8 +511,10 @@ omit `tasks`, so its empty value cannot shadow the authoritative member list.
 Under the task counts, `query run` answers what the run cost. The line is deliberately never a
 bare total: the token sum arrives with the attempts it covers, the member tasks those attempts
 belong to, and the grade of the evidence, because these numbers are advisory adapter captures
-summed per attempt, not a bill. Whether any attempt reported usage is read from the coverage
-count, so a run where none did prints exactly that and no component line underneath it. The second
+summed per attempt, not a bill. The headline compares attested attempts with the independent
+expected count derived from durable rows (or canonical witnesses when row detail is absent), not
+with physical ledger records. Whether any attempt reported usage is read from the coverage count,
+so a run where none did prints exactly that and no component line underneath it. The second
 line spells out `fresh input N (= input N + cache write N)` — `inputTokens` alone understates any
 harness that writes to a prompt cache — and marks reasoning tokens as nested inside the output
 figure rather than beside it. A component **no attempt reported** prints `--`, never `0`: a
@@ -520,8 +522,9 @@ measured zero is a measurement and keeps printing `0`, and the two must not read
 line appears only where a harness reported cost, and carries the daemon's own basis sentence,
 which states that tally's cgroup `charge` is a separate figure that is not summed there and is a
 floor. A final `partial:` line names every reason the sums are incomplete: member tasks the
-attestation ledger holds nothing about, attempts that reported no usage, attempts whose reported
-usage no declared mapping could read, a component some reporting attempt did not report
+attestation ledger holds nothing about, independently expected attempts that are missing, unknown
+attempt ceilings, duplicate leases, over-ceiling attestations, attempts that reported no usage,
+attempts whose reported usage no declared mapping could read, a component some reporting attempt did not report
 (`partial-components` — this is what one renamed harness key looks like), an attempt that
 reported only a harness total beside attempts that reported components, so the component lines
 cover fewer attempts than the total does (`total-only-attempts`), a total mixing harness-stated
@@ -530,7 +533,7 @@ and derived figures. To find which component drifted, read the per-component
 `coverage.attemptsReportedWithComponents`. Do **not** look for the `--` on the line above — that
 only appears when *no* attempt reported the component, so on any multi-attempt run the drifted
 component prints a real-looking partial number instead. No `partial:` line means the rollup covers
-every attempt the ledger could speak for. `query standup` carries the same rollup per run
+every independently expected attempt. `query standup` carries the same rollup per run
 its window touched, under `runs`. See the [RPC protocol
 reference](../reference/rpc-protocol.md#usage-rollups) for the full field set. A run retired by `tally flow supersede` reads `superseded` whatever its own
 node verdicts say, and names its successor above the board — a reader who misses that would wait

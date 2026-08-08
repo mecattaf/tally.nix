@@ -946,6 +946,8 @@ mod digest_rollup {
         tokens: UsageTokenRollup,
         cost: WireCost,
         caveats: Vec<UsageRollupCaveat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_complete: Option<bool>,
     }
 
     fn differing(value: &str, constant: &str) -> Option<String> {
@@ -960,7 +962,7 @@ mod digest_rollup {
             authority: rollup.authority,
             provenance: differing(&rollup.provenance, ROLLUP_PROVENANCE),
             composition: differing(&rollup.composition, ROLLUP_COMPOSITION),
-            coverage: rollup.coverage,
+            coverage: rollup.coverage.clone(),
             tokens: rollup.tokens,
             cost: WireCost {
                 amount_usd: rollup.cost.amount_usd,
@@ -968,6 +970,7 @@ mod digest_rollup {
                 basis: differing(&rollup.cost.basis, ROLLUP_COST_BASIS),
             },
             caveats: rollup.caveats.clone(),
+            is_complete: Some(rollup.is_complete()),
         }
         .serialize(serializer)
     }
@@ -986,6 +989,7 @@ mod digest_rollup {
         deserializer: D,
     ) -> Result<UsageRollup, D::Error> {
         let wire = Wire::deserialize(deserializer)?;
+        let is_complete = wire.is_complete.unwrap_or(wire.caveats.is_empty());
         Ok(UsageRollup {
             authority: wire.authority,
             provenance: wire.provenance.unwrap_or_default(),
@@ -998,6 +1002,7 @@ mod digest_rollup {
                 basis: wire.cost.basis.unwrap_or_default(),
             },
             caveats: wire.caveats,
+            is_complete,
         })
     }
 }
