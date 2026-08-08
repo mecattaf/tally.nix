@@ -54,6 +54,20 @@ authorized.
 - Authorized pre-prompt options remain part of the adapter prefix. Pi still
   has no trailing `--`, because its CLI rejects that separator.
 
+### Eval-manifest zero-covered outcome (#426)
+
+- A checked coverage manifest now needs at least one declared surface whose
+  explicit status is `covered` to return success. If every declaration is
+  accounted for but all are `reused` or `failed`,
+  `test/eval_manifest_check.py` exits 4 and emits the stable
+  `coverage=zero-covered` and `verification=none` summary tokens. One covered
+  declaration still returns 0 even when another checked declaration failed,
+  and emits `verification=present`. Covered entries outside the declared
+  `expected` surface do not change that verification token.
+- Multi-file precedence is invalid (1), unchecked (3), zero-covered (4), then
+  success (0), independent of argument order; usage remains the immediate exit
+  2. No close-out consumer was added.
+
 ### Campaign git-ai execution and terminal diagnostics (#441)
 
 - Campaign nodes may now carry the full closed git-ai correlation set of at
@@ -1133,12 +1147,12 @@ the `(task, attempt, leaseEpoch)`.
 
   *Round-3 repair:* the exit-code table said exit 0 "licenses 'the eval
   covered what it said it would'" — round 2's own word conflation surviving
-  in the one place its sweep did not reach, the machine-facing contract. A
-  manifest whose every declared item `failed` exits 0. The exit-0 row now
-  states what the code guarantees (every declared surface *accounted for*)
-  and says plainly that accounted-for is not verified, pointing at the
-  `covered=`/`reused=`/`failed=` tokens for how many actually were. Doc
-  only; the exit codes themselves are unchanged.
+  in the one place its sweep did not reach, the machine-facing contract. At
+  that point a manifest whose every declared item `failed` exited 0. The row
+  was corrected to state what the code then guaranteed (every declared
+  surface *accounted for*) and to point at the
+  `covered=`/`reused=`/`failed=` tokens. That round was doc-only; #426 above
+  now supersedes the zero-covered exit behavior.
 
 - **Lane: operator conveniences — reader-state (`archived`, a free-form
   triage tag) on flow runs, never set by a run (#389).** A new durable store

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -35,6 +37,10 @@ def run_main(*paths: Path) -> tuple[int, str, str]:
 def valid_manifest() -> dict:
     return {
         "version": 1,
+        "expected": {
+            "bullets": ["388:schema"],
+            "files": ["test/eval_manifest_check.py"],
+        },
         "bullets": [
             {"issue": 388, "bullet": "schema", "status": "covered"},
         ],
@@ -45,7 +51,24 @@ def valid_manifest() -> dict:
     }
 
 
+def run_manifest(manifest: dict) -> tuple[int, str, str]:
+    """Run `main` against one inline manifest wrapped as a findings file."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "findings.md"
+        path.write_text(
+            f"{checker.MARKER}\n```json\n{json.dumps(manifest)}\n```\n",
+            encoding="utf-8",
+        )
+        return run_main(path)
+
+
 class FixtureTests(unittest.TestCase):
+    def test_contract_header_documents_verification_tokens(self):
+        header = checker.__doc__ or ""
+        self.assertIn("zero declared items", header)
+        self.assertIn("verification=present", header)
+        self.assertIn("verification=none", header)
+
     def test_valid_fixture_reports_declared_surface_accounted_for_not_covered(self):
         """Round-2 HIGH-9. This test replaces one that asserted, byte for
         byte, that `valid.md` prints "3/3 bullets covered" — while one of
@@ -55,6 +78,8 @@ class FixtureTests(unittest.TestCase):
         entries actually say."""
         code, out, err = run_main(FIXTURES / "valid.md")
         self.assertEqual(code, checker.EXIT_OK, err)
+        self.assertIn("verification=present", out)
+        self.assertNotIn("verification=none", out)
         self.assertIn(
             "3/3 bullets accounted for (2 covered, 0 reused, 1 failed)", out
         )
@@ -63,19 +88,67 @@ class FixtureTests(unittest.TestCase):
         self.assertNotIn("bullets covered", out)
         self.assertNotIn("files covered", out)
 
-    def test_all_declared_failed_fixture_never_says_covered(self):
-        """Round-2 HIGH-9's headline reproduction: every declared surface
-        has an entry, and every one of those entries is `failed`."""
+    def test_all_declared_failed_fixture_is_zero_covered(self):
+        """Every declaration is accounted for, but none was covered."""
         code, out, err = run_main(FIXTURES / "all-declared-failed.md")
-        self.assertEqual(code, checker.EXIT_OK, err)
+        self.assertEqual(code, checker.EXIT_ZERO_COVERED, err)
+        self.assertIn("coverage=zero-covered", out)
+        self.assertIn("verification=none", out)
+        self.assertNotIn("verification=present", out)
         self.assertIn(
             "2/2 bullets accounted for (0 covered, 0 reused, 2 failed)", out
         )
         self.assertIn("1/1 files accounted for (0 covered, 0 reused, 1 failed)", out)
-        self.assertNotIn("covered;", out)
+        self.assertNotIn("bullets covered;", out)
+        self.assertNotIn("files covered;", out)
         # And the per-clause breakdown agrees with the whole-manifest tally
         # on the same line, which is what HIGH-9 said it could not.
         self.assertIn("covered=0 reused=0 failed=3", out)
+
+    def test_all_declared_reused_is_zero_covered(self):
+        manifest = valid_manifest()
+        manifest["bullets"][0]["status"] = "reused"
+        manifest["files"][0]["status"] = "reused"
+
+        code, out, err = run_manifest(manifest)
+
+        self.assertEqual(code, checker.EXIT_ZERO_COVERED, err)
+        self.assertIn("coverage=zero-covered", out)
+        self.assertIn("verification=none", out)
+        self.assertNotIn("verification=present", out)
+        self.assertIn("covered=0 reused=2 failed=0", out)
+
+    def test_one_declared_covered_plus_one_failed_is_success(self):
+        manifest = valid_manifest()
+        manifest["files"][0] = {
+            "path": "test/eval_manifest_check.py",
+            "status": "failed",
+            "failureClass": "input",
+        }
+
+        code, out, err = run_manifest(manifest)
+
+        self.assertEqual(code, checker.EXIT_OK, err)
+        self.assertIn("coverage=checked", out)
+        self.assertIn("verification=present", out)
+        self.assertNotIn("verification=none", out)
+        self.assertIn("covered=1 reused=0 failed=1", out)
+
+    def test_covered_entry_outside_expected_does_not_cover_a_declared_surface(self):
+        manifest = valid_manifest()
+        manifest["bullets"][0]["status"] = "reused"
+        manifest["files"][0]["status"] = "reused"
+        manifest["bullets"].append(
+            {"issue": 426, "bullet": "undeclared-extra", "status": "covered"}
+        )
+
+        code, out, err = run_manifest(manifest)
+
+        self.assertEqual(code, checker.EXIT_ZERO_COVERED, err)
+        self.assertIn("coverage=zero-covered", out)
+        self.assertIn("verification=none", out)
+        self.assertNotIn("verification=present", out)
+        self.assertIn("1/1 bullets accounted for (0 covered, 1 reused, 0 failed)", out)
 
     def test_duplicate_declared_keys_do_not_inflate_the_denominator(self):
         """Round-2 HIGH-9's secondary shape: one surface named three times
@@ -116,7 +189,7 @@ class FixtureTests(unittest.TestCase):
 
     def test_usage_with_no_arguments_is_exit_2(self):
         code, _out, err = run_main()
-        self.assertEqual(code, 2)
+        self.assertEqual(code, checker.EXIT_USAGE)
         self.assertIn("usage:", err)
 
     def test_no_expected_surface_fixture_prints_the_weak_claim_not_ok(self):
@@ -159,23 +232,32 @@ class FixtureTests(unittest.TestCase):
 
         self.assertIn("coverage=checked", strong_out)
         self.assertIn("coverage=unchecked", weak_out)
+        self.assertIn("verification=present", strong_out)
+        self.assertIn("verification=none", weak_out)
         self.assertNotIn("coverage=unchecked", strong_out)
         self.assertNotIn("coverage=checked", weak_out)
 
     def test_worst_outcome_across_files_wins_the_exit_code(self):
-        """A close-out passing several findings files must not have a
-        checked one mask an unchecked one, nor an unchecked one mask a
-        refusal."""
-        # checked + unchecked -> unchecked wins.
-        code, _out, _err = run_main(
-            FIXTURES / "valid.md", FIXTURES / "no-expected-surface.md"
-        )
-        self.assertEqual(code, checker.EXIT_COVERAGE_UNCHECKED)
-        # unchecked + refused -> refused wins.
-        code, _out, _err = run_main(
-            FIXTURES / "no-expected-surface.md", FIXTURES / "two-blocks.md"
-        )
-        self.assertEqual(code, checker.EXIT_INVALID)
+        """Precedence is invalid, unchecked, zero-covered, success."""
+        success = FIXTURES / "valid.md"
+        zero = FIXTURES / "all-declared-failed.md"
+        unchecked = FIXTURES / "no-expected-surface.md"
+        invalid = FIXTURES / "two-blocks.md"
+
+        for lower, higher, expected in (
+            (success, zero, checker.EXIT_ZERO_COVERED),
+            (zero, unchecked, checker.EXIT_COVERAGE_UNCHECKED),
+        ):
+            for paths in ((lower, higher), (higher, lower)):
+                with self.subTest(paths=paths, expected=expected):
+                    code, _out, _err = run_main(*paths)
+                    self.assertEqual(code, expected)
+
+        for other in (success, zero, unchecked):
+            for paths in ((other, invalid), (invalid, other)):
+                with self.subTest(paths=paths, expected=checker.EXIT_INVALID):
+                    code, _out, _err = run_main(*paths)
+                    self.assertEqual(code, checker.EXIT_INVALID)
 
     def test_partially_declared_surface_is_not_full_coverage(self):
         """Declaring bullets but no files means files coverage was not

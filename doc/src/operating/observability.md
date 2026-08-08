@@ -354,6 +354,39 @@ three statuses:
 logs; do not manufacture a replacement record. `tally witness verify` checks
 the ledger offline and should be part of restart and deployment verification.
 
+## Check an eval coverage manifest
+
+An adversarial eval can put a versioned coverage manifest in its Markdown
+findings file. Check that standalone artifact from the repository checkout:
+
+```console
+$ python3 test/eval_manifest_check.py <findings-file.md>...
+```
+
+Every schema-valid per-file summary retains the human accounting clauses and
+also carries stable machine tokens. `coverage` is `checked`, `unchecked`, or
+`zero-covered`. `verification=present` means at least one declared surface's
+matching `bullets[]` or `files[]` entry explicitly has `status: "covered"`;
+`verification=none` means none does. Being accounted for, reused, failed,
+successfully parsed, or covered only outside `expected` does not count. One
+explicitly covered declaration is enough for both `coverage=checked` and
+`verification=present`, even when another checked declaration failed.
+
+The process exit contract is:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every manifest is valid and checked, and each has at least one explicitly covered declared surface. |
+| 1 | At least one findings file or manifest is malformed, missing, ambiguous, or has an uncovered declaration. |
+| 2 | Usage error: no findings paths were given. |
+| 3 | Every manifest is valid, but at least one declares no expected bullets or no expected files, so coverage was not checked. |
+| 4 | Every manifest is valid and checked, but at least one has zero explicitly covered declared surfaces. |
+
+For multiple files the precedence is 1, then 3, then 4, then 0, regardless of
+argument order; usage exit 2 is immediate. No close-out is currently wired to
+this checker. The exit and tokens are the stable contract for a future consumer,
+without requiring it to parse the human diagnosis.
+
 ## Read lifecycle and provider traces
 
 Lifecycle events and provider output are separate:

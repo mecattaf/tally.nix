@@ -72,7 +72,7 @@ discover the surface a findings file was supposed to cover, and that design
 is intentional. But it means the checker CANNOT independently know an eval
 reviewed anything at all: a manifest with empty `bullets`, empty `files`,
 and no `expected` is schema-valid on exactly the same terms as one that
-accounted for everything. Both the success line and the EXIT CODE say so
+accounted for everything. Both the summary line and the EXIT CODE say so
 (see "Exit codes" below) -- "schema-valid" is a real but much weaker claim,
 and the two cases must be distinguishable without reading English, because
 the consumer this checker exists for is an orchestrator close-out reading a
@@ -97,37 +97,39 @@ make sure only the real manifest carries the literal marker line.
 
 Usage: eval_manifest_check.py <findings-file.md>...
 
-Exit codes (the contract for a mechanical consumer; the worst outcome across
-all files given wins):
+Exit codes (the contract for a mechanical consumer):
 
     0  every manifest is schema-valid, both categories declared a surface,
        and every declared surface is ACCOUNTED FOR -- each declared key has
-       an entry. Accounted for is not verified: those entries may be
-       `covered`, `reused` or `failed`, so exit 0 licenses "the eval wrote
-       down an outcome for every surface it named", NOT "the eval covered
-       what it said it would". How many were actually verified is on the
-       line, in the `covered=` / `reused=` / `failed=` tokens; a consumer
-       that needs "and they passed" must read those, because a manifest
-       whose every declared item `failed` exits 0 (see
-       `test/fixtures/eval-manifest/all-declared-failed.md`, and
-       `test_all_declared_failed_fixture_never_says_covered`, which is the
-       test that asserts this exit code on that fixture).
+       an entry -- and at least one declared surface has the explicit status
+       `covered`. Other declared entries may still be `reused` or `failed`;
+       exit 0 does not say every declared surface was verified.
     1  at least one file was refused: schema-invalid, unparsable, missing a
        manifest, carrying more than one, or declaring a surface with no
        matching entry.
-    2  usage error (no paths given).
+    2  immediate usage error (no paths given).
     3  every manifest is schema-valid, but at least one declared no surface
        in one or both categories, so its coverage was NOT checked. Schema
        validity is real; a coverage claim is not available. A close-out that
        treats 3 as success is asserting something this tool did not verify.
+    4  every manifest is schema-valid and checked, but at least one has zero
+       declared surfaces whose explicit status is `covered`. Accounting for
+       a surface, reusing it, failing it, or parsing its checker successfully
+       does not count as covered.
 
-Each success line also carries a stable `coverage=checked` / `coverage=unchecked`
-token for consumers that grep rather than branch on status. A findings file
-with no manifest section at all, or with more than one, is reported, not
-silently resolved -- "no manifest," "an invalid manifest," and "an ambiguous
-manifest" are three different failures, and all three are failures for a
-checker whose whole job is proving the eval made this claim at all,
-unambiguously.
+For multiple findings files, outcome precedence is invalid (1), unchecked
+(3), zero-covered (4), success (0), independent of argument order. Usage (2)
+returns before any file is processed. Each schema-valid summary line also
+carries a stable `coverage=checked` / `coverage=unchecked` /
+`coverage=zero-covered` token for consumers that grep rather than branch on
+status. The independent stable token `verification=present` means one or more
+declared items have the explicit status `covered`; `verification=none` means
+zero declared items have that status. Covered entries outside `expected` do
+not change this declared-surface verification signal. A findings file with no
+manifest section at all, or with more than one, is reported, not silently
+resolved -- "no manifest," "an invalid manifest," and "an ambiguous manifest"
+are three different failures, and all three are failures for a checker whose
+whole job is proving the eval made this claim at all, unambiguously.
 """
 
 from __future__ import annotations
@@ -152,14 +154,15 @@ RUN_FAILURE_CLASSES = {"timeout", "budget", "crash", "unknown"}
 # Exit codes. These are the contract for a mechanical consumer (an
 # orchestrator close-out that "names the checker" per #388's second
 # acceptance bullet); see this module's docstring. The distinction between
-# EXIT_OK and EXIT_COVERAGE_UNCHECKED exists because a close-out reads a
-# status, not English: without it, a manifest that declared no surface to be
-# held to is indistinguishable from one that declared and accounted for
-# everything, which was round-2 HIGH-10.
+# EXIT_OK, EXIT_COVERAGE_UNCHECKED, and EXIT_ZERO_COVERED exist because a
+# close-out reads a status, not English: an unchecked manifest, a manifest
+# that accounted for every declaration without covering one, and a manifest
+# that explicitly covered at least one declaration are three different facts.
 EXIT_OK = 0
 EXIT_INVALID = 1
 EXIT_USAGE = 2
 EXIT_COVERAGE_UNCHECKED = 3
+EXIT_ZERO_COVERED = 4
 
 
 class ManifestError(Exception):
@@ -299,6 +302,13 @@ class Report:
                 counts[status] += 1
         return counts
 
+    @property
+    def declared_covered(self) -> int:
+        """Declared surfaces whose entry explicitly says `covered`."""
+        return sum(
+            self.declared_statuses(kind)["covered"] for kind in ("bullets", "files")
+        )
+
 
 def check_manifest(manifest: Any) -> Report:
     report = Report()
@@ -413,12 +423,27 @@ def _coverage_clause(kind: str, report: Report) -> str:
     )
 
 
+def _coverage_state(report: Report) -> str:
+    """Stable summary token for one valid manifest's declared surface."""
+    if not report.declared["bullets"] or not report.declared["files"]:
+        return "unchecked"
+    if report.declared_covered == 0:
+        return "zero-covered"
+    return "checked"
+
+
+def _verification_state(report: Report) -> str:
+    """Whether any declared surface was explicitly covered."""
+    return "present" if report.declared_covered else "none"
+
+
 def main(paths: list[str]) -> int:
     if not paths:
         print("usage: eval_manifest_check.py <findings-file.md>...", file=sys.stderr)
         return EXIT_USAGE
     failures = 0
     unchecked = 0
+    zero_covered = 0
     for raw in paths:
         path = Path(raw)
         text = path.read_text(encoding="utf-8")
@@ -444,16 +469,20 @@ def main(paths: list[str]) -> int:
         if not report.ok:
             failures += 1
             continue
-        checked = bool(report.declared["bullets"]) and bool(report.declared["files"])
-        if not checked:
+        coverage = _coverage_state(report)
+        if coverage == "unchecked":
             unchecked += 1
-        # `coverage=` is the documented machine token: a consumer greps for
-        # `coverage=checked` rather than for the absence of an English
-        # phrase. The exit code carries the same fact for consumers that
-        # read only the status.
+        elif coverage == "zero-covered":
+            zero_covered += 1
+        verification = _verification_state(report)
+        # `coverage=` and `verification=` are documented machine tokens: a
+        # consumer greps for explicit states rather than for the absence of an
+        # English phrase. The exit code aggregates the coverage outcome across
+        # all input files.
         print(
             f"{path}: ok (schema-valid; "
-            f"coverage={'checked' if checked else 'unchecked'}; "
+            f"coverage={coverage}; "
+            f"verification={verification}; "
             f"{_coverage_clause('bullets', report)}; "
             f"{_coverage_clause('files', report)}; "
             f"covered={report.covered} reused={report.reused} failed={report.failed})"
@@ -462,6 +491,8 @@ def main(paths: list[str]) -> int:
         return EXIT_INVALID
     if unchecked:
         return EXIT_COVERAGE_UNCHECKED
+    if zero_covered:
+        return EXIT_ZERO_COVERED
     return EXIT_OK
 
 
