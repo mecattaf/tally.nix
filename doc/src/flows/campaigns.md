@@ -157,6 +157,18 @@ silently redirect an armed campaign. An explicit steward containing only
 `finalMessagePattern: "^TALLY_FINAL_MESSAGE=(.*)$"`, and `runtimeMaxSec: 120`;
 omitting the whole steward still means no steward.
 
+That Rust admission path is also the only manifest grammar. Every manifest
+object is closed, including both gate variants; forbid-path patterns may not
+end in `/`; and the agent model, steward argv, environment, and scalar bounds
+are enforced before `project` writes forge state or `arm` writes a registration
+or enqueues a pass. `finalMessagePattern` may be omitted to select the default,
+but it may not be `null`. An explicit pattern is limited to portable literals,
+anchors, character classes, escapes, quantifiers, capture/non-capture groups,
+and exactly one capture group. Backreferences, look-around, named or
+conditional groups, and inline engine flags are rejected. This keeps the
+admitted expression identical in Rust and Python rather than depending on an
+engine-specific extension.
+
 Rust hashes compact, recursively key-sorted UTF-8 JSON of the canonical
 `{manifest,tasks}` object, then carries that same manifest, immutable task
 content, and digest in a `CanonicalCampaignGraphV1` envelope on every flow

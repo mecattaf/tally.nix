@@ -82,8 +82,9 @@ def issue() -> dict[str, str]:
 def canonical_graph(
     manifest: dict[str, object], issues: list[dict[str, object]]
 ) -> dict[str, object]:
-    """Build the Rust-shaped canonical envelope for driver-only fixtures."""
-    _, references, normalized = DRIVER.forge_manifest(manifest)
+    """Build an envelope from an explicitly Rust-shaped canonical fixture."""
+    normalized = DRIVER.canonical_manifest(manifest)
+    references = normalized["tasks"]
     tasks = [
         {
             "number": reference["issue"],
@@ -1308,6 +1309,9 @@ class GitHubForgeTests(unittest.TestCase):
                 "driverRuntimeMaxSec": 900,
                 "runtimeMaxSec": 3600,
                 "pool": "campaign",
+                "mergeMethod": "squash",
+                "gitAiBinding": "off",
+                "gitAiAwaitSec": 60,
                 "agent": {
                     "adapter": "codex",
                     "argv": ["read the admitted brief"],
@@ -1315,7 +1319,10 @@ class GitHubForgeTests(unittest.TestCase):
                     "runtimeMaxSec": 900,
                     "approvalPolicy": "never",
                     "sandboxPolicy": "danger-full-access",
+                    "diagnosisSandboxPolicy": "read-only",
+                    "model": None,
                 },
+                "steward": None,
                 "gates": [
                     {
                         "kind": "command",
@@ -1332,6 +1339,8 @@ class GitHubForgeTests(unittest.TestCase):
                         "issue": 8,
                         "dependencies": [],
                         "conflictDomains": ["src/one"],
+                        "argv": None,
+                        "runtimeMaxSec": None,
                     },
                     {
                         "id": "task-2",
@@ -1339,6 +1348,8 @@ class GitHubForgeTests(unittest.TestCase):
                         "issue": 9,
                         "dependencies": ["task-1"],
                         "conflictDomains": ["src/two"],
+                        "argv": None,
+                        "runtimeMaxSec": None,
                     },
                 ],
             }
@@ -1634,14 +1645,36 @@ class GitHubForgeTests(unittest.TestCase):
                 "schemaVersion": 1,
                 "name": "fixture",
                 "repository": repository_config(checkout, "github"),
+                "maxTasks": 64,
                 "maxParallel": 1,
-                "agent": {},
+                "driverRuntimeMaxSec": 900,
+                "runtimeMaxSec": 86_400,
+                "pool": "campaign",
+                "mergeMethod": "squash",
+                "gitAiBinding": "off",
+                "gitAiAwaitSec": 60,
+                "agent": {
+                    "adapter": "codex",
+                    "argv": [
+                        "Read the file whose path is in the TALLY_BRIEF environment variable "
+                        "and execute the mission it contains. That brief is your complete "
+                        "instruction set."
+                    ],
+                    "priority": "low",
+                    "runtimeMaxSec": 14_400,
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": "danger-full-access",
+                    "diagnosisSandboxPolicy": "read-only",
+                    "model": None,
+                },
+                "steward": None,
                 "gates": [
                     {
                         "kind": "command",
                         "id": "tests",
                         "preflightArgv": ["true"],
                         "argv": ["true"],
+                        "runtimeMaxSec": 900,
                     }
                 ],
                 "tasks": [
@@ -1651,12 +1684,15 @@ class GitHubForgeTests(unittest.TestCase):
                         "issue": 8,
                         "dependencies": [],
                         "conflictDomains": [],
+                        "argv": None,
+                        "runtimeMaxSec": None,
                     },
                     {
                         "id": "verify",
                         "kind": "checkpoint",
                         "issue": 9,
                         "dependencies": ["build"],
+                        "conflictDomains": [],
                         "argv": ["true"],
                         "runtimeMaxSec": 30,
                     },
@@ -1922,6 +1958,8 @@ class NativeSubIssueTests(unittest.TestCase):
             "issue": 8,
             "dependencies": [],
             "conflictDomains": ["src/one"],
+            "argv": None,
+            "runtimeMaxSec": None,
         },
         {
             "id": "task-2",
@@ -1929,6 +1967,8 @@ class NativeSubIssueTests(unittest.TestCase):
             "issue": 9,
             "dependencies": [],
             "conflictDomains": ["src/two"],
+            "argv": None,
+            "runtimeMaxSec": None,
         },
     ]
 
@@ -1942,6 +1982,9 @@ class NativeSubIssueTests(unittest.TestCase):
             "driverRuntimeMaxSec": 900,
             "runtimeMaxSec": 3600,
             "pool": "campaign",
+            "mergeMethod": "squash",
+            "gitAiBinding": "off",
+            "gitAiAwaitSec": 60,
             "agent": {
                 "adapter": "codex",
                 "argv": ["read the admitted brief"],
@@ -1949,7 +1992,10 @@ class NativeSubIssueTests(unittest.TestCase):
                 "runtimeMaxSec": 900,
                 "approvalPolicy": "never",
                 "sandboxPolicy": "danger-full-access",
+                "diagnosisSandboxPolicy": "read-only",
+                "model": None,
             },
+            "steward": None,
             "gates": [
                 {
                     "kind": "command",
@@ -3695,9 +3741,16 @@ class StewardNarrationTests(unittest.TestCase):
         return [sys.executable, str(path)]
 
     def role(self, argv: list[str], **overrides: object) -> dict[str, object]:
-        """Normalize the way the publish node does, not by hand."""
+        """Decode the complete role shape emitted by Rust/the Nix module."""
         return DRIVER.steward_role(
-            {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30, **overrides}
+            {
+                "adapter": "narrator",
+                "argv": argv,
+                "env": {},
+                "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
+                "runtimeMaxSec": 30,
+                **overrides,
+            }
         )
 
     def test_no_steward_uses_the_brief_derived_template(self) -> None:
@@ -3816,7 +3869,7 @@ class StewardNarrationTests(unittest.TestCase):
             "bad-env-name": ({"env": {"not a name": "x"}}, "environment identifiers"),
             "bad-pattern": (
                 {"finalMessagePattern": "^unclosed(.*$"},
-                "not a valid regular expression",
+                "internal campaign contract violation",
             ),
             "no-capture-group": (
                 {"finalMessagePattern": "^narrator-result: .*$"},
@@ -3830,9 +3883,7 @@ class StewardNarrationTests(unittest.TestCase):
         for name, (override, expected) in cases.items():
             with self.subTest(name):
                 with self.assertRaisesRegex(DRIVER.DriverError, expected):
-                    DRIVER.steward_role(
-                        {"adapter": "narrator", "argv": ["/bin/true"], **override}
-                    )
+                    self.role(["/bin/true"], **override)
 
     def test_a_refused_proposal_is_re_requested_with_the_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

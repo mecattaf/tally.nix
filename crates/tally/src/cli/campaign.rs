@@ -3742,10 +3742,7 @@ mod tests {
             steward.env.get("NARRATOR_ENDPOINT").map(String::as_str),
             Some("https://narrator.invalid/v1")
         );
-        assert_eq!(
-            steward.final_message_pattern.as_deref(),
-            Some("^NARRATOR_RESULT=(.*)$")
-        );
+        assert_eq!(steward.final_message_pattern, "^NARRATOR_RESULT=(.*)$");
 
         // TALLY_BRIEF is the publish node's own; a steward may not redefine it.
         let mut value = manifest_value_for_test(json!([
@@ -3776,7 +3773,10 @@ mod tests {
             .insert("steward".into(), json!({"adapter": "narrator", "argv": []}));
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
         let error = validate_manifest(&manifest).unwrap_err().to_string();
-        assert!(error.contains("steward argv must be non-empty"), "{error}");
+        assert!(
+            error.contains("steward argv must be a non-empty direct argv"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3859,7 +3859,7 @@ mod tests {
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
         let error = validate_manifest(&manifest).unwrap_err().to_string();
         assert!(
-            error.contains("agent limits and policy names must be non-empty"),
+            error.contains("agent limits, policy names, and model must be non-empty and bounded"),
             "{error}"
         );
     }
@@ -3989,10 +3989,7 @@ mod tests {
             assert_eq!(manifest.repository.checkout, canonical_checkout);
             let steward = manifest.steward.as_ref().unwrap();
             assert!(steward.env.is_empty());
-            assert_eq!(
-                steward.final_message_pattern.as_deref(),
-                Some("^TALLY_FINAL_MESSAGE=(.*)$")
-            );
+            assert_eq!(steward.final_message_pattern, "^TALLY_FINAL_MESSAGE=(.*)$");
             assert_eq!(steward.runtime_max_sec, Some(120));
             let graph = CanonicalCampaignGraphV1::new(manifest, tasks.clone()).unwrap();
             let rust_bytes = graph.canonical_json().unwrap();
@@ -4097,6 +4094,363 @@ print(json.dumps({
             );
             assert_eq!(observed["recoveredTaskBody"], "Brief for task-a.");
         }
+
+        // #446: one mutation corpus owns the manifest acceptance language.
+        // Python is invoked only after Rust has admitted and canonicalized a
+        // case; rejected inputs therefore cannot reach a driver dispatch.
+        let base = json!({
+            "schemaVersion": 1,
+            "name": "grammar-parity",
+            "repository": {"checkout": canonical_checkout, "forge": "local"},
+            "agent": {"model": "m".repeat(128)},
+            "steward": {
+                "adapter": "narrator",
+                "argv": ["narrate"],
+                "finalMessagePattern": "^(?:result: )(.*)$"
+            },
+            "gates": [
+                {
+                    "kind": "command",
+                    "id": "gate-command",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"]
+                },
+                {
+                    "kind": "forbidPaths",
+                    "id": "gate-forbid",
+                    "forbidPaths": ["*.db"]
+                }
+            ],
+            "tasks": [
+                {"id": "task-a", "kind": "implementation", "issue": 101},
+                {
+                    "id": "verify",
+                    "kind": "checkpoint",
+                    "issue": 102,
+                    "dependencies": ["task-a"],
+                    "argv": ["true"],
+                    "runtimeMaxSec": 30
+                }
+            ]
+        });
+        let replace = |pointer: &str, value: Value| {
+            let mut document = base.clone();
+            *document
+                .pointer_mut(pointer)
+                .expect("mutation path must exist") = value;
+            document
+        };
+        let insert = |pointer: &str, key: &str, value: Value| {
+            let mut document = base.clone();
+            document
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("mutation object must exist")
+                .insert(key.to_owned(), value);
+            document
+        };
+        let remove = |pointer: &str, key: &str| {
+            let mut document = base.clone();
+            document
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("mutation object must exist")
+                .remove(key)
+                .expect("mutation member must exist");
+            document
+        };
+        let cases = vec![
+            ("valid", true, base.clone()),
+            ("unknown-manifest", false, insert("", "typo", json!(true))),
+            (
+                "unknown-repository",
+                false,
+                insert("/repository", "typo", json!(true)),
+            ),
+            (
+                "unknown-agent",
+                false,
+                insert("/agent", "typo", json!(true)),
+            ),
+            (
+                "unknown-steward",
+                false,
+                insert("/steward", "typo", json!(true)),
+            ),
+            (
+                "unknown-command-gate",
+                false,
+                insert("/gates/0", "typo", json!(true)),
+            ),
+            (
+                "unknown-forbid-gate",
+                false,
+                insert("/gates/1", "typo", json!(true)),
+            ),
+            (
+                "unknown-implementation-task",
+                false,
+                insert("/tasks/0", "typo", json!(true)),
+            ),
+            (
+                "unknown-checkpoint-task",
+                false,
+                insert("/tasks/1", "typo", json!(true)),
+            ),
+            (
+                "forbid-trailing-slash",
+                false,
+                replace("/gates/1/forbidPaths/0", json!("tmp/")),
+            ),
+            (
+                "model-127",
+                true,
+                replace("/agent/model", json!("m".repeat(127))),
+            ),
+            (
+                "model-128",
+                true,
+                replace("/agent/model", json!("m".repeat(128))),
+            ),
+            (
+                "model-129",
+                false,
+                replace("/agent/model", json!("m".repeat(129))),
+            ),
+            (
+                "regex-unicode-literal-and-noncapture",
+                true,
+                replace(
+                    "/steward/finalMessagePattern",
+                    json!("^(?:résultat: )(.*)$"),
+                ),
+            ),
+            (
+                "regex-invalid-syntax",
+                false,
+                replace("/steward/finalMessagePattern", json!("(")),
+            ),
+            (
+                "regex-zero-captures",
+                false,
+                replace("/steward/finalMessagePattern", json!("^result: .*$")),
+            ),
+            (
+                "regex-two-captures",
+                false,
+                replace("/steward/finalMessagePattern", json!("^(a)(b)$")),
+            ),
+            (
+                "regex-backreference",
+                false,
+                replace("/steward/finalMessagePattern", json!(r"^(a)\1$")),
+            ),
+            (
+                "regex-lookaround",
+                false,
+                replace("/steward/finalMessagePattern", json!("^(?=(.*))$")),
+            ),
+            (
+                "regex-named-group",
+                false,
+                replace("/steward/finalMessagePattern", json!("^(?P<answer>.*)$")),
+            ),
+            (
+                "regex-inline-flags",
+                false,
+                replace("/steward/finalMessagePattern", json!("(?i)^(.*)$")),
+            ),
+            (
+                "pattern-absent-defaults",
+                true,
+                remove("/steward", "finalMessagePattern"),
+            ),
+            (
+                "pattern-explicit-null",
+                false,
+                replace("/steward/finalMessagePattern", Value::Null),
+            ),
+            (
+                "steward-env-entry-bound",
+                false,
+                insert(
+                    "/steward",
+                    "env",
+                    Value::Object(
+                        (0..=64)
+                            .map(|index| (format!("KEY_{index}"), json!("value")))
+                            .collect(),
+                    ),
+                ),
+            ),
+            (
+                "steward-env-value-bound",
+                false,
+                insert("/steward", "env", json!({"KEY": "v".repeat(4097)})),
+            ),
+            (
+                "steward-argv-control",
+                false,
+                replace("/steward/argv", json!(["narrate\nnow"])),
+            ),
+        ];
+        let canonical_tasks = vec![
+            CanonicalCampaignTaskV1 {
+                number: 101,
+                title: "Implement the thing".to_owned(),
+                body: "Brief for task-a.".to_owned(),
+            },
+            CanonicalCampaignTaskV1 {
+                number: 102,
+                title: "Verify the thing".to_owned(),
+                body: "Run the admitted verification.".to_owned(),
+            },
+        ];
+        let decoder = r#"
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    decoded = module.canonical_campaign_graph(json.load(handle))
+print(module.canonical_json(decoded))
+"#;
+        let mut python_dispatches = 0;
+        let accepted_count = cases.iter().filter(|(_, accepted, _)| *accepted).count();
+        for (index, (name, accepted, raw_manifest)) in cases.into_iter().enumerate() {
+            let body = format!(
+                "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
+                serde_json::to_string(&raw_manifest).unwrap()
+            );
+            let admitted = parse_manifest(&body);
+            if !accepted {
+                assert!(
+                    admitted.is_err(),
+                    "{name} must be rejected by Rust before Python dispatch"
+                );
+                continue;
+            }
+            let manifest = admitted.unwrap_or_else(|error| panic!("{name} was rejected: {error}"));
+            let graph = CanonicalCampaignGraphV1::new(manifest, canonical_tasks.clone()).unwrap();
+            let rust_bytes = graph.canonical_json().unwrap();
+            let input_path = temporary
+                .path()
+                .join(format!("grammar-parity-{index}.json"));
+            fs::write(&input_path, &rust_bytes).unwrap();
+            python_dispatches += 1;
+            let output = std::process::Command::new("python3")
+                .args(["-c", decoder])
+                .arg(&driver)
+                .arg(&input_path)
+                .output()
+                .expect("python3 must run the canonical decoder");
+            assert!(
+                output.status.success(),
+                "Python canonical decoder rejected {name}:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim_end(),
+                rust_bytes,
+                "canonical bytes differ for {name}"
+            );
+        }
+        assert_eq!(python_dispatches, accepted_count);
+    }
+
+    #[tokio::test]
+    async fn invalid_manifest_leaves_arm_without_registration_or_enqueue() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let calls = temporary.path().join("gh-calls");
+        let master = temporary.path().join("master.json");
+        let invalid_manifest = json!({
+            "schemaVersion": 1,
+            "name": "invalid-arm",
+            "repository": {"checkout": "/does/not/matter", "forge": "local"},
+            "agent": {},
+            "gates": [{
+                "kind": "command",
+                "id": "test",
+                "preflightArgv": ["true"],
+                "argv": ["true"],
+                "typo": true
+            }],
+            "tasks": [{"id": "task-a", "kind": "implementation", "issue": 101}]
+        });
+        let body = format!(
+            "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
+            serde_json::to_string(&invalid_manifest).unwrap()
+        );
+        fs::write(
+            &master,
+            serde_json::to_vec(&json!({
+                "number": 42,
+                "title": "Invalid campaign",
+                "body": body,
+                "state": "open",
+                "html_url": "https://github.com/acme/widgets/issues/42",
+                "updated_at": "2026-08-08T00:00:00Z",
+                "user": {"login": "operator"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gh = fake_gh(
+            temporary.path(),
+            "gh-invalid-arm",
+            &format!(
+                r#"printf '%s\n' "$*" >> '{}'
+case "$*" in
+  "api user") printf '%s\n' '{{"login":"operator"}}' ;;
+  "api repos/acme/widgets/issues/42") cat '{}' ;;
+  *) echo "unexpected gh call: $*" >&2; exit 97 ;;
+esac"#,
+                calls.display(),
+                master.display(),
+            ),
+        );
+        let gh_program = GhProgramGuard::acquire();
+        gh_program.use_program(&gh);
+
+        let error = run_campaign_arm(
+            &temporary.path().join("missing-tally.sock"),
+            None,
+            Duration::from_secs(1),
+            CampaignArmArgs {
+                issue: "https://github.com/acme/widgets/issues/42".to_owned(),
+                no_enqueue: false,
+                wait: false,
+                allowed_actors: Vec::new(),
+                allow_test_local_forge: true,
+                flow: Some(temporary.path().join("missing-flow.js")),
+                driver: Some(temporary.path().join("missing-driver")),
+                state_dir: Some(state_dir.clone()),
+                workspace_root: None,
+                projection_wait_ms: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `typo`"),
+            "{error}"
+        );
+        let registration_count = CampaignRegistry::open(&state_dir)
+            .unwrap()
+            .registrations()
+            .unwrap()
+            .len();
+        assert_eq!(registration_count, 0);
+        assert_eq!(
+            fs::read_to_string(calls).unwrap().lines().collect::<Vec<_>>(),
+            ["api user", "api repos/acme/widgets/issues/42"],
+            "invalid admission must stop before sub-issue reads, registration, asset resolution, or queue RPC"
+        );
     }
 
     /// #433: the reconcile digest-mismatch receipt must stop starving the

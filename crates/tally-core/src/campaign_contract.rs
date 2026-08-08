@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -25,6 +26,10 @@ pub const DEFAULT_AGENT_SANDBOX_POLICY: &str = "danger-full-access";
 pub const DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY: &str = "read-only";
 pub const DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN: &str = "^TALLY_FINAL_MESSAGE=(.*)$";
 pub const DEFAULT_STEWARD_RUNTIME_MAX_SEC: u64 = 120;
+pub const MAX_AGENT_MODEL_CHARS: usize = 128;
+pub const MAX_STEWARD_ENV_ENTRIES: usize = 64;
+pub const MAX_STEWARD_ENV_VALUE_CHARS: usize = 4096;
+pub const MAX_STEWARD_PATTERN_CHARS: usize = 1024;
 pub const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
 
 #[derive(Debug, Error)]
@@ -71,7 +76,7 @@ pub struct CampaignAgent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum CampaignGate {
     #[serde(rename = "command", rename_all = "camelCase")]
     Command {
@@ -126,7 +131,7 @@ pub struct CampaignSteward {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default = "default_steward_final_message_pattern")]
-    pub final_message_pattern: Option<String>,
+    pub final_message_pattern: String,
     #[serde(default = "default_steward_runtime_max_sec")]
     pub runtime_max_sec: Option<u64>,
 }
@@ -263,8 +268,7 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
     if !manifest.repository.checkout.is_absolute() {
         return Err(invalid("campaign repository.checkout must be absolute"));
     }
-    if manifest.repository.base_branch.is_empty() || manifest.repository.base_branch.contains('\0')
-    {
+    if !non_empty_without_controls(&manifest.repository.base_branch) {
         return Err(invalid("campaign repository.baseBranch must be non-empty"));
     }
     if !safe_component(&manifest.repository.remote) {
@@ -318,15 +322,16 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
         if !safe_component(&steward.adapter) {
             return Err(invalid("campaign steward adapter is not a safe component"));
         }
-        if steward.argv.is_empty() || steward.argv.iter().any(|item| item.is_empty()) {
-            return Err(invalid(
-                "campaign steward argv must be non-empty and contain no empty values",
-            ));
-        }
+        validate_argv(&steward.argv, "campaign steward argv")?;
         if steward.runtime_max_sec == Some(0) {
             return Err(invalid("campaign steward runtimeMaxSec must be positive"));
         }
-        for name in steward.env.keys() {
+        if steward.env.len() > MAX_STEWARD_ENV_ENTRIES {
+            return Err(invalid(format!(
+                "campaign steward env must contain at most {MAX_STEWARD_ENV_ENTRIES} entries"
+            )));
+        }
+        for (name, value) in &steward.env {
             if name.is_empty()
                 || name == "TALLY_BRIEF"
                 || !name.chars().enumerate().all(|(index, character)| {
@@ -339,16 +344,13 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
                     "campaign steward env name {name:?} is not an assignable environment identifier"
                 )));
             }
+            if !non_empty_bounded_without_controls(value, MAX_STEWARD_ENV_VALUE_CHARS) {
+                return Err(invalid(format!(
+                    "campaign steward env value for {name:?} must be non-empty, contain no control characters, and contain at most {MAX_STEWARD_ENV_VALUE_CHARS} characters"
+                )));
+            }
         }
-        if steward
-            .final_message_pattern
-            .as_ref()
-            .is_some_and(|pattern| pattern.is_empty())
-        {
-            return Err(invalid(
-                "campaign steward finalMessagePattern must be non-empty when set",
-            ));
-        }
+        validate_steward_pattern(&steward.final_message_pattern)?;
     }
     validate_gates(&manifest.gates)?;
     if manifest.tasks.is_empty() || manifest.tasks.len() > manifest.max_tasks {
@@ -437,7 +439,7 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
 }
 
 pub fn validate_agent(agent: &CampaignAgent) -> Result<(), CampaignContractError> {
-    if agent.adapter.is_empty() || agent.adapter.contains('\0') {
+    if !non_empty_without_controls(&agent.adapter) {
         return Err(invalid("campaign agent.adapter must be non-empty"));
     }
     validate_argv(&agent.argv, "campaign agent.argv")?;
@@ -448,13 +450,25 @@ pub fn validate_agent(agent: &CampaignAgent) -> Result<(), CampaignContractError
         return Err(invalid("campaign agent.priority is invalid"));
     }
     if agent.runtime_max_sec == Some(0)
-        || agent.approval_policy.as_deref() == Some("")
-        || agent.sandbox_policy.as_deref() == Some("")
-        || agent.diagnosis_sandbox_policy.as_deref() == Some("")
-        || agent.model.as_deref() == Some("")
+        || agent
+            .approval_policy
+            .as_deref()
+            .is_some_and(|value| !non_empty_without_controls(value))
+        || agent
+            .sandbox_policy
+            .as_deref()
+            .is_some_and(|value| !non_empty_without_controls(value))
+        || agent
+            .diagnosis_sandbox_policy
+            .as_deref()
+            .is_some_and(|value| !non_empty_without_controls(value))
+        || agent
+            .model
+            .as_deref()
+            .is_some_and(|value| !non_empty_bounded_without_controls(value, MAX_AGENT_MODEL_CHARS))
     {
         return Err(invalid(
-            "campaign agent limits and policy names must be non-empty",
+            "campaign agent limits, policy names, and model must be non-empty and bounded",
         ));
     }
     Ok(())
@@ -496,8 +510,9 @@ pub fn validate_gates(gates: &[CampaignGate]) -> Result<(), CampaignContractErro
                 for pattern in forbid_paths {
                     let components = pattern.split('/').collect::<Vec<_>>();
                     if pattern.is_empty()
-                        || pattern.len() > 1024
+                        || pattern.chars().count() > 1024
                         || pattern.starts_with('/')
+                        || pattern.ends_with('/')
                         || pattern.contains('\0')
                         || components.contains(&"..")
                         || components
@@ -522,6 +537,118 @@ pub fn validate_argv(argv: &[String], context: &str) -> Result<(), CampaignContr
     {
         return Err(invalid(format!(
             "{context} must be a non-empty direct argv of non-empty strings without control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the deliberately small regular-expression language shared with
+/// Python's `re` runtime. Rust owns admission; Python only compiles the
+/// admitted value defensively before execution.
+pub fn validate_steward_pattern(pattern: &str) -> Result<(), CampaignContractError> {
+    if !non_empty_bounded_without_controls(pattern, MAX_STEWARD_PATTERN_CHARS) {
+        return Err(invalid(format!(
+            "campaign steward finalMessagePattern must be non-empty, contain no control characters, and contain at most {MAX_STEWARD_PATTERN_CHARS} characters"
+        )));
+    }
+
+    let characters = pattern.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut in_class = false;
+    while index < characters.len() {
+        let character = characters[index];
+        if character == '\\' {
+            index += 1;
+            let Some(escaped) = characters.get(index).copied() else {
+                return Err(invalid(
+                    "campaign steward finalMessagePattern ends with an incomplete escape",
+                ));
+            };
+            if escaped.is_ascii_digit() || matches!(escaped, 'k' | 'g') {
+                return Err(invalid(
+                    "campaign steward finalMessagePattern must not contain backreferences",
+                ));
+            }
+            if escaped == 'x' {
+                let hex = characters.get(index + 1..index + 3).unwrap_or_default();
+                if hex.len() != 2 || !hex.iter().all(|candidate| candidate.is_ascii_hexdigit()) {
+                    return Err(invalid(
+                        "campaign steward finalMessagePattern contains an invalid hexadecimal escape",
+                    ));
+                }
+                index += 2;
+            } else if !matches!(
+                escaped,
+                '\\' | '.'
+                    | '^'
+                    | '$'
+                    | '|'
+                    | '?'
+                    | '*'
+                    | '+'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '-'
+                    | '/'
+                    | 'd'
+                    | 'D'
+                    | 's'
+                    | 'S'
+                    | 'w'
+                    | 'W'
+                    | 'n'
+                    | 'r'
+                    | 't'
+                    | 'f'
+            ) {
+                return Err(invalid(format!(
+                    "campaign steward finalMessagePattern contains non-portable escape \\{escaped}"
+                )));
+            }
+        } else if character == '[' {
+            if in_class {
+                return Err(invalid(
+                    "campaign steward finalMessagePattern contains a non-portable nested character class",
+                ));
+            }
+            in_class = true;
+        } else if character == ']' {
+            in_class = false;
+        } else if in_class
+            && index + 1 < characters.len()
+            && matches!(
+                (character, characters[index + 1]),
+                ('&', '&') | ('-', '-') | ('~', '~') | ('|', '|')
+            )
+        {
+            return Err(invalid(
+                "campaign steward finalMessagePattern contains a non-portable character-class operation",
+            ));
+        } else if !in_class
+            && character == '('
+            && characters.get(index + 1) == Some(&'?')
+            && characters.get(index + 2) != Some(&':')
+        {
+            return Err(invalid(
+                "campaign steward finalMessagePattern must not contain look-around, named or conditional groups, or inline flags",
+            ));
+        }
+        index += 1;
+    }
+
+    let compiled = Regex::new(pattern).map_err(|error| {
+        invalid(format!(
+            "campaign steward finalMessagePattern is not valid in the portable regex subset: {error}"
+        ))
+    })?;
+    let captures = compiled.captures_len().saturating_sub(1);
+    if captures != 1 {
+        return Err(invalid(format!(
+            "campaign steward finalMessagePattern must contain exactly one capture group, found {captures}"
         )));
     }
     Ok(())
@@ -628,6 +755,14 @@ fn safe_component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
+fn non_empty_without_controls(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_control)
+}
+
+fn non_empty_bounded_without_controls(value: &str, maximum: usize) -> bool {
+    non_empty_without_controls(value) && value.chars().count() <= maximum
+}
+
 fn safe_task_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 80
@@ -684,8 +819,8 @@ fn default_agent_diagnosis_sandbox_policy() -> Option<String> {
     Some(DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY.to_owned())
 }
 
-fn default_steward_final_message_pattern() -> Option<String> {
-    Some(DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN.to_owned())
+fn default_steward_final_message_pattern() -> String {
+    DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN.to_owned()
 }
 
 const fn default_steward_runtime_max_sec() -> Option<u64> {
@@ -758,12 +893,38 @@ mod tests {
         .unwrap();
         assert_eq!(steward.env, BTreeMap::new());
         assert_eq!(
-            steward.final_message_pattern.as_deref(),
-            Some(DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN)
+            steward.final_message_pattern,
+            DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN
         );
         assert_eq!(
             steward.runtime_max_sec,
             Some(DEFAULT_STEWARD_RUNTIME_MAX_SEC)
         );
+    }
+
+    #[test]
+    fn steward_pattern_subset_is_portable_and_single_capture() {
+        for accepted in [
+            DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN,
+            r"^(?:résultat: )[A-Z\d_-]*(.*)$",
+            r"^value=(\x41.*)$",
+        ] {
+            validate_steward_pattern(accepted).unwrap();
+        }
+        for rejected in [
+            "(",
+            "^no capture$",
+            "^(one)(two)$",
+            r"^(a)\1$",
+            r"^(?=(.*))$",
+            r"^(?P<answer>.*)$",
+            r"(?i)^(.*)$",
+            r"^([a&&b]*)$",
+        ] {
+            assert!(
+                validate_steward_pattern(rejected).is_err(),
+                "pattern should be rejected: {rejected}"
+            );
+        }
     }
 }

@@ -247,7 +247,9 @@ fn args() -> Value {
             "priority": "low",
             "runtimeMaxSec": 14_400,
             "approvalPolicy": "never",
-            "sandboxPolicy": "danger-full-access"
+            "sandboxPolicy": "danger-full-access",
+            "diagnosisSandboxPolicy": null,
+            "model": null
         },
         "gates": [
             {"kind": "forbidPaths", "id": "no-db", "forbidPaths": ["*.db"], "runtimeMaxSec": 900}
@@ -382,6 +384,21 @@ fn run(client: Rc<TestClient>) -> Result<tally_flow::RunReport, Box<tally_flow::
     .map_err(Box::new)
 }
 
+// Boa's unoptimized schema walk now includes the complete canonical campaign
+// grammar and needs more than libtest's 2 MiB worker stack. Production and the
+// flake's release tests already have ample headroom; keep debug runs useful too.
+fn on_flow_test_stack(test: fn()) {
+    let outcome = std::thread::Builder::new()
+        .name("spec-build-failed-agent-gate".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(test)
+        .expect("spawn the flow test with a bounded stack")
+        .join();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// #424 ruling 2. The agent node fails; the pass must still dispatch the
 /// tree-delta gate before it ends, and must dispatch it with
 /// `ownershipRan: false` — ownership never ran, so the driver has no certified
@@ -390,8 +407,7 @@ fn run(client: Rc<TestClient>) -> Result<tally_flow::RunReport, Box<tally_flow::
 /// Deleting the `strayDelta` block from `spec-build.js` (the eval's M8:
 /// restoring the pre-#424 return at stage "agent") makes this red on the
 /// `tree-delta-build` submission that is then never made.
-#[test]
-fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate() {
+fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate_case() {
     let task = implementation_task(Some(json!(["README.md"])));
     // The gate finds the stray write the failing agent left.
     let client = TestClient::new(replies(
@@ -448,8 +464,7 @@ fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate() {
 /// The other outcome of the same call: the gate passes, so the pass reports the
 /// agent failure it always reported. The new node must not swallow the failure
 /// that caused it to run.
-#[test]
-fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure() {
+fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure_case() {
     let task = implementation_task(Some(json!(["README.md"])));
     let client = TestClient::new(replies(
         task,
@@ -525,11 +540,25 @@ fn assert_keyless_task_is_refused(arm: &str, task: Value) {
 /// If a future change relaxes either arm, this test goes red and the doc and
 /// CHANGELOG sentences that depend on it have to be revisited rather than
 /// quietly becoming false.
-#[test]
-fn the_flow_cannot_send_an_implementation_task_without_conflict_domains() {
+fn the_flow_cannot_send_an_implementation_task_without_conflict_domains_case() {
     assert_keyless_task_is_refused(
         "file-based implementationTaskSchema",
         implementation_task(None),
     );
     assert_keyless_task_is_refused("forge-native issueTaskSchema", issue_task(None));
+}
+
+#[test]
+fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate() {
+    on_flow_test_stack(a_failed_agent_pass_still_dispatches_the_tree_delta_gate_case);
+}
+
+#[test]
+fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure() {
+    on_flow_test_stack(a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure_case);
+}
+
+#[test]
+fn the_flow_cannot_send_an_implementation_task_without_conflict_domains() {
+    on_flow_test_stack(the_flow_cannot_send_an_implementation_task_without_conflict_domains_case);
 }

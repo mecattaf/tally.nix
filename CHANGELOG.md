@@ -6,6 +6,20 @@ authorized.
 
 ## [Unreleased]
 
+### Single campaign manifest grammar (#446)
+
+- Campaign admission now closes both gate variants, rejects trailing-slash
+  forbid patterns, bounds agent models and steward environment values, and
+  validates steward argv and scalar fields in the shared Rust contract.
+- `finalMessagePattern: null` is rejected while omission still receives the
+  canonical default. Accepted patterns use a bounded Rust/Python-portable
+  subset, forbid engine-specific groups, flags, look-around, and
+  backreferences, and contain exactly one capture group.
+- The packaged Python driver no longer parses or defaults raw manifests. It
+  exactly decodes `CanonicalCampaignGraphV1`, while the flow input schema now
+  requires every normalized canonical member. A mutation corpus pins accepted
+  canonical bytes and rejects near-valid input before driver dispatch.
+
 ### Canonical campaign admission (#444)
 
 - Added `tally_core::campaign_contract` as the single owner of campaign

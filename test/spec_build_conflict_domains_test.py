@@ -856,6 +856,8 @@ class PublicationNarrationTests(PublicationHarness):
                 }))
                 """,
             ),
+            "env": {},
+            "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
             "runtimeMaxSec": 30,
         }
 
@@ -901,6 +903,8 @@ class PublicationNarrationTests(PublicationHarness):
                 raise SystemExit(1)
                 """,
             ),
+            "env": {},
+            "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
             "runtimeMaxSec": 30,
         }
 

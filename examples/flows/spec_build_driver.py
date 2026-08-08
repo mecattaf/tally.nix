@@ -33,10 +33,6 @@ CAMPAIGN_END = "<!-- tally:campaign:v1:end -->"
 WORKLIST_BEGIN = "<!-- tally:campaign-worklist:v1 -->"
 WORKLIST_END = "<!-- tally:campaign-worklist:v1:end -->"
 TASK_MARKER_PREFIX = "<!-- tally:campaign-task:v1 id="
-BRIEF_SENTINEL = (
-    "Read the file whose path is in the TALLY_BRIEF environment variable and execute "
-    "the mission it contains. That brief is your complete instruction set."
-)
 DIAGNOSIS_MARKER = re.compile(
     r"^<!-- tally:spec-build:diagnosis:v1 "
     r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
@@ -78,7 +74,6 @@ MERGE_METHODS = frozenset({"merge", "squash"})
 # The narrate slot of §2's steward duty roster. The model proposes text; this
 # commitlint-shaped grammar is what decides whether the text is used, and the
 # node — never the model — runs git.
-DEFAULT_NARRATION_PATTERN = r"^TALLY_FINAL_MESSAGE=(.*)$"
 # Environment the publish node owns and a steward adapter may not redefine.
 # TALLY_BRIEF is stripped outright rather than overridden: the narrator is
 # handed its request on stdin and has no business reading the driver's own
@@ -107,7 +102,6 @@ NARRATION_BODY_MAX = 4_000
 NARRATION_BODY_LINE_MAX = 100
 NARRATION_REASON_MAX = 200
 NARRATION_ATTEMPTS = 2
-NARRATION_DEFAULT_RUNTIME_MAX_SEC = 120
 # The fourth proof axis (AUGUST-01-DESIGN.md §7). `off` is the shipped state.
 GIT_AI_BINDINGS = frozenset({"off", "advisory", "required"})
 GIT_AI_PROGRAM = "git-ai"
@@ -235,6 +229,15 @@ def object_exact(value: Any, fields: set[str], context: str) -> dict[str, Any]:
     if unknown:
         fail(f"{context} has unknown fields: {', '.join(unknown)}")
     return value
+
+
+def object_complete(value: Any, fields: set[str], context: str) -> dict[str, Any]:
+    """Decode a canonical object whose normalized members are all present."""
+    record = object_exact(value, fields, context)
+    missing = sorted(fields - set(record))
+    if missing:
+        fail(f"{context} is missing canonical fields: {', '.join(missing)}")
+    return record
 
 
 def required_string(value: Any, context: str, maximum: int | None = None) -> str:
@@ -693,43 +696,52 @@ def assisted_by_trailer(record: dict[str, Any] | None) -> str | None:
 
 
 def steward_role(value: Any, context: str = "campaign steward") -> dict[str, Any] | None:
-    """The §2 steward bound as a catalog role, not as a script choice.
+    """Decode the fully normalized §2 steward catalog role.
 
     `adapter` names the entry in the estate's adapter table; that entry's argv
     and env are what decide which model answers, at which endpoint, with which
-    credentials. `finalMessagePattern` is the adapter's own declared
-    final-message capture. Null is the shipped state: no steward, template
-    narration, no model call.
+    credentials. Rust campaign admission (or the Nix module for module-declared
+    campaigns) has already supplied every member and admitted the portable
+    final-message grammar. Null is the shipped state: no steward, template
+    narration, no model call. No defaults live on this side of the boundary.
     """
     if value is None:
         return None
-    role = object_exact(
+    role = object_complete(
         value,
         {"adapter", "argv", "env", "finalMessagePattern", "runtimeMaxSec"},
         context,
     )
-    adapter = required_string(role.get("adapter"), f"{context}.adapter", 128)
+    adapter = required_string(role.get("adapter"), f"{context}.adapter", 80)
     if not COMPONENT.fullmatch(adapter):
         fail(f"{context}.adapter is not a safe component")
     arguments = argv(role.get("argv"), f"{context}.argv")
-    environment = role.get("env", {})
+    environment = role["env"]
     if not isinstance(environment, dict):
         fail(f"{context}.env must be an object")
+    if len(environment) > 64:
+        fail(f"internal campaign contract violation: {context}.env exceeds 64 entries")
     for key, item in environment.items():
         if not isinstance(key, str) or not ENVIRONMENT_NAME.fullmatch(key):
             fail(f"{context}.env names must be environment identifiers")
         if key in RESERVED_STEWARD_ENVIRONMENT:
             fail(f"{context}.env must not set reserved variable {key}")
         required_string(item, f"{context}.env.{key}", 4096)
-    pattern = role.get("finalMessagePattern", DEFAULT_NARRATION_PATTERN)
+    pattern = role["finalMessagePattern"]
     pattern = required_string(pattern, f"{context}.finalMessagePattern", 1024)
     try:
         compiled = re.compile(pattern)
     except re.error as error:
-        fail(f"{context}.finalMessagePattern is not a valid regular expression: {error}")
+        fail(
+            "internal campaign contract violation: "
+            f"{context}.finalMessagePattern did not compile in Python: {error}"
+        )
     if compiled.groups != 1:
-        fail(f"{context}.finalMessagePattern must declare exactly one capture group")
-    runtime = role.get("runtimeMaxSec", NARRATION_DEFAULT_RUNTIME_MAX_SEC)
+        fail(
+            "internal campaign contract violation: "
+            f"{context}.finalMessagePattern does not have exactly one capture group"
+        )
+    runtime = role["runtimeMaxSec"]
     if runtime is not None:
         runtime = positive_integer(runtime, f"{context}.runtimeMaxSec")
     return {
@@ -1027,77 +1039,6 @@ def github_json(arguments: list[str], context: str) -> Any:
         fail(f"{context} returned invalid JSON: {error}")
 
 
-def managed_section(body: str, start: str, end: str, context: str) -> str:
-    start_index = body.find(start)
-    if start_index < 0:
-        fail(f"{context} is missing {start}")
-    content_start = start_index + len(start)
-    end_index = body.find(end, content_start)
-    if end_index < 0:
-        fail(f"{context} is missing {end}")
-    if body.find(start, content_start) >= 0 or body.find(end, end_index + len(end)) >= 0:
-        fail(f"{context} repeats a managed campaign marker")
-    return body[content_start:end_index].strip()
-
-
-def forge_agent(value: Any) -> dict[str, Any]:
-    agent = object_exact(
-        value,
-        {
-            "adapter",
-            "argv",
-            "priority",
-            "runtimeMaxSec",
-            "approvalPolicy",
-            "sandboxPolicy",
-            "diagnosisSandboxPolicy",
-            "model",
-        },
-        "campaign agent",
-    )
-    adapter = agent.get("adapter", "codex")
-    adapter = required_string(adapter, "campaign agent.adapter")
-    arguments = agent.get("argv", [BRIEF_SENTINEL])
-    arguments = argv(arguments, "campaign agent.argv")
-    priority = agent.get("priority", "low")
-    if priority not in {"interrupt", "high", "medium", "low"}:
-        fail("campaign agent.priority is invalid")
-    runtime = agent.get("runtimeMaxSec", 14_400)
-    if runtime is not None:
-        runtime = positive_integer(runtime, "campaign agent.runtimeMaxSec")
-    # A campaign node is unattended, so it never asks for an escalation, and its
-    # sandbox must reach git metadata or the implementation node cannot commit.
-    approval = agent.get("approvalPolicy", "never")
-    if approval is not None:
-        approval = required_string(approval, "campaign agent.approvalPolicy")
-    sandbox = agent.get("sandboxPolicy", "danger-full-access")
-    if sandbox is not None:
-        sandbox = required_string(sandbox, "campaign agent.sandboxPolicy")
-    # The diagnosis brief prohibits mutation, so its node does not inherit the
-    # implementation node's writable sandbox.
-    diagnosis_sandbox = agent.get("diagnosisSandboxPolicy", "read-only")
-    if diagnosis_sandbox is not None:
-        diagnosis_sandbox = required_string(
-            diagnosis_sandbox, "campaign agent.diagnosisSandboxPolicy"
-        )
-    # The model this campaign dispatches with. It is what the daemon records
-    # as the job's canonical model and therefore what the merge node may
-    # honestly name in an `Assisted-by:` trailer; null leaves both alone.
-    model = agent.get("model")
-    if model is not None:
-        model = required_string(model, "campaign agent.model", 128)
-    return {
-        "adapter": adapter,
-        "argv": arguments,
-        "priority": priority,
-        "runtimeMaxSec": runtime,
-        "approvalPolicy": approval,
-        "sandboxPolicy": sandbox,
-        "diagnosisSandboxPolicy": diagnosis_sandbox,
-        "model": model,
-    }
-
-
 def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
     """The commitlint-shaped grammar check on one steward proposal.
 
@@ -1294,248 +1235,173 @@ def narrate(
     return template_narration(task, body=fallback_body), transcript
 
 
-def forge_gates(value: Any) -> list[dict[str, Any]]:
+def canonical_gate_list(value: Any, context: str) -> list[dict[str, Any]]:
+    """Decode the closed, already-normalized canonical gate variants."""
     if not isinstance(value, list) or not 1 <= len(value) <= 16:
-        fail("campaign gates must contain 1..=16 entries")
-    result: list[dict[str, Any]] = []
-    identifiers: set[str] = set()
+        fail(f"{context} must contain 1..=16 entries")
     for index, candidate in enumerate(value):
-        context = f"campaign gates[{index}]"
+        gate_context = f"{context}[{index}]"
         if not isinstance(candidate, dict):
-            fail(f"{context} must be an object")
+            fail(f"{gate_context} must be an object")
         kind = candidate.get("kind")
         if kind == "command":
-            gate = object_exact(
+            gate = object_complete(
                 candidate,
                 {"kind", "id", "preflightArgv", "argv", "runtimeMaxSec"},
-                context,
+                gate_context,
             )
-            normalized = {
-                "kind": "command",
-                "id": required_string(gate.get("id"), f"{context}.id", 80),
-                "preflightArgv": argv(gate.get("preflightArgv"), f"{context}.preflightArgv"),
-                "argv": argv(gate.get("argv"), f"{context}.argv"),
-                "runtimeMaxSec": positive_integer(
-                    gate.get("runtimeMaxSec", 900), f"{context}.runtimeMaxSec"
-                ),
-            }
+            required_string(gate["id"], f"{gate_context}.id", 80)
+            argv(gate["preflightArgv"], f"{gate_context}.preflightArgv")
+            argv(gate["argv"], f"{gate_context}.argv")
+            positive_integer(gate["runtimeMaxSec"], f"{gate_context}.runtimeMaxSec")
         elif kind == "forbidPaths":
-            gate = object_exact(
+            gate = object_complete(
                 candidate,
                 {"kind", "id", "forbidPaths", "runtimeMaxSec"},
-                context,
+                gate_context,
             )
-            identifier = required_string(gate.get("id"), f"{context}.id", 80)
-            patterns = string_list(gate.get("forbidPaths"), f"{context}.forbidPaths", nonempty=True)
-            if len(patterns) > 128 or len(patterns) != len(set(patterns)):
-                fail(f"{context}.forbidPaths must contain 1..=128 unique patterns")
-            for pattern in patterns:
-                path = Path(pattern)
-                if path.is_absolute() or ".." in path.parts or pattern.endswith("/"):
-                    fail(f"{context}.forbidPaths contains an unsafe pattern")
-            normalized = {
-                "kind": "forbidPaths",
-                "id": identifier,
-                "forbidPaths": patterns,
-                "runtimeMaxSec": positive_integer(
-                    gate.get("runtimeMaxSec", 900), f"{context}.runtimeMaxSec"
-                ),
-            }
+            required_string(gate["id"], f"{gate_context}.id", 80)
+            patterns = string_list(
+                gate["forbidPaths"], f"{gate_context}.forbidPaths", nonempty=True
+            )
+            if len(patterns) > 128:
+                fail(f"{gate_context}.forbidPaths exceeds 128 entries")
+            for pattern_index, pattern in enumerate(patterns):
+                if len(pattern) > 1024:
+                    fail(f"{gate_context}.forbidPaths[{pattern_index}] exceeds 1024 characters")
+            positive_integer(gate["runtimeMaxSec"], f"{gate_context}.runtimeMaxSec")
         else:
-            fail(f"{context}.kind must be command or forbidPaths")
-        identifier = normalized["id"]
-        if not COMPONENT.fullmatch(identifier) or identifier in identifiers:
-            fail("campaign gate ids must be safe and unique")
-        identifiers.add(identifier)
-        result.append(normalized)
-    return result
+            fail(f"{gate_context}.kind must be command or forbidPaths")
+    return value
 
 
-def forge_manifest_repository(value: Any) -> dict[str, Any]:
-    """`manifest.repository` with the arm CLI's own defaults filled in first.
+def canonical_nullable_string(value: Any, context: str) -> str | None:
+    if value is None:
+        return None
+    return required_string(value, context)
 
-    `repo_config` validates a *brief's* `repositoryConfig`, which this driver
-    emits itself and therefore always spells in full. A campaign manifest is
-    written by hand, and the arm CLI's `CampaignRepository` defaults
-    `baseBranch`, `remote` and `forge`. Handing the raw manifest object to
-    `repo_config` made those three required here and optional there: a manifest
-    omitting any of them armed cleanly and then died at reconcile. The defaults
-    are spelled to match `CampaignRepository`'s exactly, so both halves
-    normalize the same manifest to the same canonical value (#429).
-    """
-    if not isinstance(value, dict):
-        fail("campaign manifest.repository must be an object")
-    return repo_config(
-        {
-            "baseBranch": "main",
-            "remote": "origin",
-            "forge": "github",
-            **value,
-        }
+
+def canonical_nullable_positive_integer(value: Any, context: str) -> int | None:
+    if value is None:
+        return None
+    return positive_integer(value, context)
+
+
+def canonical_agent(value: Any, context: str) -> dict[str, Any]:
+    fields = {
+        "adapter",
+        "argv",
+        "priority",
+        "runtimeMaxSec",
+        "approvalPolicy",
+        "sandboxPolicy",
+        "diagnosisSandboxPolicy",
+        "model",
+    }
+    agent = object_complete(value, fields, context)
+    required_string(agent["adapter"], f"{context}.adapter")
+    argv(agent["argv"], f"{context}.argv")
+    required_string(agent["priority"], f"{context}.priority")
+    canonical_nullable_positive_integer(agent["runtimeMaxSec"], f"{context}.runtimeMaxSec")
+    canonical_nullable_string(agent["approvalPolicy"], f"{context}.approvalPolicy")
+    canonical_nullable_string(agent["sandboxPolicy"], f"{context}.sandboxPolicy")
+    canonical_nullable_string(
+        agent["diagnosisSandboxPolicy"], f"{context}.diagnosisSandboxPolicy"
     )
+    model = canonical_nullable_string(agent["model"], f"{context}.model")
+    if model is not None and len(model) > 128:
+        fail(f"{context}.model exceeds 128 characters")
+    return agent
 
 
-def forge_manifest(
-    value: Any,
-) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    manifest = object_exact(
-        value,
-        {
-            "schemaVersion",
-            "name",
-            "repository",
-            "maxTasks",
-            "maxParallel",
-            "driverRuntimeMaxSec",
-            "runtimeMaxSec",
-            "pool",
-            "mergeMethod",
-            "gitAiBinding",
-            "gitAiAwaitSec",
-            "agent",
-            "steward",
-            "gates",
-            "tasks",
-        },
-        "campaign manifest",
-    )
-    if manifest.get("schemaVersion") != 1:
-        fail("campaign manifest schemaVersion must equal 1")
-    campaign = required_string(manifest.get("name"), "campaign manifest.name", 80)
-    if not COMPONENT.fullmatch(campaign):
-        fail("campaign manifest.name is not a safe component")
-    repository_config = forge_manifest_repository(manifest.get("repository"))
-    max_tasks = manifest.get("maxTasks", 64)
-    if not isinstance(max_tasks, int) or isinstance(max_tasks, bool) or not 1 <= max_tasks <= 100:
-        fail("campaign manifest.maxTasks must be in 1..=100")
-    max_parallel = manifest.get("maxParallel", 1)
+def canonical_task_references(value: Any, context: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        fail(f"{context} must be a non-empty array")
+    fields = {
+        "id",
+        "kind",
+        "issue",
+        "dependencies",
+        "conflictDomains",
+        "argv",
+        "runtimeMaxSec",
+    }
+    for index, candidate in enumerate(value):
+        task_context = f"{context}[{index}]"
+        task = object_complete(candidate, fields, task_context)
+        required_string(task["id"], f"{task_context}.id", 80)
+        if task["kind"] not in {"implementation", "checkpoint"}:
+            fail(f"{task_context}.kind must be implementation or checkpoint")
+        positive_integer(task["issue"], f"{task_context}.issue")
+        string_list(task["dependencies"], f"{task_context}.dependencies")
+        string_list(task["conflictDomains"], f"{task_context}.conflictDomains")
+        if task["argv"] is not None:
+            argv(task["argv"], f"{task_context}.argv")
+        canonical_nullable_positive_integer(task["runtimeMaxSec"], f"{task_context}.runtimeMaxSec")
+    return value
+
+
+def canonical_manifest(value: Any) -> dict[str, Any]:
+    """Exact decoder for the normalized manifest carried by Rust."""
+    fields = {
+        "schemaVersion",
+        "name",
+        "repository",
+        "maxTasks",
+        "maxParallel",
+        "driverRuntimeMaxSec",
+        "runtimeMaxSec",
+        "pool",
+        "mergeMethod",
+        "gitAiBinding",
+        "gitAiAwaitSec",
+        "agent",
+        "steward",
+        "gates",
+        "tasks",
+    }
+    manifest = object_complete(value, fields, "canonical campaign manifest v1")
     if (
-        not isinstance(max_parallel, int)
-        or isinstance(max_parallel, bool)
-        or not 1 <= max_parallel <= max_tasks
+        not isinstance(manifest["schemaVersion"], int)
+        or isinstance(manifest["schemaVersion"], bool)
+        or manifest["schemaVersion"] != 1
     ):
-        fail("campaign manifest.maxParallel must be positive and not exceed maxTasks")
-    driver_runtime = positive_integer(
-        manifest.get("driverRuntimeMaxSec", 900),
-        "campaign manifest.driverRuntimeMaxSec",
+        fail("canonical campaign manifest v1.schemaVersion must equal 1")
+    required_string(manifest["name"], "canonical campaign manifest v1.name", 80)
+    repository = object_complete(
+        manifest["repository"],
+        {"checkout", "baseBranch", "remote", "forge"},
+        "canonical campaign manifest v1.repository",
     )
-    runtime = manifest.get("runtimeMaxSec", 86_400)
-    if runtime is not None:
-        positive_integer(runtime, "campaign manifest.runtimeMaxSec")
-    pool = manifest.get("pool", "campaign")
-    if not isinstance(pool, str) or not COMPONENT.fullmatch(pool):
-        fail("campaign manifest.pool is not a safe component")
-    method = merge_method(manifest.get("mergeMethod"), "campaign manifest.mergeMethod")
-    binding = git_ai_binding(manifest.get("gitAiBinding"), "campaign manifest.gitAiBinding")
-    await_sec = git_ai_await_sec(
-        manifest.get("gitAiAwaitSec"), "campaign manifest.gitAiAwaitSec"
+    required_string(repository["checkout"], "canonical campaign manifest v1.repository.checkout")
+    required_string(
+        repository["baseBranch"], "canonical campaign manifest v1.repository.baseBranch"
     )
-    agent = forge_agent(manifest.get("agent"))
-    steward = steward_role(manifest.get("steward"), "campaign manifest.steward")
-    gates = forge_gates(manifest.get("gates"))
-    candidates = manifest.get("tasks")
-    if not isinstance(candidates, list) or not 1 <= len(candidates) <= max_tasks:
-        fail(f"campaign manifest.tasks must contain 1..={max_tasks} entries")
-    references: list[dict[str, Any]] = []
-    prior: set[str] = set()
-    issues: set[int] = set()
-    for index, candidate in enumerate(candidates):
-        context = f"campaign manifest.tasks[{index}]"
-        if not isinstance(candidate, dict):
-            fail(f"{context} must be an object")
-        kind = candidate.get("kind")
-        if kind == "implementation":
-            task = object_exact(
-                candidate,
-                {"id", "kind", "issue", "dependencies", "conflictDomains"},
-                context,
-            )
-        elif kind == "checkpoint":
-            task = object_exact(
-                candidate,
-                {"id", "kind", "issue", "dependencies", "argv", "runtimeMaxSec"},
-                context,
-            )
-        else:
-            fail(f"{context}.kind must be implementation or checkpoint")
-        identifier = required_string(task.get("id"), f"{context}.id", 80)
-        if not TASK_ID.fullmatch(identifier) or identifier in prior:
-            fail(f"{context}.id is invalid or duplicated")
-        number = task.get("issue")
-        if not isinstance(number, int) or isinstance(number, bool) or number < 1 or number in issues:
-            fail(f"{context}.issue must be a unique positive integer")
-        dependencies = string_list(task.get("dependencies", []), f"{context}.dependencies")
-        if len(dependencies) != len(set(dependencies)) or any(item not in prior for item in dependencies):
-            fail(f"{context}.dependencies must be unique earlier task ids")
-        conflicts = (
-            normalize_conflict_domains(
-                task.get("conflictDomains"),
-                f"{context}.conflictDomains",
-                required=max_parallel > 1,
-            )
-            if kind == "implementation"
-            else []
-        )
-        checkpoint_argv = (
-            argv(task.get("argv"), f"{context}.argv") if kind == "checkpoint" else None
-        )
-        checkpoint_runtime = (
-            positive_integer(task.get("runtimeMaxSec"), f"{context}.runtimeMaxSec")
-            if kind == "checkpoint"
-            else None
-        )
-        references.append(
-            {
-                "id": identifier,
-                "kind": kind,
-                "issue": number,
-                "dependencies": dependencies,
-                "conflictDomains": conflicts,
-                "argv": checkpoint_argv,
-                "runtimeMaxSec": checkpoint_runtime,
-            }
-        )
-        prior.add(identifier)
-        issues.add(number)
-    config = {
-        "campaign": campaign,
-        "repositoryConfig": {
-            "checkout": str(repository_config["checkout"]),
-            "baseBranch": repository_config["baseBranch"],
-            "remote": repository_config["remote"],
-            "forge": repository_config["forge"],
-        },
-        "maxParallel": max_parallel,
-        "mergeMethod": method,
-        "gitAiBinding": binding,
-        "gitAiAwaitSec": await_sec,
-        "agent": agent,
-        "steward": steward,
-        "gates": gates,
-    }
-    normalized_manifest = {
-        "schemaVersion": 1,
-        "name": campaign,
-        "repository": {
-            "checkout": str(repository_config["checkout"]),
-            "baseBranch": repository_config["baseBranch"],
-            "remote": repository_config["remote"],
-            "forge": repository_config["forge"],
-        },
-        "maxTasks": max_tasks,
-        "maxParallel": max_parallel,
-        "driverRuntimeMaxSec": driver_runtime,
-        "runtimeMaxSec": runtime,
-        "pool": pool,
-        "mergeMethod": method,
-        "gitAiBinding": binding,
-        "gitAiAwaitSec": await_sec,
-        "agent": agent,
-        "steward": steward,
-        "gates": gates,
-        "tasks": references,
-    }
-    return config, references, normalized_manifest
+    required_string(repository["remote"], "canonical campaign manifest v1.repository.remote")
+    required_string(repository["forge"], "canonical campaign manifest v1.repository.forge")
+    max_tasks = positive_integer(manifest["maxTasks"], "canonical campaign manifest v1.maxTasks")
+    positive_integer(manifest["maxParallel"], "canonical campaign manifest v1.maxParallel")
+    positive_integer(
+        manifest["driverRuntimeMaxSec"], "canonical campaign manifest v1.driverRuntimeMaxSec"
+    )
+    canonical_nullable_positive_integer(
+        manifest["runtimeMaxSec"], "canonical campaign manifest v1.runtimeMaxSec"
+    )
+    required_string(manifest["pool"], "canonical campaign manifest v1.pool", 80)
+    required_string(manifest["mergeMethod"], "canonical campaign manifest v1.mergeMethod")
+    required_string(manifest["gitAiBinding"], "canonical campaign manifest v1.gitAiBinding")
+    positive_integer(
+        manifest["gitAiAwaitSec"], "canonical campaign manifest v1.gitAiAwaitSec"
+    )
+    canonical_agent(manifest["agent"], "canonical campaign manifest v1.agent")
+    steward_role(manifest["steward"], "canonical campaign manifest v1.steward")
+    canonical_gate_list(manifest["gates"], "canonical campaign manifest v1.gates")
+    references = canonical_task_references(
+        manifest["tasks"], "canonical campaign manifest v1.tasks"
+    )
+    if len(references) > max_tasks:
+        fail("canonical campaign manifest v1.tasks exceeds maxTasks")
+    return manifest
 
 
 def canonical_campaign_graph(value: Any) -> dict[str, Any]:
@@ -1546,23 +1412,21 @@ def canonical_campaign_graph(value: Any) -> dict[str, Any]:
     driver checks the versioned envelope and consumes its canonical members
     without applying defaults or rewriting paths.
     """
-    graph = object_exact(
+    graph = object_complete(
         value,
         {"manifest", "tasks", "executableDigest"},
         "canonical campaign graph v1",
     )
-    manifest = graph.get("manifest")
-    tasks = graph.get("tasks")
-    digest = graph.get("executableDigest")
-    if not isinstance(manifest, dict):
-        fail("canonical campaign graph v1.manifest must be an object")
-    if not isinstance(tasks, list):
-        fail("canonical campaign graph v1.tasks must be an array")
+    manifest = canonical_manifest(graph["manifest"])
+    tasks = graph["tasks"]
+    digest = graph["executableDigest"]
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 100:
+        fail("canonical campaign graph v1.tasks must contain 1..=100 entries")
     if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         fail("canonical campaign graph v1.executableDigest must be a lowercase SHA-256 identity")
     canonical_tasks: list[dict[str, Any]] = []
     for index, candidate in enumerate(tasks):
-        task = object_exact(
+        task = object_complete(
             candidate,
             {"number", "title", "body"},
             f"canonical campaign graph v1.tasks[{index}]",
@@ -1652,9 +1516,9 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     carried_manifest = data.get("armedManifest")
     if carried_manifest is not None and not isinstance(carried_manifest, dict):
         fail("reconcile brief.armedManifest must be an object or null")
-    # Rust already normalized this compatibility receipt. The exact decoder
-    # joins this path with the canonical graph when #446 lands.
-    armed_manifest = carried_manifest
+    armed_manifest = (
+        None if carried_manifest is None else canonical_manifest(carried_manifest)
+    )
     if canonical is None and armed_manifest is None:
         fail("reconcile brief requires campaignGraph or armedManifest")
     if canonical is not None and canonical["executableDigest"] != admitted_digest:

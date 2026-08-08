@@ -12,6 +12,104 @@ export const meta = {
   pools: ["campaign-agent", "campaign-control"],
   argsSchema: {
     type: "object",
+    $defs: {
+      canonicalArgv: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "string",
+          minLength: 1,
+          pattern: "^[^\\u0000-\\u001f\\u007f]+$"
+        }
+      },
+      canonicalAgent: {
+        type: "object",
+        required: [
+          "adapter",
+          "argv",
+          "priority",
+          "runtimeMaxSec",
+          "approvalPolicy",
+          "sandboxPolicy",
+          "diagnosisSandboxPolicy",
+          "model"
+        ],
+        properties: {
+          adapter: { type: "string", minLength: 1 },
+          argv: { $ref: "#/$defs/canonicalArgv" },
+          priority: { enum: ["interrupt", "high", "medium", "low"] },
+          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
+          approvalPolicy: { type: ["string", "null"], minLength: 1 },
+          sandboxPolicy: { type: ["string", "null"], minLength: 1 },
+          diagnosisSandboxPolicy: { type: ["string", "null"], minLength: 1 },
+          model: { type: ["string", "null"], minLength: 1, maxLength: 128 }
+        },
+        additionalProperties: false
+      },
+      canonicalSteward: {
+        type: ["object", "null"],
+        required: ["adapter", "argv", "env", "finalMessagePattern", "runtimeMaxSec"],
+        properties: {
+          adapter: {
+            type: "string",
+            minLength: 1,
+            maxLength: 80,
+            pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          },
+          argv: { $ref: "#/$defs/canonicalArgv" },
+          env: {
+            type: "object",
+            maxProperties: 64,
+            propertyNames: { pattern: "^[A-Za-z_][A-Za-z0-9_]*$" },
+            additionalProperties: { type: "string", minLength: 1, maxLength: 4096 }
+          },
+          finalMessagePattern: { type: "string", minLength: 1, maxLength: 1024 },
+          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 }
+        },
+        additionalProperties: false
+      },
+      canonicalGate: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["kind", "id", "preflightArgv", "argv", "runtimeMaxSec"],
+            properties: {
+              kind: { const: "command" },
+              id: {
+                type: "string",
+                maxLength: 80,
+                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              preflightArgv: { $ref: "#/$defs/canonicalArgv" },
+              argv: { $ref: "#/$defs/canonicalArgv" },
+              runtimeMaxSec: { type: "integer", minimum: 1 }
+            },
+            additionalProperties: false
+          },
+          {
+            type: "object",
+            required: ["kind", "id", "forbidPaths", "runtimeMaxSec"],
+            properties: {
+              kind: { const: "forbidPaths" },
+              id: {
+                type: "string",
+                maxLength: 80,
+                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              forbidPaths: {
+                type: "array",
+                minItems: 1,
+                maxItems: 128,
+                uniqueItems: true,
+                items: { type: "string", minLength: 1, maxLength: 1024 }
+              },
+              runtimeMaxSec: { type: "integer", minimum: 1 }
+            },
+            additionalProperties: false
+          }
+        ]
+      }
+    },
     required: [
       "repository",
       "issue",
@@ -43,7 +141,97 @@ export const meta = {
         type: "object",
         required: ["manifest", "tasks", "executableDigest"],
         properties: {
-          manifest: { type: "object" },
+          manifest: {
+            type: "object",
+            required: [
+              "schemaVersion",
+              "name",
+              "repository",
+              "maxTasks",
+              "maxParallel",
+              "driverRuntimeMaxSec",
+              "runtimeMaxSec",
+              "pool",
+              "mergeMethod",
+              "gitAiBinding",
+              "gitAiAwaitSec",
+              "agent",
+              "steward",
+              "gates",
+              "tasks"
+            ],
+            properties: {
+              schemaVersion: { const: 1 },
+              name: {
+                type: "string",
+                maxLength: 80,
+                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              repository: {
+                type: "object",
+                required: ["checkout", "baseBranch", "remote", "forge"],
+                properties: {
+                  checkout: { type: "string", pattern: "^/" },
+                  baseBranch: { type: "string", minLength: 1 },
+                  remote: {
+                    type: "string",
+                    maxLength: 80,
+                    pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+                  },
+                  forge: { enum: ["github", "local"] }
+                },
+                additionalProperties: false
+              },
+              maxTasks: { type: "integer", minimum: 1, maximum: 100 },
+              maxParallel: { type: "integer", minimum: 1, maximum: 100 },
+              driverRuntimeMaxSec: { type: "integer", minimum: 1 },
+              runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
+              pool: {
+                type: "string",
+                maxLength: 80,
+                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              mergeMethod: { enum: ["merge", "squash"] },
+              gitAiBinding: { enum: ["off", "advisory", "required"] },
+              gitAiAwaitSec: { type: "integer", minimum: 1 },
+              agent: { $ref: "#/$defs/canonicalAgent" },
+              steward: { $ref: "#/$defs/canonicalSteward" },
+              gates: {
+                type: "array",
+                minItems: 1,
+                maxItems: 16,
+                items: { $ref: "#/$defs/canonicalGate" }
+              },
+              tasks: {
+                type: "array",
+                minItems: 1,
+                maxItems: 100,
+                items: {
+                  type: "object",
+                  required: [
+                    "id",
+                    "kind",
+                    "issue",
+                    "dependencies",
+                    "conflictDomains",
+                    "argv",
+                    "runtimeMaxSec"
+                  ],
+                  properties: {
+                    id: { type: "string" },
+                    kind: { enum: ["implementation", "checkpoint"] },
+                    issue: { type: "integer" },
+                    dependencies: { type: "array" },
+                    conflictDomains: { type: "array" },
+                    argv: { type: ["array", "null"] },
+                    runtimeMaxSec: { type: ["integer", "null"] }
+                  },
+                  additionalProperties: false
+                }
+              }
+            },
+            additionalProperties: false
+          },
           tasks: {
             type: "array",
             minItems: 1,
@@ -203,109 +391,16 @@ export const meta = {
       // module derives it from this campaign's own node deadline; absent is
       // the driver's default.
       gitAiAwaitSec: { type: "integer", minimum: 1 },
-      // The steward bound as a catalog role. Null, or absent, is the
-      // shipped state: template narration and no model call at publication.
-      steward: {
-        type: ["object", "null"],
-        required: ["adapter", "argv"],
-        properties: {
-          adapter: { type: "string", minLength: 1, maxLength: 128 },
-          argv: {
-            type: "array",
-            minItems: 1,
-            items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
-          },
-          // The adapter entry's environment, which is where a narrator's
-          // endpoint and credentials live. Reserved names are refused by the
-          // driver rather than silently overriding the publish node's own.
-          env: {
-            type: "object",
-            maxProperties: 64,
-            propertyNames: { pattern: "^[A-Za-z_][A-Za-z0-9_]*$" },
-            additionalProperties: { type: "string", maxLength: 4096 }
-          },
-          // The adapter's declared final-message capture, read back as the
-          // narration proposal. Absent means the shipped contract.
-          finalMessagePattern: { type: "string", minLength: 1, maxLength: 1024 },
-          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 }
-        },
-        additionalProperties: false
-      },
-      agent: {
-        type: "object",
-        required: [
-          "adapter",
-          "argv",
-          "priority",
-          "runtimeMaxSec",
-          "approvalPolicy",
-          "sandboxPolicy"
-        ],
-        properties: {
-          adapter: { type: "string", minLength: 1 },
-          argv: {
-            type: "array",
-            minItems: 1,
-            items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
-          },
-          priority: { enum: ["interrupt", "high", "medium", "low"] },
-          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
-          approvalPolicy: { type: ["string", "null"], minLength: 1 },
-          sandboxPolicy: { type: ["string", "null"], minLength: 1 },
-          diagnosisSandboxPolicy: { type: ["string", "null"], minLength: 1 },
-          // The model this campaign dispatches its coder with. Null leaves the
-          // adapter's own resolution alone -- and leaves the merge node with
-          // no model to name, so no `Assisted-by:` trailer is written.
-          model: { type: ["string", "null"], minLength: 1 }
-        },
-        additionalProperties: false
-      },
+      // Both module-declared and forge-native paths carry the normalized
+      // contract; the driver never fills these members in.
+      steward: { $ref: "#/$defs/canonicalSteward" },
+      agent: { $ref: "#/$defs/canonicalAgent" },
       gates: {
         type: "array",
         minItems: 1,
         maxItems: 16,
         uniqueItems: true,
-        items: {
-          oneOf: [
-            {
-              type: "object",
-              required: ["kind", "id", "preflightArgv", "argv", "runtimeMaxSec"],
-              properties: {
-                kind: { const: "command" },
-                id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
-                preflightArgv: {
-                  type: "array",
-                  minItems: 1,
-                  items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
-                },
-                argv: {
-                  type: "array",
-                  minItems: 1,
-                  items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
-                },
-                runtimeMaxSec: { type: "integer", minimum: 1 }
-              },
-              additionalProperties: false
-            },
-            {
-              type: "object",
-              required: ["kind", "id", "forbidPaths", "runtimeMaxSec"],
-              properties: {
-                kind: { const: "forbidPaths" },
-                id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
-                forbidPaths: {
-                  type: "array",
-                  minItems: 1,
-                  maxItems: 128,
-                  uniqueItems: true,
-                  items: { type: "string", minLength: 1, maxLength: 1024 }
-                },
-                runtimeMaxSec: { type: "integer", minimum: 1 }
-              },
-              additionalProperties: false
-            }
-          ]
-        }
+        items: { $ref: "#/$defs/canonicalGate" }
       }
     },
     oneOf: [
@@ -342,6 +437,33 @@ export const meta = {
   // the dependency-ready implementation frontier is admitted.
   iterationCap: 4096,
   selectors: []
+};
+
+const canonicalArgvSchema = meta.argsSchema.$defs.canonicalArgv;
+const canonicalAgentDefinition = meta.argsSchema.$defs.canonicalAgent;
+const canonicalCampaignAgentSchema = {
+  ...canonicalAgentDefinition,
+  properties: { ...canonicalAgentDefinition.properties, argv: canonicalArgvSchema }
+};
+const canonicalStewardDefinition = meta.argsSchema.$defs.canonicalSteward;
+const canonicalCampaignStewardSchema = {
+  ...canonicalStewardDefinition,
+  properties: { ...canonicalStewardDefinition.properties, argv: canonicalArgvSchema }
+};
+const [canonicalCommandGateDefinition, canonicalForbidGateDefinition] =
+  meta.argsSchema.$defs.canonicalGate.oneOf;
+const canonicalCampaignGateSchema = {
+  oneOf: [
+    {
+      ...canonicalCommandGateDefinition,
+      properties: {
+        ...canonicalCommandGateDefinition.properties,
+        preflightArgv: canonicalArgvSchema,
+        argv: canonicalArgvSchema
+      }
+    },
+    canonicalForbidGateDefinition
+  ]
 };
 
 const stringList = {
@@ -590,9 +712,14 @@ const effectiveConfigSchema = {
     mergeMethod: { enum: ["merge", "squash"] },
     gitAiBinding: { enum: ["off", "advisory", "required"] },
     gitAiAwaitSec: { type: "integer", minimum: 1 },
-    agent: { type: "object" },
-    steward: { type: ["object", "null"] },
-    gates: { type: "array", minItems: 1, maxItems: 16 }
+    agent: canonicalCampaignAgentSchema,
+    steward: canonicalCampaignStewardSchema,
+    gates: {
+      type: "array",
+      minItems: 1,
+      maxItems: 16,
+      items: canonicalCampaignGateSchema
+    }
   },
   additionalProperties: false
 };
