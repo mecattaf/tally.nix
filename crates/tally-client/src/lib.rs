@@ -19,6 +19,10 @@ use tokio::time::Instant;
 /// The protocol's default symmetric request and response frame limit (16 MiB).
 pub const DEFAULT_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_TASK_REF_COMPONENT_BYTES: usize = 80;
+/// Stable terminal-error code used when an executor rejects a request before
+/// launching the payload. Shared by the daemon wire result and flow host so a
+/// validation failure cannot be rewritten as a projection/schema failure.
+pub const EXECUTOR_VALIDATION_FAILURE_CODE: &str = "executor-validation-failed";
 
 /// A stable operator-facing task name scoped by its campaign, for example
 /// `crm/t07`. The durable UUID remains the execution identity; this reference

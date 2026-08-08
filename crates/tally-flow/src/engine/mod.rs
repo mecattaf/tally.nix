@@ -15,6 +15,7 @@ use boa_engine::{
     JsValue, NativeFunction, Script, Source, Trace,
 };
 use serde_json::{json, Map, Value};
+use tally_client::EXECUTOR_VALIDATION_FAILURE_CODE;
 
 use crate::catalog::sha256;
 use crate::dialect::validate_instance;

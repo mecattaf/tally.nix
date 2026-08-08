@@ -978,6 +978,196 @@ mod tests {
             .await;
     }
 
+    /// #441 acceptance 2: this is deliberately built from an admitted
+    /// campaign node, not a hand-written GitAiExecution. Removing `taskRef`
+    /// from `execution_request` makes the launched payload fail; removing it
+    /// from the closed validation set makes validation fail first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn campaign_task_ref_executes_with_bounded_git_ai_correlation_attributes() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                config.git_ai.enable = true;
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": [
+                            "sh",
+                            "-c",
+                            r#"case "$GIT_AI_CUSTOM_ATTRIBUTES" in *'"taskRef":"crm/t07"'*) exit 0 ;; *) exit 91 ;; esac"#
+                        ],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "orchestrator",
+                        "evidence": ["exit:0"],
+                        "orchestration": {
+                            "flowRunId": "00000000-0000-4000-8000-000000000441",
+                            "nodeOrdinal": 2,
+                            "taskRef": "crm/t07"
+                        }
+                    })))
+                    .await
+                    .unwrap();
+                let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                let job = daemon.handler.context.read().await.jobs[&job_id].clone();
+                let request = execution_request(
+                    &daemon.handler.executor,
+                    &job,
+                    settings().unit_limits,
+                    ("/run/tally/tally.sock", None),
+                    &paths.data_dir,
+                    &daemon.handler.git_ai,
+                    false,
+                )
+                .unwrap();
+                let git_ai = request.git_ai.expect("git-ai is enabled");
+                assert_eq!(git_ai.attributes.len(), 7);
+                assert_eq!(git_ai.attributes["taskRef"], "crm/t07");
+                assert_eq!(
+                    git_ai.attributes["flowRunId"],
+                    "00000000-0000-4000-8000-000000000441"
+                );
+                assert_eq!(git_ai.attributes["nodeOrdinal"], "2");
+                git_ai.validate().unwrap();
+
+                daemon
+                    .handler
+                    .resume(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(3), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(matches!(
+                    &finished.outcome,
+                    Some(Ok(outcome)) if matches!(
+                        &outcome.termination,
+                        ExecutionTermination::Exited(0)
+                    )
+                ));
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": admitted["task_uuid"]})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["verdict"], "pass");
+                assert!(terminal["error"].is_null());
+            })
+            .await;
+    }
+
+    /// #441 acceptance 3: a pre-launch executor validation rejection is a
+    /// terminal, structured fact on the waiter, canonical witness, and run
+    /// query even though no capture generation exists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn executor_validation_failure_is_witnessed_and_projected_as_the_terminal_cause() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                config.git_ai.enable = true;
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                // Configuration validation protects this invariant at startup;
+                // breaking it after open gives the live executor boundary a
+                // deterministic InvalidRequest without launching a payload.
+                daemon.handler.git_ai.await_timeout_sec = 0;
+                let flow_run_id = "00000000-0000-4000-8000-000000000442";
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "orchestrator",
+                        "evidence": ["exit:0"],
+                        "orchestration": {
+                            "flowName": "spec-build",
+                            "flowRunId": flow_run_id,
+                            "nodeOrdinal": 2,
+                            "nodeLabel": "preflight-prep",
+                            "taskRef": "crm/t07"
+                        }
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(1), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(matches!(
+                    &finished.outcome,
+                    Some(Err(ExecutorError::InvalidRequest(message)))
+                        if message == "git-ai await timeout must be positive"
+                ));
+                daemon.finish_job(finished).await.unwrap();
+
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": admitted["task_uuid"]})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["error"]["code"], EXECUTOR_VALIDATION_FAILURE_CODE);
+                assert_eq!(
+                    terminal["error"]["message"],
+                    "execution request is invalid: git-ai await timeout must be positive"
+                );
+                assert_eq!(
+                    terminal["error"]["details"]["validationMessage"],
+                    "git-ai await timeout must be positive"
+                );
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records.len(), 1);
+                let witnessed = records[0].error.as_ref().unwrap();
+                assert_eq!(witnessed.code, EXECUTOR_VALIDATION_FAILURE_CODE);
+                assert_eq!(
+                    witnessed,
+                    &serde_json::from_value::<TerminalError>(terminal["error"].clone()).unwrap()
+                );
+
+                let run = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": flow_run_id})))
+                    .await
+                    .unwrap();
+                assert_eq!(run["failures"][0]["stage"], "preflight-prep");
+                assert_eq!(
+                    run["failures"][0]["error"],
+                    terminal["error"],
+                    "query.run must project the canonical witnessed cause"
+                );
+                assert!(run["failures"][0]["capturePath"].is_null());
+            })
+            .await;
+    }
+
     /// Drive a request through the real dispatcher so that caller-class
     /// resolution runs. Calling `DaemonHandler::enqueue` directly would skip it.
     async fn rpc(
@@ -1883,6 +2073,7 @@ mod tests {
                 evidence_class: None,
                 manifest_hash: None,
                 completion: None,
+                error: None,
                 result_revision: Some("b".repeat(40)),
                 authorship: Some(Authorship {
                     provider: "git-ai".to_owned(),
@@ -2299,6 +2490,7 @@ mod tests {
                 evidence_class: Some(json!({"fixture": "acceptance-24"})),
                 manifest_hash: Some(json!("sha256:fixture-manifest")),
                 completion: None,
+                error: None,
                 result_revision: None,
                 authorship: None,
                 authorship_sessions: None,
@@ -3779,6 +3971,7 @@ mod tests {
                         evidence_class: None,
                         manifest_hash: None,
                         completion: None,
+                        error: None,
                         result_revision: None,
                         authorship: None,
                         authorship_sessions: None,
@@ -3906,6 +4099,7 @@ mod tests {
                     witness_seq: 9,
                     model: Some("gpt-5.6-codex".to_owned()),
                     completion: None,
+                    error: None,
                     stderr_excerpt: None,
                 };
                 daemon
@@ -4091,6 +4285,7 @@ mod tests {
                     witness_seq: 9,
                     model: None,
                     completion: None,
+                    error: None,
                     stderr_excerpt: None,
                 };
 
@@ -4189,6 +4384,7 @@ mod tests {
                 evidence_class: None,
                 manifest_hash: None,
                 completion: None,
+                error: None,
                 result_revision: None,
                 authorship: None,
                 authorship_sessions: None,
@@ -4296,6 +4492,7 @@ mod tests {
                     witness_seq: 1,
                     model: None,
                     completion: None,
+                    error: None,
                     stderr_excerpt: None,
                 };
                 daemon.handler.complete_gh_post_ack(delivered.clone(), result);
@@ -4538,6 +4735,7 @@ mod tests {
                             evidence_class: None,
                             manifest_hash: None,
                             completion: None,
+                            error: None,
                             result_revision: None,
                             authorship: None,
                             authorship_sessions: None,
@@ -9017,6 +9215,7 @@ mod tests {
                         evidence_class: None,
                         manifest_hash: None,
                         completion: None,
+                        error: None,
                         result_revision: None,
                         authorship: None,
                         authorship_sessions: None,

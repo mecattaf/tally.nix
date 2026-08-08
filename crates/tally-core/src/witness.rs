@@ -164,6 +164,53 @@ impl AuthorshipSession {
     }
 }
 
+/// A terminal error diagnosed by tally itself rather than by the executed
+/// payload. It is hash-covered in the canonical witness and projected without
+/// reinterpretation through terminal RPCs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TerminalError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+impl TerminalError {
+    fn validate(&self) -> Result<(), String> {
+        if self.code.is_empty()
+            || self.code.len() > 64
+            || !self
+                .code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(
+                "error code must be a non-empty lowercase kebab-case scalar of at most 64 bytes"
+                    .to_owned(),
+            );
+        }
+        if self.message.is_empty()
+            || self.message.len() > 4096
+            || self.message.chars().any(char::is_control)
+        {
+            return Err(
+                "error message must be non-empty, at most 4096 bytes, and contain no control characters"
+                    .to_owned(),
+            );
+        }
+        if self.details.as_ref().is_some_and(|details| {
+            !details.is_object()
+                || serde_json::to_vec(details).map_or(true, |encoded| encoded.len() > 16 * 1024)
+        }) {
+            return Err(
+                "error details must be an object of at most 16384 encoded bytes".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WitnessRecord {
@@ -213,6 +260,8 @@ pub struct WitnessRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<SemanticCompletion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TerminalError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorship: Option<Authorship>,
@@ -253,6 +302,7 @@ pub struct WitnessBody {
     pub evidence_class: Option<Value>,
     pub manifest_hash: Option<Value>,
     pub completion: Option<SemanticCompletion>,
+    pub error: Option<TerminalError>,
     pub result_revision: Option<String>,
     pub authorship: Option<Authorship>,
     pub authorship_sessions: Option<Vec<AuthorshipSession>>,
@@ -440,6 +490,7 @@ fn build_record_with_raw(
         evidence_class: body.evidence_class,
         manifest_hash: body.manifest_hash,
         completion: body.completion,
+        error: body.error,
         result_revision: body.result_revision,
         authorship: body.authorship,
         authorship_sessions,
@@ -580,6 +631,7 @@ fn canonical_field_index(field: &str) -> Option<usize> {
         "evidenceClass",
         "manifestHash",
         "completion",
+        "error",
         "resultRevision",
         "authorship",
         "authorshipSessions",
@@ -684,6 +736,15 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, ValidationFailure> {
     }
     if let Some(authorship) = &record.authorship {
         validate_canonical_field_value(object, "authorship", authorship)?;
+    }
+    if let Some(error) = &record.error {
+        validate_canonical_field_value(object, "error", error)?;
+        error.validate().map_err(ValidationFailure::invalid)?;
+        if record.verdict != Verdict::Failed {
+            return Err(ValidationFailure::invalid(
+                "error is permitted only on a failed verdict",
+            ));
+        }
     }
     if let Some(authorship_sessions) = &record.authorship_sessions {
         validate_canonical_field_value(object, "authorshipSessions", authorship_sessions)?;
@@ -1963,6 +2024,7 @@ mod tests {
             evidence_class: None,
             manifest_hash: None,
             completion: None,
+            error: None,
             result_revision: None,
             authorship: None,
             authorship_sessions: None,
@@ -2033,6 +2095,7 @@ mod tests {
                 }))
                 .unwrap(),
             ),
+            error: None,
             result_revision: Some("f".repeat(40)),
             authorship: Some(Authorship {
                 provider: "git-ai".to_owned(),
@@ -2146,6 +2209,33 @@ mod tests {
             previous_hash = record.hash;
         }
         bytes
+    }
+
+    #[test]
+    fn terminal_error_is_canonical_hash_covered_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        let mut failed = body();
+        failed.verdict = Verdict::Failed;
+        failed.exit_code = 1;
+        failed.error = Some(TerminalError {
+            code: "executor-validation-failed".to_owned(),
+            message: "execution request is invalid: fixture rejection".to_owned(),
+            details: Some(serde_json::json!({"validationMessage": "fixture rejection"})),
+        });
+        WitnessLedger::open(&path).unwrap().append(failed).unwrap();
+
+        let (report, records) = read_verified_records(&path).unwrap();
+        assert!(report.ok, "{:?}", report.problems);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            serde_json::to_value(records[0].error.as_ref().unwrap()).unwrap(),
+            serde_json::json!({
+                "code": "executor-validation-failed",
+                "message": "execution request is invalid: fixture rejection",
+                "details": {"validationMessage": "fixture rejection"}
+            })
+        );
     }
 
     proptest! {

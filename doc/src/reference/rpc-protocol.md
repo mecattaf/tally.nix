@@ -269,8 +269,14 @@ positive. Its terminal result is:
 
 ```text
 {task_uuid, taskRef?, job_id, verdict, exit_code, artifact_content_hash,
- attempt, lease_epoch, witness_seq, completion?, stderr_excerpt?, stderr_truncated?}
+ attempt, lease_epoch, witness_seq, completion?, error?, stderr_excerpt?, stderr_truncated?}
 ```
+
+`error` is the canonical tally-side terminal cause `{code,message,details?}`
+when one exists. An executor request rejected before launch uses
+`executor-validation-failed`; its `details.validationMessage` is the executor's
+validation reason. The object is reconstructed from the witness after restart,
+so a missing capture does not erase the diagnosis.
 
 The two stderr fields are present for every failed job whose capture is
 available. `stderr_excerpt` is the lossy UTF-8 rendering of at most the final
@@ -406,7 +412,8 @@ operator check. `currentNodes` carries node label, task reference, live state, s
 elapsed seconds, configured `runtimeMaxSec`, and `budgetRemainingSeconds`. That remainder is
 signed: a node past its budget reports the overrun as a negative value rather than saturating at
 zero. `failures` carries the failed stage, canonical verdict, attempt/epoch, retained
-failure-capture path when present, and the bounded stderr tail. For the built-in `spec-build`
+failure-capture path when present, the bounded stderr tail, and the canonical structured
+`error` when tally diagnosed the terminal cause. For the built-in `spec-build`
 flow, the latest schema-validated reconciliation result also supplies the full campaign task
 table. Its tasks are classified as `done`, `running`, `blocked`, or `pending`, with unresolved
 dependencies, current/failing node, and merged pull request where available. Other flows still

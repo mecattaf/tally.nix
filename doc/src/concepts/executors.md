@@ -26,6 +26,15 @@ Both the production daemon and the remote helper call `require_systemd`, so a
 missing `systemd-run` is an error in deployed operation. Production will not
 launch work it could not re-adopt or reclaim after a crash.
 
+When `gitAi.enable = true`, the prepared request carries a closed, bounded
+custom-attribute map for authorship correlation. Its only admitted keys are
+the required `taskUuid`, `attempt`, `leaseEpoch`, and `adapter`, plus optional
+`flowRunId`, `nodeOrdinal`, and `taskRef` (at most seven total). A campaign node
+with a task reference therefore preserves that reference through git-ai note
+matching. Any executor request validation rejection is terminal before launch
+with code `executor-validation-failed`; it is witnessed and does not fabricate
+a capture or wait for an adapter projection.
+
 ## Daemonless SSH targets
 
 An SSH executor is a named configuration containing host, user, key,

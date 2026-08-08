@@ -893,6 +893,7 @@ pub(super) fn recovery_gh_completions(
                 witness_seq: record.seq,
                 model: record.model.clone(),
                 completion: record.completion.clone(),
+                error: record.error.clone(),
                 stderr_excerpt: retained_failure_stderr_excerpt(record, executor),
             },
         })
@@ -1154,6 +1155,7 @@ pub(super) fn reconcile_reuse_witnesses(
                         evidence_class: event.row.evidence_class.clone(),
                         manifest_hash: event.row.manifest_hash.clone(),
                         completion: None,
+                        error: None,
                         result_revision: None,
                         authorship: None,
                         authorship_sessions: None,

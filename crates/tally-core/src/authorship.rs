@@ -536,6 +536,7 @@ mod tests {
                 evidence_class: None,
                 manifest_hash: None,
                 completion: None,
+                error: None,
                 result_revision: Some(revision.to_owned()),
                 authorship: Some(Authorship {
                     provider: "git-ai".to_owned(),

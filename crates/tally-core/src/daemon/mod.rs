@@ -85,6 +85,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tally_client::EXECUTOR_VALIDATION_FAILURE_CODE;
 use thiserror::Error;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
@@ -174,8 +175,8 @@ use crate::wire::{
 };
 use crate::witness::{
     current_host_id, read_verified_attestations, read_verified_records, AttestationLedger,
-    AttestationRecord, AttestationVerifyReport, Charge, Derivation, LaborClass, Verdict,
-    WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
+    AttestationRecord, AttestationVerifyReport, Charge, Derivation, LaborClass, TerminalError,
+    Verdict, WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
 };
 
 /// The daemon's one cached handle per advisory attestation chain.
@@ -418,6 +419,7 @@ pub struct JobResult {
     pub witness_seq: u64,
     pub model: Option<String>,
     pub completion: Option<SemanticCompletion>,
+    pub error: Option<TerminalError>,
     pub stderr_excerpt: Option<crate::executor::CaptureExcerpt>,
     /// The same value just appended to the witness record: `None` unless
     /// this attempt actually measured a declared GPU pool's main-process
@@ -451,6 +453,9 @@ impl JobResult {
         if let Some(completion) = &self.completion {
             value["completion"] =
                 serde_json::to_value(completion).expect("semantic completion always serializes");
+        }
+        if let Some(error) = &self.error {
+            value["error"] = serde_json::to_value(error).expect("terminal errors always serialize");
         }
         if let Some(excerpt) = &self.stderr_excerpt {
             value["stderr_excerpt"] = Value::String(excerpt.text.clone());

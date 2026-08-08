@@ -384,7 +384,12 @@ impl RpcHandler for HumanQueryHandler {
                     }, {
                         "taskUuid": "00000000-0000-4000-8000-000000000267",
                         "taskRef": "crm/t05", "ordinal": 6, "stage": "agent-t05", "verdict": "failed",
-                        "attempt": 1, "leaseEpoch": 2, "timestamp": "2026-08-01T10:00:05Z"
+                        "attempt": 1, "leaseEpoch": 2, "timestamp": "2026-08-01T10:00:05Z",
+                        "error": {
+                            "code": "executor-validation-failed",
+                            "message": "execution request is invalid: git-ai await timeout must be positive",
+                            "details": {"validationMessage": "git-ai await timeout must be positive"}
+                        }
                     }],
                     "snapshot": {}
                 })),
@@ -1349,6 +1354,9 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
                 "elapsed=not-started",
                 // An absent capture pointer is stated, not omitted.
                 "capture: <not retained>",
+                // A pre-launch executor rejection remains visible even though
+                // there is no stderr capture to inspect.
+                "error [executor-validation-failed]: execution request is invalid: git-ai await timeout must be positive",
                 // Failure-tail indentation survives; the six-space frame plus
                 // the line's own four spaces.
                 "\n          at gate.rs:1",

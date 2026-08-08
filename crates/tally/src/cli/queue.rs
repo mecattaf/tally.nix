@@ -1145,6 +1145,21 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
                 Some(path) => outln!("    capture: {}", compact_text(path)),
                 None => outln!("    capture: <not retained>"),
             }
+            if let Some(error) = failure["error"].as_object() {
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("terminal-error");
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("terminal error details unavailable");
+                outln!(
+                    "    error [{}]: {}",
+                    compact_text(code),
+                    compact_text(message)
+                );
+            }
             if let Some(stderr) = failure["stderrTail"].as_str() {
                 let truncated = failure["stderrTruncated"].as_bool().unwrap_or(false);
                 outln!(

@@ -6,6 +6,23 @@ authorized.
 
 ## [Unreleased]
 
+### Campaign git-ai execution and terminal diagnostics (#441)
+
+- Campaign nodes may now carry the full closed git-ai correlation set of at
+  most seven attributes: `taskUuid`, `attempt`, `leaseEpoch`, `adapter`,
+  `flowRunId`, `nodeOrdinal`, and `taskRef`. The daemon had emitted `taskRef`
+  since #265 while executor validation still admitted only six attributes, so
+  every task-correlated campaign node was rejected before launch.
+- Executor request validation failures now produce a canonical structured
+  `error` with code `executor-validation-failed` on the terminal result and
+  hash-covered witness. Restart reconstruction and `query.run` project that
+  same object, and the human run view prints it even when pre-launch rejection
+  means there is no stderr capture.
+- A flow terminal result that already carries this error skips the advisory
+  `finalMessage` projection wait entirely. The flow host preserves its code and
+  validation message instead of spending the wait budget and relabelling the
+  failure `result-projection-timeout` or `result-schema-mismatch`.
+
 ### Adapters and observability (#425, #434, #419)
 
 Three surfaces the operator reads to decide what is broken: a resume that

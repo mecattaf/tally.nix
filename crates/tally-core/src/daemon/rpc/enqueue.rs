@@ -1246,6 +1246,7 @@ impl DaemonHandler {
                             evidence_class: row.evidence_class.clone(),
                             manifest_hash: row.manifest_hash.clone(),
                             completion: None,
+                            error: None,
                             result_revision: None,
                             authorship: None,
                             authorship_sessions: None,
@@ -1266,6 +1267,7 @@ impl DaemonHandler {
                         witness_seq: record.seq,
                         model: record.model.clone(),
                         completion: None,
+                        error: None,
                         stderr_excerpt: None,
                         gpu_seconds: None,
                     };

@@ -48,12 +48,15 @@ impl GitAiExecution {
             return Err("git-ai await timeout must be positive".to_owned());
         }
         let required = ["taskUuid", "attempt", "leaseEpoch", "adapter"];
-        if self.attributes.len() > 6
+        if self.attributes.len() > 7
             || required
                 .iter()
                 .any(|name| self.attributes.get(*name).is_none_or(String::is_empty))
             || self.attributes.keys().any(|name| {
-                !required.contains(&name.as_str()) && name != "flowRunId" && name != "nodeOrdinal"
+                !required.contains(&name.as_str())
+                    && name != "flowRunId"
+                    && name != "nodeOrdinal"
+                    && name != "taskRef"
             })
             || self.attributes.values().any(|value| {
                 value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
