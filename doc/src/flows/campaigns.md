@@ -147,6 +147,32 @@ parent relation plus the manifest's issue number bind each brief to its task.
 The task-body marker is projection ownership metadata added only by `project`;
 an explicit `issue` field lets `project` adopt an unmarked task issue.
 
+`campaign arm` is the sole normalization authority for that executable graph.
+It resolves `repository.checkout` with the filesystem, requires the resolved
+target to be a Git worktree, and stores the canonical path in the admitted
+manifest before validation or hashing. A symlink or absolute path containing
+`..` therefore pins its current target; retargeting the symlink later does not
+silently redirect an armed campaign. An explicit steward containing only
+`adapter` and `argv` is expanded to `env: {}`,
+`finalMessagePattern: "^TALLY_FINAL_MESSAGE=(.*)$"`, and `runtimeMaxSec: 120`;
+omitting the whole steward still means no steward.
+
+Rust hashes compact, recursively key-sorted UTF-8 JSON of the canonical
+`{manifest,tasks}` object, then carries that same manifest, immutable task
+content, and digest in a `CanonicalCampaignGraphV1` envelope on every flow
+dispatch. Poll refetches and normalizes the live graph before it compares the
+armed digest. The packaged Python driver consumes the carried envelope for
+execution and fetches only mutable forge state; it does not resolve paths,
+apply manifest defaults, or rebuild a second digest contract from the issue
+body. Dispatch also retains the normalized `armedManifest` from the #433
+receipt boundary. A normal flow carries both values. A direct compatibility
+brief may omit `campaignGraph`: the driver exact-decodes `armedManifest`, fills
+only the immutable title/body members from the native task issues, and requires
+the reconstructed envelope to reproduce `worklist.graphDigest` before it can
+execute. It applies no defaults and rewrites no paths. Python regex compile
+failure remains an internal contract violation, because user-level regex
+admission has already happened in Rust.
+
 The master worklist is generated from those references:
 
 ```markdown
@@ -1176,8 +1202,8 @@ A checkpoint receipt is named by `<task>-<source digest>/<base revision>`:
 - **The source digest is fixed by `arm`.** For a recurring campaign it is the
   SHA-256 of the worklist blob read at the pinned revision. For a forge-native
   campaign it is the admitted executable-graph digest recorded under
-  `$XDG_STATE_HOME/tally/campaigns/armed/`, and the reconcile node refuses to
-  run at all when the live issue graph no longer hashes to it. So this half
+  `$XDG_STATE_HOME/tally/campaigns/armed/`, and Rust poll refuses to dispatch
+  when its freshly normalized live issue graph no longer hashes to it. So this half
   cannot drift underneath a pass: it changes only when an operator edits a
   brief, gate, checkout, agent policy, or the DAG and explicitly re-arms — and
   when it does, every checkpoint receipt for that campaign becomes unreadable

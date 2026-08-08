@@ -9,172 +9,19 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::AdapterConfig;
+use tally_core::campaign_contract::{
+    admit_manifest_json, admit_manifest_value, validate_argv, validate_manifest, CampaignAgent,
+    CampaignManifest, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
+};
 use tally_core::config::ResourceKind;
 
-const CAMPAIGN_SCHEMA_VERSION: u32 = 1;
 const CAMPAIGN_BEGIN: &str = "<!-- tally:campaign:v1 -->";
 const CAMPAIGN_END: &str = "<!-- tally:campaign:v1:end -->";
 const WORKLIST_BEGIN: &str = "<!-- tally:campaign-worklist:v1 -->";
 const WORKLIST_END: &str = "<!-- tally:campaign-worklist:v1:end -->";
 const TASK_MARKER_PREFIX: &str = "<!-- tally:campaign-task:v1 id=";
-const DEFAULT_MAX_TASKS: usize = 64;
-const DEFAULT_DRIVER_RUNTIME_MAX_SEC: u64 = 900;
-const DEFAULT_AGENT_RUNTIME_MAX_SEC: u64 = 14_400;
-const DEFAULT_RUNNER_POOL: &str = "campaign";
-const DEFAULT_AGENT_PRIORITY: &str = "low";
-const DEFAULT_AGENT_APPROVAL_POLICY: &str = "never";
-const DEFAULT_AGENT_SANDBOX_POLICY: &str = "danger-full-access";
-const DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY: &str = "read-only";
-const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
 const REGISTRY_SCHEMA_VERSION: u32 = 2;
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CampaignRepository {
-    checkout: PathBuf,
-    #[serde(default = "default_base_branch")]
-    base_branch: String,
-    #[serde(default = "default_remote")]
-    remote: String,
-    #[serde(default = "default_forge")]
-    forge: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CampaignAgent {
-    #[serde(default = "default_agent_adapter")]
-    adapter: String,
-    #[serde(default = "default_agent_argv")]
-    argv: Vec<String>,
-    #[serde(default = "default_agent_priority")]
-    priority: String,
-    #[serde(default = "default_agent_runtime_max_sec")]
-    runtime_max_sec: Option<u64>,
-    #[serde(default = "default_agent_approval_policy")]
-    approval_policy: Option<String>,
-    #[serde(default = "default_agent_sandbox_policy")]
-    sandbox_policy: Option<String>,
-    /// Named adapter sandbox policy for diagnosis nodes. The diagnosis brief
-    /// prohibits mutation, so the default holds that node to a read-only
-    /// policy rather than inheriting the implementation node's writable one.
-    /// The packaged driver normalizes this exact field and default into the
-    /// canonical agent it digests, so both halves of the pin must carry it
-    /// byte-identically (#429).
-    #[serde(default = "default_agent_diagnosis_sandbox_policy")]
-    diagnosis_sandbox_policy: Option<String>,
-    /// The model this campaign dispatches its coder with. Absent leaves the
-    /// adapter's own resolution alone and leaves the merge node with no model
-    /// to name in an `Assisted-by:` trailer.
-    #[serde(default)]
-    model: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-enum CampaignGate {
-    #[serde(rename = "command", rename_all = "camelCase")]
-    Command {
-        id: String,
-        preflight_argv: Vec<String>,
-        argv: Vec<String>,
-        #[serde(default = "default_gate_runtime_max_sec")]
-        runtime_max_sec: u64,
-    },
-    #[serde(rename = "forbidPaths", rename_all = "camelCase")]
-    ForbidPaths {
-        id: String,
-        forbid_paths: Vec<String>,
-        #[serde(default = "default_gate_runtime_max_sec")]
-        runtime_max_sec: u64,
-    },
-}
-
-impl CampaignGate {
-    fn id(&self) -> &str {
-        match self {
-            Self::Command { id, .. } | Self::ForbidPaths { id, .. } => id,
-        }
-    }
-
-    const fn is_command(&self) -> bool {
-        matches!(self, Self::Command { .. })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CampaignTaskReference {
-    id: String,
-    kind: String,
-    issue: u64,
-    #[serde(default)]
-    dependencies: Vec<String>,
-    #[serde(default)]
-    conflict_domains: Vec<String>,
-    #[serde(default)]
-    argv: Option<Vec<String>>,
-    #[serde(default)]
-    runtime_max_sec: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CampaignManifest {
-    schema_version: u32,
-    name: String,
-    repository: CampaignRepository,
-    #[serde(default = "default_max_tasks")]
-    max_tasks: usize,
-    #[serde(default = "default_max_parallel")]
-    max_parallel: usize,
-    #[serde(default = "default_driver_runtime_max_sec")]
-    driver_runtime_max_sec: u64,
-    #[serde(default = "default_campaign_runtime_max_sec")]
-    runtime_max_sec: Option<u64>,
-    #[serde(default = "default_runner_pool")]
-    pool: String,
-    /// How the merge node integrates a task. Squash is the campaign default:
-    /// the exposed footprint is one conventional commit per task, and a merge
-    /// commit carrying a template message is not that.
-    #[serde(default = "default_merge_method")]
-    merge_method: String,
-    /// Whether the merge node binds Git AI authorship on the commit it just
-    /// integrated. `off` is the shipped state; `advisory` records the outcome
-    /// as a merge receipt and never fails the node; `required` fails it.
-    #[serde(default = "default_git_ai_binding")]
-    git_ai_binding: String,
-    /// How long the merge node may wait on git-ai's settlement barrier. The
-    /// barrier runs inside that node, so a deadline that does not comfortably
-    /// exceed this budget is refused while the binding is armed.
-    #[serde(default = "default_git_ai_await_sec")]
-    git_ai_await_sec: u64,
-    agent: CampaignAgent,
-    /// The steward bound as a catalog role. Absent leaves the narrate slot
-    /// empty: publication text stays the brief-derived template.
-    #[serde(default)]
-    steward: Option<CampaignSteward>,
-    gates: Vec<CampaignGate>,
-    tasks: Vec<CampaignTaskReference>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CampaignSteward {
-    adapter: String,
-    argv: Vec<String>,
-    /// The adapter entry's environment: where a narrator's endpoint and
-    /// credentials live. Empty is the shipped state.
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-    /// The adapter's declared final-message capture. Absent means the shipped
-    /// `^TALLY_FINAL_MESSAGE=(.*)$` contract.
-    #[serde(default)]
-    final_message_pattern: Option<String>,
-    #[serde(default)]
-    runtime_max_sec: Option<u64>,
-}
 
 #[derive(Debug, Clone)]
 struct ProjectTask {
@@ -229,10 +76,9 @@ struct IssueLocator {
 #[derive(Debug, Clone)]
 struct CampaignGraph {
     locator: IssueLocator,
-    manifest: CampaignManifest,
+    canonical: CanonicalCampaignGraphV1,
     master: GithubIssue,
     tasks: Vec<GithubIssue>,
-    executable_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,82 +123,6 @@ struct CampaignRegistration {
     flow: PathBuf,
     driver: PathBuf,
     workspace_root: PathBuf,
-}
-
-fn default_base_branch() -> String {
-    "main".to_owned()
-}
-
-fn default_remote() -> String {
-    "origin".to_owned()
-}
-
-fn default_forge() -> String {
-    "github".to_owned()
-}
-
-fn default_agent_adapter() -> String {
-    "codex".to_owned()
-}
-
-fn default_agent_argv() -> Vec<String> {
-    vec![BRIEF_SENTINEL.to_owned()]
-}
-
-fn default_agent_priority() -> String {
-    DEFAULT_AGENT_PRIORITY.to_owned()
-}
-
-const fn default_agent_runtime_max_sec() -> Option<u64> {
-    Some(DEFAULT_AGENT_RUNTIME_MAX_SEC)
-}
-
-fn default_agent_approval_policy() -> Option<String> {
-    Some(DEFAULT_AGENT_APPROVAL_POLICY.to_owned())
-}
-
-fn default_agent_sandbox_policy() -> Option<String> {
-    Some(DEFAULT_AGENT_SANDBOX_POLICY.to_owned())
-}
-
-fn default_agent_diagnosis_sandbox_policy() -> Option<String> {
-    Some(DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY.to_owned())
-}
-
-const fn default_gate_runtime_max_sec() -> u64 {
-    900
-}
-
-const fn default_max_tasks() -> usize {
-    DEFAULT_MAX_TASKS
-}
-
-const fn default_max_parallel() -> usize {
-    1
-}
-
-const fn default_driver_runtime_max_sec() -> u64 {
-    DEFAULT_DRIVER_RUNTIME_MAX_SEC
-}
-
-const fn default_campaign_runtime_max_sec() -> Option<u64> {
-    Some(86_400)
-}
-
-fn default_merge_method() -> String {
-    "squash".to_owned()
-}
-
-fn default_git_ai_binding() -> String {
-    "off".to_owned()
-}
-
-const fn default_git_ai_await_sec() -> u64 {
-    60
-}
-
-fn default_runner_pool() -> String {
-    DEFAULT_RUNNER_POOL.to_owned()
 }
 
 pub(super) async fn run_campaign(
@@ -1048,305 +818,7 @@ fn parse_manifest(body: &str) -> Result<CampaignManifest> {
         .and_then(|value| value.strip_suffix("```"))
         .map(str::trim)
         .ok_or_else(|| invalid("campaign manifest must be one fenced JSON object"))?;
-    let manifest: CampaignManifest = serde_json::from_str(json)
-        .map_err(|error| invalid(format!("campaign manifest is invalid: {error}")))?;
-    validate_manifest(&manifest)?;
-    Ok(manifest)
-}
-
-fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
-    if manifest.schema_version != CAMPAIGN_SCHEMA_VERSION {
-        return Err(invalid("campaign manifest schemaVersion must equal 1"));
-    }
-    if !safe_component(&manifest.name) {
-        return Err(invalid("campaign name is not a safe component"));
-    }
-    if !manifest.repository.checkout.is_absolute() {
-        return Err(invalid("campaign repository.checkout must be absolute"));
-    }
-    if manifest.repository.base_branch.is_empty() || manifest.repository.base_branch.contains('\0')
-    {
-        return Err(invalid("campaign repository.baseBranch must be non-empty"));
-    }
-    if !safe_component(&manifest.repository.remote) {
-        return Err(invalid(
-            "campaign repository.remote is not a safe Git remote name",
-        ));
-    }
-    if !matches!(manifest.repository.forge.as_str(), "github" | "local") {
-        return Err(invalid("campaign repository.forge must be github or local"));
-    }
-    if !(1..=100).contains(&manifest.max_tasks) {
-        return Err(invalid("forge-native campaign maxTasks must be in 1..=100"));
-    }
-    if !(1..=manifest.max_tasks).contains(&manifest.max_parallel) {
-        return Err(invalid(
-            "campaign maxParallel must be positive and not exceed maxTasks",
-        ));
-    }
-    if manifest.driver_runtime_max_sec == 0 || manifest.runtime_max_sec == Some(0) {
-        return Err(invalid(
-            "campaign runtime limits must be positive when present",
-        ));
-    }
-    if !safe_component(&manifest.pool) {
-        return Err(invalid("campaign pool is not a safe component"));
-    }
-    if !matches!(manifest.merge_method.as_str(), "merge" | "squash") {
-        return Err(invalid("campaign mergeMethod must be merge or squash"));
-    }
-    if !matches!(
-        manifest.git_ai_binding.as_str(),
-        "off" | "advisory" | "required"
-    ) {
-        return Err(invalid(
-            "campaign gitAiBinding must be off, advisory, or required",
-        ));
-    }
-    if manifest.git_ai_await_sec == 0 {
-        return Err(invalid("campaign gitAiAwaitSec must be positive"));
-    }
-    if manifest.git_ai_binding != "off"
-        && manifest.driver_runtime_max_sec < 2 * manifest.git_ai_await_sec
-    {
-        return Err(invalid(format!(
-            "campaign driverRuntimeMaxSec must be at least twice gitAiAwaitSec ({}) while gitAiBinding is not off",
-            2 * manifest.git_ai_await_sec
-        )));
-    }
-    validate_agent(&manifest.agent)?;
-    if let Some(steward) = &manifest.steward {
-        if !safe_component(&steward.adapter) {
-            return Err(invalid("campaign steward adapter is not a safe component"));
-        }
-        if steward.argv.is_empty() || steward.argv.iter().any(|item| item.is_empty()) {
-            return Err(invalid(
-                "campaign steward argv must be non-empty and contain no empty values",
-            ));
-        }
-        if steward.runtime_max_sec == Some(0) {
-            return Err(invalid("campaign steward runtimeMaxSec must be positive"));
-        }
-        for name in steward.env.keys() {
-            if name.is_empty()
-                || name == "TALLY_BRIEF"
-                || !name.chars().enumerate().all(|(index, character)| {
-                    character == '_'
-                        || character.is_ascii_alphabetic()
-                        || (index > 0 && character.is_ascii_digit())
-                })
-            {
-                return Err(invalid(format!(
-                    "campaign steward env name {name:?} is not an assignable environment identifier"
-                )));
-            }
-        }
-        if steward
-            .final_message_pattern
-            .as_ref()
-            .is_some_and(|pattern| pattern.is_empty())
-        {
-            return Err(invalid(
-                "campaign steward finalMessagePattern must be non-empty when set",
-            ));
-        }
-    }
-    validate_gates(&manifest.gates)?;
-    if manifest.tasks.is_empty() || manifest.tasks.len() > manifest.max_tasks {
-        return Err(invalid(format!(
-            "campaign must contain 1..={} tasks",
-            manifest.max_tasks
-        )));
-    }
-    let mut prior = BTreeSet::new();
-    let mut issues = BTreeSet::new();
-    for task in &manifest.tasks {
-        if !matches!(task.kind.as_str(), "implementation" | "checkpoint") {
-            return Err(invalid(format!(
-                "campaign task {} kind must be implementation or checkpoint",
-                task.id
-            )));
-        }
-        if !safe_task_id(&task.id) {
-            return Err(invalid(format!(
-                "campaign task id {:?} is invalid",
-                task.id
-            )));
-        }
-        if !prior.insert(task.id.clone()) {
-            return Err(invalid(format!("campaign repeats task id {:?}", task.id)));
-        }
-        if task.issue == 0 || !issues.insert(task.issue) {
-            return Err(invalid(
-                "campaign task issue numbers must be positive and unique",
-            ));
-        }
-        let mut dependencies = BTreeSet::new();
-        for dependency in &task.dependencies {
-            if !dependencies.insert(dependency) {
-                return Err(invalid(format!(
-                    "campaign task {} repeats dependency {}",
-                    task.id, dependency
-                )));
-            }
-            if !prior.contains(dependency) {
-                return Err(invalid(format!(
-                    "campaign task {} dependency {} must name an earlier task",
-                    task.id, dependency
-                )));
-            }
-        }
-        match task.kind.as_str() {
-            "implementation" => {
-                if task.argv.is_some() || task.runtime_max_sec.is_some() {
-                    return Err(invalid(format!(
-                        "implementation task {} must not carry argv or runtimeMaxSec",
-                        task.id
-                    )));
-                }
-                validate_conflict_domains(&task.conflict_domains, manifest.max_parallel > 1)
-                    .with_context(|| format!("campaign task {} conflictDomains", task.id))?;
-            }
-            "checkpoint" => {
-                if !task.conflict_domains.is_empty() {
-                    return Err(invalid(format!(
-                        "checkpoint task {} must not carry conflictDomains",
-                        task.id
-                    )));
-                }
-                let argv = task
-                    .argv
-                    .as_ref()
-                    .ok_or_else(|| invalid(format!("checkpoint task {} requires argv", task.id)))?;
-                validate_argv(argv, &format!("checkpoint task {} argv", task.id))?;
-                if !matches!(task.runtime_max_sec, Some(value) if value > 0) {
-                    return Err(invalid(format!(
-                        "checkpoint task {} requires a positive runtimeMaxSec",
-                        task.id
-                    )));
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-    Ok(())
-}
-
-fn validate_agent(agent: &CampaignAgent) -> Result<()> {
-    if agent.adapter.is_empty() || agent.adapter.contains('\0') {
-        return Err(invalid("campaign agent.adapter must be non-empty"));
-    }
-    validate_argv(&agent.argv, "campaign agent.argv")?;
-    if !matches!(
-        agent.priority.as_str(),
-        "interrupt" | "high" | "medium" | "low"
-    ) {
-        return Err(invalid("campaign agent.priority is invalid"));
-    }
-    if agent.runtime_max_sec == Some(0)
-        || agent.approval_policy.as_deref() == Some("")
-        || agent.sandbox_policy.as_deref() == Some("")
-        || agent.diagnosis_sandbox_policy.as_deref() == Some("")
-        || agent.model.as_deref() == Some("")
-    {
-        return Err(invalid(
-            "campaign agent limits and policy names must be non-empty",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_gates(gates: &[CampaignGate]) -> Result<()> {
-    if gates.is_empty() || gates.len() > 16 {
-        return Err(invalid("campaign gates must contain 1..=16 entries"));
-    }
-    let mut identifiers = BTreeSet::new();
-    for gate in gates {
-        if !safe_component(gate.id()) || !identifiers.insert(gate.id()) {
-            return Err(invalid("campaign gate ids must be safe and unique"));
-        }
-        match gate {
-            CampaignGate::Command {
-                preflight_argv,
-                argv,
-                runtime_max_sec,
-                ..
-            } => {
-                validate_argv(preflight_argv, "campaign gate preflightArgv")?;
-                validate_argv(argv, "campaign gate argv")?;
-                if *runtime_max_sec == 0 {
-                    return Err(invalid("campaign gate runtimeMaxSec must be positive"));
-                }
-            }
-            CampaignGate::ForbidPaths {
-                forbid_paths,
-                runtime_max_sec,
-                ..
-            } => {
-                if forbid_paths.is_empty() || forbid_paths.len() > 128 || *runtime_max_sec == 0 {
-                    return Err(invalid(
-                        "forbidPaths gates require 1..=128 patterns and a positive runtimeMaxSec",
-                    ));
-                }
-                let mut patterns = BTreeSet::new();
-                for pattern in forbid_paths {
-                    let components = pattern.split('/').collect::<Vec<_>>();
-                    if pattern.is_empty()
-                        || pattern.len() > 1024
-                        || pattern.starts_with('/')
-                        || pattern.contains('\0')
-                        || components.contains(&"..")
-                        || components
-                            .iter()
-                            .any(|component| component.contains("**") && *component != "**")
-                        || !patterns.insert(pattern)
-                    {
-                        return Err(invalid("campaign forbidPaths patterns are invalid"));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_argv(argv: &[String], context: &str) -> Result<()> {
-    if argv.is_empty()
-        || argv
-            .iter()
-            .any(|argument| argument.is_empty() || argument.chars().any(char::is_control))
-    {
-        return Err(invalid(format!(
-            "{context} must be a non-empty direct argv of non-empty strings without control characters"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_conflict_domains(domains: &[String], required: bool) -> Result<()> {
-    if required && domains.is_empty() {
-        return Err(invalid(
-            "must be non-empty when campaign maxParallel is greater than one",
-        ));
-    }
-    let mut seen = BTreeSet::new();
-    for domain in domains {
-        let path = Path::new(domain);
-        if domain.is_empty()
-            || domain.ends_with('/')
-            || path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
-            || !seen.insert(domain)
-        {
-            return Err(invalid("must contain unique normalized relative paths"));
-        }
-    }
-    Ok(())
+    Ok(admit_manifest_json(json)?)
 }
 
 fn fetch_campaign_graph(locator: &IssueLocator) -> Result<CampaignGraph> {
@@ -1429,65 +901,30 @@ fn campaign_graph_from(locator: &IssueLocator, master: GithubIssue) -> Result<Ca
         }
         tasks.push(issue);
     }
-    // This is the admitted executable graph. Managed checkbox state, issue
-    // open/closed projection, update timestamps, and master prose outside the
-    // fenced manifest are deliberately excluded. The Python reconciler
-    // reconstructs this exact value and refuses any digest mismatch.
-    let digest_value = json!({
-        "manifest": &manifest,
-        "tasks": tasks.iter().map(|issue| json!({
-            "number": issue.number,
-            "title": issue.title,
-            "body": issue.body.as_deref().unwrap_or_default(),
-        })).collect::<Vec<_>>(),
-    });
-    let digest = sha256_json(&digest_value)?;
+    // Managed checkbox state, issue open/closed projection, update timestamps,
+    // and master prose outside the fenced manifest are deliberately excluded.
+    // This canonical value is both what Rust hashes and what the flow carries.
+    let canonical = CanonicalCampaignGraphV1::new(
+        manifest,
+        tasks
+            .iter()
+            .map(|issue| CanonicalCampaignTaskV1 {
+                number: issue.number,
+                title: issue.title.clone(),
+                body: issue.body.as_deref().unwrap_or_default().to_owned(),
+            })
+            .collect(),
+    )?;
     Ok(CampaignGraph {
         locator: locator.clone(),
-        manifest,
+        canonical,
         master,
         tasks,
-        executable_digest: digest,
     })
 }
 
 fn sha256_json(value: &Value) -> Result<String> {
-    fn write(value: &Value, output: &mut String) -> Result<()> {
-        match value {
-            Value::Null => output.push_str("null"),
-            Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-            Value::Number(value) => output.push_str(&value.to_string()),
-            Value::String(value) => output.push_str(&serde_json::to_string(value)?),
-            Value::Array(values) => {
-                output.push('[');
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        output.push(',');
-                    }
-                    write(value, output)?;
-                }
-                output.push(']');
-            }
-            Value::Object(values) => {
-                output.push('{');
-                let mut keys = values.keys().collect::<Vec<_>>();
-                keys.sort();
-                for (index, key) in keys.into_iter().enumerate() {
-                    if index > 0 {
-                        output.push(',');
-                    }
-                    output.push_str(&serde_json::to_string(key)?);
-                    output.push(':');
-                    write(&values[key], output)?;
-                }
-                output.push('}');
-            }
-        }
-        Ok(())
-    }
-
-    let mut canonical = String::new();
-    write(value, &mut canonical)?;
+    let canonical = tally_core::campaign_contract::canonical_json(value)?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
 }
 
@@ -1517,7 +954,7 @@ fn forge_state_value(graph: &CampaignGraph) -> Value {
 /// interval's own documentation has always claimed.
 fn forge_observation(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
     sha256_json(&json!({
-        "graph": graph.executable_digest,
+        "graph": graph.canonical.executable_digest,
         "forgeState": forge_state_value(graph),
         "armSerial": arm_serial,
     }))
@@ -1529,7 +966,7 @@ fn campaign_observation(
     arm_serial: u64,
 ) -> Result<String> {
     sha256_json(&json!({
-        "graph": graph.executable_digest,
+        "graph": graph.canonical.executable_digest,
         "forgeState": forge_state_value(graph),
         "steering": steering.master,
         // A comment on one task's sub-issue thread must nudge the campaign
@@ -1661,8 +1098,9 @@ fn validate_host(
     driver: &Path,
     allow_test_local_forge: bool,
 ) -> Result<()> {
+    let manifest = &graph.canonical.manifest;
     let config = load_client_config(config_path)?;
-    let required_nodes = max_flow_nodes(&graph.manifest);
+    let required_nodes = max_flow_nodes(manifest);
     if config.enqueue.fanout_cap < required_nodes {
         return Err(invalid(format!(
             "campaign pass requires enqueue.fanoutCap >= {required_nodes}; host has {}",
@@ -1673,7 +1111,7 @@ fn validate_host(
         "flow",
         "campaign-agent",
         "campaign-control",
-        graph.manifest.pool.as_str(),
+        manifest.pool.as_str(),
     ] {
         if !config.pools.contains_key(pool) {
             return Err(invalid(format!(
@@ -1681,22 +1119,22 @@ fn validate_host(
             )));
         }
     }
-    let runner = &config.pools[&graph.manifest.pool];
+    let runner = &config.pools[&manifest.pool];
     if runner.resource() != ResourceKind::Mutex || runner.capacity != 1 {
         return Err(invalid(format!(
             "campaign runner pool {:?} must be a capacity-1 mutex",
-            graph.manifest.pool
+            manifest.pool
         )));
     }
     let mut required_adapters = vec![
         "shell",
         "spec-build-driver",
-        graph.manifest.agent.adapter.as_str(),
+        manifest.agent.adapter.as_str(),
     ];
     // The steward is bound as a catalog role, so arming refuses a campaign
     // whose narrator names an adapter this host does not configure rather than
     // degrading every publication to the template at run time.
-    if let Some(steward) = &graph.manifest.steward {
+    if let Some(steward) = &manifest.steward {
         required_adapters.push(steward.adapter.as_str());
     }
     for adapter in required_adapters {
@@ -1706,16 +1144,13 @@ fn validate_host(
             )));
         }
     }
-    validate_agent_policies(
-        &graph.manifest.agent,
-        &config.adapters[&graph.manifest.agent.adapter],
-    )?;
+    validate_agent_policies(&manifest.agent, &config.adapters[&manifest.agent.adapter])?;
     if !flow.is_file() || !driver.is_file() {
         return Err(invalid(
             "campaign flow and driver assets must be regular files",
         ));
     }
-    let checkout = &graph.manifest.repository.checkout;
+    let checkout = &manifest.repository.checkout;
     if !checkout.is_dir() {
         return Err(invalid(format!(
             "campaign repository checkout does not exist: {}",
@@ -1736,7 +1171,7 @@ fn validate_host(
             checkout.display()
         )));
     }
-    if graph.manifest.repository.forge == "local" {
+    if manifest.repository.forge == "local" {
         if !allow_test_local_forge {
             return Err(invalid(
                 "forge=local is test-only for issue campaigns; pass --allow-test-local-forge only in an isolated mechanism test",
@@ -1746,17 +1181,13 @@ fn validate_host(
         let remote = ProcessCommand::new("git")
             .arg("-C")
             .arg(checkout)
-            .args([
-                "remote",
-                "get-url",
-                graph.manifest.repository.remote.as_str(),
-            ])
+            .args(["remote", "get-url", manifest.repository.remote.as_str()])
             .output()
             .context("cannot execute git while binding campaign remote")?;
         if !remote.status.success() {
             bail!(
                 "cannot resolve campaign remote {:?}: {}",
-                graph.manifest.repository.remote,
+                manifest.repository.remote,
                 String::from_utf8_lossy(&remote.stderr).trim()
             );
         }
@@ -2041,11 +1472,12 @@ async fn dispatch_campaign(
         rpc_timeout,
         ..
     } = host;
-    if graph.executable_digest != registration.approved_graph_digest {
+    let manifest = &graph.canonical.manifest;
+    if graph.canonical.executable_digest != registration.approved_graph_digest {
         bail!(
             "campaign executable graph changed from admitted {} to {}; inspect the issue graph and run `tally campaign arm {}` to approve it",
             registration.approved_graph_digest,
-            graph.executable_digest,
+            graph.canonical.executable_digest,
             registration.issue_url
         );
     }
@@ -2070,19 +1502,22 @@ async fn dispatch_campaign(
             "kind": "github-issue",
             "graphDigest": &registration.approved_graph_digest,
         },
-        // The arm CLI's canonical manifest, carried so a reconcile digest
-        // mismatch can name its first divergent canonical path (#433). This
-        // dispatch only runs because the graph's Rust digest still equals the
-        // armed digest, so this value IS the armed manifest. It is evidence
-        // for the receipt, never part of the executable graph digest.
-        "armedManifest": &graph.manifest,
+        // Keep #433's normalized manifest receipt at the public arm boundary.
+        // Current flows carry the complete graph below; compatibility callers
+        // may carry only this manifest plus its graph digest, in which case
+        // the driver must reconstruct and verify the omitted task envelope.
+        "armedManifest": manifest,
+        // The complete graph Rust normalized and hashed. The packaged driver
+        // consumes this envelope; it never reparses the issue manifest into a
+        // second executable contract.
+        "campaignGraph": &graph.canonical,
         "steering": steering.master,
         "taskSteering": steering.tasks,
         "capabilities": {"subIssueWalk": registration.sub_issue_walk},
         "workspaceRoot": &registration.workspace_root,
         "tally": &executable,
         "driver": &registration.driver,
-        "driverRuntimeMaxSec": graph.manifest.driver_runtime_max_sec,
+        "driverRuntimeMaxSec": manifest.driver_runtime_max_sec,
         "continuation": {
             "argv": host.continuation_argv(&executable),
             // The control pool, not the campaign mutex: the scan must be free
@@ -2090,7 +1525,7 @@ async fn dispatch_campaign(
             // queues behind the capacity-1 runner mutex, so passes serialize.
             "pool": ["campaign-control"],
             "priority": "low",
-            "runtimeMaxSec": graph.manifest.driver_runtime_max_sec,
+            "runtimeMaxSec": manifest.driver_runtime_max_sec,
             "eventsDir": host.events_dir(),
         },
     });
@@ -2099,12 +1534,12 @@ async fn dispatch_campaign(
         argv: Some(dispatch_flow_argv(
             &executable,
             &registration.flow,
-            max_flow_nodes(&graph.manifest),
+            max_flow_nodes(manifest),
             registration.projection_wait_ms,
         )),
-        pools: Some(vec!["flow".to_owned(), graph.manifest.pool.clone()]),
+        pools: Some(vec!["flow".to_owned(), manifest.pool.clone()]),
         executor: None,
-        priority: Some(priority(&graph.manifest.agent.priority)),
+        priority: Some(priority(&manifest.agent.priority)),
         adapter: Some("shell".to_owned()),
         cwd: None,
         workspace: None,
@@ -2133,9 +1568,9 @@ async fn dispatch_campaign(
             "allowedActors": &registration.allowed_actors,
             "graphDigest": &registration.approved_graph_digest,
         })),
-        manifest_hash: Some(graph.executable_digest.clone()),
+        manifest_hash: Some(graph.canonical.executable_digest.clone()),
         consumption_estimate: None,
-        runtime_max_sec: graph.manifest.runtime_max_sec,
+        runtime_max_sec: manifest.runtime_max_sec,
         no_enqueue: false,
         credentials: Default::default(),
         origin: None,
@@ -2214,7 +1649,7 @@ async fn run_campaign_arm(
         issue_number: locator.number,
         armed_at: Utc::now().to_rfc3339(),
         arm_serial,
-        approved_graph_digest: graph.executable_digest.clone(),
+        approved_graph_digest: graph.canonical.executable_digest.clone(),
         authenticated_actor,
         allowed_actors,
         allow_test_local_forge: args.allow_test_local_forge,
@@ -2243,7 +1678,7 @@ async fn run_campaign_arm(
                 "status": "armed",
                 "issue": locator.url,
                 "tasks": graph.tasks.len(),
-                "graphDigest": graph.executable_digest,
+                "graphDigest": graph.canonical.executable_digest,
                 "allowedActors": registration.allowed_actors,
                 "subIssueWalk": registration.sub_issue_walk,
                 "projection": projection_label(registration.sub_issue_walk),
@@ -2310,11 +1745,11 @@ async fn run_campaign_poll(
             }
             let graph = campaign_graph_from(&locator, master)?;
             require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
-            if graph.executable_digest != registration.approved_graph_digest {
+            if graph.canonical.executable_digest != registration.approved_graph_digest {
                 bail!(
                     "executable graph changed from admitted {} to {}; explicit re-arm is required",
                     registration.approved_graph_digest,
-                    graph.executable_digest
+                    graph.canonical.executable_digest
                 );
             }
             // The cheap comparison comes first. Reading the steering surfaces
@@ -3229,7 +2664,7 @@ fn legacy_checkpoint_tag_prefix(
     ))
 }
 
-fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<()> {
+fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<CampaignManifest> {
     let mut projected = tasks.to_vec();
     let mut used = projected
         .iter()
@@ -3248,12 +2683,11 @@ fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<()> {
         }
     }
     let value = manifest_value(config, &projected)?;
-    let manifest: CampaignManifest = serde_json::from_value(value).map_err(|error| {
+    admit_manifest_value(value).map_err(|error| {
         invalid(format!(
             "campaign configuration cannot form a valid manifest: {error}"
         ))
-    })?;
-    validate_manifest(&manifest)
+    })
 }
 
 fn reconcile_dependencies(repository: &str, tasks: &[ProjectTask]) -> Result<()> {
@@ -3336,9 +2770,14 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
         .as_deref()
         .map(|path| read_json_document(path, "campaign configuration"))
         .transpose()?;
-    let config = project_config(&document, separate.as_ref())?;
+    let raw_config = project_config(&document, separate.as_ref())?;
     let mut tasks = project_tasks(&document)?;
-    validate_project_shape(&config, &tasks)?;
+    let canonical_preview = validate_project_shape(&raw_config, &tasks)?;
+    let mut config = serde_json::to_value(canonical_preview)?;
+    config
+        .as_object_mut()
+        .expect("CampaignManifest serializes as an object")
+        .remove("tasks");
     let name = config
         .get("name")
         .and_then(Value::as_str)
@@ -3559,7 +2998,7 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
     }
 
     let final_value = manifest_value(&config, &tasks)?;
-    let manifest: CampaignManifest = serde_json::from_value(final_value).map_err(|error| {
+    let manifest = admit_manifest_value(final_value).map_err(|error| {
         invalid(format!(
             "projected campaign configuration is invalid: {error}"
         ))
@@ -3591,6 +3030,7 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tally_core::campaign_contract::{BRIEF_SENTINEL, DEFAULT_AGENT_SANDBOX_POLICY};
 
     /// The one shared checkpoint-ref vector file, asserted from here and from
     /// `test/spec_build_checkpoint_receipts_test.py`.
@@ -4064,14 +3504,18 @@ mod tests {
     fn a_task_thread_comment_moves_the_observation_revision() {
         let graph = CampaignGraph {
             locator: parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap(),
-            manifest: serde_json::from_value(manifest_value_for_test(json!([{
-                "id": "foundation",
-                "kind": "implementation",
-                "issue": 43,
-                "dependencies": [],
-                "conflictDomains": []
-            }])))
-            .unwrap(),
+            canonical: CanonicalCampaignGraphV1 {
+                manifest: serde_json::from_value(manifest_value_for_test(json!([{
+                    "id": "foundation",
+                    "kind": "implementation",
+                    "issue": 43,
+                    "dependencies": [],
+                    "conflictDomains": []
+                }])))
+                .unwrap(),
+                tasks: Vec::new(),
+                executable_digest: format!("sha256:{}", "a".repeat(64)),
+            },
             master: GithubIssue {
                 number: 42,
                 title: "Campaign".to_owned(),
@@ -4085,7 +3529,6 @@ mod tests {
                 pull_request: None,
             },
             tasks: Vec::new(),
-            executable_digest: format!("sha256:{}", "a".repeat(64)),
         };
         let quiet = CampaignSteering::default();
         let steered = CampaignSteering {
@@ -4144,14 +3587,22 @@ mod tests {
         };
         CampaignGraph {
             locator: parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap(),
-            manifest: serde_json::from_value(manifest_value_for_test(json!([{
-                "id": "foundation",
-                "kind": "implementation",
-                "issue": 43,
-                "dependencies": [],
-                "conflictDomains": []
-            }])))
-            .unwrap(),
+            canonical: CanonicalCampaignGraphV1 {
+                manifest: serde_json::from_value(manifest_value_for_test(json!([{
+                    "id": "foundation",
+                    "kind": "implementation",
+                    "issue": 43,
+                    "dependencies": [],
+                    "conflictDomains": []
+                }])))
+                .unwrap(),
+                tasks: vec![CanonicalCampaignTaskV1 {
+                    number: task.number,
+                    title: task.title.clone(),
+                    body: task.body.clone().unwrap_or_default(),
+                }],
+                executable_digest: format!("sha256:{}", "a".repeat(64)),
+            },
             master: GithubIssue {
                 number: 42,
                 title: "Campaign".to_owned(),
@@ -4165,7 +3616,6 @@ mod tests {
                 pull_request: None,
             },
             tasks: vec![task],
-            executable_digest: format!("sha256:{}", "a".repeat(64)),
         }
     }
 
@@ -4637,23 +4087,10 @@ mod tests {
         );
     }
 
-    /// The packaged driver and this CLI must agree on the canonical campaign
-    /// agent byte-for-byte, because each digests it independently and the
-    /// reconcile node refuses any mismatch. #429: the driver's `forge_manifest`
-    /// unconditionally normalized an 8th agent field (`diagnosisSandboxPolicy`)
-    /// that this struct did not carry, so no manifest could make the two
-    /// digests agree and every forge-native arm failed reconcile. This test
-    /// computes the graph digest through BOTH halves — the Rust `sha256_json`
-    /// path here, and the real `spec_build_driver.py` `canonical_sha256` path
-    /// run as a `python3` subprocess (the packaged file, not a copy of its
-    /// logic) — and asserts byte equality, so a future version skew inside a
-    /// pin fails in CI instead of at first arm.
-    ///
-    /// Two manifests, because a schema has two ways to skew. The first carries
-    /// every optional field explicitly, which catches a field one half omits
-    /// or renames. The second carries only the required ones, which catches a
-    /// field whose two halves disagree on the DEFAULT — the shape an ad-hoc
-    /// campaign manifest actually has, and the shape dotfiles#163 arm'd under.
+    /// Rust admits, normalizes, and hashes the graph once. The packaged Python
+    /// driver must consume those exact bytes even when the operator spelled a
+    /// checkout through a symlink or `..`, and a minimal explicit steward must
+    /// already contain every default before it crosses the boundary.
     #[test]
     fn graph_digest_is_byte_identical_between_the_cli_and_the_packaged_driver() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -4664,32 +4101,111 @@ mod tests {
             driver.display()
         );
 
-        // `forge_manifest` validates `repository.checkout` as an existing Git
-        // directory, so the fixture needs a real one. Canonicalize it so the
-        // driver's `Path.resolve()` cannot rewrite it into a different digest.
-        let checkout_dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(checkout_dir.path())
-            .status()
-            .expect("git init must run for the schema-parity fixture");
-        assert!(
-            status.success(),
-            "git init failed for the schema-parity fixture"
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("actual-checkout");
+        fs::create_dir(&checkout).unwrap();
+        let run_git = |directory: &Path, arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(directory)
+                .output()
+                .expect("git must run for campaign parity");
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(&checkout, &["config", "user.name", "Tally Test"]);
+        run_git(&checkout, &["config", "user.email", "tally-test@invalid"]);
+        fs::write(checkout.join("README.md"), "fixture\n").unwrap();
+        run_git(&checkout, &["add", "README.md"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "fixture"]);
+        let remote = temporary.path().join("remote.git");
+        fs::create_dir(&remote).unwrap();
+        run_git(
+            &remote,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
         );
-        let checkout = fs::canonicalize(checkout_dir.path()).unwrap();
-        let checkout = checkout.to_str().expect("checkout path must be UTF-8");
+        run_git(
+            &checkout,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_git(&checkout, &["push", "--quiet", "-u", "origin", "main"]);
 
-        // The packaged driver's digest path, run once per fixture: load the
-        // real file under python3, normalize the manifest through the driver's
-        // own `forge_manifest`, and hash it with the driver's own
-        // `canonical_sha256`.
-        let driver_digest = |manifest: &Value, tasks: &Value| -> String {
-            let input_dir = tempfile::tempdir().unwrap();
-            let input_path = input_dir.path().join("parity-graph.json");
+        let symlink = temporary.path().join("checkout-link");
+        std::os::unix::fs::symlink(&checkout, &symlink).unwrap();
+        let dot_parent = temporary.path().join("spelling-parent");
+        fs::create_dir(&dot_parent).unwrap();
+        let dotdot = dot_parent.join("..").join("actual-checkout");
+        let canonical_checkout = fs::canonicalize(&checkout).unwrap();
+
+        let tasks = vec![CanonicalCampaignTaskV1 {
+            number: 101,
+            title: "Implement the thing".to_owned(),
+            body: "Brief for task-a.".to_owned(),
+        }];
+        for spelling in [&symlink, &dotdot] {
+            let raw_manifest = json!({
+                "schemaVersion": 1,
+                "name": "parity",
+                "repository": {"checkout": spelling, "forge": "local"},
+                "agent": {},
+                "steward": {"adapter": "narrator", "argv": ["narrate"]},
+                "gates": [{"kind": "forbidPaths", "id": "gate-forbid", "forbidPaths": ["*.db"]}],
+                "tasks": [{"id": "task-a", "kind": "implementation", "issue": 101}]
+            });
+            let body = format!(
+                "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
+                serde_json::to_string(&raw_manifest).unwrap()
+            );
+            let manifest = parse_manifest(&body).expect("arm admission must succeed");
+            assert_eq!(manifest.repository.checkout, canonical_checkout);
+            let steward = manifest.steward.as_ref().unwrap();
+            assert!(steward.env.is_empty());
+            assert_eq!(
+                steward.final_message_pattern.as_deref(),
+                Some("^TALLY_FINAL_MESSAGE=(.*)$")
+            );
+            assert_eq!(steward.runtime_max_sec, Some(120));
+            let graph = CanonicalCampaignGraphV1::new(manifest, tasks.clone()).unwrap();
+            let rust_bytes = graph.canonical_json().unwrap();
+
+            let input_path = temporary.path().join(format!(
+                "parity-{}.json",
+                if spelling == &symlink {
+                    "symlink"
+                } else {
+                    "dotdot"
+                }
+            ));
             fs::write(
                 &input_path,
-                serde_json::to_string(&json!({"manifest": manifest, "tasks": tasks})).unwrap(),
+                serde_json::to_string(&json!({
+                    "graph": &graph,
+                    "master": {
+                        "number": 100,
+                        "state": "open",
+                        "html_url": "https://github.com/acme/spec/issues/100",
+                        "body": "mutable projection body"
+                    },
+                    "issues": [{
+                        "number": 101,
+                        "title": "mutable forge title",
+                        "body": "mutable forge body",
+                        "state": "open",
+                        "html_url": "https://github.com/acme/spec/issues/101"
+                    }],
+                    "admittedIssues": [{
+                        "number": 101,
+                        "title": "Implement the thing",
+                        "body": "Brief for task-a.",
+                        "state": "open",
+                        "html_url": "https://github.com/acme/spec/issues/101"
+                    }]
+                }))
+                .unwrap(),
             )
             .unwrap();
             let script = r#"
@@ -4702,9 +4218,32 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 with open(sys.argv[2], encoding="utf-8") as handle:
     data = json.load(handle)
-_, _, normalized_manifest = module.forge_manifest(data["manifest"])
-source = {"manifest": normalized_manifest, "tasks": data["tasks"]}
-sys.stdout.write(module.canonical_sha256(source))
+decoded = module.canonical_campaign_graph(data["graph"])
+responses = iter([data["master"], data["issues"]])
+module.github_json = lambda *args, **kwargs: next(responses)
+worklist = module.issue_graph_worklist({
+    "repository": "acme/spec",
+    "issue": {"number": "100", "url": "https://github.com/acme/spec/issues/100"},
+    "worklist": {"kind": "github-issue", "graphDigest": decoded["executableDigest"]},
+    "armedManifest": decoded["manifest"],
+    "campaignGraph": decoded,
+})
+responses = iter([data["master"], data["admittedIssues"]])
+module.github_json = lambda *args, **kwargs: next(responses)
+recovered = module.issue_graph_worklist({
+    "repository": "acme/spec",
+    "issue": {"number": "100", "url": "https://github.com/acme/spec/issues/100"},
+    "worklist": {"kind": "github-issue", "graphDigest": decoded["executableDigest"]},
+    "armedManifest": decoded["manifest"],
+})
+print(json.dumps({
+    "canonical": module.canonical_json(decoded),
+    "digest": decoded["executableDigest"],
+    "checkout": str(worklist["config"]["repositoryConfig"]["checkout"]),
+    "taskBody": worklist["tasks"][0]["brief"]["body"],
+    "recoveredCheckout": str(recovered["config"]["repositoryConfig"]["checkout"]),
+    "recoveredTaskBody": recovered["tasks"][0]["brief"]["body"],
+}, sort_keys=True, separators=(",", ":")))
 "#;
             let output = std::process::Command::new("python3")
                 .args(["-c", script])
@@ -4719,146 +4258,20 @@ sys.stdout.write(module.canonical_sha256(source))
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
-            String::from_utf8(output.stdout)
-                .expect("driver parity probe must print UTF-8")
-                .trim()
-                .to_owned()
-        };
-
-        // The arm CLI's digest path: parse the manifest, canonicalize, hash.
-        let cli_digest = |manifest: &Value, tasks: &Value| -> String {
-            let parsed: CampaignManifest = serde_json::from_value(manifest.clone())
-                .expect("the parity manifest must parse as a CampaignManifest");
-            validate_manifest(&parsed).expect("the parity manifest must validate");
-            sha256_json(&json!({"manifest": &parsed, "tasks": tasks}))
-                .expect("sha256_json must succeed on the parity graph")
-        };
-
-        // One manifest carrying every optional field at every level.
-        let manifest = json!({
-            "schemaVersion": 1,
-            "name": "parity",
-            "repository": {
-                "checkout": checkout,
-                "baseBranch": "main",
-                "remote": "origin",
-                "forge": "github"
-            },
-            "maxTasks": 4,
-            "maxParallel": 1,
-            "driverRuntimeMaxSec": 900,
-            "runtimeMaxSec": 86_400,
-            "pool": "campaign",
-            "mergeMethod": "squash",
-            "gitAiBinding": "off",
-            "gitAiAwaitSec": 60,
-            "agent": {
-                "adapter": "codex",
-                "argv": [BRIEF_SENTINEL],
-                "priority": "low",
-                "runtimeMaxSec": 14_400,
-                "approvalPolicy": "never",
-                "sandboxPolicy": "danger-full-access",
-                "diagnosisSandboxPolicy": "read-only",
-                "model": "parity/model"
-            },
-            "steward": {
-                "adapter": "narrator",
-                "argv": ["narrate"],
-                "env": {"STEWARD_MODE": "narrate"},
-                "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
-                "runtimeMaxSec": 900
-            },
-            "gates": [
-                {
-                    "kind": "command",
-                    "id": "gate-command",
-                    "preflightArgv": ["true"],
-                    "argv": ["true"],
-                    "runtimeMaxSec": 900
-                },
-                {
-                    "kind": "forbidPaths",
-                    "id": "gate-forbid",
-                    "forbidPaths": ["*.db"],
-                    "runtimeMaxSec": 900
-                }
-            ],
-            "tasks": [
-                {
-                    "id": "task-a",
-                    "kind": "implementation",
-                    "issue": 101,
-                    "dependencies": [],
-                    "conflictDomains": ["src"]
-                },
-                {
-                    "id": "task-b",
-                    "kind": "checkpoint",
-                    "issue": 102,
-                    "dependencies": ["task-a"],
-                    "argv": ["true"],
-                    "runtimeMaxSec": 60
-                }
-            ]
-        });
-        let tasks = json!([
-            {"number": 101, "title": "Implement the thing", "body": "Brief for task-a."},
-            {"number": 102, "title": "Checkpoint the thing", "body": "Brief for task-b."}
-        ]);
-
-        assert_eq!(
-            cli_digest(&manifest, &tasks),
-            driver_digest(&manifest, &tasks),
-            "the CLI and the packaged driver disagree on the campaign graph digest \
-             for a manifest carrying every optional field; a forge-native campaign \
-             would fail reconcile with this skew"
-        );
-
-        // The same graph with every optional field left out, so each half fills
-        // it from its OWN default. This is the shape an ad-hoc campaign manifest
-        // has, and it is the one that failed at dotfiles#163: a field the two
-        // halves default differently is invisible to the maximal fixture above.
-        let defaults = json!({
-            "schemaVersion": 1,
-            "name": "parity",
-            "repository": {"checkout": checkout},
-            "agent": {},
-            "gates": [{"kind": "forbidPaths", "id": "gate-forbid", "forbidPaths": ["*.db"]}],
-            "tasks": [
-                {"id": "task-a", "kind": "implementation", "issue": 101}
-            ]
-        });
-        let default_tasks = json!([
-            {"number": 101, "title": "Implement the thing", "body": "Brief for task-a."}
-        ]);
-        assert_eq!(
-            cli_digest(&defaults, &default_tasks),
-            driver_digest(&defaults, &default_tasks),
-            "the CLI and the packaged driver disagree on the campaign graph digest \
-             for a manifest that leaves every optional field to each half's own \
-             default; a forge-native campaign would fail reconcile with this skew"
-        );
-
-        // Explicit nulls, the third way the two halves can disagree: absent
-        // (defaulted) and present-but-null are different manifests, and the CLI
-        // reaches them through `Option::None` while the driver reaches them
-        // through Python `None`. An operator whose adapter declares no
-        // read-only policy writes exactly this.
-        let mut nulled = defaults.clone();
-        nulled["agent"] = json!({
-            "diagnosisSandboxPolicy": null,
-            "approvalPolicy": null,
-            "sandboxPolicy": null,
-            "runtimeMaxSec": null,
-            "model": null
-        });
-        assert_eq!(
-            cli_digest(&nulled, &default_tasks),
-            driver_digest(&nulled, &default_tasks),
-            "the CLI and the packaged driver disagree on the campaign graph digest \
-             for a manifest whose optional agent fields are explicitly null"
-        );
+            let observed: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(observed["canonical"], rust_bytes);
+            assert_eq!(observed["digest"], graph.executable_digest);
+            assert_eq!(
+                observed["checkout"],
+                canonical_checkout.to_str().expect("checkout must be UTF-8")
+            );
+            assert_eq!(observed["taskBody"], "Brief for task-a.");
+            assert_eq!(
+                observed["recoveredCheckout"],
+                canonical_checkout.to_str().expect("checkout must be UTF-8")
+            );
+            assert_eq!(observed["recoveredTaskBody"], "Brief for task-a.");
+        }
     }
 
     /// #433: the reconcile digest-mismatch receipt must stop starving the
@@ -5184,16 +4597,9 @@ print(json.dumps({
     }
 
     fn agent_with(sandbox: Option<&str>) -> CampaignAgent {
-        CampaignAgent {
-            adapter: "codex".to_owned(),
-            argv: default_agent_argv(),
-            priority: default_agent_priority(),
-            runtime_max_sec: default_agent_runtime_max_sec(),
-            approval_policy: default_agent_approval_policy(),
-            sandbox_policy: sandbox.map(str::to_owned),
-            diagnosis_sandbox_policy: default_agent_diagnosis_sandbox_policy(),
-            model: None,
-        }
+        let mut agent: CampaignAgent = serde_json::from_value(json!({})).unwrap();
+        agent.sandbox_policy = sandbox.map(str::to_owned);
+        agent
     }
 
     #[test]

@@ -316,10 +316,13 @@ def emit(value: dict[str, Any]) -> None:
 
 
 def canonical_sha256(value: Any) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    encoded = canonical_json(value).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def canonical_json(value: Any) -> str:
+    """Compact recursively key-sorted JSON shared with campaign_contract."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def json_type(value: Any) -> str:
@@ -519,7 +522,10 @@ def repo_config(value: Any) -> dict[str, Any]:
         fail("repositoryConfig.forge must be github or local")
     git(checkout, "rev-parse", "--git-dir")
     return {
-        "checkout": checkout.resolve(),
+        # Forge-native campaign checkouts arrive filesystem-canonical from
+        # Rust. Keep that admitted identity instead of independently resolving
+        # a second spelling at the consumer boundary.
+        "checkout": checkout,
         "baseBranch": base_branch,
         "remote": remote,
         "forge": forge,
@@ -1532,9 +1538,99 @@ def forge_manifest(
     return config, references, normalized_manifest
 
 
+def canonical_campaign_graph(value: Any) -> dict[str, Any]:
+    """Decode the graph Rust already normalized and hashed.
+
+    This is an integrity boundary, not a second manifest admission path. The
+    detailed grammar belongs to `tally_core::campaign_contract`; the packaged
+    driver checks the versioned envelope and consumes its canonical members
+    without applying defaults or rewriting paths.
+    """
+    graph = object_exact(
+        value,
+        {"manifest", "tasks", "executableDigest"},
+        "canonical campaign graph v1",
+    )
+    manifest = graph.get("manifest")
+    tasks = graph.get("tasks")
+    digest = graph.get("executableDigest")
+    if not isinstance(manifest, dict):
+        fail("canonical campaign graph v1.manifest must be an object")
+    if not isinstance(tasks, list):
+        fail("canonical campaign graph v1.tasks must be an array")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        fail("canonical campaign graph v1.executableDigest must be a lowercase SHA-256 identity")
+    canonical_tasks: list[dict[str, Any]] = []
+    for index, candidate in enumerate(tasks):
+        task = object_exact(
+            candidate,
+            {"number", "title", "body"},
+            f"canonical campaign graph v1.tasks[{index}]",
+        )
+        number = task.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            fail(f"canonical campaign graph v1.tasks[{index}].number must be positive")
+        title = required_string(
+            task.get("title"), f"canonical campaign graph v1.tasks[{index}].title", 300
+        )
+        body = required_body(
+            task.get("body"), f"canonical campaign graph v1.tasks[{index}].body", 64_000
+        )
+        canonical_tasks.append({"number": number, "title": title, "body": body})
+    calculated = canonical_sha256({"manifest": manifest, "tasks": canonical_tasks})
+    if calculated != digest:
+        fail(
+            "internal campaign contract violation: canonical graph digest "
+            f"{digest} does not match its carried manifest/tasks {calculated}"
+        )
+    return {
+        "manifest": manifest,
+        "tasks": canonical_tasks,
+        "executableDigest": digest,
+    }
+
+
+def canonical_manifest_config(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Project canonical members into the driver's executable configuration."""
+    repository = manifest["repository"]
+    references = manifest["tasks"]
+    config = {
+        "campaign": manifest["name"],
+        "repositoryConfig": {
+            "checkout": repository["checkout"],
+            "baseBranch": repository["baseBranch"],
+            "remote": repository["remote"],
+            "forge": repository["forge"],
+        },
+        "maxParallel": manifest["maxParallel"],
+        "mergeMethod": manifest["mergeMethod"],
+        "gitAiBinding": manifest["gitAiBinding"],
+        "gitAiAwaitSec": manifest["gitAiAwaitSec"],
+        "agent": manifest["agent"],
+        "steward": manifest["steward"],
+        "gates": manifest["gates"],
+    }
+    return config, references
+
+
+FORGE_NATIVE_RECONCILE_FIELDS = {
+    "repository",
+    "issue",
+    "worklist",
+    "campaignGraph",
+    # The normalized #433 receipt is also the compatibility form of the
+    # public arm/driver boundary. When campaignGraph is absent, its immutable
+    # task members are recovered from the native issue graph and the complete
+    # envelope must reproduce worklist.graphDigest before it can execute.
+    "armedManifest",
+}
+
+
 def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
-        brief, {"repository", "issue", "worklist", "armedManifest"}, "reconcile brief"
+        brief, FORGE_NATIVE_RECONCILE_FIELDS, "reconcile brief"
     )
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
@@ -1549,6 +1645,37 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     admitted_digest = required_string(selector.get("graphDigest"), "worklist.graphDigest")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", admitted_digest):
         fail("worklist.graphDigest must be a lowercase SHA-256 identity")
+    carried_graph = data.get("campaignGraph")
+    canonical = (
+        None if carried_graph is None else canonical_campaign_graph(carried_graph)
+    )
+    carried_manifest = data.get("armedManifest")
+    if carried_manifest is not None and not isinstance(carried_manifest, dict):
+        fail("reconcile brief.armedManifest must be an object or null")
+    # Rust already normalized this compatibility receipt. The exact decoder
+    # joins this path with the canonical graph when #446 lands.
+    armed_manifest = carried_manifest
+    if canonical is None and armed_manifest is None:
+        fail("reconcile brief requires campaignGraph or armedManifest")
+    if canonical is not None and canonical["executableDigest"] != admitted_digest:
+        fail(
+            "internal campaign contract violation: worklist.graphDigest does not "
+            "match campaignGraph.executableDigest"
+        )
+    if (
+        canonical is not None
+        and armed_manifest is not None
+        and canonical["manifest"] != armed_manifest
+    ):
+        fail(
+            "internal campaign contract violation: armedManifest does not match "
+            "campaignGraph.manifest"
+        )
+    normalized_manifest = (
+        canonical["manifest"] if canonical is not None else armed_manifest
+    )
+    assert normalized_manifest is not None
+    config, references = canonical_manifest_config(normalized_manifest)
     master = github_json(
         ["api", f"repos/{repository}/issues/{issue['number']}"],
         "campaign master issue",
@@ -1560,14 +1687,6 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     body = master.get("body")
     if not isinstance(body, str):
         fail("campaign master issue has no body")
-    section = managed_section(body, CAMPAIGN_BEGIN, CAMPAIGN_END, "campaign master issue")
-    if not section.startswith("```json") or not section.endswith("```"):
-        fail("campaign manifest must be one fenced JSON object")
-    try:
-        manifest_value = json.loads(section[len("```json") : -3].strip())
-    except json.JSONDecodeError as error:
-        fail(f"campaign manifest is invalid JSON: {error}")
-    config, references, normalized_manifest = forge_manifest(manifest_value)
     subissues = github_json(
         [
             "api",
@@ -1597,11 +1716,43 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     expected_numbers = {reference["issue"] for reference in references}
     if set(by_number) != expected_numbers:
         fail("campaign manifest task issues and native sub-issues differ")
+    if canonical is None:
+        # `armedManifest` is already normalized by Rust. This branch applies
+        # no defaults and rewrites no paths: it supplies only the immutable
+        # issue content omitted by the compatibility receipt, then routes the
+        # reconstructed envelope through the same exact decoder and digest
+        # integrity check as a carried campaignGraph.
+        canonical = canonical_campaign_graph(
+            {
+                "manifest": normalized_manifest,
+                "tasks": [
+                    {
+                        "number": reference["issue"],
+                        "title": by_number[reference["issue"]].get("title"),
+                        "body": by_number[reference["issue"]].get("body"),
+                    }
+                    for reference in references
+                ],
+                "executableDigest": admitted_digest,
+            }
+        )
     tasks: list[dict[str, Any]] = []
-    for reference in references:
+    canonical_tasks = canonical["tasks"]
+    if len(canonical_tasks) != len(references):
+        fail(
+            "internal campaign contract violation: canonical manifest task count "
+            "does not match canonical issue content"
+        )
+    for index, reference in enumerate(references):
         candidate = by_number[reference["issue"]]
-        title = required_string(candidate.get("title"), f"task {reference['id']} title", 300)
-        task_body = required_body(candidate.get("body"), f"task {reference['id']} body", 64_000)
+        admitted_task = canonical_tasks[index]
+        if admitted_task["number"] != reference["issue"]:
+            fail(
+                "internal campaign contract violation: canonical manifest task order "
+                "does not match canonical issue content"
+            )
+        title = admitted_task["title"]
+        task_body = admitted_task["body"]
         task_url = required_string(candidate.get("html_url"), f"task {reference['id']} URL")
         expected_task_url = f"https://github.com/{repository}/issues/{reference['issue']}"
         if task_url != expected_task_url:
@@ -1622,27 +1773,6 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
             common["argv"] = reference["argv"]
             common["runtimeMaxSec"] = reference["runtimeMaxSec"]
         tasks.append(common)
-    source_value = {
-        "manifest": normalized_manifest,
-        "tasks": [
-            {
-                "number": reference["issue"],
-                "title": by_number[reference["issue"]].get("title"),
-                "body": by_number[reference["issue"]].get("body"),
-            }
-            for reference in references
-        ],
-    }
-    digest = canonical_sha256(source_value)
-    if digest != admitted_digest:
-        fail(
-            graph_digest_mismatch_receipt(
-                data.get("armedManifest"),
-                normalized_manifest,
-                admitted_digest,
-                digest,
-            )
-        )
     for task in tasks:
         task["revision"] = canonical_sha256(
             {"source": admitted_digest, "task": task["id"]}
@@ -3422,7 +3552,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             if brief.get(name) is not None:
                 fail(f"a forge-native campaign cannot carry {name}")
         data = object_exact(
-            brief, {"repository", "issue", "worklist", "armedManifest"}, "reconcile brief"
+            brief, FORGE_NATIVE_RECONCILE_FIELDS, "reconcile brief"
         )
         worklist = issue_graph_worklist(data)
         campaign = worklist["config"]["campaign"]
@@ -4240,7 +4370,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
     if forge_native:
         data = object_exact(
             brief,
-            {"repository", "issue", "worklist"},
+            FORGE_NATIVE_RECONCILE_FIELDS,
             "escalate brief",
         )
     else:

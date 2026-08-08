@@ -79,6 +79,28 @@ def issue() -> dict[str, str]:
     return {"number": "7", "url": "https://github.com/acme/spec/issues/7"}
 
 
+def canonical_graph(
+    manifest: dict[str, object], issues: list[dict[str, object]]
+) -> dict[str, object]:
+    """Build the Rust-shaped canonical envelope for driver-only fixtures."""
+    _, references, normalized = DRIVER.forge_manifest(manifest)
+    tasks = [
+        {
+            "number": reference["issue"],
+            "title": issues[index]["title"],
+            "body": issues[index]["body"],
+        }
+        for index, reference in enumerate(references)
+    ]
+    return {
+        "manifest": normalized,
+        "tasks": tasks,
+        "executableDigest": DRIVER.canonical_sha256(
+            {"manifest": normalized, "tasks": tasks}
+        ),
+    }
+
+
 def continuation_spec(events: Path) -> dict[str, object]:
     """The module-declared continuation the Nix campaign module renders."""
     return {
@@ -329,6 +351,15 @@ class FakeGitHub:
                     body = sys.stdin.read()
                     state.setdefault("master", {})["body"] = body
                     print("https://github.com/acme/spec/issues/7")
+                elif args[:2] == ["issue", "close"]:
+                    number = args[2]
+                    if number == "7":
+                        state.setdefault("master", {})["state"] = "closed"
+                    else:
+                        for candidate in state.get("subIssues", []):
+                            if str(candidate.get("number")) == number:
+                                candidate["state"] = "closed"
+                    print(f"https://github.com/acme/spec/issues/{number}")
                 else:
                     print(f"unexpected fake gh argv: {args!r}", file=sys.stderr)
                     state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -413,6 +444,7 @@ class ForgeNativeReconcileTests(unittest.TestCase):
                         "repository": "acme/spec",
                         "issue": issue(),
                         "worklist": {"kind": "github-issue"},
+                        "campaignGraph": {},
                     }
                 )
 
@@ -1365,27 +1397,18 @@ class GitHubForgeTests(unittest.TestCase):
                 ],
                 "calls": [],
             }
-            _, references, normalized_manifest = DRIVER.forge_manifest(manifest)
-            graph_digest = DRIVER.canonical_sha256(
-                {
-                    "manifest": normalized_manifest,
-                    "tasks": [
-                        {
-                            "number": reference["issue"],
-                            "title": state["subIssues"][index]["title"],
-                            "body": state["subIssues"][index]["body"],
-                        }
-                        for index, reference in enumerate(references)
-                    ],
-                }
-            )
+            graph = canonical_graph(manifest, state["subIssues"])
             reconcile_brief = {
                 "repository": "acme/spec",
                 "issue": issue(),
                 "worklist": {
                     "kind": "github-issue",
-                    "graphDigest": graph_digest,
+                    "graphDigest": graph["executableDigest"],
                 },
+                # Receipt evidence carried by the arm alongside the canonical
+                # envelope must remain an admitted, non-executable member.
+                "armedManifest": graph["manifest"],
+                "campaignGraph": graph,
             }
             with FakeGitHub(root, state) as github:
                 result = DRIVER.action_reconcile(reconcile_brief)
@@ -1639,7 +1662,6 @@ class GitHubForgeTests(unittest.TestCase):
                     },
                 ],
             }
-            _, references, normalized = DRIVER.forge_manifest(manifest)
             issues = [
                 {
                     "number": 8,
@@ -1656,18 +1678,8 @@ class GitHubForgeTests(unittest.TestCase):
                     "html_url": "https://github.com/acme/spec/issues/9",
                 },
             ]
-            source = {
-                "manifest": normalized,
-                "tasks": [
-                    {
-                        "number": reference["issue"],
-                        "title": issues[index]["title"],
-                        "body": issues[index]["body"],
-                    }
-                    for index, reference in enumerate(references)
-                ],
-            }
-            digest = DRIVER.canonical_sha256(source)
+            graph = canonical_graph(manifest, issues)
+            digest = graph["executableDigest"]
             master = {
                 "number": 7,
                 "state": "open",
@@ -1681,6 +1693,8 @@ class GitHubForgeTests(unittest.TestCase):
                 "repository": "acme/spec",
                 "issue": issue(),
                 "worklist": {"kind": "github-issue", "graphDigest": digest},
+                "armedManifest": graph["manifest"],
+                "campaignGraph": graph,
             }
             with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
                 worklist = DRIVER.issue_graph_worklist(brief)
@@ -1692,86 +1706,56 @@ class GitHubForgeTests(unittest.TestCase):
                 git(checkout, "rev-parse", "origin/main"),
             )
 
-            changed = [dict(candidate) for candidate in issues]
-            changed[0]["body"] = "Edited after arm."
-            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
-                with self.assertRaisesRegex(DRIVER.DriverError, "explicitly re-arm"):
-                    DRIVER.issue_graph_worklist(brief)
-
-            # #433: the same refusal, read for what it now tells the operator.
-            # The manifest is byte-identical on both sides here and only a task
-            # body moved, so the receipt must say the manifest matched rather
-            # than invent a path -- and it must not republish the body text
-            # that diverged, which is exactly the operator content the receipt
-            # channel is not allowed to widen.
-            armed = dict(brief, armedManifest=normalized)
-            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
-                with self.assertRaises(DRIVER.DriverError) as raised:
-                    DRIVER.issue_graph_worklist(armed)
-            receipt = str(raised.exception)
-            self.assertIn("inspect it and explicitly re-arm", receipt)
-            self.assertIn(f"armed digest: {digest}", receipt)
-            live_digest = DRIVER.canonical_sha256(
-                {
-                    "manifest": normalized,
-                    "tasks": [
-                        {
-                            "number": reference["issue"],
-                            "title": changed[index]["title"],
-                            "body": changed[index]["body"],
-                        }
-                        for index, reference in enumerate(references)
-                    ],
-                }
-            )
-            self.assertIn(f"live digest: {live_digest}", receipt)
-            self.assertNotEqual(digest, live_digest)
-            self.assertIn(
-                "first divergent canonical path: none within the manifest", receipt
-            )
-            self.assertNotIn("Edited after arm.", receipt)
-
-            # #433 acceptance 3: two manifests differing in exactly one nested
-            # key. The armed side is the #429 shape -- an agent without
-            # `diagnosisSandboxPolicy` -- and the live normalized manifest has
-            # it, so the receipt must name that exact path, both digests, and
-            # not the value.
-            skewed = json.loads(json.dumps(normalized))
-            del skewed["agent"]["diagnosisSandboxPolicy"]
-            stale = dict(brief, armedManifest=skewed)
-            stale["worklist"] = {
-                "kind": "github-issue",
-                "graphDigest": DRIVER.canonical_sha256(
-                    {"manifest": skewed, "tasks": source["tasks"]}
-                ),
-            }
+            # The public receipt boundary predates campaignGraph. A caller
+            # carrying the normalized manifest and its admitted graph digest
+            # must recover the same executable projection without applying a
+            # second table of manifest defaults.
+            manifest_only = dict(brief)
+            manifest_only.pop("campaignGraph")
             with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
-                with self.assertRaises(DRIVER.DriverError) as raised:
-                    DRIVER.issue_graph_worklist(stale)
-            receipt = str(raised.exception)
-            self.assertIn(f"armed digest: {stale['worklist']['graphDigest']}", receipt)
-            self.assertIn(f"live digest: {digest}", receipt)
-            self.assertIn(
-                "first divergent canonical path: "
-                "manifest.agent.diagnosisSandboxPolicy: "
-                "absent-in-armed / present-in-live",
-                receipt,
-            )
-            self.assertIn("inspect it and explicitly re-arm", receipt)
-            self.assertNotIn("read-only", receipt)
+                recovered = DRIVER.issue_graph_worklist(manifest_only)
+            self.assertEqual(recovered["config"], worklist["config"])
+            self.assertEqual(recovered["tasks"], worklist["tasks"])
 
-            # A campaign armed before `armedManifest` existed carries none, and
-            # the receipt says the path is unavailable rather than inventing
-            # one from the live side alone.
+            # Rust refetched and normalized immediately before dispatch. A
+            # forge edit racing after that point is mutable state, not a second
+            # executable contract for Python to normalize.
+            changed = [dict(candidate) for candidate in issues]
+            changed[0]["title"] = "Edited after Rust dispatched"
+            changed[0]["body"] = "Edited after Rust dispatched."
             with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
-                with self.assertRaises(DRIVER.DriverError) as raised:
-                    DRIVER.issue_graph_worklist(brief)
-            receipt = str(raised.exception)
-            self.assertIn(
-                "first divergent canonical path: unavailable (no armed manifest",
-                receipt,
+                carried = DRIVER.issue_graph_worklist(brief)
+            self.assertEqual(carried["tasks"][0]["title"], "Build")
+            self.assertEqual(
+                carried["tasks"][0]["brief"]["body"],
+                "Implement the admitted change.",
             )
-            self.assertIn(f"armed digest: {digest}", receipt)
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
+                with self.assertRaisesRegex(
+                    DRIVER.DriverError, "internal campaign contract violation"
+                ):
+                    DRIVER.issue_graph_worklist(manifest_only)
+
+            corrupted = json.loads(json.dumps(brief))
+            corrupted["campaignGraph"]["tasks"][0]["body"] = "not what Rust hashed"
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "internal campaign contract violation"
+            ):
+                DRIVER.issue_graph_worklist(corrupted)
+
+            divergent_receipt = json.loads(json.dumps(brief))
+            divergent_receipt["armedManifest"]["name"] = "not-the-carried-graph"
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "armedManifest does not match campaignGraph.manifest"
+            ):
+                DRIVER.issue_graph_worklist(divergent_receipt)
+
+            invalid_evidence = json.loads(json.dumps(brief))
+            invalid_evidence["armedManifest"] = "not an object"
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "armedManifest must be an object or null"
+            ):
+                DRIVER.issue_graph_worklist(invalid_evidence)
 
     def test_merged_pr_completion_is_bound_to_task_revision(self) -> None:
         revision = "sha256:" + "1" * 64
@@ -1999,20 +1983,8 @@ class NativeSubIssueTests(unittest.TestCase):
             f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n\n"
             f"{DRIVER.WORKLIST_BEGIN}\n\n{DRIVER.WORKLIST_END}\n"
         )
-        _, references, normalized = DRIVER.forge_manifest(manifest)
-        digest = DRIVER.canonical_sha256(
-            {
-                "manifest": normalized,
-                "tasks": [
-                    {
-                        "number": reference["issue"],
-                        "title": subissues[index]["title"],
-                        "body": subissues[index]["body"],
-                    }
-                    for index, reference in enumerate(references)
-                ],
-            }
-        )
+        graph = canonical_graph(manifest, subissues)
+        digest = graph["executableDigest"]
         state = {
             "actor": "tally-bot",
             "master": {
@@ -2032,6 +2004,8 @@ class NativeSubIssueTests(unittest.TestCase):
             "repository": "acme/spec",
             "issue": issue(),
             "worklist": {"kind": "github-issue", "graphDigest": digest},
+            "armedManifest": graph["manifest"],
+            "campaignGraph": graph,
             "capabilities": {"subIssueWalk": True},
         }
         return state, brief
@@ -2080,6 +2054,58 @@ class NativeSubIssueTests(unittest.TestCase):
             "body": body,
             "author": {"login": "tally-bot"},
         }
+
+    def test_completed_native_campaign_with_armed_evidence_summarizes_then_closes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+            digest = brief["campaignGraph"]["executableDigest"]
+            base_revision = git(checkout, "rev-parse", "origin/main")
+            completed_walk = []
+            for task, subissue in zip(self.MANIFEST_TASKS, state["subIssues"]):
+                revision = DRIVER.canonical_sha256(
+                    {"source": digest, "task": task["id"]}
+                )
+                branch = DRIVER.stable_publish_branch(
+                    "fixture", "7", task["id"], revision
+                )
+                marker = DRIVER.pull_request_marker(
+                    "fixture", "7", task["id"], revision
+                )
+                completed_walk.append(
+                    self.walk_node(
+                        task["issue"],
+                        state="CLOSED",
+                        pulls=[
+                            self.merged_pull(
+                                f"https://github.com/acme/spec/pull/{task['issue']}",
+                                marker,
+                                branch,
+                                base_revision,
+                            )
+                        ],
+                    )
+                )
+                subissue["state"] = "closed"
+            state["walk"] = completed_walk
+
+            with FakeGitHub(root, state) as github:
+                result = DRIVER.action_reconcile(brief)
+
+            self.assertTrue(result["complete"])
+            self.assertIsNotNone(result["closingSummary"])
+            published = github.state()
+            self.assertEqual(published["master"]["state"], "closed")
+            self.assertEqual(len(published["comments"]), 1)
+            self.assertIn("tally:campaign-complete:v1", published["comments"][0])
+            self.assertIn("### Campaign complete", published["comments"][0])
+            close_calls = [
+                call for call in published["calls"] if call[:2] == ["issue", "close"]
+            ]
+            self.assertEqual(close_calls, [["issue", "close", "7", "--repo", "acme/spec"]])
 
     def test_a_hand_closed_sub_issue_is_an_anomaly_not_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

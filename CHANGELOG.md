@@ -6,6 +6,24 @@ authorized.
 
 ## [Unreleased]
 
+### Canonical campaign admission (#444)
+
+- Added `tally_core::campaign_contract` as the single owner of campaign
+  manifest types, defaults, validation, canonical JSON, and executable graph
+  digests. Arm and project now filesystem-canonicalize the checkout and require
+  an existing Git worktree before that path can enter the manifest or digest.
+- A minimal explicit steward now canonicalizes to an empty environment, the
+  `^TALLY_FINAL_MESSAGE=(.*)$` capture, and a 120-second runtime while an
+  omitted steward remains absent.
+- Every forge-native dispatch carries the complete normalized
+  `CanonicalCampaignGraphV1`. The packaged driver consumes those admitted
+  manifest/task bytes and only refetches mutable forge state, eliminating its
+  independent path resolution and manifest-defaulting digest contract.
+- The dispatch also retains #433's normalized `armedManifest`. Compatibility
+  briefs may omit `campaignGraph`; the driver exact-decodes that manifest,
+  restores only immutable native task content, and requires the resulting
+  envelope to reproduce `worklist.graphDigest` without applying defaults.
+
 ### Campaign git-ai execution and terminal diagnostics (#441)
 
 - Campaign nodes may now carry the full closed git-ai correlation set of at

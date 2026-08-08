@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod authorship;
 pub mod brief;
+pub mod campaign_contract;
 pub mod capture_migration;
 pub mod completion;
 pub mod config;
