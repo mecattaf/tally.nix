@@ -159,7 +159,9 @@ $ tally query proof --flow-run <flow-run-uuid>
 Start with `query run` when the question is “what is happening now?” It shows the
 spec-build reconciler's task table, any current nodes with elapsed time and remaining runtime
 budget, and failure capture pointers plus stderr tails. Use `--json` when a steering agent needs
-the same compact view as structured data.
+the same compact view as structured data: `items` is the complete durable member identity list,
+including members with no row, lifecycle event, or witness of their own. The reconciliation-only
+`tasks` key is omitted when no such board exists, leaving one unambiguous member array.
 
 It also answers "what did this run cost", summed per attempt out of the advisory attestation
 ledger and scoped by the run's durable membership — so a retried task is charged for every
@@ -256,8 +258,12 @@ itself changes, and no daemon or reconciler code path can write this file —
 only the CLI verb above, which writes it directly. `query run` always exposes
 the current `archived` flag and `triageTag` (and prints a loud `-- ARCHIVED`
 banner in its human text view, however you got to that run); `query jobs` and
-`query standup` default to **hiding** archived runs, add `--archived` to see
-them, or `--no-archived` to say the default explicitly.
+`query standup` broad views default to **hiding** archived runs, add
+`--archived` to see them, or `--no-archived` to say the default explicitly.
+`query jobs --flow-run <id>` is instead an explicit by-ID inspection: it
+always returns matching archived members with `archived: true`, just as
+`query run <id>` returns the archived run. The broad-view controls
+`--archived` and `--no-archived` therefore conflict with `--flow-run`.
 
 `query standup`'s digest carries two separate hidden counts, because they
 count different lists at different granularity — one archived run holding
@@ -274,25 +280,15 @@ the two numbers would make either a claim about a list it does not describe:
 
 Both are accumulated as the collections are filtered, by the same call that
 filters them and never by a separate recount — so "the list looks short" is
-never silently indistinguishable from "the list is short." Two window-wide
-aggregates are the deliberate exception: `reused` and `canonicalGpuSeconds`
-are summed once over the whole window, before either hidden count is
-applied, so an archived run's GPU seconds and reuse count remain in those
-totals even once its rows are hidden elsewhere in the same digest. Window
-cost is currently reader-state-independent by construction; treat
-`reused`/`canonicalGpuSeconds` as window totals, not as totals over what the
-digest currently shows.
-
-`query jobs --flow-run <archived-run-id>` has a related sharp edge: it
-returns `items: []` exactly as it would for a quiet run or one with no
-members, and `flowRunTasks` still reports the run's true (unfiltered)
-membership size with nothing in the response distinguishing "quiet," "no
-members," and "archived and withheld." Unlike `query run`, which always
-exposes `archived` rather than hiding content, an explicit `--flow-run`
-filter on `query jobs` currently withholds silently. This is a known,
-unresolved tension in the design (`query run`'s own argument is that an
-explicit by-id request must not silently withhold what was asked for) and is
-tracked as issue #415 rather than fixed here.
+never silently indistinguishable from "the list is short." The `reused` and
+`canonicalGpuSeconds` aggregates describe that same visible task-entry view.
+After archive filtering, they are recomputed from the retained task UUIDs and
+the canonical witness records: reuse uses the latest terminal
+`laborClass: reused`, while GPU seconds use the canonical GPU contribution
+predicate across qualifying attempts. They are not inferred from displayed
+entry `gpuSeconds` and are not summed from the filtered per-run cost rows.
+With `--archived`, every task entry remains visible, so both aggregates are
+the whole-window values.
 
 A reader-state store that is missing, empty, truncated, or hand-edited into
 garbage degrades every query that consults it to "nothing is archived" rather

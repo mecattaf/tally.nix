@@ -14,7 +14,7 @@ they are not advertised and are not part of this contract.
 | Surface | Current version | Where it appears |
 |---|---:|---|
 | Query schema | `1` | `schemaVersion` on query results |
-| Query protocol | `4` | `protocolVersion` on query results and watch records |
+| Query protocol | `5` | `protocolVersion` on query results and watch records |
 | Enqueue response schema | `1` | `schemaVersion` on enqueue and retry results |
 | Witness schema | `2` | `schemaVersion` on canonical verdict records |
 
@@ -37,7 +37,7 @@ full-duplex Unix-stream connection:
 
 ```json
 {"id":"client-7","method":"query.pools","params":{}}
-{"id":"client-7","result":{"schemaVersion":1,"protocolVersion":4,"pools":[]}}
+{"id":"client-7","result":{"schemaVersion":1,"protocolVersion":5,"pools":[]}}
 ```
 
 A request has these fields:
@@ -376,7 +376,7 @@ the single `flow` pool.
 
 ## Query methods
 
-All query objects currently report `schemaVersion: 1` and `protocolVersion: 4`. Important common
+All query objects currently report `schemaVersion: 1` and `protocolVersion: 5`. Important common
 shapes are:
 
 - collection: `{schemaVersion, protocolVersion, items, nextCursor, truncated, elidedItems,
@@ -385,7 +385,7 @@ shapes are:
 - snapshot: `{createdAt, cursor, history, witnessHead:{seq,hash}}`;
 - job detail: `{schemaVersion, protocolVersion, job, attempts, snapshot}`;
 - run status: `{schemaVersion, protocolVersion, flowRunId, flowName?, campaign?, repository?,
-  state, counts, tasks, currentNodes, failures, snapshot}`;
+  state, counts, items, tasks?, currentNodes, failures, snapshot}`;
 - pool view: `{schemaVersion, protocolVersion, pools}`;
 - proof: `{schemaVersion, protocolVersion, taskUuid, attempt, leaseEpoch, status,
   witnessExpected, witnessRecord, authorship?, evidence, advisoryAttestations, ledger, history}`.
@@ -394,12 +394,17 @@ shapes are:
 
 ```text
 liveState (alias state), terminalVerdict (alias verdict), pool, executor,
-adapter, source, origin, parent, flowRun, session, since, until, limit, cursor
+adapter, source, origin, parent, flowRun, session, since, until, limit, cursor, archived
 ```
 
 `since` and `until` are RFC 3339 timestamps. `terminalVerdict` is one of the witness verdicts.
 `flowRun` matches `orchestration.flowRunId`, which is how `tally query jobs --flow-run ID` groups
-a run's nodes. Each job summary includes its durable identity, optional top-level `taskRef`, and admission fields, live and
+a run's nodes. It is an explicit by-ID inspection: archived members remain in `items` with
+`archived: true`, independent of the broad-list `archived` control. The CLI rejects
+`--flow-run` combined with either `--archived` or `--no-archived`, since neither broad-list flag
+can hide or reveal anything in an explicit lookup. Without `flowRun`, `archived: false` (the
+default) hides jobs whose creating run is archived, while `archived: true` includes and annotates
+them. Each job summary includes its durable identity, optional top-level `taskRef`, and admission fields, live and
 terminal state, parent/children, provenance with authority labels, evidence, timestamps,
 resource use, artifact/witness facts, authorship when present, and trace availability. Two of the
 admission fields are `dedupKey`, the node's submission identity, and `disposition`, which is
@@ -408,7 +413,9 @@ no row — `attached`, and full-mode `reused` and `terminal` — are reported by
 `node-submitted` and `node-terminal` lifecycle events instead.
 
 `query.run` accepts a flow-run UUID as `id` and returns the compact state needed during an
-operator check. `currentNodes` carries node label, task reference, live state, start time,
+operator check. `items` is the exact durable member-identity list and therefore contains every
+resolved `taskUuid`, including a member that has no row, lifecycle event, or witness of its own.
+`currentNodes` carries node label, task reference, live state, start time,
 elapsed seconds, configured `runtimeMaxSec`, and `budgetRemainingSeconds`. That remainder is
 signed: a node past its budget reports the overrun as a negative value rather than saturating at
 zero. `failures` carries the failed stage, canonical verdict, attempt/epoch, retained
@@ -417,8 +424,10 @@ failure-capture path when present, the bounded stderr tail, and the canonical st
 flow, the latest schema-validated reconciliation result also supplies the full campaign task
 table. Its tasks are classified as `done`, `running`, `blocked`, or `pending`, with unresolved
 dependencies, current/failing node, and merged pull request where available. Other flows still
-receive current nodes and failures but have an empty task table; for those runs `state` reaches
-`complete` when every admitted node holds a passing terminal verdict on its current attempt.
+receive `items`, current nodes, and failures but omit the reconciliation-only `tasks` key. This
+keeps `items` authoritative for durable membership instead of letting an empty task board shadow
+it for consumers that prefer `tasks` when present. For those runs `state` reaches `complete` when
+every admitted node holds a passing terminal verdict on its current attempt.
 
 `query.run` also returns `usage`: what the run cost, summed per attempt from the advisory
 attestation ledger — keyed by `taskUuid`/`attempt`/`leaseEpoch` — over the run's durable
@@ -564,7 +573,12 @@ format it returns the object. With `format: "text"` it returns a JSON **string**
 pretty-printed JSON object; the CLI unwraps that string before printing.
 
 `query.standup` returns a window, completed and in-flight entries, reuse and gate-failure
-summaries, cancellations, and canonical GPU seconds. The RPC accepts a `source` filter even
+summaries, cancellations, and canonical GPU seconds. `reused` and `canonicalGpuSeconds` describe
+the task entries visible after reader-state filtering: the former is recomputed from the latest
+canonical witness labor class for retained terminal tasks, and the latter from every retained
+task's witness records using the canonical GPU contribution predicate. Neither is derived from
+entry `gpuSeconds` or from `runs`. Passing `archived: true` retains the whole window and therefore
+the whole-window aggregates. The RPC accepts a `source` filter even
 though the current CLI exposes only `--since`. Each completed, in-flight, gate-failed, and
 cancelled entry includes optional `taskRef`. `runs` carries one `{flowRunId, usage}` entry per
 flow run the window touched, whose `usage` is the same rollup `query.run` returns — see [Usage

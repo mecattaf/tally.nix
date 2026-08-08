@@ -105,9 +105,9 @@ pub(super) enum Command {
 /// and a CLI verb that went through the daemon at all would blur that line.
 #[derive(Debug, Subcommand)]
 pub(super) enum ReaderStateCommand {
-    /// Mark a flow run archived. Its jobs and stand-up entries are hidden by
-    /// default from `query jobs` / `query standup` until `--archived` is
-    /// passed to one of those commands.
+    /// Mark a flow run archived. Its jobs and stand-up entries are hidden from
+    /// broad `query jobs` / `query standup` views by default; an explicit
+    /// `query jobs --flow-run` lookup still returns and annotates its members.
     Archive {
         #[arg(value_name = "FLOW_RUN_ID")]
         flow_run: String,
@@ -1051,13 +1051,14 @@ pub(super) enum QueryCommand {
         /// it the command follows the cursor and prints the whole window.
         #[arg(long)]
         json: bool,
-        /// Include jobs whose creating run is archived operator reader-state.
-        /// The default hides them.
-        #[arg(long, conflicts_with = "no_archived")]
+        /// Include jobs whose creating run is archived operator reader-state
+        /// in a broad query. An explicit `--flow-run` lookup always includes
+        /// its archived members and therefore conflicts with this control.
+        #[arg(long, conflicts_with_all = ["no_archived", "flow_run"])]
         archived: bool,
         /// Explicit spelling of the default: hide jobs whose creating run is
-        /// archived.
-        #[arg(long)]
+        /// archived in a broad query. Explicit flow-run lookups never hide.
+        #[arg(long, conflicts_with = "flow_run")]
         no_archived: bool,
     },
     Job {

@@ -68,6 +68,29 @@ authorized.
   success (0), independent of argument order; usage remains the immediate exit
   2. No close-out consumer was added.
 
+### Filtered query views and archive state (#415)
+
+- `query jobs --flow-run ID` is now an explicit lookup, matching `query run
+  ID`: archived members remain visible with `archived: true`. Broad jobs
+  queries still hide archived runs by default and include them with
+  `--archived`; the CLI rejects either `--archived` or `--no-archived` beside
+  `--flow-run` because those broad-view controls cannot change an explicit
+  lookup.
+- Singular `query run ID --json` now carries `items`, the exact durable
+  member-identity list, so a row-less reused or attached member remains visible
+  by `taskUuid` even when no reconciled campaign task table exists.
+  An absent reconciliation board no longer serializes as `tasks: []`, which
+  previously shadowed that member list for tasks-preferring consumers.
+- After `query standup` hides archived task entries, `reused` and
+  `canonicalGpuSeconds` are recomputed from the retained task UUIDs and the
+  canonical witness records. Reuse follows the latest terminal
+  `laborClass: reused`; GPU seconds use the existing canonical contribution
+  predicate across qualifying attempts. `--archived` retains the whole
+  window and its whole-window aggregates. Hidden task and run counts, per-run
+  usage rows, and `usageBasis` conservation are unchanged.
+- The query protocol is now **5** (schema remains 1) because these aggregate
+  and explicit-lookup meanings replace the documented protocol-4 contract.
+
 ### Campaign git-ai execution and terminal diagnostics (#441)
 
 - Campaign nodes may now carry the full closed git-ai correlation set of at

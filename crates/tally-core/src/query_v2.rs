@@ -373,10 +373,12 @@ pub struct JobSummary {
     pub credential_names: Vec<String>,
     pub trace: TraceAvailability,
     /// True when the flow run that created this job (per its orchestration
-    /// capsule) is archived reader-state. Set post-projection by
-    /// [`apply_reader_state_to_jobs`], which owns the reader-state store this
-    /// projection has no access to; an unfilled summary carries `false`
-    /// rather than a wrong value.
+    /// capsule) is archived reader-state. In an explicit `flowRun` lookup it
+    /// is also true when the selected run is archived, including for a
+    /// membership-only summary that has no orchestration capsule of its own.
+    /// Set post-projection by [`apply_reader_state_to_jobs`], which owns the
+    /// reader-state store this projection has no access to; an unfilled summary
+    /// carries `false` rather than a wrong value.
     #[serde(default)]
     pub archived: bool,
 }
@@ -432,18 +434,11 @@ pub struct CollectionEnvelope<T> {
     /// members at all — which now means the run really admitted nothing, rather
     /// than that its nodes went missing.
     ///
-    /// A THIRD case this count cannot distinguish from either of those, as of
-    /// #389: a run with members whose items were all withheld because the run
-    /// itself is archived operator reader-state. `items` comes back empty
-    /// exactly as it would for a quiet or member-less run, and this field
-    /// still reports the true (unfiltered) membership size — so
-    /// `flowRunTasks: 1, items: []` for an explicit `--flow-run <archived>`
-    /// currently reads as one of the first two cases when it is really the
-    /// third, with nothing in the envelope saying so. Filed as issue #415
-    /// rather than resolved here: whether an explicit `--flow-run` filter
-    /// should withhold archived items at all — `query run <id>`
-    /// deliberately does not — is a design question for a ruling, not a
-    /// doc-comment fix.
+    /// An explicit `flowRun` filter is a by-ID inspection, so reader-state
+    /// never withholds its jobs: an archived member remains in `items` with
+    /// `archived: true`. Consequently `flowRunTasks: N, items: []` retains its
+    /// original meaning: the run has members, but none matched the remaining
+    /// job filters or window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_run_tasks: Option<usize>,
     pub snapshot: QuerySnapshotMetadata,
@@ -626,6 +621,14 @@ pub fn query_jobs(
             .clone()
             .unwrap_or_else(|| format!("witness:{}", record.seq))
     }));
+    // An explicit run lookup is also an identity lookup for every UUID in its
+    // durable membership ledger. A row-less member can have no detail,
+    // lifecycle, live, or witness fact left in this projection; omitting the
+    // membership set from `anchors` would therefore report `flowRunTasks: N`
+    // beside fewer than N items even when no other filter was supplied.
+    if let Some(tasks) = &flow_tasks {
+        anchors.extend(tasks.iter().cloned());
+    }
 
     let detail_by_task = details
         .iter()
@@ -666,7 +669,7 @@ pub fn query_jobs(
             .get(anchor.as_str())
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let summary = build_summary(
+        let mut summary = build_summary(
             &anchor,
             detail_by_task.get(anchor.as_str()).copied(),
             live_by_task.get(anchor.as_str()).copied(),
@@ -675,6 +678,15 @@ pub fn query_jobs(
             children.get(&anchor).cloned().unwrap_or_default(),
             pool_signals,
         );
+        // Membership is itself the durable fact that this anchor is a task
+        // UUID. Preserve that identity on a skeletal summary even when all of
+        // the task's other observable facts are absent.
+        if flow_tasks
+            .as_ref()
+            .is_some_and(|tasks| tasks.contains(&anchor))
+        {
+            summary.task_uuid = Some(anchor.clone());
+        }
         if matches_jobs_filter(&summary, filter, flow_tasks.as_ref(), since, until) {
             items.push(summary);
         }
@@ -1063,6 +1075,18 @@ pub struct RunTaskProjection {
     pub pull_request: Option<String>,
 }
 
+/// One durable member of an explicitly identified flow run.
+///
+/// This identity list is deliberately separate from [`RunTaskProjection`]:
+/// `tasks` is the optional spec-build reconciliation board, while `items`
+/// must name every UUID resolved from durable run membership even when that
+/// member has no row, lifecycle event, or witness of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RunMemberProjection {
+    pub task_uuid: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RunNodeProjection {
@@ -1145,6 +1169,15 @@ pub struct RunView {
     /// Advisory by construction and partial by default; see
     /// [`crate::usage_rollup`].
     pub usage: UsageRollup,
+    /// Exact member identities resolved from the durable membership union.
+    /// Unlike `tasks`, this is present for every flow kind and does not depend
+    /// on a spec-build reconciliation result.
+    #[serde(default)]
+    pub items: Vec<RunMemberProjection>,
+    /// The optional spec-build reconciliation board. This is not the durable
+    /// member list, so an empty board is omitted rather than emitted beside a
+    /// populated `items` array under the historically ambiguous `tasks` key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<RunTaskProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<RunAnomalyProjection>,
@@ -1258,6 +1291,11 @@ pub fn query_run(
     attestations: &AttestationEvidence<'_>,
 ) -> Result<RunView, ObservabilityError> {
     let flow_tasks = flow_run_tasks(flow_run, details, witness, membership);
+    let items = flow_tasks
+        .iter()
+        .cloned()
+        .map(|task_uuid| RunMemberProjection { task_uuid })
+        .collect();
     let parent_detail = details.iter().find(|detail| detail.task_uuid == flow_run);
     let parent_live = live.iter().find(|fact| fact.anchor == flow_run);
     let parent_events = history
@@ -1638,6 +1676,7 @@ pub fn query_run(
         // and witnesses that name the run — so a node this run was handed but
         // whose row names its creating run (the W-316 shape) is inside the sum.
         usage: roll_up(flow_tasks.iter().map(String::as_str), attestations),
+        items,
         tasks,
         anomalies,
         current_nodes,
@@ -1756,12 +1795,25 @@ pub fn apply_reader_state_to_run(view: &mut RunView, reader_state: &ReaderState)
         .map(ToOwned::to_owned);
 }
 
-/// Overlay operator reader-state onto a page of jobs, filtering out jobs
-/// whose *creating* run (the orchestration capsule's `flowRunId`, the same
-/// single source [`crate::query::query_standup`]'s primary attribution uses)
-/// is archived, unless the caller opted in with `include_archived`. Every
-/// item's `archived` field is set first, so a caller who did opt in still
-/// sees which of the returned jobs are archived.
+/// How a jobs query applies archived reader-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobsReaderStateMode<'a> {
+    /// A broad collection. Archived jobs are retained only when the caller
+    /// explicitly opted in.
+    Broad { include_archived: bool },
+    /// A canonical `flowRun` filter is an explicit by-ID inspection. Its jobs
+    /// are annotated with both their creating run's state and the selected
+    /// run's state, but never withheld.
+    ExplicitLookup { flow_run: &'a str },
+}
+
+/// Overlay operator reader-state onto a page of jobs. Every item's `archived`
+/// field is set first. Broad collections use the job's *creating* run (the
+/// orchestration capsule's `flowRunId`, the same single source
+/// [`crate::query::query_standup`]'s primary attribution uses) and filter
+/// archived jobs unless the caller opted in. An explicit lookup also annotates
+/// from the selected run, which is the only archive identity a membership-only
+/// item has, and retains all of its items.
 ///
 /// Returns how many jobs this call actually removed — computed from the same
 /// pass that built the returned list, never from a separate count that could
@@ -1769,15 +1821,25 @@ pub fn apply_reader_state_to_run(view: &mut RunView, reader_state: &ReaderState)
 pub fn apply_reader_state_to_jobs(
     items: &mut Vec<JobSummary>,
     reader_state: &ReaderState,
-    include_archived: bool,
+    mode: JobsReaderStateMode<'_>,
 ) -> usize {
+    let selected_run_archived = match mode {
+        JobsReaderStateMode::ExplicitLookup { flow_run } => reader_state.is_archived(flow_run),
+        JobsReaderStateMode::Broad { .. } => false,
+    };
     for item in items.iter_mut() {
-        item.archived = item
-            .orchestration
-            .as_ref()
-            .is_some_and(|orchestration| reader_state.is_archived(orchestration.flow_run_id()));
+        item.archived = selected_run_archived
+            || item
+                .orchestration
+                .as_ref()
+                .is_some_and(|orchestration| reader_state.is_archived(orchestration.flow_run_id()));
     }
-    if include_archived {
+    if matches!(
+        mode,
+        JobsReaderStateMode::Broad {
+            include_archived: true
+        } | JobsReaderStateMode::ExplicitLookup { .. }
+    ) {
         return 0;
     }
     let before = items.len();
@@ -1856,6 +1918,72 @@ fn filterable_entries(digest: &StandupDigest) -> usize {
     runs.len() + completed.len() + gate_fails.len() + cancelled.len() + in_flight.len()
 }
 
+/// Recompute the two task-entry aggregates from the UUIDs that remain visible
+/// after reader-state filtering. GPU seconds deliberately retain every
+/// qualifying attempt for a visible task, matching `query_standup`; reuse is
+/// a task classification, so it follows the newest canonical witness whose
+/// verdict is the one projected into a surviving terminal entry.
+fn visible_standup_aggregates(digest: &StandupDigest, witness: &[WitnessRecord]) -> (usize, f64) {
+    let visible_tasks = digest
+        .completed
+        .iter()
+        .chain(&digest.gate_fails)
+        .chain(&digest.cancelled)
+        .filter_map(|entry| entry.task_uuid.as_deref())
+        .chain(
+            digest
+                .in_flight
+                .iter()
+                .filter_map(|entry| entry.task_uuid.as_deref()),
+        )
+        .collect::<BTreeSet<_>>();
+    let terminal_verdicts = digest
+        .completed
+        .iter()
+        .chain(&digest.gate_fails)
+        .chain(&digest.cancelled)
+        .filter_map(|entry| Some((entry.task_uuid.as_deref()?, entry.verdict)))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut latest_witness = BTreeMap::<&str, &WitnessRecord>::new();
+    for record in witness {
+        let Some(task_uuid) = record.task_uuid.as_deref() else {
+            continue;
+        };
+        if !terminal_verdicts.contains_key(task_uuid) {
+            continue;
+        }
+        latest_witness
+            .entry(task_uuid)
+            .and_modify(|current| {
+                if record.seq > current.seq {
+                    *current = record;
+                }
+            })
+            .or_insert(record);
+    }
+    let reused = latest_witness
+        .into_iter()
+        .filter(|(task_uuid, record)| {
+            record.labor_class == LaborClass::Reused
+                && terminal_verdicts.get(task_uuid).copied() == Some(record.verdict)
+        })
+        .count();
+    let canonical_gpu_seconds = witness
+        .iter()
+        .filter(|record| {
+            record
+                .task_uuid
+                .as_deref()
+                .is_some_and(|task_uuid| visible_tasks.contains(task_uuid))
+        })
+        .filter(|record| counts_toward_canonical_gpu_seconds(record))
+        .filter_map(|record| record.gpu_seconds)
+        .sum();
+
+    (reused, canonical_gpu_seconds)
+}
+
 /// Overlay operator reader-state onto a stand-up digest, filtering entries
 /// whose creating run is archived unless `include_archived` is set, and
 /// setting [`StandupDigest::archived_hidden`] and
@@ -1876,6 +2004,13 @@ fn filterable_entries(digest: &StandupDigest) -> usize {
 /// *attached* a task (the W-316 shape) is archived exactly like a run that
 /// created one, and its cost row must not survive un-hidden while its count
 /// stays silently zero.
+///
+/// After the four task-entry collections are filtered, their retained task
+/// UUIDs also define the displayed aggregates. `reused` follows the latest
+/// matching canonical witness's [`LaborClass::Reused`] classification, while
+/// `canonical_gpu_seconds` sums retained tasks' witness attempts through
+/// [`counts_toward_canonical_gpu_seconds`]. Neither aggregate is inferred from
+/// an entry's `gpu_seconds` field or from the separately filtered `runs` rows.
 ///
 /// Both counts are accumulated by [`retain_counting`] as the collections are
 /// filtered, never by a separate recount over `details` or anything else. A
@@ -1910,6 +2045,7 @@ fn filterable_entries(digest: &StandupDigest) -> usize {
 pub fn apply_reader_state_to_standup(
     digest: &mut StandupDigest,
     details: &[RowDetailFact],
+    witness: &[WitnessRecord],
     reader_state: &ReaderState,
     include_archived: bool,
 ) -> usize {
@@ -1953,6 +2089,10 @@ pub fn apply_reader_state_to_standup(
         keep(&entry.task_uuid)
     });
     digest.archived_hidden = task_hidden;
+
+    let (reused, canonical_gpu_seconds) = visible_standup_aggregates(digest, witness);
+    digest.reused = reused;
+    digest.canonical_gpu_seconds = canonical_gpu_seconds;
 
     // Every removal across the fields `filterable_entries` names reached a
     // counter. A `debug_assert` rather than a hard one on purpose: a
@@ -3490,8 +3630,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_4_authority_vocabulary_is_byte_stable() {
-        assert_eq!(QUERY_PROTOCOL_VERSION, 4);
+    fn current_protocol_authority_vocabulary_is_byte_stable() {
+        assert_eq!(QUERY_PROTOCOL_VERSION, 5);
         assert_eq!(
             [
                 FactAuthority::DurableAdmissionFact,
@@ -4433,7 +4573,7 @@ mod tests {
         )
         .unwrap();
         let projected = jobs.items[0].authorship.as_ref().unwrap();
-        assert_eq!(jobs.protocol_version, 4);
+        assert_eq!(jobs.protocol_version, 5);
         assert_eq!(projected.status, AuthorshipStatus::Mismatch);
         assert!(projected.identity_mismatch);
         assert_eq!(projected.result_revision, "b".repeat(40));
@@ -4694,6 +4834,12 @@ mod tests {
             &evidence,
         )
         .unwrap();
+        assert_eq!(
+            view.items,
+            [RunMemberProjection {
+                task_uuid: shared.to_owned(),
+            }]
+        );
         assert_eq!(view.usage.coverage.tasks, 1);
         assert_eq!(view.usage.coverage.attempts_reported, 1);
         assert_eq!(view.usage.coverage.tasks_without_attestation, 0);
@@ -4718,6 +4864,53 @@ mod tests {
             &evidence,
         );
         assert!(matches!(scan_only, Err(ObservabilityError::UnknownJob(_))));
+    }
+
+    #[test]
+    fn explicit_run_serialization_falls_back_to_items_for_membership_only_identity() {
+        let flow_run = "00000000-0000-4000-8000-000000000415";
+        let member = "00000000-0000-4000-8000-000000000416";
+        let mut membership = FlowMembership::default();
+        membership.insert(crate::flow_membership::FlowMembershipRecord::new(
+            flow_run.to_owned(),
+            member.to_owned(),
+            crate::flow_membership::MembershipDisposition::Reused,
+            Some(0),
+            Some("reuse-only".to_owned()),
+        ));
+
+        let view = query_run(
+            flow_run,
+            &[],
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &membership,
+            &AttestationEvidence::unavailable(),
+        )
+        .unwrap();
+        assert_eq!(
+            view.items,
+            [RunMemberProjection {
+                task_uuid: member.to_owned(),
+            }]
+        );
+        assert!(view.tasks.is_empty());
+
+        let public = serde_json::to_value(view).unwrap();
+        assert!(
+            public.get("tasks").is_none(),
+            "an empty reconciliation board must not shadow durable members"
+        );
+        let members = public
+            .get("tasks")
+            .or_else(|| public.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert!(members
+            .iter()
+            .any(|item| item["taskUuid"].as_str() == Some(member)));
     }
 
     #[test]
@@ -4806,6 +4999,62 @@ mod tests {
             archived_runs_hidden: 0,
             usage_basis: None,
         }
+    }
+
+    fn standup_aggregate_witness(
+        head: &mut ChainHead,
+        task_uuid: &str,
+        flow_run: &str,
+        attempt: u32,
+        labor_class: LaborClass,
+        gpu_seconds: f64,
+    ) -> WitnessRecord {
+        let verdict = if labor_class == LaborClass::Reused {
+            Verdict::Reused
+        } else {
+            Verdict::Pass
+        };
+        let record = build_record(
+            WitnessBody {
+                task_uuid: Some(task_uuid.to_owned()),
+                transition_timestamp: format!("2026-08-01T10:00:{:02}.000Z", head.seq + 12),
+                verdict,
+                exit_code: 0,
+                artifact_content_hash: None,
+                store_paths: None,
+                drv: None,
+                gpu_seconds: Some(gpu_seconds),
+                wall_clock: 12.0,
+                attempt,
+                lease_epoch: 7,
+                dedup_key: None,
+                payload_hash: None,
+                brief_hash: None,
+                origin: AdmissionOrigin::direct(EnqueueSource::Orchestrator),
+                orchestration: Some(flow_orchestration(flow_run, 1, "aggregate-fixture", None)),
+                labor_class,
+                trace_ref: None,
+                pools: vec!["campaign-agent".to_owned()],
+                executor: None,
+                host_id: None,
+                charge: None,
+                model: None,
+                evidence_class: None,
+                manifest_hash: None,
+                completion: None,
+                error: None,
+                result_revision: None,
+                authorship: None,
+                authorship_sessions: None,
+            },
+            head,
+        )
+        .unwrap();
+        *head = ChainHead {
+            seq: record.seq,
+            hash: record.hash.clone(),
+        };
+        record
     }
 
     #[test]
@@ -5226,14 +5475,26 @@ mod tests {
         let reader_state = reader_state_fixture(&[(archived_run, None)]);
 
         let mut default_view = items.clone();
-        let hidden = apply_reader_state_to_jobs(&mut default_view, &reader_state, false);
+        let hidden = apply_reader_state_to_jobs(
+            &mut default_view,
+            &reader_state,
+            JobsReaderStateMode::Broad {
+                include_archived: false,
+            },
+        );
         assert_eq!(hidden, 1);
         assert_eq!(default_view.len(), 1);
         assert_eq!(default_view[0].anchor, visible_node.task_uuid);
         assert!(!default_view[0].archived);
 
         let mut included_view = items.clone();
-        let hidden = apply_reader_state_to_jobs(&mut included_view, &reader_state, true);
+        let hidden = apply_reader_state_to_jobs(
+            &mut included_view,
+            &reader_state,
+            JobsReaderStateMode::Broad {
+                include_archived: true,
+            },
+        );
         assert_eq!(hidden, 0);
         assert_eq!(included_view.len(), 2);
         let flagged = included_view
@@ -5247,13 +5508,84 @@ mod tests {
             .unwrap();
         assert!(!unflagged.archived);
 
+        let mut explicit_view = items.clone();
+        let hidden = apply_reader_state_to_jobs(
+            &mut explicit_view,
+            &reader_state,
+            JobsReaderStateMode::ExplicitLookup {
+                flow_run: archived_run,
+            },
+        );
+        assert_eq!(hidden, 0);
+        assert_eq!(explicit_view.len(), 2);
+        assert!(
+            explicit_view
+                .iter()
+                .find(|item| item.anchor == hidden_node.task_uuid)
+                .unwrap()
+                .archived
+        );
+
         // The returned hidden count always equals what was actually removed
         // from the list beside it -- never a separately recomputed number.
         items.clear();
         assert_eq!(
-            apply_reader_state_to_jobs(&mut items, &reader_state, false),
+            apply_reader_state_to_jobs(
+                &mut items,
+                &reader_state,
+                JobsReaderStateMode::Broad {
+                    include_archived: false,
+                },
+            ),
             0
         );
+    }
+
+    #[test]
+    fn explicit_flow_run_projects_membership_only_identity_and_selected_archive_state() {
+        let archived_run = "00000000-0000-4000-8000-000000000415";
+        let member = "00000000-0000-4000-8000-000000000416";
+        let mut membership = FlowMembership::default();
+        membership.insert(crate::flow_membership::FlowMembershipRecord::new(
+            archived_run.to_owned(),
+            member.to_owned(),
+            crate::flow_membership::MembershipDisposition::Attached,
+            Some(1),
+            Some("membership-only".to_owned()),
+        ));
+
+        let mut result = query_jobs(
+            &[],
+            &[],
+            &history(),
+            &[],
+            &BTreeMap::new(),
+            &JobsFilter {
+                flow_run: Some(archived_run.to_owned()),
+                ..JobsFilter::default()
+            },
+            &membership,
+        )
+        .unwrap();
+        assert_eq!(result.flow_run_tasks, Some(1));
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].anchor, member);
+        assert_eq!(result.items[0].task_uuid.as_deref(), Some(member));
+        assert!(result.items[0].orchestration.is_none());
+
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+        assert_eq!(
+            apply_reader_state_to_jobs(
+                &mut result.items,
+                &reader_state,
+                JobsReaderStateMode::ExplicitLookup {
+                    flow_run: archived_run,
+                },
+            ),
+            0
+        );
+        assert_eq!(result.items.len(), 1);
+        assert!(result.items[0].archived);
     }
 
     #[test]
@@ -5301,7 +5633,8 @@ mod tests {
         let before_completed = digest.completed.len();
 
         let reader_state = reader_state_fixture(&[(archived_run, None)]);
-        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+        let hidden =
+            apply_reader_state_to_standup(&mut digest, &details, &[], &reader_state, false);
 
         assert_eq!(hidden, 1);
         assert_eq!(digest.archived_hidden, 1);
@@ -5331,12 +5664,121 @@ mod tests {
             flow_run_id: archived_run.to_owned(),
             usage: empty_usage(),
         }];
-        let hidden = apply_reader_state_to_standup(&mut included, &details, &reader_state, true);
+        let hidden =
+            apply_reader_state_to_standup(&mut included, &details, &[], &reader_state, true);
         assert_eq!(hidden, 0);
         assert_eq!(included.archived_hidden, 0);
         assert_eq!(included.archived_runs_hidden, 0);
         assert_eq!(included.completed.len(), 1);
         assert_eq!(included.runs.len(), 1);
+    }
+
+    #[test]
+    fn archived_only_reused_task_contributes_zero_by_default_and_one_forty_two_when_included() {
+        let archived_run = "00000000-0000-4000-8000-000000000274";
+        let task = "00000000-0000-4000-8000-000000000275";
+        let mut task_detail = detail(RowStatus::Completed);
+        task_detail.task_uuid = task.to_owned();
+        task_detail.orchestration =
+            Some(flow_orchestration(archived_run, 1, "agent-archived", None));
+        let details = [task_detail];
+        let mut head = ChainHead::default();
+        let witness = [
+            standup_aggregate_witness(&mut head, task, archived_run, 1, LaborClass::Fresh, 42.0),
+            standup_aggregate_witness(&mut head, task, archived_run, 2, LaborClass::Reused, 999.0),
+        ];
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+
+        let mut default_view = standup_fixture(task);
+        default_view.completed[0].verdict = Verdict::Reused;
+        default_view.completed[0].gpu_seconds = Some(999.0);
+        default_view.reused = 1;
+        default_view.canonical_gpu_seconds = 42.0;
+        apply_reader_state_to_standup(&mut default_view, &details, &witness, &reader_state, false);
+        assert!(default_view.completed.is_empty());
+        assert_eq!(default_view.reused, 0);
+        assert_eq!(default_view.canonical_gpu_seconds, 0.0);
+
+        let mut included_view = standup_fixture(task);
+        included_view.completed[0].verdict = Verdict::Reused;
+        included_view.completed[0].gpu_seconds = Some(999.0);
+        apply_reader_state_to_standup(&mut included_view, &details, &witness, &reader_state, true);
+        assert_eq!(included_view.completed.len(), 1);
+        assert_eq!(included_view.reused, 1);
+        assert_eq!(included_view.canonical_gpu_seconds, 42.0);
+    }
+
+    #[test]
+    fn mixed_archive_filter_keeps_only_visible_witness_contributions() {
+        let archived_run = "00000000-0000-4000-8000-000000000276";
+        let visible_run = "00000000-0000-4000-8000-000000000277";
+        let archived_task = "00000000-0000-4000-8000-000000000278";
+        let visible_task = "00000000-0000-4000-8000-000000000279";
+        let mut archived_detail = detail(RowStatus::Completed);
+        archived_detail.task_uuid = archived_task.to_owned();
+        archived_detail.orchestration =
+            Some(flow_orchestration(archived_run, 1, "agent-archived", None));
+        let mut visible_detail = detail(RowStatus::Completed);
+        visible_detail.task_uuid = visible_task.to_owned();
+        visible_detail.orchestration =
+            Some(flow_orchestration(visible_run, 1, "agent-visible", None));
+        let details = [archived_detail, visible_detail];
+        let mut head = ChainHead::default();
+        let witness = [
+            standup_aggregate_witness(
+                &mut head,
+                archived_task,
+                archived_run,
+                1,
+                LaborClass::Fresh,
+                42.0,
+            ),
+            standup_aggregate_witness(
+                &mut head,
+                archived_task,
+                archived_run,
+                2,
+                LaborClass::Reused,
+                999.0,
+            ),
+            standup_aggregate_witness(
+                &mut head,
+                visible_task,
+                visible_run,
+                1,
+                LaborClass::Fresh,
+                7.0,
+            ),
+            standup_aggregate_witness(
+                &mut head,
+                visible_task,
+                visible_run,
+                2,
+                LaborClass::Reused,
+                999.0,
+            ),
+        ];
+        let mut digest = standup_fixture(archived_task);
+        digest.completed[0].verdict = Verdict::Reused;
+        digest.completed[0].gpu_seconds = Some(999.0);
+        digest.completed.push(crate::query::CompletedEntry {
+            task_uuid: Some(visible_task.to_owned()),
+            task_ref: None,
+            gpu_seconds: Some(999.0),
+            verdict: Verdict::Reused,
+            session_ref: None,
+            gh_origin: None,
+        });
+        digest.reused = 2;
+        digest.canonical_gpu_seconds = 49.0;
+
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+        apply_reader_state_to_standup(&mut digest, &details, &witness, &reader_state, false);
+
+        assert_eq!(digest.completed.len(), 1);
+        assert_eq!(digest.completed[0].task_uuid.as_deref(), Some(visible_task));
+        assert_eq!(digest.reused, 1);
+        assert_eq!(digest.canonical_gpu_seconds, 7.0);
     }
 
     /// The L3/L7 seam: `usage_basis` is present exactly when `runs` is
@@ -5377,7 +5819,7 @@ mod tests {
 
         // Then reader-state, hiding the only run there is.
         let reader_state = reader_state_fixture(&[(run, None)]);
-        apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+        apply_reader_state_to_standup(&mut digest, &details, &[], &reader_state, false);
 
         assert!(digest.runs.is_empty());
         assert_eq!(digest.archived_runs_hidden, 1);
@@ -5405,7 +5847,7 @@ mod tests {
             &evidence,
         );
         let untouched = reader_state_fixture(&[]);
-        apply_reader_state_to_standup(&mut kept, &details, &untouched, false);
+        apply_reader_state_to_standup(&mut kept, &details, &[], &untouched, false);
         assert_eq!(kept.runs.len(), 1);
         assert_eq!(kept.archived_runs_hidden, 0);
         assert!(kept.usage_basis.is_some());
@@ -5447,7 +5889,8 @@ mod tests {
         ];
 
         let reader_state = reader_state_fixture(&[(attach_only_run, None)]);
-        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+        let hidden =
+            apply_reader_state_to_standup(&mut digest, &details, &[], &reader_state, false);
 
         assert_eq!(hidden, 0, "no task entry's CREATING run is archived");
         assert_eq!(digest.archived_hidden, 0);
@@ -5490,7 +5933,8 @@ mod tests {
         let mut digest = standup_fixture("00000000-0000-4000-8000-000000000297");
         let reader_state = reader_state_fixture(&[(archived_run, None)]);
 
-        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+        let hidden =
+            apply_reader_state_to_standup(&mut digest, &details, &[], &reader_state, false);
         assert_eq!(
             hidden, 0,
             "the archived detail never appeared in any digest bucket, so nothing was hidden"
@@ -5581,7 +6025,8 @@ mod tests {
         }];
 
         let reader_state = reader_state_fixture(&[(archived_run, None)]);
-        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+        let hidden =
+            apply_reader_state_to_standup(&mut digest, &details, &[], &reader_state, false);
 
         // One entry removed from each of the four task collections. Drop any
         // single collection from the count and this is 3, not 4.
@@ -5637,7 +6082,13 @@ mod tests {
             }];
             let before = filterable_entries(&digest);
 
-            apply_reader_state_to_standup(&mut digest, &details, &reader_state, include_archived);
+            apply_reader_state_to_standup(
+                &mut digest,
+                &details,
+                &[],
+                &reader_state,
+                include_archived,
+            );
 
             let removed = before - filterable_entries(&digest);
             assert_eq!(

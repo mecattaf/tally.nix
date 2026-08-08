@@ -2235,7 +2235,7 @@ mod tests {
             .query("query.job", Some(json!({"id": task_uuid})))
             .await
             .unwrap();
-        assert_eq!(after["protocolVersion"], 4);
+        assert_eq!(after["protocolVersion"], 5);
         assert_eq!(after["job"]["authorship"], before["job"]["authorship"]);
         assert_eq!(
             after["job"]["authorship"]["workspace"]["value"]["repo"],
@@ -9482,7 +9482,7 @@ mod tests {
                     .call("query.status", Some(json!({"pool": "slot"})))
                     .await
                     .unwrap();
-                assert_eq!(status["protocolVersion"], 4);
+                assert_eq!(status["protocolVersion"], 5);
                 assert_eq!(status["pools"][0]["pool"], "slot");
                 assert!(status["jobs"].as_array().unwrap().iter().any(|job| {
                     job["taskUuid"].as_str() == Some(task_uuid) && job["verdict"] == "pass"
@@ -9495,12 +9495,12 @@ mod tests {
                     .unwrap();
                 assert!(render_text
                     .as_str()
-                    .is_some_and(|text| text.contains("\"protocolVersion\": 4")));
+                    .is_some_and(|text| text.contains("\"protocolVersion\": 5")));
                 let render_json = client
                     .call("query.render", Some(json!({"format": "json"})))
                     .await
                     .unwrap();
-                assert_eq!(render_json["protocolVersion"], 4);
+                assert_eq!(render_json["protocolVersion"], 5);
 
                 let reused = client.call("queue.enqueue", Some(payload)).await.unwrap();
                 assert_eq!(reused["state"], "reused");
@@ -10526,7 +10526,7 @@ mod tests {
                     .query("query.jobs", Some(json!({})))
                     .await
                     .unwrap();
-                assert_eq!(jobs["protocolVersion"], 4);
+                assert_eq!(jobs["protocolVersion"], 5);
                 assert_eq!(jobs["nextCursor"], Value::Null);
                 assert_eq!(jobs["snapshot"]["history"]["complete"], true);
                 let parent = jobs["items"]
@@ -11955,7 +11955,8 @@ mod tests {
                 // so its state comes from the node verdicts rather than the
                 // task counts.
                 assert_eq!(run["state"], "complete");
-                assert!(run["tasks"].as_array().unwrap().is_empty());
+                assert!(run.get("tasks").is_none());
+                assert_eq!(run["items"], json!([{"taskUuid": task_uuid}]));
                 let unrelated = client
                     .call(
                         "query.jobs",
@@ -14785,6 +14786,7 @@ mod tests {
             .run_until(async {
                 const ARCHIVED_RUN: &str = "00000000-0000-4000-8000-000000000389";
                 const LIVE_RUN: &str = "00000000-0000-4000-8000-00000000038a";
+                const MEMBERSHIP_ONLY_TASK: &str = "00000000-0000-4000-8000-00000000038b";
 
                 let temp = tempdir().unwrap();
                 let paths = fs1_paths(temp.path());
@@ -14834,6 +14836,23 @@ mod tests {
                     .await
                     .unwrap();
 
+                // A durable run member need not have any row, lifecycle, live,
+                // or witness fact of its own. This is the identity-only shape
+                // that an explicit lookup must still project.
+                daemon
+                    .handler
+                    .record_flow_membership(
+                        crate::flow_membership::FlowMembershipRecord::new(
+                            ARCHIVED_RUN.to_owned(),
+                            MEMBERSHIP_ONLY_TASK.to_owned(),
+                            crate::flow_membership::MembershipDisposition::Attached,
+                            Some(2),
+                            Some("membership-only".to_owned()),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+
                 // Written exactly the way the CLI writes it: a direct call
                 // against the data-dir file, off the daemon's own RPC path.
                 crate::reader_state::set_reader_state(
@@ -14855,6 +14874,21 @@ mod tests {
                     .unwrap();
                 assert_eq!(archived_view["archived"], true);
                 assert_eq!(archived_view["triageTag"], "flaky-fixture");
+                assert!(
+                    archived_view.get("tasks").is_none(),
+                    "an empty reconciliation board must not shadow durable members"
+                );
+                let archived_members = archived_view
+                    .get("tasks")
+                    .or_else(|| archived_view.get("items"))
+                    .and_then(Value::as_array)
+                    .unwrap();
+                assert_eq!(archived_members.len(), 2);
+                for expected in [archived_task.as_str(), MEMBERSHIP_ONLY_TASK] {
+                    assert!(archived_members
+                        .iter()
+                        .any(|member| member["taskUuid"].as_str() == Some(expected)));
+                }
                 let live_view = daemon
                     .handler
                     .query("query.run", Some(json!({"id": LIVE_RUN})))
@@ -14891,6 +14925,35 @@ mod tests {
                     .find(|item| item["anchor"] == archived_task)
                     .expect("archived job present when opted in");
                 assert_eq!(flagged["archived"], true);
+
+                // A flow-run filter is an explicit by-ID inspection, like
+                // `query.run`: it keeps the archived member and annotates it
+                // even though the same member is hidden from the broad
+                // default query above.
+                let archived_run_jobs = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"flowRun": ARCHIVED_RUN})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(archived_run_jobs["flowRunTasks"], 2);
+                let archived_items = archived_run_jobs["items"].as_array().unwrap();
+                assert_eq!(archived_items.len(), 2);
+                for expected in [archived_task.as_str(), MEMBERSHIP_ONLY_TASK] {
+                    let item = archived_items
+                        .iter()
+                        .find(|item| item["anchor"].as_str() == Some(expected))
+                        .unwrap_or_else(|| panic!("explicit lookup omitted {expected}"));
+                    assert_eq!(item["taskUuid"], expected);
+                    assert_eq!(item["archived"], true);
+                }
+                let identity_only = archived_items
+                    .iter()
+                    .find(|item| item["anchor"] == MEMBERSHIP_ONLY_TASK)
+                    .unwrap();
+                assert!(identity_only["orchestration"].is_null());
 
                 // `query.standup` hides the archived run's entry and its run
                 // rollup by default. `archivedHidden` (task entries) and

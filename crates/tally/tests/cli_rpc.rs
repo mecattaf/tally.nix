@@ -113,7 +113,7 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["cursor"], "page-v1:jobs");
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "items": [],
                         "nextCursor": null,
                         "snapshot": {}
@@ -124,7 +124,7 @@ impl RpcHandler for CliHandler {
                         request.params.as_ref().unwrap()["id"],
                         "00000000-0000-4000-8000-000000000024"
                     );
-                    Ok(serde_json::json!({"schemaVersion": 1, "protocolVersion": 4}))
+                    Ok(serde_json::json!({"schemaVersion": 1, "protocolVersion": 5}))
                 }
                 "query.run" => {
                     assert_eq!(
@@ -133,13 +133,13 @@ impl RpcHandler for CliHandler {
                     );
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "flowRunId": "00000000-0000-4000-8000-000000000045",
                         "flowName": "spec-build",
                         "campaign": "crm",
                         "state": "running",
                         "counts": {"done": 1, "running": 1, "blocked": 0, "pending": 0},
-                        "tasks": [],
+                        "items": [],
                         "currentNodes": [],
                         "failures": [],
                         "snapshot": {}
@@ -164,7 +164,7 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["provenance"], false);
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "items": [],
                         "nextCursor": null,
                         "snapshot": {}
@@ -176,7 +176,7 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["attempt"], 2);
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "status": "verified"
                     }))
                 }
@@ -188,7 +188,7 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["cursor"], "page-v1:trace");
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "items": [],
                         "nextCursor": null,
                         "snapshot": {},
@@ -201,7 +201,7 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["kind"], "calendar");
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "items": [],
                         "nextCursor": null,
                         "snapshot": {}
@@ -213,11 +213,11 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["limit"], 100);
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "status": "ok",
                         "items": [{
                             "schemaVersion": 1,
-                            "protocolVersion": 4,
+                            "protocolVersion": 5,
                             "sequence": 25,
                             "cursor": "change:00000000000000000025",
                             "observedAt": "2026-07-24T00:00:00Z",
@@ -246,7 +246,7 @@ impl RpcHandler for HumanQueryHandler {
                 "query.log" => {
                     let mut response = serde_json::json!({
                     "schemaVersion": 1,
-                    "protocolVersion": 4,
+                    "protocolVersion": 5,
                     "items": [
                         {
                             "origin": "journal", "eventId": "event:1", "cursor": "event:1",
@@ -314,7 +314,7 @@ impl RpcHandler for HumanQueryHandler {
                 }
                 "query.run" => Ok(serde_json::json!({
                     "schemaVersion": 1,
-                    "protocolVersion": 4,
+                    "protocolVersion": 5,
                     "flowRunId": "00000000-0000-4000-8000-000000000262",
                     "flowName": "spec-build",
                     "campaign": "crm",
@@ -425,7 +425,7 @@ impl RpcHandler for HostileQueryHandler {
                         .is_some_and(|params| params["cursor"].is_string());
                     Ok(serde_json::json!({
                     "schemaVersion": 1,
-                    "protocolVersion": 4,
+                    "protocolVersion": 5,
                     "items": [
                         {
                             "origin": "jour\u{1b}[2Jnal", "eventId": "event:1", "cursor": "event:1",
@@ -455,7 +455,7 @@ impl RpcHandler for HostileQueryHandler {
                 }
                 "query.run" => Ok(serde_json::json!({
                     "schemaVersion": 1,
-                    "protocolVersion": 4,
+                    "protocolVersion": 5,
                     "flowRunId": "\u{1b}[2J00000000-0000-4000-8000-000000000262",
                     "flowName": "\u{1b}[2Jspec-build",
                     "campaign": "c\u{1b}]0;pwned\u{7}rm",
@@ -537,7 +537,7 @@ impl RpcHandler for FloodQueryHandler {
                 .collect::<Vec<_>>();
             Ok(serde_json::json!({
                 "schemaVersion": 1,
-                "protocolVersion": 4,
+                "protocolVersion": 5,
                 "flowRunId": "00000000-0000-4000-8000-000000000262",
                 "flowName": "spec-build",
                 "state": "running",
@@ -1129,7 +1129,7 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn query_v4_cli_forwards_all_durable_observability_commands() {
+async fn query_v5_cli_forwards_all_durable_observability_commands() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("tally.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -1267,7 +1267,7 @@ async fn query_v4_cli_forwards_all_durable_observability_commands() {
             ] {
                 assert!(output.status.success(), "{:?}", output);
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(value["protocolVersion"], 4);
+                assert_eq!(value["protocolVersion"], 5);
             }
             server.await.unwrap();
         })
@@ -1547,13 +1547,13 @@ impl RpcHandler for UsageEdgeQueryHandler {
             };
             Ok(serde_json::json!({
                 "schemaVersion": 1,
-                "protocolVersion": 4,
+                "protocolVersion": 5,
                 "flowRunId": id,
                 "flowName": "spec-build",
                 "state": "complete",
                 "counts": {"done": 1, "running": 0, "blocked": 0, "pending": 0},
                 "usage": usage,
-                "tasks": [],
+                "items": [],
                 "currentNodes": [],
                 "failures": [],
                 "snapshot": {}
@@ -2099,7 +2099,7 @@ async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
     assert!(valid.status.success());
     let valid_json: Value = serde_json::from_slice(&valid.stdout).unwrap();
     assert_eq!(valid_json["schemaVersion"], 2);
-    assert_eq!(valid_json["protocolVersion"], 4);
+    assert_eq!(valid_json["protocolVersion"], 5);
     assert_eq!(valid_json["ok"], true);
     assert_eq!(valid_json["chains"]["verdict"]["report"]["records"], 4);
     assert_eq!(valid_json["chains"]["verdict"]["chainHead"]["seq"], 4);
@@ -2204,7 +2204,7 @@ fn synthetic_lifecycle_window(items: usize) -> Value {
         .collect::<Vec<_>>();
     serde_json::json!({
         "schemaVersion": 1,
-        "protocolVersion": 4,
+        "protocolVersion": 5,
         "items": items,
         "nextCursor": null,
         "position": "log-v1:00000000000000000600:00000000000000000000",
@@ -2303,7 +2303,7 @@ async fn query_jobs_serves_an_oversized_item_with_a_marked_elision_and_exits_zer
     let listener = UnixListener::bind(&socket).unwrap();
     let envelope = serde_json::json!({
         "schemaVersion": 1,
-        "protocolVersion": 4,
+        "protocolVersion": 5,
         "items": [
             {
                 "anchor": "00000000-0000-4000-8000-000000000045",
@@ -2462,7 +2462,7 @@ async fn query_jobs_names_the_item_it_cannot_render_and_exits_nonzero() {
         .collect::<Vec<_>>();
     let envelope = serde_json::json!({
         "schemaVersion": 1,
-        "protocolVersion": 4,
+        "protocolVersion": 5,
         "items": [{"anchor": "00000000-0000-4000-8000-000000000045", "rows": structural}],
         "nextCursor": null,
         "snapshot": {"createdAt": "2026-08-01T10:30:00.000Z"},
@@ -2526,7 +2526,7 @@ async fn an_empty_flow_run_window_says_the_run_resolved_to_no_members() {
     let listener = UnixListener::bind(&socket).unwrap();
     let envelope = serde_json::json!({
         "schemaVersion": 1,
-        "protocolVersion": 4,
+        "protocolVersion": 5,
         "items": [],
         "nextCursor": null,
         "position": "log-v1:00000000000000000041:00000000000000000007",

@@ -338,7 +338,7 @@ async fn real_type_notify_daemon_survives_watchdog_periods() {
         .call("query.status", Some(serde_json::json!({})))
         .await
         .unwrap();
-    assert_eq!(query["protocolVersion"], 4);
+    assert_eq!(query["protocolVersion"], 5);
     drop(client);
     assert!(systemctl(&[
         OsStr::new("--user"),

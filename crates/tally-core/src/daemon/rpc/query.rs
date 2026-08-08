@@ -1,6 +1,7 @@
 use super::super::*;
 use crate::query_v2::{
     apply_reader_state_to_jobs, apply_reader_state_to_run, apply_reader_state_to_standup,
+    JobsReaderStateMode,
 };
 use crate::reader_state::{reader_state_path, ReaderState};
 
@@ -454,6 +455,7 @@ impl DaemonHandler {
                     apply_reader_state_to_standup(
                         &mut digest,
                         &details,
+                        &witness,
                         &reader_state,
                         include_archived,
                     );
@@ -710,6 +712,7 @@ impl DaemonHandler {
         let reader_state = self.reader_state_advisory().await;
         let executor = self.executor.clone();
         let limit = params.limit;
+        let explicit_flow_run = params.flow_run.clone();
         let envelope = off_thread(move || {
             let lanes = trace_lanes(&details, &live, &history);
             // Grouped once: resolving the lane set through the public
@@ -755,7 +758,13 @@ impl DaemonHandler {
                     &executor,
                 );
             }
-            apply_reader_state_to_jobs(&mut result.items, &reader_state, params.archived);
+            let reader_state_mode = match explicit_flow_run.as_deref() {
+                Some(flow_run) => JobsReaderStateMode::ExplicitLookup { flow_run },
+                None => JobsReaderStateMode::Broad {
+                    include_archived: params.archived,
+                },
+            };
+            apply_reader_state_to_jobs(&mut result.items, &reader_state, reader_state_mode);
             let envelope = serde_json::to_value(result).map_err(internal_wire)?;
             crate::pagination::prepare_snapshot(envelope).map_err(pagination_wire)
         })

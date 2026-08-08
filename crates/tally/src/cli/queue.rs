@@ -1038,9 +1038,13 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
             );
         }
     }
-    let tasks = run["tasks"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run task table"))?;
+    let tasks = match run.get("tasks") {
+        None => &[][..],
+        Some(tasks) => tasks
+            .as_array()
+            .map(Vec::as_slice)
+            .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run task table"))?,
+    };
     // The counts above stay whole-run; the filter narrows the board only.
     let shown = tasks
         .iter()

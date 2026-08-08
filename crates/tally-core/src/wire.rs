@@ -1879,7 +1879,7 @@ mod tests {
                         let envelope = cursor.is_none().then(|| {
                             serde_json::json!({
                                 "schemaVersion": 1,
-                                "protocolVersion": 4,
+                                "protocolVersion": 5,
                                 "items": self.page_items.as_ref().clone(),
                                 "nextCursor": null,
                             })

@@ -504,7 +504,9 @@ the remaining `runtimeMaxSec` budget, negative when a node has run past that bud
 section prints the retained failure capture path — or `<not retained>` when none exists — and
 the bounded stderr tail with its indentation intact. Terminal escape sequences written by an
 adapter are stripped from every human rendering. `--json` emits the same compact projection as a
-structured object.
+structured object; its `items` array names every durable run member by `taskUuid`, independently
+of whether the optional reconciled `tasks` table exists. Runs without that reconciliation board
+omit `tasks`, so its empty value cannot shadow the authoritative member list.
 
 Under the task counts, `query run` answers what the run cost. The line is deliberately never a
 bare total: the token sum arrives with the attempts it covers, the member tasks those attempts
@@ -607,11 +609,14 @@ it and always requests the default `all` scope. Likewise, the RPC stand-up metho
 `source` filter that the CLI does not expose. Every completed, in-flight, gate-failed, or
 cancelled stand-up entry includes `taskRef` when the job belongs to a campaign task.
 
-`query jobs` and `query standup` both take `--archived` (include jobs/entries whose creating run
-is archived reader-state) and `--no-archived` (the default, spelled explicitly). `query standup`'s
-digest additionally carries `archivedHidden` (task entries hidden) and `archivedRunsHidden` (`runs`
-rows hidden) — two separate counts, since one archived run can hold several task entries. See
-[Archive a run](observability.md#archive-a-run).
+Broad `query jobs` and `query standup` views both take `--archived` (include jobs/entries whose
+creating run is archived reader-state) and `--no-archived` (the default, spelled explicitly).
+`query jobs --flow-run ID` is an explicit lookup that always returns matching archived members
+with `archived: true`, so both broad-view archive controls conflict with `--flow-run`.
+`query standup`'s digest additionally carries `archivedHidden` (task entries hidden) and
+`archivedRunsHidden` (`runs` rows hidden) — two separate counts, since one archived run can hold
+several task entries. Its `reused` and `canonicalGpuSeconds` totals cover the task entries that
+remain visible. See [Archive a run](observability.md#archive-a-run).
 
 ### Watch
 

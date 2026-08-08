@@ -17,7 +17,7 @@ use crate::usage_rollup::{
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
-pub const QUERY_PROTOCOL_VERSION: u32 = 4;
+pub const QUERY_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1010,9 +1010,18 @@ pub struct StandupDigest {
     pub window: StandupWindow,
     pub completed: Vec<CompletedEntry>,
     pub in_flight: Vec<InFlightEntry>,
+    /// Number of visible terminal task entries whose latest canonical witness
+    /// classifies the work as [`LaborClass::Reused`]. Reader-state filtering
+    /// recomputes this from the task UUIDs left in the four entry collections,
+    /// so it never describes an archived entry omitted from this digest.
     pub reused: usize,
     pub gate_fails: Vec<CompletedEntry>,
     pub cancelled: Vec<CompletedEntry>,
+    /// Canonical GPU seconds contributed by witness records for the task UUIDs
+    /// visible in the four entry collections. The contribution predicate is
+    /// [`counts_toward_canonical_gpu_seconds`], the same one used by the
+    /// initial projection; reader-state filtering recomputes the sum from the
+    /// retained UUIDs rather than from entry fields or per-run cost rows.
     pub canonical_gpu_seconds: f64,
     /// Every flow run this window touched, in run-ID order. Filled by
     /// [`crate::query_v2::apply_standup_usage`], which owns the durable
@@ -1044,14 +1053,11 @@ pub struct StandupDigest {
     /// number because the two lists are not the same unit (one archived run
     /// can hold several task entries).
     ///
-    /// Two window-wide aggregates are deliberately NOT reader-state
-    /// filtered and this count says nothing about them: `reused` and
-    /// `canonical_gpu_seconds` are both summed once, over the whole
-    /// window, before this call removes anything — an archived run's GPU
-    /// seconds and reuse count remain in those totals even once its
-    /// entries and cost row are hidden. Window cost is currently
-    /// reader-state-independent by construction; see
-    /// `doc/src/operating/observability.md`'s "Archive a run" section.
+    /// The `reused` and `canonical_gpu_seconds` aggregates are recomputed from
+    /// the task UUIDs that remain after this count is accumulated. They
+    /// therefore describe the same visible task-entry view as the four
+    /// collections, while this field continues to describe only how many
+    /// entries were withheld.
     #[serde(default)]
     pub archived_hidden: usize,
     /// How many `runs` entries (per-run usage rollups) this call hid

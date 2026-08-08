@@ -15,6 +15,23 @@ fn rpc_timeout_flag_is_global() {
 }
 
 #[test]
+fn flow_run_jobs_lookup_conflicts_with_broad_archive_controls() {
+    let flow_run = "00000000-0000-4000-8000-000000000415";
+    assert!(Opts::try_parse_from(["tally", "query", "jobs", "--flow-run", flow_run]).is_ok());
+    for archive_control in ["--archived", "--no-archived"] {
+        let arguments = [
+            "tally",
+            "query",
+            "jobs",
+            "--flow-run",
+            flow_run,
+            archive_control,
+        ];
+        assert!(Opts::try_parse_from(arguments).is_err(), "{arguments:?}");
+    }
+}
+
+#[test]
 fn rpc_timeout_selection_prefers_flag_then_environment_then_default() {
     assert_eq!(
         resolve_rpc_timeout(Some(7), Some(OsStr::new("invalid"))).unwrap(),

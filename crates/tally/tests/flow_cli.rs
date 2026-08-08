@@ -58,7 +58,7 @@ fn serve_empty_flow_history(
                     assert_eq!(request["params"]["id"], runner_task_uuid);
                     json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "job": {
                             "taskUuid": runner_task_uuid,
                             "source": "manual"
@@ -76,7 +76,7 @@ fn serve_empty_flow_history(
                 }),
                 "query.jobs" => json!({
                     "schemaVersion": 1,
-                    "protocolVersion": 4,
+                    "protocolVersion": 5,
                     "items": [],
                     "nextCursor": null,
                     "snapshot": {

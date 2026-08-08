@@ -460,8 +460,9 @@ async fn query_run_falls_back_to_a_labelled_durable_view_that_agrees_with_the_li
             // shape would be worse than no fallback.
             assert_eq!(durable["flowRunId"], live["flowRunId"]);
             let task_ids = |view: &Value| {
-                view["tasks"]
-                    .as_array()
+                view.get("tasks")
+                    .or_else(|| view.get("items"))
+                    .and_then(Value::as_array)
                     .unwrap()
                     .iter()
                     .map(|task| task["taskUuid"].clone())

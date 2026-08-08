@@ -252,7 +252,7 @@ $ tally witness verify /srv/tally/witness.jsonl \
     --format json
 ```
 
-The JSON result has `schemaVersion: 2`, `protocolVersion: 4`, a combined `ok`, the verdict and
+The JSON result has `schemaVersion: 2`, `protocolVersion: 5`, a combined `ok`, the verdict and
 adapter-attestation reports plus chain heads, and an `execAttestations` report for every supplied
 host ledger. A missing selected ledger is treated as a valid empty chain with the genesis head.
 
