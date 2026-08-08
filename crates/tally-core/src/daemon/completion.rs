@@ -1,5 +1,35 @@
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static COMPLETION_ENRICHMENT_OBSERVERS:
+        RefCell<HashMap<Uuid, mpsc::UnboundedSender<Job>>> = RefCell::new(HashMap::new());
+}
+
+/// Observe the exact post-completion job after its adapter metadata has been
+/// installed. Kept per thread and keyed by job so parallel daemon tests cannot
+/// consume one another's observations.
+#[cfg(test)]
+pub(super) fn observe_completion_enrichment(job_id: Uuid) -> mpsc::UnboundedReceiver<Job> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    COMPLETION_ENRICHMENT_OBSERVERS.with(|observers| {
+        assert!(
+            observers.borrow_mut().insert(job_id, sender).is_none(),
+            "completion enrichment observer already registered for {job_id}"
+        );
+    });
+    receiver
+}
+
+#[cfg(test)]
+fn publish_completion_enrichment(job: &Job) {
+    COMPLETION_ENRICHMENT_OBSERVERS.with(|observers| {
+        if let Some(observer) = observers.borrow_mut().remove(&job.job_id) {
+            let _ = observer.send(job.clone());
+        }
+    });
+}
+
 pub(super) struct TerminalWork {
     pub(super) job: Job,
     pub(super) result: JobResult,
@@ -468,6 +498,8 @@ impl DaemonHandler {
             if let Ok(Some(final_message)) = captures.final_message() {
                 enriched.row.final_message = Some(final_message.to_owned());
             }
+            #[cfg(test)]
+            publish_completion_enrichment(&enriched);
             // Unlike the three string captures, a usage observation is
             // recorded even when it is an absence: a scraped attempt that
             // carried no usage is a different fact from an attempt nobody

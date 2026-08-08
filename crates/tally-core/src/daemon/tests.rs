@@ -6597,6 +6597,261 @@ mod tests {
         config
     }
 
+    fn launch_cwd_recovery_row(uuid: Uuid, launched_in: &Path) -> RowSeed {
+        let mut row = durable_row(uuid, "launch-cwd-recovery", 2);
+        row.adapter = "cwd-keyed".to_owned();
+        row.cwd = Some(launched_in.to_path_buf());
+        row.argv = vec!["continue recovered work".to_owned()];
+        row.attempt = 2;
+        row
+    }
+
+    fn append_session_attestation(
+        path: &Path,
+        row: &RowSeed,
+        attempt: u32,
+        lease_epoch: u64,
+        session_ref: &str,
+    ) {
+        append_attestation(
+            path,
+            json!({
+                "kind": "adapter-scrape",
+                "taskUuid": row.uuid.to_string(),
+                "jobId": row.uuid.to_string(),
+                "adapter": row.adapter,
+                "attempt": attempt,
+                "leaseEpoch": lease_epoch,
+                "captures": {"sessionRef": session_ref},
+                "usageAuthority": "advisory-only",
+            }),
+        )
+        .unwrap();
+    }
+
+    fn assert_session_launch_cwd_reaches_resume_guard(
+        config: &Config,
+        row: &RowSeed,
+        session_ref: &str,
+        launched_in: &Path,
+    ) {
+        assert_eq!(row.session_ref.as_deref(), Some(session_ref));
+        assert_eq!(
+            row.session_cwd,
+            Some(RecordedLaunchCwd::In(launched_in.to_path_buf()))
+        );
+        AdapterEngine::new(&config.adapters)
+            .guard_resume_launch_cwd(
+                &row.adapter,
+                row.session_cwd.as_ref(),
+                Some(launched_in),
+            )
+            .unwrap();
+    }
+
+    /// #440. A pool-return representation recovers its session pointer from
+    /// the previous attempt's attestation before it is installed. The launch
+    /// directory record must be hydrated at that same represent-only seam.
+    #[test]
+    fn represent_hydration_records_launch_cwd_beside_the_pointer() {
+        let temp = tempdir().unwrap();
+        let launched_in = temp.path().join("represent-session-home");
+        let program = temp.path().join("cwd-keyed-agent");
+        let config = cwd_keyed_config(&program);
+        let executor = Executor::new(temp.path().join("state"), std::env::current_exe().unwrap());
+        let row = launch_cwd_recovery_row(Uuid::new_v4(), &launched_in);
+        let attestation_path = temp.path().join("attestations.jsonl");
+        append_session_attestation(&attestation_path, &row, 1, 1, "represent-session");
+        let mut attestations = SharedAttestations::new(attestation_path);
+        let mut plan = empty_plan();
+        plan.rows.push(RecoveryRow {
+            row: row.clone(),
+            state: RecoveryRowState::Pending,
+            labor_class: LaborClass::Recovered,
+            guardrail_depth: 0,
+        });
+        plan.actions.push(RecoveryAction::RePresent {
+            row: Box::new(row),
+            trigger: crate::evidence::RetryTrigger::PoolReturn,
+            previous_witness_seq: 1,
+            previous_attempt: 1,
+            previous_lease_epoch: 1,
+        });
+
+        hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &mut attestations)
+            .unwrap();
+
+        assert_session_launch_cwd_reaches_resume_guard(
+            &config,
+            &plan.rows[0].row,
+            "represent-session",
+            &launched_in,
+        );
+    }
+
+    /// #440. An adopted attempt has no current capture to scrape, so its
+    /// continuation identity comes from the latest prior attestation. Bind
+    /// the launch record to that adopted-metadata path specifically.
+    #[test]
+    fn adopted_metadata_records_launch_cwd_beside_the_pointer() {
+        let temp = tempdir().unwrap();
+        let launched_in = temp.path().join("adopted-session-home");
+        let program = temp.path().join("cwd-keyed-agent");
+        let config = cwd_keyed_config(&program);
+        let row = launch_cwd_recovery_row(Uuid::new_v4(), &launched_in);
+        let attestation_path = temp.path().join("attestations.jsonl");
+        append_session_attestation(&attestation_path, &row, 1, 1, "adopted-session");
+        let mut attestations = SharedAttestations::new(attestation_path);
+        let mut plan = empty_plan();
+        plan.rows.push(RecoveryRow {
+            row: row.clone(),
+            state: RecoveryRowState::AdoptedRunning,
+            labor_class: LaborClass::Recovered,
+            guardrail_depth: 0,
+        });
+        plan.actions.push(RecoveryAction::AdoptRunning {
+            identity: RecoveryIdentity::Task(row.uuid),
+            unit: format!("tally-job-{}.service", row.uuid),
+            invocation_id: "adopted-invocation".to_owned(),
+            attempt: row.attempt,
+            lease_epoch: row.lease_epoch,
+            labor_class: Some(LaborClass::Recovered),
+        });
+
+        hydrate_adopted_adapter_metadata(&mut plan, &mut attestations).unwrap();
+
+        assert_session_launch_cwd_reaches_resume_guard(
+            &config,
+            &plan.rows[0].row,
+            "adopted-session",
+            &launched_in,
+        );
+    }
+
+    /// #440. A durable continued row keeps `session_ref`, while serde drops
+    /// `session_cwd`. `QueueExisting` therefore has to reinstall the record
+    /// when it turns that recovered row into a live job.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovered_job_install_records_launch_cwd_beside_the_pointer() {
+        let temp = tempdir().unwrap();
+        let paths = DaemonPaths {
+            socket: temp.path().join("run/tally.sock"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let launched_in = temp.path().join("installed-session-home");
+        fs::create_dir(&launched_in).unwrap();
+        let program = temp.path().join("cwd-keyed-agent");
+        let config = cwd_keyed_config(&program);
+        let mut row = launch_cwd_recovery_row(Uuid::new_v4(), &launched_in);
+        row.attempt = 1;
+        row.lease_epoch = 1;
+        row.resumed_from = Some(Uuid::new_v4().to_string());
+        row.session_ref = Some("installed-session".to_owned());
+        initialize_final_witness_state(&paths);
+        write_enqueue_event_atomic(
+            &paths.events_dir(),
+            &DurableEnqueueEvent::new(row.clone()).unwrap(),
+        )
+        .unwrap();
+        let persisted = read_acknowledged_events(&paths.events_dir()).unwrap();
+        assert_eq!(persisted[0].row.session_ref.as_deref(), Some("installed-session"));
+        assert_eq!(persisted[0].row.session_cwd, None);
+
+        let executor = direct_executor(&paths.state_dir)
+            .with_systemd_run(temp.path().join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+        let daemon =
+            Daemon::open_with_executor(config.clone(), paths, settings(), executor)
+                .await
+                .unwrap();
+        let installed = daemon
+            .handler
+            .context
+            .read()
+            .await
+            .jobs
+            .get(&row.uuid)
+            .cloned()
+            .unwrap();
+
+        assert_session_launch_cwd_reaches_resume_guard(
+            &config,
+            &installed.row,
+            "installed-session",
+            &launched_in,
+        );
+    }
+
+    /// #440. Completion scrapes after the terminal acknowledgement and the
+    /// live job has already been retired. Observe that exact enriched job so
+    /// this test cannot pass through `FoundJob::observed_row`'s later recovery.
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_scrape_records_launch_cwd_beside_the_pointer() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let launched_in = temp.path().join("completed-session-home");
+                fs::create_dir(&launched_in).unwrap();
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"completed-session\"}'\n",
+                );
+                let config = cwd_keyed_config(&program);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths,
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial work"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                let mut enriched_rx = completion::observe_completion_enrichment(job_id);
+                let finished = await_positive_progress(
+                    "launch-cwd completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let enriched = await_positive_progress(
+                    "post-completion launch-cwd enrichment",
+                    enriched_rx.recv(),
+                )
+                .await
+                .unwrap();
+
+                assert_session_launch_cwd_reaches_resume_guard(
+                    &config,
+                    &enriched.row,
+                    "completed-session",
+                    &launched_in,
+                );
+            })
+            .await;
+    }
+
     /// #425 (F2). "This row declared no working directory" and "nothing
     /// recorded where this session was launched" are different facts, and only
     /// the second is a reason to refuse.
