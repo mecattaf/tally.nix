@@ -5,6 +5,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
+#[cfg(test)]
+use tally_client::EXECUTOR_VALIDATION_FAILURE_CODE;
 use tally_client::{is_rearmable_rpc_error, RpcClient, WireErrorCode, WireIoError};
 use tally_core::flow_lineage::FLOW_LINEAGE_SCHEMA_VERSION;
 use tally_core::query::QUERY_PROTOCOL_VERSION;
@@ -317,11 +319,12 @@ impl LiveFlowClient {
     ) -> Result<(), ClientError> {
         let key = (result.task_uuid.clone(), attempt);
         let expectation = self.result_expected.lock().await.get(&key).cloned();
-        let projected = if expectation.is_some() && result.result.is_none() {
-            self.await_projected_result(&result.task_uuid).await
-        } else {
-            Ok(None)
-        };
+        let projected =
+            if expectation.is_some() && result.result.is_none() && result.error.is_none() {
+                self.await_projected_result(&result.task_uuid).await
+            } else {
+                Ok(None)
+            };
         if let Some(projected) = projected? {
             result.result = Some(projected);
         } else if let Some(expectation) = expectation.filter(|_| result.error.is_none()) {
@@ -2479,6 +2482,39 @@ export const meta = {
             },
         );
         client
+    }
+
+    /// #441 acceptance 3: the terminal waiter already delivered the
+    /// synchronous executor rejection, so consulting the advisory projection
+    /// would both hide the cause and spend the entire projection wait budget.
+    #[tokio::test]
+    async fn executor_validation_failure_skips_the_advisory_projection_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = projection_client(&socket).await;
+        let mut result = projection_node_result(Verdict::Failed, Some(1));
+        result.error = Some(NodeFailure {
+            code: EXECUTOR_VALIDATION_FAILURE_CODE.to_owned(),
+            message: "execution request is invalid: git-ai await timeout must be positive"
+                .to_owned(),
+            details: Some(json!({
+                "validationMessage": "git-ai await timeout must be positive"
+            })),
+        });
+
+        client.enrich_terminal_result(&mut result, 1).await.unwrap();
+
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            EXECUTOR_VALIDATION_FAILURE_CODE
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "a terminal executor error must not issue query.job projection polls"
+        );
     }
 
     /// #432: a node whose exit evidence passed but whose advisory projection is

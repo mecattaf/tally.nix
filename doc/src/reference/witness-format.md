@@ -62,6 +62,7 @@ The known top-level fields have this order and shape:
 | `evidenceClass` | no | Opaque evidence classification, hash-covered. |
 | `manifestHash` | no | Opaque manifest identity, hash-covered. |
 | `completion` | no | Versioned execution/gates/acceptance result. |
+| `error` | no | Bounded structured tally-side terminal cause `{code,message,details?}`. It is present only with verdict `failed`; executor request rejection uses code `executor-validation-failed`. |
 | `resultRevision` | no | Lowercase 40- or 64-character Git object ID. |
 | `authorship` | no | Git AI binding status and hashes. Requires `resultRevision`. |
 | `authorshipSessions` | no | Sorted, unique 1–16 observations `{tool,id,model}`. Requires suitable `authorship`. |
@@ -91,6 +92,13 @@ substituted
 `laborClass: "substituted"`. Both require `exitCode: 0`. A substituted derivation record is
 stricter still: it has task/store/derivation evidence, attempt and lease epoch 1, zero wall
 clock, the `build` pool, and no artifact hash, GPU use, or charge.
+
+`error` records a cause diagnosed by tally itself, not stderr synthesized from
+the payload. Its code is lowercase kebab-case (at most 64 bytes), its non-empty
+message is at most 4 KiB, and optional object details encode to at most 16 KiB.
+It is part of the canonical hash input and therefore survives daemon restart
+and terminal-result reconstruction even when failure occurred before a capture
+generation existed.
 
 ### What `gpuSeconds` and `charge` measure
 

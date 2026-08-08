@@ -24,7 +24,7 @@ use crate::usage::UsageObservation;
 use crate::usage_rollup::{roll_up, AttestationEvidence, UsageRollup};
 use crate::witness::{
     counts_toward_canonical_gpu_seconds, AttestationRecord, AuthorshipSession, AuthorshipStatus,
-    Charge, LaborClass, Verdict, VerifyReport, WitnessRecord,
+    Charge, LaborClass, TerminalError, Verdict, VerifyReport, WitnessRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1103,6 +1103,8 @@ pub struct RunFailureProjection {
     pub stderr_tail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TerminalError>,
 }
 
 /// A campaign fact that contradicts the forge's own projection: a sub-issue
@@ -1422,6 +1424,16 @@ pub fn query_run(
             })
             .filter(|record| record.fields.event == TallyEvent::Failed)
             .max_by_key(|record| record.sequence);
+        let terminal_error = witness
+            .iter()
+            .filter(|record| record.task_uuid.as_deref() == Some(node.anchor.as_str()))
+            .filter(|record| node.current_attempt == Some(record.attempt))
+            .filter(|record| {
+                node.lease_epoch
+                    .is_none_or(|lease_epoch| lease_epoch == record.lease_epoch)
+            })
+            .max_by_key(|record| record.seq)
+            .and_then(|record| record.error.clone());
         failures.push(RunFailureProjection {
             task_uuid: node.anchor.clone(),
             task_ref: node.task_ref.clone(),
@@ -1434,6 +1446,7 @@ pub fn query_run(
             capture_path: None,
             stderr_tail: failed_event.and_then(|record| record.fields.stderr_tail.clone()),
             stderr_truncated: failed_event.and_then(|record| record.fields.stderr_truncated),
+            error: terminal_error,
         });
     }
     failures.sort_by_key(|failure| (failure.ordinal, failure.task_uuid.clone()));
@@ -3402,6 +3415,7 @@ mod tests {
                 evidence_class: None,
                 manifest_hash: None,
                 completion: None,
+                error: None,
                 result_revision: None,
                 authorship: None,
                 authorship_sessions: None,
@@ -3450,6 +3464,7 @@ mod tests {
                 evidence_class: None,
                 manifest_hash: None,
                 completion: None,
+                error: None,
                 result_revision: Some("b".repeat(40)),
                 authorship: Some(Authorship {
                     provider: "git-ai".to_owned(),

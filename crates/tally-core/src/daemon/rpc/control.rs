@@ -1098,6 +1098,7 @@ fn job_result_from_witness(record: &WitnessRecord, executor: &Executor) -> JobRe
         witness_seq: record.seq,
         model: record.model.clone(),
         completion: record.completion.clone(),
+        error: record.error.clone(),
         stderr_excerpt,
         gpu_seconds: record.gpu_seconds,
     }
@@ -1363,6 +1364,7 @@ mod tests {
                 evidence_class: Some(serde_json::json!({"kind": "adapter-smoke"})),
                 manifest_hash: None,
                 completion: None,
+                error: None,
                 result_revision: None,
                 authorship: None,
                 authorship_sessions: None,

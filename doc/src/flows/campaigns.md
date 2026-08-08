@@ -1648,6 +1648,12 @@ violation, and an operator grepping a dead campaign can tell the two apart.
 (`retryable-projection` is raised only when the exit evidence passed; a node
 whose exit evidence failed keeps the older `result-projection-timeout`.)
 
+A terminal result that already carries a structured tally-side error does not
+enter this wait. In particular, executor request validation is synchronous and
+returns immediately as `executor-validation-failed`; its original validation
+message remains the flow error and the witnessed/queryable terminal cause.
+There may be no capture for such a node because its payload was never launched.
+
 The wait defaults to 10 s and is widened per campaign at arm time:
 
 ```

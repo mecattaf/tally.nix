@@ -626,6 +626,33 @@ impl HostShared {
 
         result.disposition = admission.disposition;
         validate_terminal_result(&result, &admission, plan.location, plan.ordinal)?;
+        if let Some(execution_error) = result
+            .error
+            .clone()
+            .filter(|error| error.code == EXECUTOR_VALIDATION_FAILURE_CODE)
+        {
+            self.observe(result.witness_seq, plan.ordinal).await?;
+            self.emit_node_terminal(plan.ordinal, &dedup_key, &result)?;
+            if plan.settle {
+                return Ok(result);
+            }
+            return Err(FlowError::new(
+                "FlowExecutionError",
+                EXECUTOR_VALIDATION_FAILURE_CODE,
+                execution_error.message.clone(),
+            )
+            .at(plan.location)
+            .with_ordinal(plan.ordinal)
+            .detail(
+                "executor",
+                serde_json::to_value(&execution_error)
+                    .expect("executor validation errors always serialize"),
+            )
+            .detail(
+                "node",
+                serde_json::to_value(&result).expect("serializing a node result cannot fail"),
+            ));
+        }
         if plan.result_schema.is_none()
             && result.error.as_ref().is_some_and(|error| {
                 error.code == RESULT_PROJECTION_TIMEOUT_CODE

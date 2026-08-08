@@ -442,6 +442,16 @@ impl Daemon {
             Some(Ok(outcome)) => outcome.record.accounting,
             _ => None,
         };
+        let terminal_error = match &finished.outcome {
+            Some(Err(ExecutorError::InvalidRequest(validation_message))) => Some(TerminalError {
+                code: EXECUTOR_VALIDATION_FAILURE_CODE.to_owned(),
+                message: format!("execution request is invalid: {validation_message}"),
+                details: Some(json!({
+                    "validationMessage": validation_message,
+                })),
+            }),
+            _ => None,
+        };
         let semantic_completion = match (&effective_gate_manifest, &finished.outcome) {
             (None, Some(Ok(outcome))) if outcome.semantic_completion.is_some() => {
                 return Err(DaemonError::Invalid(format!(
@@ -664,6 +674,7 @@ impl Daemon {
                     evidence_class: job.row.evidence_class.clone(),
                     manifest_hash: job.row.manifest_hash.clone(),
                     completion: semantic_completion.clone(),
+                    error: terminal_error.clone(),
                     result_revision: result_revision.clone(),
                     authorship: authorship.clone(),
                     authorship_sessions: authorship_sessions.clone(),
@@ -682,6 +693,7 @@ impl Daemon {
                 witness_seq: record.seq,
                 model,
                 completion: semantic_completion,
+                error: terminal_error,
                 stderr_excerpt,
             };
             let stable = job.stable_key();

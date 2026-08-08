@@ -71,6 +71,28 @@ impl Reply {
             }),
         }
     }
+
+    fn executor_validation_failure() -> Self {
+        Self {
+            disposition: Disposition::Created,
+            witness_seq: 1,
+            verdict: Verdict::Failed,
+            stderr_excerpt: None,
+            stderr_truncated: None,
+            result: None,
+            divergent_hash: false,
+            recorded_label: None,
+            client_error: None,
+            error: Some(NodeFailure {
+                code: EXECUTOR_VALIDATION_FAILURE_CODE.to_owned(),
+                message: "execution request is invalid: git-ai await timeout must be positive"
+                    .to_owned(),
+                details: Some(json!({
+                    "validationMessage": "git-ai await timeout must be positive"
+                })),
+            }),
+        }
+    }
 }
 
 struct MockClient {
@@ -1183,6 +1205,40 @@ fn an_unprojected_advisory_capture_is_retryable_projection_not_schema_mismatch()
     assert_eq!(
         report.final_value,
         Some(Value::String(RETRYABLE_PROJECTION_CODE.to_owned()))
+    );
+}
+
+/// #441 acceptance 3: a pre-launch executor rejection is already the node's
+/// terminal cause. A result schema must not relabel it as a missing advisory
+/// projection or a schema mismatch, and non-settled flow code receives the
+/// validation message directly.
+#[test]
+fn executor_validation_failure_reaches_the_flow_error_without_reclassification() {
+    let source = format!(
+        "{}\n(async () => sh(['driver'], {{\n\
+         pools: ['cpu'], resultSchema: {{type: 'object'}}\n\
+         }}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(
+        &source,
+        MockClient::new(vec![Reply::executor_validation_failure()]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.name, "FlowExecutionError");
+    assert_eq!(error.code, EXECUTOR_VALIDATION_FAILURE_CODE);
+    assert_eq!(
+        error.message,
+        "execution request is invalid: git-ai await timeout must be positive"
+    );
+    assert_eq!(
+        error.details["executor"]["details"]["validationMessage"],
+        "git-ai await timeout must be positive"
+    );
+    assert_eq!(
+        error.details["node"]["error"]["code"],
+        EXECUTOR_VALIDATION_FAILURE_CODE
     );
 }
 

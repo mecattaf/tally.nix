@@ -1228,6 +1228,7 @@ pub(super) fn forced_witness(job: &Job, verdict: Verdict, host_id: Option<String
         evidence_class: job.row.evidence_class.clone(),
         manifest_hash: job.row.manifest_hash.clone(),
         completion: None,
+        error: None,
         result_revision: None,
         authorship: None,
         authorship_sessions: None,
@@ -1265,6 +1266,7 @@ pub(super) fn substituted_witness(row: &RowSeed, drv: Derivation) -> WitnessBody
         evidence_class: row.evidence_class.clone(),
         manifest_hash: row.manifest_hash.clone(),
         completion: None,
+        error: None,
         result_revision: None,
         authorship: None,
         authorship_sessions: None,
@@ -1328,6 +1330,7 @@ pub(super) fn finalize_forced_locked(
         witness_seq: record.seq,
         model: record.model.clone(),
         completion: None,
+        error: None,
         stderr_excerpt: None,
     };
     context

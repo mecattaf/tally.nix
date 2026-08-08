@@ -2799,6 +2799,7 @@ mod tests {
             evidence_class: None,
             manifest_hash: None,
             completion: None,
+            error: None,
             result_revision: None,
             authorship: None,
             authorship_sessions: None,

@@ -23,6 +23,7 @@ the shipped implementation; placeholders vary with the job.
 | A retired run ID is replayed | code `flow-run-superseded`; `flow run OLD was superseded by NEW ...` | `tally flow supersede` durably retired that run; start the successor. |
 | CLI loses the socket on a large request or response | `wire frame exceeds N bytes` or `daemon closed the socket before replying` | One side exceeded its configured frame bound. |
 | Declared culmination is absent | `cannot read gate manifest PATH: ...` in `completion.gates.manifestError` | The job did not write the declared file on its execution host. |
+| Campaign node fails before creating captures | code `executor-validation-failed`; `execution request is invalid: ...` | The executor rejected the prepared request before launching the payload. Read `tally query run`; the structured error is canonical even when `capture: <not retained>`. |
 | Remote work appears hung | `tally: remote executor "NAME" transport is unavailable; retaining leases and retrying: ...` | SSH or the fixed worker helper is unavailable after dispatch. |
 | The daemon crash-loops at startup after an upgrade | `recovery error: executor fact collection failed: N acknowledged row(s) have unusable local execution facts` with `[pre-label unit-exit record]` | `unit-exit/` records written before campaign task labels entered the unit name. Run the named migration. |
 

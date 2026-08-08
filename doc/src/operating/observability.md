@@ -325,7 +325,10 @@ captures for the last provider event. Its authority is
 the same projected value as `NodeResult.result`. If a configured projection
 does not appear within ten seconds of terminal acknowledgement, the flow node
 reports `result-projection-timeout` rather than silently returning an empty
-result.
+result. A structured terminal error is already authoritative and bypasses this
+wait; executor request rejection is returned immediately as
+`executor-validation-failed` and remains visible in the witness and
+`query run` failure entry even when no capture was created.
 
 Shell output is not automatically a trace or a final message. A custom adapter
 must declare the scrape or trace explicitly.
