@@ -280,6 +280,19 @@ the canonical executable graph SHA-256 beneath
 body-editor identity, so the digest—not an inferred editor—is the continuing
 authority boundary.
 
+The JSON files in `campaigns/armed/` are closed schema-2 authority records. That
+shape is frozen to what the preceding tally generation can read. Host-local
+tuning is stored separately under
+`$XDG_STATE_HOME/tally/campaigns/host-tuning/<registration-id>.host-v1.json`, so
+an older binary scans only authority it understands. An explicit override
+creates that sidecar; when it is absent, a current reader supplies the same
+historical 10-second default without rewriting authority or creating a sidecar.
+A current reader also repairs the short-lived schema-2 shape that incorrectly
+embedded `projectionWaitMs`: while holding the registry lock it moves an
+explicit value to the sidecar, treats `null` as the absent/default
+representation, and rewrites the authority record. No other unknown authority
+member is admitted by that migration.
+
 The poller may refetch projection state and allowed-actor comments, but it
 refuses any changed executable graph until the operator inspects it and runs
 `arm` again. The reconciler independently refetches and recomputes that digest
@@ -1686,15 +1699,22 @@ The wait defaults to 10 s and is widened per campaign at arm time:
 tally campaign arm <issue-url> --projection-wait-ms 240000
 ```
 
-The value is recorded in the campaign's registration and put on the argv of
-every `tally flow run` the campaign dispatches — the arming pass and every later
-pass `tally campaign poll` dispatches — as `--result-projection-wait-ms`. Arming
-is the seam because a campaign pass runs as a daemon-launched transient unit
-whose environment is built from an explicit `--setenv` list: nothing an operator
-exports in their own shell reaches it, so an environment-only knob would not
-have been reachable from where campaigns are actually started. Re-arm with a
-different value to change it; re-arming without the flag clears it back to the
-10 s default.
+An explicit value is recorded in the registration's versioned host-tuning
+sidecar and put on the argv of every `tally flow run` the campaign dispatches —
+the arming pass and every later pass `tally campaign poll` dispatches — as
+`--result-projection-wait-ms`. Arming is the seam because a campaign pass runs
+as a daemon-launched transient unit whose environment is built from an explicit
+`--setenv` list: nothing an operator exports in their own shell reaches it, so
+an environment-only knob would not have been reachable from where campaigns are
+actually started. Re-arm with a different value to change it; re-arming without
+the flag clears it back to the 10 s default.
+
+Rolling the binary back one generation leaves the schema-2 authority readable.
+That older binary does not scan the sidecar and therefore uses its historical
+10 s wait even when an override is present. It may continue polling and updating
+observation fields without changing the approved digest or pinned paths. After
+rolling forward again, the current reader joins the unchanged authority to the
+retained sidecar and restores the override.
 
 It stays out of the campaign manifest deliberately. The manifest is hashed into
 the executable graph digest, so putting a host tuning knob there would make

@@ -5,13 +5,15 @@ use std::fs;
 use std::io::Read;
 use std::process::{Command as ProcessCommand, Stdio};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::AdapterConfig;
 use tally_core::campaign_contract::{
     admit_manifest_json, admit_manifest_value, validate_argv, validate_manifest, CampaignAgent,
     CampaignManifest, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
+};
+use tally_core::campaign_registry::{
+    CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 use tally_core::config::ResourceKind;
 
@@ -20,7 +22,6 @@ const CAMPAIGN_END: &str = "<!-- tally:campaign:v1:end -->";
 const WORKLIST_BEGIN: &str = "<!-- tally:campaign-worklist:v1 -->";
 const WORKLIST_END: &str = "<!-- tally:campaign-worklist:v1:end -->";
 const TASK_MARKER_PREFIX: &str = "<!-- tally:campaign-task:v1 id=";
-const REGISTRY_SCHEMA_VERSION: u32 = 2;
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
 
 #[derive(Debug, Clone)]
@@ -79,50 +80,6 @@ struct CampaignGraph {
     canonical: CanonicalCampaignGraphV1,
     master: GithubIssue,
     tasks: Vec<GithubIssue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CampaignRegistration {
-    schema_version: u32,
-    registration_id: String,
-    issue_url: String,
-    repository: String,
-    issue_number: u64,
-    armed_at: String,
-    arm_serial: u64,
-    approved_graph_digest: String,
-    authenticated_actor: String,
-    allowed_actors: Vec<String>,
-    allow_test_local_forge: bool,
-    /// What the arm-time probe found this forge can serve. A registration
-    /// written before the probe existed carries no record, and absent means
-    /// degraded — the conservative direction, since the checkbox projection
-    /// and per-branch pull-request lookup work on every forge. Re-arming is
-    /// what turns the native sub-issue walk on.
-    #[serde(default)]
-    sub_issue_walk: bool,
-    #[serde(default)]
-    last_observation: Option<String>,
-    /// The cheap half of the last observation: everything the poll can see
-    /// from the two REST reads it makes anyway. Absent on a registration
-    /// written before this existed, which only costs one extra walk.
-    #[serde(default)]
-    last_forge_observation: Option<String>,
-    /// How long each pass of this campaign waits for a node's advisory
-    /// finalMessage projection before classifying the node
-    /// `retryable-projection` (#432). Absent leaves the flow host's own 10 s
-    /// default alone, which is what a registration written before this
-    /// existed carries and what every campaign armed without the flag carries.
-    /// It lives here rather than in the manifest because it is a property of
-    /// this host's daemon congestion, not of the campaign: putting it in the
-    /// manifest would fold a host tuning knob into the executable graph digest
-    /// and force a re-arm to change it.
-    #[serde(default)]
-    projection_wait_ms: Option<u64>,
-    flow: PathBuf,
-    driver: PathBuf,
-    workspace_root: PathBuf,
 }
 
 pub(super) async fn run_campaign(
@@ -1207,130 +1164,6 @@ fn validate_host(
     Ok(())
 }
 
-fn registry_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("campaigns/armed")
-}
-
-struct RegistryLock(fs::File);
-
-impl RegistryLock {
-    fn acquire(state_dir: &Path, exclusive: bool) -> Result<Self> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let directory = registry_dir(state_dir);
-        fs::create_dir_all(&directory)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(directory.join("registry.lock"))?;
-        if exclusive {
-            FileExt::lock_exclusive(&file)?;
-        } else {
-            FileExt::lock_shared(&file)?;
-        }
-        Ok(Self(file))
-    }
-}
-
-impl Drop for RegistryLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
-    }
-}
-
-fn registration_path(state_dir: &Path, issue_url: &str) -> PathBuf {
-    let digest = Sha256::digest(issue_url.as_bytes());
-    registry_dir(state_dir).join(format!("{:x}.json", digest))
-}
-
-fn write_registration(state_dir: &Path, registration: &CampaignRegistration) -> Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let directory = registry_dir(state_dir);
-    fs::create_dir_all(&directory)?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    let path = registration_path(state_dir, &registration.issue_url);
-    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(registration)?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    use std::io::Write as _;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, &path)?;
-    Ok(())
-}
-
-fn read_registration(path: &Path) -> Result<CampaignRegistration> {
-    let bytes = fs::read(path)?;
-    let registration: CampaignRegistration = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid campaign registration {}", path.display()))?;
-    if registration.schema_version != REGISTRY_SCHEMA_VERSION
-        || uuid::Uuid::parse_str(&registration.registration_id).is_err()
-        || registration.issue_number == 0
-        || registration.arm_serial == 0
-        || !registration
-            .approved_graph_digest
-            .strip_prefix("sha256:")
-            .is_some_and(|value| {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            })
-        || !safe_github_login(&registration.authenticated_actor)
-        || registration.allowed_actors.is_empty()
-        || registration
-            .allowed_actors
-            .iter()
-            .any(|actor| !safe_github_login(actor) || actor != &actor.to_ascii_lowercase())
-        || !registration
-            .allowed_actors
-            .contains(&registration.authenticated_actor)
-        || !registration.flow.is_absolute()
-        || !registration.driver.is_absolute()
-        || !registration.workspace_root.is_absolute()
-    {
-        return Err(invalid(format!(
-            "campaign registration {} violates schema v2; explicitly disarm and re-arm legacy registrations",
-            path.display()
-        )));
-    }
-    let locator = parse_issue_url(&registration.issue_url)?;
-    if locator.repository != registration.repository || locator.number != registration.issue_number
-    {
-        return Err(invalid(format!(
-            "campaign registration {} has inconsistent locator fields",
-            path.display()
-        )));
-    }
-    Ok(registration)
-}
-
-fn registrations(state_dir: &Path) -> Result<Vec<(PathBuf, CampaignRegistration)>> {
-    let directory = registry_dir(state_dir);
-    if !directory.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths = fs::read_dir(&directory)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension() == Some(OsStr::new("json")))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths
-        .into_iter()
-        .map(|path| read_registration(&path).map(|registration| (path, registration)))
-        .collect()
-}
-
 fn priority(value: &str) -> Priority {
     match value {
         "interrupt" => Priority::Interrupt,
@@ -1608,7 +1441,7 @@ async fn run_campaign_arm(
 ) -> Result<()> {
     let locator = parse_issue_url(&args.issue)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
-    let _lock = RegistryLock::acquire(&state_dir, true)?;
+    let registry = CampaignRegistry::open(&state_dir)?;
     let authenticated_actor = authenticated_actor()?;
     let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &authenticated_actor)?;
     let graph = fetch_campaign_graph(&locator)?;
@@ -1617,12 +1450,7 @@ async fn run_campaign_arm(
     // mid-flight that half its projection is unavailable.
     let sub_issue_walk = probe_sub_issue_walk(&locator)?;
     let steering = fetch_campaign_steering(&graph, &allowed_actors, sub_issue_walk)?;
-    let path = registration_path(&state_dir, &locator.url);
-    let prior = if path.exists() {
-        Some(read_registration(&path)?)
-    } else {
-        None
-    };
+    let prior = registry.read_issue(&locator.url)?;
     let flow = resolve_flow(args.flow)?;
     let driver = resolve_driver(args.driver)?;
     let workspace_root = args
@@ -1638,31 +1466,33 @@ async fn run_campaign_arm(
             .checked_add(1)
             .ok_or_else(|| invalid("campaign arm retry counter is exhausted"))
     })?;
-    let mut registration = CampaignRegistration {
-        schema_version: REGISTRY_SCHEMA_VERSION,
-        registration_id: prior.as_ref().map_or_else(
-            || uuid::Uuid::now_v7().to_string(),
-            |value| value.registration_id.clone(),
-        ),
-        issue_url: locator.url.clone(),
-        repository: locator.repository.clone(),
-        issue_number: locator.number,
-        armed_at: Utc::now().to_rfc3339(),
-        arm_serial,
-        approved_graph_digest: graph.canonical.executable_digest.clone(),
-        authenticated_actor,
-        allowed_actors,
-        allow_test_local_forge: args.allow_test_local_forge,
-        sub_issue_walk,
-        last_observation: prior.and_then(|value| value.last_observation),
-        // Arming always dispatches, so the cheap precondition starts empty and
-        // the first poll after an arm re-establishes it.
-        last_forge_observation: None,
+    let mut registration = CampaignRegistration::new(
+        CampaignRegistrationV2 {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            registration_id: prior.as_ref().map_or_else(
+                || uuid::Uuid::now_v7().to_string(),
+                |value| value.registration_id.clone(),
+            ),
+            issue_url: locator.url.clone(),
+            repository: locator.repository.clone(),
+            issue_number: locator.number,
+            armed_at: Utc::now().to_rfc3339(),
+            arm_serial,
+            approved_graph_digest: graph.canonical.executable_digest.clone(),
+            authenticated_actor,
+            allowed_actors,
+            allow_test_local_forge: args.allow_test_local_forge,
+            sub_issue_walk,
+            last_observation: prior.and_then(|value| value.last_observation.clone()),
+            // Arming always dispatches, so the cheap precondition starts empty
+            // and the first poll after an arm re-establishes it.
+            last_forge_observation: None,
+            flow,
+            driver,
+            workspace_root,
+        },
         projection_wait_ms,
-        flow,
-        driver,
-        workspace_root,
-    };
+    );
     validate_host(
         &graph,
         config_path,
@@ -1670,7 +1500,7 @@ async fn run_campaign_arm(
         &registration.driver,
         registration.allow_test_local_forge,
     )?;
-    write_registration(&state_dir, &registration)?;
+    registry.write(&registration)?;
     if args.no_enqueue {
         outln!(
             "{}",
@@ -1700,7 +1530,7 @@ async fn run_campaign_arm(
         args.wait,
     )
     .await?;
-    write_registration(&state_dir, &registration)?;
+    registry.write(&registration)?;
     outln!(
         "{}",
         serde_json::to_string(&armed_projection(&result, registration.sub_issue_walk))?
@@ -1727,8 +1557,8 @@ async fn run_campaign_poll(
         return Err(invalid("campaign poll currently requires --once"));
     }
     let state_dir = resolve_state_dir(args.state_dir)?;
-    let _lock = RegistryLock::acquire(&state_dir, true)?;
-    let entries = registrations(&state_dir)?;
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let entries = registry.registrations()?;
     let mut observed = 0usize;
     let mut dispatched = 0usize;
     let mut pruned = 0usize;
@@ -1740,7 +1570,7 @@ async fn run_campaign_poll(
             require_authenticated_actor(&registration)?;
             let master = fetch_issue(&locator)?;
             if master.state != "open" {
-                fs::remove_file(&path)?;
+                registry.remove(&registration)?;
                 return Ok((false, true));
             }
             let graph = campaign_graph_from(&locator, master)?;
@@ -1769,7 +1599,7 @@ async fn run_campaign_poll(
             let observation = campaign_observation(&graph, &steering, registration.arm_serial)?;
             if registration.last_observation.as_deref() == Some(&observation) {
                 registration.last_forge_observation = Some(forge);
-                write_registration(&state_dir, &registration)?;
+                registry.write(&registration)?;
                 return Ok((false, false));
             }
             registration.last_forge_observation = Some(forge);
@@ -1786,7 +1616,7 @@ async fn run_campaign_poll(
                 args.wait,
             )
             .await?;
-            write_registration(&state_dir, &registration)?;
+            registry.write(&registration)?;
             if args.wait {
                 let code = waited_exit_code(&result);
                 if code != 0 {
@@ -1827,11 +1657,12 @@ async fn run_campaign_poll(
 
 fn run_campaign_list(args: CampaignListArgs) -> Result<()> {
     let state_dir = resolve_state_dir(args.state_dir)?;
-    let _lock = RegistryLock::acquire(&state_dir, false)?;
-    let values = registrations(&state_dir)?
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let values = registry
+        .registrations()?
         .into_iter()
-        .map(|(_, registration)| registration)
-        .collect::<Vec<_>>();
+        .map(|(_, registration)| registration.list_value())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     outln!("{}", serde_json::to_string(&values)?);
     Ok(())
 }
@@ -1839,14 +1670,8 @@ fn run_campaign_list(args: CampaignListArgs) -> Result<()> {
 fn run_campaign_disarm(args: CampaignDisarmArgs) -> Result<()> {
     let locator = parse_issue_url(&args.issue)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
-    let _lock = RegistryLock::acquire(&state_dir, true)?;
-    let path = registration_path(&state_dir, &locator.url);
-    let removed = if path.exists() {
-        fs::remove_file(&path)?;
-        true
-    } else {
-        false
-    };
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let removed = registry.remove_issue(&locator.url)?;
     outln!(
         "{}",
         serde_json::to_string(&json!({"issue": locator.url, "disarmed": removed}))?
@@ -3480,7 +3305,7 @@ mod tests {
 
     #[test]
     fn a_registration_written_before_the_probe_reads_as_degraded() {
-        let registration: CampaignRegistration = serde_json::from_value(json!({
+        let registration: CampaignRegistrationV2 = serde_json::from_value(json!({
             "schemaVersion": REGISTRY_SCHEMA_VERSION,
             "registrationId": "0198f000-0000-7000-8000-000000000001",
             "issueUrl": "https://github.com/acme/widgets/issues/42",
@@ -4398,30 +4223,35 @@ print(json.dumps({
         let root = tempfile::tempdir().unwrap();
         let state_dir = root.path();
         let authenticated = "operator".to_owned();
-        let registration = CampaignRegistration {
-            schema_version: REGISTRY_SCHEMA_VERSION,
-            registration_id: uuid::Uuid::now_v7().to_string(),
-            issue_url: "https://github.com/acme/widgets/issues/42".to_owned(),
-            repository: "acme/widgets".to_owned(),
-            issue_number: 42,
-            armed_at: "2026-08-01T00:00:00Z".to_owned(),
-            arm_serial: 1,
-            approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
-            authenticated_actor: authenticated.clone(),
-            allowed_actors: normalize_allowed_actors(&["Reviewer".into()], &authenticated).unwrap(),
-            allow_test_local_forge: false,
-            sub_issue_walk: true,
-            last_observation: None,
-            last_forge_observation: None,
-            projection_wait_ms: Some(240_000),
-            flow: PathBuf::from("/nix/store/flow.js"),
-            driver: PathBuf::from("/nix/store/driver"),
-            workspace_root: PathBuf::from("/srv/tally-campaigns"),
-        };
-        let _lock = RegistryLock::acquire(state_dir, true).unwrap();
-        write_registration(state_dir, &registration).unwrap();
-        let loaded =
-            read_registration(&registration_path(state_dir, &registration.issue_url)).unwrap();
+        let registration = CampaignRegistration::new(
+            CampaignRegistrationV2 {
+                schema_version: REGISTRY_SCHEMA_VERSION,
+                registration_id: uuid::Uuid::now_v7().to_string(),
+                issue_url: "https://github.com/acme/widgets/issues/42".to_owned(),
+                repository: "acme/widgets".to_owned(),
+                issue_number: 42,
+                armed_at: "2026-08-01T00:00:00Z".to_owned(),
+                arm_serial: 1,
+                approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
+                authenticated_actor: authenticated.clone(),
+                allowed_actors: normalize_allowed_actors(&["Reviewer".into()], &authenticated)
+                    .unwrap(),
+                allow_test_local_forge: false,
+                sub_issue_walk: true,
+                last_observation: None,
+                last_forge_observation: None,
+                flow: PathBuf::from("/nix/store/flow.js"),
+                driver: PathBuf::from("/nix/store/driver"),
+                workspace_root: PathBuf::from("/srv/tally-campaigns"),
+            },
+            Some(240_000),
+        );
+        let registry = CampaignRegistry::open(state_dir).unwrap();
+        registry.write(&registration).unwrap();
+        let loaded = registry
+            .read_issue(&registration.issue_url)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.registration_id, registration.registration_id);
         assert_eq!(loaded.allowed_actors, ["operator", "reviewer"]);
         assert_eq!(
@@ -4528,15 +4358,15 @@ print(json.dumps({
 
     /// #432 acceptance 2, the seam that actually reaches a campaign pass. A
     /// registration written before `--projection-wait-ms` existed carries no
-    /// field at all; it must still load, and it must leave the flow host's own
-    /// default alone rather than being refused or defaulted to zero.
+    /// field at all; it must still load with the historical 10-second value
+    /// rather than being refused or defaulted to zero.
     #[test]
     fn a_registration_without_a_projection_wait_still_loads() {
         let root = tempfile::tempdir().unwrap();
         let state_dir = root.path();
         let url = "https://github.com/acme/widgets/issues/42";
-        let path = registration_path(state_dir, url);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let registry = CampaignRegistry::open(state_dir).unwrap();
+        let path = registry.registration_path(url);
         fs::write(
             &path,
             serde_json::to_string(&json!({
@@ -4559,8 +4389,11 @@ print(json.dumps({
             .unwrap(),
         )
         .unwrap();
-        let loaded = read_registration(&path).unwrap();
-        assert_eq!(loaded.projection_wait_ms, None);
+        let loaded = registry.read(&path).unwrap();
+        assert_eq!(
+            loaded.projection_wait_ms,
+            Some(tally_core::campaign_registry::DEFAULT_CAMPAIGN_PROJECTION_WAIT_MS)
+        );
     }
 
     fn codex_shaped_adapter(commit_capable: &[&str]) -> AdapterConfig {

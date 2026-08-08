@@ -486,6 +486,23 @@ $ sudo nix-env --switch-generation <N-1> -p /nix/var/nix/profiles/system
 $ sudo /nix/var/nix/profiles/system/bin/switch-to-configuration switch
 ```
 
+Campaign registration state survives that profile switch. Before an adjacent
+generation rollback, quiesce campaign admission and run the current `tally
+campaign list` once. The list takes the registry lock and migrates any
+historical schema-2 record that embedded `projectionWaitMs` into the frozen
+authority plus a `campaigns/host-tuning/` sidecar for an explicit override.
+Files directly under `campaigns/armed/` are then readable by the N-1 binary; do
+not move or delete them as part of the profile switch. N-1 ignores the sidecar
+and uses its 10 s projection wait. A current reader also supplies that 10 s
+value when no sidecar exists, without rewriting the authority record. When the
+profile is switched forward again, tally recovers an explicit override from a
+retained sidecar while preserving registration ID, approved digest, observation
+fields, and executable paths.
+
+This guarantee is for the adjacent schema-2 generations. If a rollback crosses
+an authority-schema migration, follow that release's explicit registry
+migration procedure instead of assuming the state is interchangeable.
+
 Because the migration gates archived the old files aside, rolling the binary
 back is not enough: the old daemon meets new-format state it never wrote.
 Quiesce admission, stop the daemon, and swap the state before activating the

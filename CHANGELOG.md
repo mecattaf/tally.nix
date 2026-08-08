@@ -24,6 +24,22 @@ authorized.
   restores only immutable native task content, and requires the resulting
   envelope to reproduce `worklist.graphDigest` without applying defaults.
 
+### Campaign registry rollback compatibility (#447)
+
+- Campaign schema-2 authority is frozen to the closed field set understood by
+  the preceding tally generation. An explicit host-local `projectionWaitMs`
+  tuning now lives in a separately versioned `campaigns/host-tuning/` sidecar;
+  an absent sidecar resolves to the historical 10-second default. Both the
+  default and an explicit override produce authority bytes the literal N-1
+  decoder accepts.
+- Current readers narrowly migrate the already-shipped polluted schema-2 shape
+  under the registry lock, reject every other unknown authority member, and
+  preserve the sidecar across an N-1 poll/rewrite. During rollback N-1 uses its
+  historical 10-second wait; rolling forward restores the explicit override
+  without changing campaign authority, observations, digest, or asset paths.
+- Registration paths, validation, locking, atomic publication, and migration
+  now live in the shared versioned `tally_core::campaign_registry` lifecycle.
+
 ### Campaign git-ai execution and terminal diagnostics (#441)
 
 - Campaign nodes may now carry the full closed git-ai correlation set of at
