@@ -26,6 +26,15 @@ An adapter may also declare a resume argv template. Placeholders such as
 capture is absent. An adapter without a resume template cannot silently turn a
 continuation into a fresh launch.
 
+The stock `codex` template requires the captured session and recorded working
+directory, but not a captured model. Real default-model `codex exec --json`
+streams do not state which model Codex chose, so recovery leaves the model
+absent and lets Codex select its default again. A job that explicitly requested
+an authorized model keeps that request in `adapterOptions`; the same declared
+`launch.model` override inserts it exactly once on both launch and resume.
+Codex's `launch.resumeOptionsBeforeCapture = "sessionRef"` declaration keeps
+that option before the positional thread ID required by its resume grammar.
+
 Adapter environment follows the same boundary: names beginning `TALLY_` and
 `CREDENTIALS_DIRECTORY` are reserved, and NUL-containing names, values, or argv
 are rejected.
@@ -84,6 +93,10 @@ cache read, plus `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`,
 `costUsd`. Cost is only ever what the harness reported; tally has no pricing
 table and computes no dollar figure. A total the harness did not state is
 derived from the components and labelled as derived.
+
+The provider-facing `scrape.usage.counterScope` repeats the adapter's
+`usageCounterScope` declaration beside the capture whose values it describes;
+when present, adapter validation requires the two declarations to agree.
 
 `inputTokens` alone is not the cross-harness "fresh input" figure. claude-code's
 cache-write tokens are fresh, uncached prompt tokens its `input_tokens`

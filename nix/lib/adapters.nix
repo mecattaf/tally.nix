@@ -6,6 +6,7 @@ let
       stream ? "stdout",
       mode ? "regex",
       pattern,
+      counterScope ? null,
       fields ? { },
     }:
     assert lib.assertMsg (builtins.elem stream [
@@ -21,6 +22,13 @@ let
       builtins.isString pattern && pattern != ""
     ) "tally adapter scrape pattern must be a non-empty string";
     assert lib.assertMsg (
+      counterScope == null
+      || builtins.elem counterScope [
+        "attempt"
+        "session-cumulative"
+      ]
+    ) "tally adapter scrape counterScope must be null, attempt, or session-cumulative";
+    assert lib.assertMsg (
       builtins.isAttrs fields
       && builtins.all (
         paths: builtins.isList paths && paths != [ ] && builtins.all builtins.isString paths
@@ -29,6 +37,7 @@ let
     {
       inherit stream mode pattern;
     }
+    // lib.optionalAttrs (counterScope != null) { inherit counterScope; }
     // lib.optionalAttrs (fields != { }) { inherit fields; };
 
   mkAdapter =
@@ -36,6 +45,7 @@ let
       argv ? [ ],
       resume ? null,
       resumeRequiresLaunchCwd ? false,
+      usageCounterScope ? "attempt",
       scrape ? { },
       trace ? null,
       yieldHook ? null,
@@ -56,6 +66,10 @@ let
     assert lib.assertMsg (
       !resumeRequiresLaunchCwd || resume != null
     ) "tally adapter resumeRequiresLaunchCwd requires a resume template to constrain";
+    assert lib.assertMsg (builtins.elem usageCounterScope [
+      "attempt"
+      "session-cumulative"
+    ]) "tally adapter usageCounterScope must be attempt or session-cumulative";
     assert lib.assertMsg (
       yieldHook == null || validArgv yieldHook
     ) "tally adapter yieldHook must be null or a list of strings";
@@ -78,6 +92,12 @@ let
     assert lib.assertMsg (builtins.isBool (
       launch.rejectOptionLikeWorkloadHead or false
     )) "tally adapter launch.rejectOptionLikeWorkloadHead must be a boolean";
+    assert lib.assertMsg (
+      let
+        capture = launch.resumeOptionsBeforeCapture or null;
+      in
+      capture == null || (builtins.isString capture && capture != "")
+    ) "tally adapter launch.resumeOptionsBeforeCapture must be null or a non-empty string";
     assert lib.assertMsg (
       hardening == null
       || builtins.elem hardening [
@@ -108,6 +128,7 @@ let
         argv
         resume
         resumeRequiresLaunchCwd
+        usageCounterScope
         scrape
         trace
         yieldHook
@@ -423,6 +444,9 @@ let
     shell = mkAdapter { };
 
     codex = mkAdapter {
+      # `codex exec resume` rehydrates the thread's cumulative counters. The
+      # executable delta accounting for this declaration arrives in #403.
+      usageCounterScope = "session-cumulative";
       trace = {
         stream = "stdout";
         framing = "json-lines";
@@ -440,8 +464,6 @@ let
         "exec"
         "resume"
         "--json"
-        "--model"
-        "%<model>%"
         "%<sessionRef>%"
         "--"
       ];
@@ -451,6 +473,11 @@ let
           pattern = "$..thread_id";
         };
         model = mkScrapeCapture {
+          # Advisory and optional: a default-model `codex exec --json` stream
+          # does not state the chosen model. An explicit per-job model is
+          # rendered through launch.model on resume just as it is on launch;
+          # the resume template must not turn this observation into a
+          # requirement or infer a default that codex never reported.
           mode = "jsonPath";
           pattern = "$..model";
         };
@@ -466,6 +493,7 @@ let
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
+          counterScope = "session-cumulative";
           fields = {
             inputTokensWithCacheRead = [ "input_tokens" ];
             cacheReadTokens = [ "cached_input_tokens" ];
@@ -494,6 +522,10 @@ let
       yieldHook = checkpointHook;
       launch = {
         allowPrePromptArgv = true;
+        # `codex exec resume` parses the thread id as a positional. Authorized
+        # options therefore belong before that capture, not merely before the
+        # final workload separator.
+        resumeOptionsBeforeCapture = "sessionRef";
         cwdArgv = [
           "-C"
           "%<cwd>%"

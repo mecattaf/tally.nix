@@ -751,6 +751,7 @@ mod tests {
             stream: ScrapeStream::Stdout,
             mode,
             pattern: pattern.to_owned(),
+            counter_scope: None,
             fields: serde_json::from_str(fields).expect("declared fields parse"),
         }
     }

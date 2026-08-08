@@ -5263,10 +5263,11 @@
             test "$(jq -c '.adapters.shell.trace' ${adapterConfig})" = 'null'
             test "$(jq -c '.adapters.pi.trace' ${adapterConfig})" = '{"framing":"json-lines","stream":"stdout"}'
             test "$(jq -c '.adapters.codex.argv' ${adapterConfig})" = '["codex","exec","--json","--"]'
-            test "$(jq -c '.adapters.codex.resume' ${adapterConfig})" = '["codex","-C","%<cwd>%","exec","resume","--json","--model","%<model>%","%<sessionRef>%","--"]'
+            test "$(jq -c '.adapters.codex.resume' ${adapterConfig})" = '["codex","-C","%<cwd>%","exec","resume","--json","%<sessionRef>%","--"]'
+            test "$(jq -r '.adapters.codex.launch.resumeOptionsBeforeCapture' ${adapterConfig})" = sessionRef
             test "$(jq -c '.adapters.codex.launch.cwdArgv' ${adapterConfig})" = '["-C","%<cwd>%"]'
             test "$(jq -c '.adapters.codex.launch.sandboxPolicies["dangerously-bypass"]' ${adapterConfig})" = '["--dangerously-bypass-approvals-and-sandbox"]'
-            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"extraWritablePaths":[],"launch":{},"resume":null,"resumeRequiresLaunchCwd":false,"scrape":{},"trace":null,"yieldHook":null}'
+            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"extraWritablePaths":[],"launch":{},"resume":null,"resumeRequiresLaunchCwd":false,"scrape":{},"trace":null,"usageCounterScope":"attempt","yieldHook":null}'
             # The cross-cwd resume invariant is a declaration, and pi is the
             # only preset with the measurement behind it: pi's SessionManager
             # filters by exact resolved-path equality, so a resume from another
@@ -5278,6 +5279,11 @@
             test "$(jq -r '.adapters.pi.resumeRequiresLaunchCwd' ${adapterConfig})" = true
             test "$(jq -r '.adapters.codex.resumeRequiresLaunchCwd' ${adapterConfig})" = false
             test "$(jq -r '.adapters["claude-code"].resumeRequiresLaunchCwd' ${adapterConfig})" = false
+            test "$(jq -r '.adapters.codex.usageCounterScope' ${adapterConfig})" = session-cumulative
+            test "$(jq -r '.adapters.codex.scrape.usage.counterScope' ${adapterConfig})" = session-cumulative
+            for preset in pi claude-code shell nix-custom; do
+              test "$(jq -r --arg preset "$preset" '.adapters[$preset].usageCounterScope' ${adapterConfig})" = attempt
+            done
             for preset in pi claude-code codex; do
               test "$(jq -c --arg preset "$preset" '.adapters[$preset].yieldHook' ${adapterConfig})" = '["tally","lease","status"]'
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.sessionRef.mode' ${adapterConfig})" = jsonPath
@@ -5457,18 +5463,26 @@
             test "$(printf '%s' "$claude_render" | jq -c '.captures.usage')" = '{"input_tokens":12}'
             test "$(printf '%s' "$claude_render" | jq -r '.captures.finalMessage')" = 'claude final'
             test "$(printf '%s' "$claude_render" | jq -r '.defaultGateManifest')" = true
-            printf '%s\n' \
-              '{"type":"thread.started","thread_id":"codex-thread","model":"Codex/Exact.Model"}' \
-              '{"type":"item.completed","item":{"type":"agent_message","text":"codex first"}}' \
-              '{"type":"item.completed","item":{"type":"command_execution","text":"ignore command"}}' \
-              '{"type":"turn.completed","model":"Codex/Exact.Model","usage":{"input_tokens":13}}' \
-              '{"type":"item.completed","item":{"type":"agent_message","text":"codex final"}}' > codex.jsonl
-            codex_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render codex --cwd "$PWD" --scrape-stdout "$PWD/codex.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
-            expected_codex="$(jq -cn --arg cwd "$PWD" '["codex","-C",$cwd,"exec","resume","--json","--model","Codex/Exact.Model","codex-thread","--","work"]')"
+            # This is the committed excerpt of a real default-model
+            # `codex exec --json` capture. It states the session, final answer,
+            # and all five observed usage keys, but no model. The stock preset
+            # must keep that absence honest and still render a resumable argv.
+            codex_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render codex --cwd "$PWD" --scrape-stdout ${./test/fixtures/usage/codex.jsonl} --scrape-stderr "$PWD/empty.err" -- work)"
+            expected_codex="$(jq -cn --arg cwd "$PWD" '["codex","-C",$cwd,"exec","resume","--json","codex-usage-thread","--","work"]')"
             test "$(printf '%s' "$codex_render" | jq -c '.argv')" = "$expected_codex"
-            test "$(printf '%s' "$codex_render" | jq -c '.captures.usage')" = '{"input_tokens":13}'
-            test "$(printf '%s' "$codex_render" | jq -r '.captures.finalMessage')" = 'codex final'
+            test "$(printf '%s' "$codex_render" | jq -r '.captures.sessionRef')" = codex-usage-thread
+            test "$(printf '%s' "$codex_render" | jq -e '.captures | has("model") | not')" = true
+            test "$(printf '%s' "$codex_render" | jq -c '.captures.usage')" = '{"input_tokens":7060166,"cached_input_tokens":6798080,"cache_write_input_tokens":0,"output_tokens":32842,"reasoning_output_tokens":15163}'
+            test "$(printf '%s' "$codex_render" | jq -r '.captures.finalMessage')" = '<redacted text>'
             test "$(printf '%s' "$codex_render" | jq -r '.defaultGateManifest')" = true
+            # Mutation guard: restoring the old required placeholder makes the
+            # same real capture fail because it never stated a model.
+            jq '.adapters.codex.resume = ["codex", "-C", "%<cwd>%", "exec", "resume", "--json", "--model", "%<model>%", "%<sessionRef>%", "--"]' ${adapterConfig} > codex-required-model.json
+            if ${tally}/bin/tally --config "$PWD/codex-required-model.json" __adapter-render codex --cwd "$PWD" --scrape-stdout ${./test/fixtures/usage/codex.jsonl} --scrape-stderr "$PWD/empty.err" -- work >codex-required-model.out 2>codex-required-model.err; then
+              echo "required Codex model placeholder accepted a capture with no model" >&2
+              exit 1
+            fi
+            grep -F 'resume capture "model" is absent for adapter "codex"' codex-required-model.err >/dev/null
             shell_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render shell -- /bin/true)"
             test "$(printf '%s' "$shell_render" | jq -r '.defaultGateManifest')" = false
             touch $out

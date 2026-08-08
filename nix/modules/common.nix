@@ -99,6 +99,21 @@ let
             interpreted according to this capture's mode.
           '';
         };
+        counterScope = mkOption {
+          type = types.nullOr (
+            types.enum [
+              "attempt"
+              "session-cumulative"
+            ]
+          );
+          default = null;
+          example = "session-cumulative";
+          description = ''
+            Optional lifetime declaration for counters carried by the usage
+            capture. When present it must agree with the adapter's
+            usageCounterScope; other named captures cannot declare it.
+          '';
+        };
         fields = mkOption {
           type = types.attrsOf (types.listOf types.str);
           default = { };
@@ -130,6 +145,10 @@ let
         {
           assertion = builtins.all (paths: paths != [ ]) (builtins.attrValues config.fields);
           message = "tally adapter scrape ${name} declares a field with no candidate path";
+        }
+        {
+          assertion = config.counterScope == null || name == "usage";
+          message = "tally adapter scrape counterScope is only valid on the usage capture";
         }
       ];
     }
@@ -216,6 +235,16 @@ let
             Refuse a non-empty first workload argv element beginning with a
             dash before launch or resume composition. False preserves the
             workload as opaque positional data.
+          '';
+        };
+        resumeOptionsBeforeCapture = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "sessionRef";
+          description = ''
+            On resume, insert authorized adapter options immediately before
+            the argv element containing this capture placeholder. This keeps
+            provider options ahead of a positional session identifier.
           '';
         };
         cwdArgv = mkOption {
@@ -335,6 +364,20 @@ let
             naming both. Leave false to declare nothing: tally enforces
             nothing, which is not a claim that cross-directory resume is safe
             for that harness.
+          '';
+        };
+        usageCounterScope = mkOption {
+          type = types.enum [
+            "attempt"
+            "session-cumulative"
+          ];
+          default = "attempt";
+          example = "session-cumulative";
+          description = ''
+            Lifetime declared by the harness usage counters. The executable
+            cumulative-resume accounting policy is introduced by #403; this
+            declaration is already rendered here so the usage capture can
+            state and validate the same lifetime.
           '';
         };
         scrape = mkOption {
@@ -3362,18 +3405,23 @@ let
         inherit (value) argv allowedValues;
       };
 
-  renderAdapterLaunch = launch: {
-    inherit (launch)
-      allowPrePromptArgv
-      rejectOptionLikeWorkloadHead
-      cwdArgv
-      approvalPolicies
-      sandboxPolicies
-      commitCapableSandboxPolicies
-      ;
-    model = renderAdapterValueOverride launch.model;
-    effort = renderAdapterValueOverride launch.effort;
-  };
+  renderAdapterLaunch =
+    launch:
+    {
+      inherit (launch)
+        allowPrePromptArgv
+        rejectOptionLikeWorkloadHead
+        cwdArgv
+        approvalPolicies
+        sandboxPolicies
+        commitCapableSandboxPolicies
+        ;
+      model = renderAdapterValueOverride launch.model;
+      effort = renderAdapterValueOverride launch.effort;
+    }
+    // optionalAttrs (launch.resumeOptionsBeforeCapture != null) {
+      inherit (launch) resumeOptionsBeforeCapture;
+    };
 
   renderAdapter =
     _: adapter:
@@ -3381,6 +3429,7 @@ let
       inherit (adapter)
         argv
         resume
+        usageCounterScope
         trace
         yieldHook
         env
@@ -3393,6 +3442,7 @@ let
         {
           inherit (capture) stream mode pattern;
         }
+        // optionalAttrs (capture.counterScope != null) { inherit (capture) counterScope; }
         // optionalAttrs (capture.fields != { }) { inherit (capture) fields; }
       ) adapter.scrape;
     }

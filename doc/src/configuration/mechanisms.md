@@ -263,6 +263,7 @@ job-supplied policy out of free-form argv:
 | Launch option | Authorization boundary |
 |---|---|
 | [`allowPrePromptArgv`](core-options.md#servicestallyadaptersnamelaunchallowprepromptargv) | Whether a job may insert argv before the adapter's final `--`. |
+| [`resumeOptionsBeforeCapture`](core-options.md#servicestallyadaptersnamelaunchresumeoptionsbeforecapture) | Optional capture whose resume positional must follow authorized adapter options. |
 | [`cwdArgv`](core-options.md#servicestallyadaptersnamelaunchcwdargv) | Optional argv template that must contain `%<cwd>%`. |
 | [`approvalPolicies`](core-options.md#servicestallyadaptersnamelaunchapprovalpolicies) | Map from allowed policy names to exact argv fragments. |
 | [`sandboxPolicies`](core-options.md#servicestallyadaptersnamelaunchsandboxpolicies) | Map from allowed sandbox names to exact argv fragments. |
@@ -278,6 +279,10 @@ Each named capture selects
 [`pattern`](core-options.md#servicestallyadaptersnamescrapenamepattern).
 All captures are advisory: they may support resume, queries, usage observations,
 or attestations, but they do not create evidence or a verdict.
+The optional
+[`counterScope`](core-options.md#servicestallyadaptersnamescrapenamecounterscope)
+is valid only on `usage` and, when present, must match the adapter's
+`usageCounterScope`.
 
 | Mode | Behavior |
 |---|---|
@@ -295,13 +300,15 @@ check. Angle-bracketed values are adapter placeholders, not shell expansion.
 | `shell` | empty pass-through prefix | none | no captures, trace, or yield hook |
 | `pi` | `pi --mode json` | `pi --mode json --session %<sessionRef>% --model %<model>%` | `sessionRef`, `model`, and `usage` use `jsonPath`; `finalMessage` and `occupancy` use `jsonPathLast`; stdout `json-lines` trace |
 | `claude-code` | `claude --print --verbose --output-format stream-json --` | `claude --resume %<sessionRef>% --model %<model>% --print --verbose --output-format stream-json --` | the same four capture modes; stdout `json-lines` trace |
-| `codex` | `codex exec --json --` | `codex -C %<cwd>% exec resume --json --model %<model>% %<sessionRef>% --` | the same four capture modes; stdout `json-lines` trace |
+| `codex` | `codex exec --json --` | `codex -C %<cwd>% exec resume --json %<sessionRef>% --` | the same four capture modes; stdout `json-lines` trace |
 
 For the session capture, `pi` uses `$.id`, `claude-code` uses
 `$..session_id`, and `codex` uses `$..thread_id`. The three structured presets
 also install `tally lease status` as their cooperative `yieldHook`. `codex`
-declares cwd argv and named approval and sandbox policies; the presets do not
-silently authorize arbitrary job-supplied flags.
+declares cwd argv and named approval and sandbox policies. When a job carries
+an admitted explicit Codex model, its declared model option is inserted before
+the positional `%<sessionRef>%`; default-model recovery adds no model option.
+The presets do not silently authorize arbitrary job-supplied flags.
 
 `pi` declares no `usage` key mapping, and that is now a finding rather than a
 gap. A real `pi --mode json` capture is checked in at

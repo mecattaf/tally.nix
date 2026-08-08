@@ -84,6 +84,11 @@ pub struct ScrapeCapture {
     #[serde(default)]
     pub mode: ScrapeMode,
     pub pattern: String,
+    /// Declared lifetime of counters carried by this capture. This is only
+    /// meaningful on the `usage` capture; it mirrors the adapter-wide
+    /// accounting setting at the provider-facing declaration boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_scope: Option<UsageCounterScope>,
     /// Per-harness key mapping for this capture: a logical field name to the
     /// ordered candidate paths that carry it inside the captured value. `$`
     /// (or the empty string) is the captured value itself; anything else is
@@ -115,6 +120,12 @@ pub struct AdapterLaunchConfig {
     /// adapters whose own end-of-options handling makes that safe.
     #[serde(default)]
     pub reject_option_like_workload_head: bool,
+    /// On resume, insert authorized adapter options immediately before the
+    /// argv element containing this capture placeholder. Providers whose
+    /// resume grammar has a positional session identifier use this to keep
+    /// options ahead of that positional without hard-coding their CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_options_before_capture: Option<String>,
     #[serde(default)]
     pub cwd_argv: Option<Vec<String>>,
     #[serde(default)]
@@ -199,6 +210,15 @@ pub struct AdapterConfig {
     pub resume: Option<Vec<String>>,
     #[serde(default)]
     pub scrape: BTreeMap<String, ScrapeCapture>,
+    /// Whether the harness resets usage counters for every invocation or
+    /// reports counters accumulated by the resumed session.
+    ///
+    /// Attempt-scoped is the compatibility default. The accounting behavior
+    /// for cumulative resumes is introduced by #403; this declaration is
+    /// already needed here so a provider-facing usage capture can state and
+    /// validate the same lifetime.
+    #[serde(default)]
+    pub usage_counter_scope: UsageCounterScope,
     #[serde(default)]
     pub trace: Option<AdapterTrace>,
     #[serde(default)]
@@ -236,6 +256,17 @@ pub struct AdapterConfig {
     pub resume_requires_launch_cwd: bool,
     #[serde(default)]
     pub extra_config: BTreeMap<String, Value>,
+}
+
+/// Lifetime of the primitive counters exposed by an adapter's usage scrape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageCounterScope {
+    /// Every invocation starts its counters at zero.
+    #[default]
+    Attempt,
+    /// A resume continues the counters of the named session.
+    SessionCumulative,
 }
 
 impl AdapterConfig {
@@ -393,7 +424,7 @@ impl<'a> AdapterEngine<'a> {
         cwd: Option<&Path>,
     ) -> Result<AdapterInvocation, AdapterError> {
         let adapter = self.adapter(name)?;
-        let prefix = render_launch_prefix(name, adapter, &adapter.argv, options, cwd)?;
+        let prefix = render_launch_prefix(name, adapter, &adapter.argv, options, cwd, None)?;
         let argv = compose_argv(name, adapter, &prefix, workload_argv)?;
         invocation(name, adapter, options, argv)
     }
@@ -473,6 +504,7 @@ impl<'a> AdapterEngine<'a> {
             &rendered,
             &inserted_options,
             (!template_has_cwd).then_some(cwd).flatten(),
+            resume_options_insertion_index(name, adapter)?,
         )?;
         let argv = compose_argv(name, adapter, &prefix, workload_argv)?;
         invocation(name, adapter, options, argv)
@@ -695,6 +727,7 @@ fn render_launch_prefix(
     base: &[String],
     options: &AdapterJobOptions,
     cwd: Option<&Path>,
+    insert_before: Option<usize>,
 ) -> Result<Vec<String>, AdapterError> {
     if !options.pre_prompt_argv.is_empty() && !adapter.launch.allow_pre_prompt_argv {
         return invalid_config(
@@ -747,6 +780,11 @@ fn render_launch_prefix(
 
     if inserted.is_empty() {
         return Ok(base.to_vec());
+    }
+    if let Some(index) = insert_before {
+        let mut rendered = base.to_vec();
+        rendered.splice(index..index, inserted);
+        return Ok(rendered);
     }
     // Pre-prompt options go at the end of the prefix, which is where a
     // harness expects its own flags: after the subcommand, before the
@@ -930,6 +968,7 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
         }
     }
     validate_launch_config(name, &adapter.launch)?;
+    resume_options_insertion_index(name, adapter)?;
     let mut names = BTreeSet::new();
     for (capture_name, capture) in &adapter.scrape {
         if !valid_capture_name(capture_name) {
@@ -941,6 +980,25 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
                 name,
                 format!("capture {capture_name:?} has an empty or NUL pattern"),
             );
+        }
+        if let Some(counter_scope) = capture.counter_scope {
+            if capture_name != "usage" {
+                return invalid_config(
+                    name,
+                    format!(
+                        "capture {capture_name:?} declares counterScope, which is only valid on the usage capture"
+                    ),
+                );
+            }
+            if counter_scope != adapter.usage_counter_scope {
+                return invalid_config(
+                    name,
+                    format!(
+                        "usage capture counterScope {counter_scope:?} disagrees with adapter usageCounterScope {:?}",
+                        adapter.usage_counter_scope
+                    ),
+                );
+            }
         }
         match capture.mode {
             ScrapeMode::Regex => {
@@ -995,6 +1053,50 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
         }
     }
     Ok(())
+}
+
+fn resume_options_insertion_index(
+    name: &str,
+    adapter: &AdapterConfig,
+) -> Result<Option<usize>, AdapterError> {
+    let Some(capture) = adapter.launch.resume_options_before_capture.as_deref() else {
+        return Ok(None);
+    };
+    if capture.is_empty() || !valid_capture_name(capture) {
+        return invalid_config(
+            name,
+            "launch.resumeOptionsBeforeCapture must name a valid capture".to_owned(),
+        );
+    }
+    let template = adapter
+        .resume
+        .as_deref()
+        .ok_or_else(|| AdapterError::InvalidConfig {
+            adapter: name.to_owned(),
+            detail: "launch.resumeOptionsBeforeCapture requires a resume template".to_owned(),
+        })?;
+    let marker = format!("%<{capture}>%");
+    let mut matches = template
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| argument.contains(&marker).then_some(index));
+    let Some(index) = matches.next() else {
+        return invalid_config(
+            name,
+            format!(
+                "launch.resumeOptionsBeforeCapture names {capture:?}, but resume has no {marker} placeholder"
+            ),
+        );
+    };
+    if matches.next().is_some() {
+        return invalid_config(
+            name,
+            format!(
+                "launch.resumeOptionsBeforeCapture names {capture:?}, but resume contains {marker} more than once"
+            ),
+        );
+    }
+    Ok(Some(index))
 }
 
 fn validate_launch_config(adapter: &str, launch: &AdapterLaunchConfig) -> Result<(), AdapterError> {
@@ -1355,6 +1457,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..attempt".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -1364,6 +1467,7 @@ mod tests {
                         stream: ScrapeStream::Stderr,
                         mode: ScrapeMode::Regex,
                         pattern: "(?m)^branch=(.+)$".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -1373,6 +1477,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..model".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -1382,6 +1487,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..session_id".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -1391,10 +1497,12 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..usage".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
             ]),
+            usage_counter_scope: UsageCounterScope::Attempt,
             trace: None,
             yield_hook: Some(vec![
                 "tally".to_owned(),
@@ -1416,6 +1524,33 @@ mod tests {
 
     fn engine(adapters: &BTreeMap<String, AdapterConfig>) -> AdapterEngine<'_> {
         AdapterEngine::new(adapters)
+    }
+
+    #[test]
+    fn usage_capture_counter_scope_must_match_adapter_accounting() {
+        let mut declared = adapter();
+        declared.scrape.get_mut("usage").unwrap().counter_scope =
+            Some(UsageCounterScope::SessionCumulative);
+        let adapters = BTreeMap::from([("counter-scope".to_owned(), declared.clone())]);
+        assert!(matches!(
+            engine(&adapters).validate_all(),
+            Err(AdapterError::InvalidConfig { detail, .. })
+                if detail.contains("usage capture counterScope")
+                    && detail.contains("disagrees with adapter usageCounterScope")
+        ));
+
+        declared.usage_counter_scope = UsageCounterScope::SessionCumulative;
+        let adapters = BTreeMap::from([("counter-scope".to_owned(), declared.clone())]);
+        engine(&adapters).validate_all().unwrap();
+
+        declared.scrape.get_mut("model").unwrap().counter_scope =
+            Some(UsageCounterScope::SessionCumulative);
+        let adapters = BTreeMap::from([("counter-scope".to_owned(), declared)]);
+        assert!(matches!(
+            engine(&adapters).validate_all(),
+            Err(AdapterError::InvalidConfig { detail, .. })
+                if detail.contains("only valid on the usage capture")
+        ));
     }
 
     #[test]
@@ -1485,6 +1620,7 @@ mod tests {
                     stream: ScrapeStream::Stdout,
                     mode: ScrapeMode::JsonPath,
                     pattern: "$.id".to_owned(),
+                    counter_scope: None,
                     fields: BTreeMap::new(),
                 },
             )]),
@@ -2118,8 +2254,6 @@ mod tests {
                 "exec".to_owned(),
                 "resume".to_owned(),
                 "--json".to_owned(),
-                "--model".to_owned(),
-                "%<model>%".to_owned(),
                 "%<sessionRef>%".to_owned(),
                 "--".to_owned(),
             ]),
@@ -2130,6 +2264,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..model".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -2139,6 +2274,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..thread_id".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -2146,6 +2282,7 @@ mod tests {
             launch: AdapterLaunchConfig {
                 allow_pre_prompt_argv: true,
                 reject_option_like_workload_head: false,
+                resume_options_before_capture: Some("sessionRef".to_owned()),
                 cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
                 approval_policies: BTreeMap::from([("never".to_owned(), Vec::new())]),
                 sandbox_policies: BTreeMap::from([("danger-full-access".to_owned(), Vec::new())]),
@@ -2201,11 +2338,35 @@ mod tests {
         let scraped = engine
             .scrape_text(
                 "codex",
-                "{\"type\":\"thread.started\",\"thread_id\":\"thread-28\",\"model\":\"gpt-5-codex\"}\n",
+                "{\"type\":\"thread.started\",\"thread_id\":\"thread-28\"}\n",
                 "",
             )
             .unwrap();
         assert_eq!(scraped.session_ref().unwrap(), Some("thread-28"));
+        assert!(!scraped.captures.contains_key("model"));
+        let default_resumed = engine
+            .resume_with_options(
+                "codex",
+                &["continue".to_owned()],
+                &scraped,
+                &AdapterJobOptions::default(),
+                Some(cwd),
+            )
+            .unwrap();
+        assert_eq!(
+            default_resumed.argv,
+            [
+                "codex",
+                "-C",
+                "/worktrees/issue-28",
+                "exec",
+                "resume",
+                "--json",
+                "thread-28",
+                "--",
+                "continue",
+            ]
+        );
         let resumed = engine
             .resume_with_options(
                 "codex",
@@ -2224,15 +2385,23 @@ mod tests {
                 "exec",
                 "resume",
                 "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--model",
                 "gpt-5-codex",
-                "thread-28",
-                "--dangerously-bypass-approvals-and-sandbox",
                 "-c",
                 "model_reasoning_effort=high",
+                "thread-28",
                 "--",
                 "continue",
             ]
+        );
+        assert_eq!(
+            resumed
+                .argv
+                .iter()
+                .filter(|argument| argument.as_str() == "--model")
+                .count(),
+            1
         );
     }
 
@@ -2258,6 +2427,7 @@ mod tests {
                     stream: ScrapeStream::Stdout,
                     mode: ScrapeMode::JsonPath,
                     pattern: "$.id".to_owned(),
+                    counter_scope: None,
                     fields: Default::default(),
                 },
             )]),

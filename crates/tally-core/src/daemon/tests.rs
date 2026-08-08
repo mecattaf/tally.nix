@@ -11,8 +11,8 @@ mod tests {
 
     use super::*;
     use crate::adapters::{
-        AdapterConfig, AdapterLaunchConfig, AdapterTrace, ScrapeCapture, ScrapeMode, ScrapeStream,
-        TraceFraming,
+        AdapterConfig, AdapterLaunchConfig, AdapterTrace, AdapterValueOverride, ScrapeCapture,
+        ScrapeMode, ScrapeStream, TraceFraming,
     };
     use crate::config::{
         CoResidencyPredicate, ExecutionTargetConfig, JournaldConfig, MeterBudgetClass, PoolConfig,
@@ -499,6 +499,7 @@ mod tests {
                         stream: ScrapeStream::Stderr,
                         mode: ScrapeMode::Regex,
                         pattern: "(?m)^branch=(.+)$".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -508,6 +509,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..model".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -517,6 +519,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..session_id".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -526,6 +529,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..usage".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
@@ -535,10 +539,12 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..final_message".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 ),
             ]),
+            usage_counter_scope: crate::adapters::UsageCounterScope::Attempt,
             trace: None,
             yield_hook: Some(vec![
                 "tally".to_owned(),
@@ -3612,9 +3618,11 @@ mod tests {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..session_id".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         )]),
+                        usage_counter_scope: crate::adapters::UsageCounterScope::Attempt,
                         trace: None,
                         yield_hook: None,
                         env: BTreeMap::new(),
@@ -6010,6 +6018,7 @@ mod tests {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..thread_id".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         )]),
@@ -6099,6 +6108,313 @@ mod tests {
             .await;
     }
 
+    /// #443. The stock Codex stream does not identify the model when Codex
+    /// selected its default. Recovery must retain that absence: a required
+    /// `%<model>%` would make this real, complete capture impossible to
+    /// continue, while inventing a model would silently pin a choice Codex
+    /// never reported. An explicit job option is a different fact and remains
+    /// a typed, durable request on both sides of the restart.
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_model_codex_recovery_is_model_less_while_explicit_model_is_preserved() {
+        const CODEX_CAPTURE: &str =
+            include_str!("../../../../test/fixtures/usage/codex.jsonl");
+
+        fn codex_config(program: &Path) -> Config {
+            let mut config = one_pool_config();
+            config.adapters.insert(
+                "codex".to_owned(),
+                AdapterConfig {
+                    argv: vec![
+                        program.to_string_lossy().into_owned(),
+                        "exec".to_owned(),
+                        "--json".to_owned(),
+                        "--".to_owned(),
+                    ],
+                    resume: Some(vec![
+                        program.to_string_lossy().into_owned(),
+                        "-C".to_owned(),
+                        "%<cwd>%".to_owned(),
+                        "exec".to_owned(),
+                        "resume".to_owned(),
+                        "--json".to_owned(),
+                        "%<sessionRef>%".to_owned(),
+                        "--".to_owned(),
+                    ]),
+                    scrape: BTreeMap::from([
+                        (
+                            "sessionRef".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..thread_id".to_owned(),
+                                counter_scope: None,
+                                fields: BTreeMap::new(),
+                            },
+                        ),
+                        (
+                            "model".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..model".to_owned(),
+                                counter_scope: None,
+                                fields: BTreeMap::new(),
+                            },
+                        ),
+                        (
+                            "usage".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..usage".to_owned(),
+                                counter_scope: Some(
+                                    crate::adapters::UsageCounterScope::SessionCumulative,
+                                ),
+                                fields: BTreeMap::from([
+                                    (
+                                        "inputTokensWithCacheRead".to_owned(),
+                                        vec!["input_tokens".to_owned()],
+                                    ),
+                                    (
+                                        "cacheReadTokens".to_owned(),
+                                        vec!["cached_input_tokens".to_owned()],
+                                    ),
+                                    (
+                                        "cacheWriteTokens".to_owned(),
+                                        vec!["cache_write_input_tokens".to_owned()],
+                                    ),
+                                    (
+                                        "outputTokens".to_owned(),
+                                        vec!["output_tokens".to_owned()],
+                                    ),
+                                    (
+                                        "reasoningTokens".to_owned(),
+                                        vec!["reasoning_output_tokens".to_owned()],
+                                    ),
+                                ]),
+                            },
+                        ),
+                        (
+                            "finalMessage".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPathLast,
+                                pattern: "$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text".to_owned(),
+                                counter_scope: None,
+                                fields: BTreeMap::new(),
+                            },
+                        ),
+                    ]),
+                    launch: AdapterLaunchConfig {
+                        cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
+                        resume_options_before_capture: Some("sessionRef".to_owned()),
+                        model: Some(AdapterValueOverride {
+                            argv: vec!["--model".to_owned(), "%<value>%".to_owned()],
+                            allowed_values: vec!["gpt-5.6-codex".to_owned()],
+                        }),
+                        ..AdapterLaunchConfig::default()
+                    },
+                    usage_counter_scope:
+                        crate::adapters::UsageCounterScope::SessionCumulative,
+                    ..AdapterConfig::default()
+                },
+            );
+            config
+        }
+
+        async fn finish_next(daemon: &mut Daemon) {
+            let finished =
+                tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            daemon.finish_job(finished).await.unwrap();
+            daemon.handler.drain_post_ack_tasks().await;
+        }
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let cwd = temp.path().join("worktree");
+                fs::create_dir(&cwd).unwrap();
+                let program = temp.path().join("codex");
+                assert!(CODEX_CAPTURE.ends_with('\n'));
+                crate::test_support::install_shell_program(
+                    &program,
+                    format!(
+                        "#!/bin/sh\ncat <<'TALLY_REAL_CODEX_CAPTURE'\n{CODEX_CAPTURE}TALLY_REAL_CODEX_CAPTURE\n"
+                    ),
+                );
+                let config = codex_config(&program);
+                config.validate().unwrap();
+                let state_dir = paths.state_dir.clone();
+                let absent_systemd_run = temp.path().join("absent-systemd-run");
+                let executor = || {
+                    direct_executor(&state_dir)
+                        .with_systemd_run(absent_systemd_run.clone())
+                        .with_unit_probe(ExitFileProbe)
+                };
+                let mut daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths.clone(),
+                    settings(),
+                    executor(),
+                )
+                .await
+                .unwrap();
+
+                let default = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial default-model request"],
+                        "pool": "slot",
+                        "adapter": "codex",
+                        "cwd": cwd,
+                    })))
+                    .await
+                    .unwrap();
+                finish_next(&mut daemon).await;
+                let default_id = default["job_id"].as_str().unwrap().to_owned();
+                let default_uuid = Uuid::parse_str(&default_id).unwrap();
+
+                let explicit = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial explicit-model request"],
+                        "pool": "slot",
+                        "adapter": "codex",
+                        "cwd": cwd,
+                        "adapterOptions": {"model": "gpt-5.6-codex"},
+                    })))
+                    .await
+                    .unwrap();
+                finish_next(&mut daemon).await;
+                let explicit_id = explicit["job_id"].as_str().unwrap().to_owned();
+                let explicit_uuid = Uuid::parse_str(&explicit_id).unwrap();
+                drop(daemon);
+
+                // Recovery replays the retained real capture. The default
+                // row has a session, final answer, and normalized usage, but
+                // still no model; the explicit row retains its typed request.
+                let mut restarted =
+                    Daemon::open_with_executor(config, paths, settings(), executor())
+                        .await
+                        .unwrap();
+                {
+                    let context = restarted.handler.context.read().await;
+                    let default_row = &context.rows[&default_uuid];
+                    assert_eq!(
+                        default_row.session_ref.as_deref(),
+                        Some("codex-usage-thread")
+                    );
+                    assert!(default_row.model.is_none());
+                    assert!(default_row.adapter_options.model.is_none());
+                    let usage = default_row
+                        .usage
+                        .as_ref()
+                        .and_then(crate::usage::UsageObservation::breakdown)
+                        .expect("the real Codex capture reports usage");
+                    assert_eq!(usage.input_tokens_as_reported, Some(7_060_166));
+                    assert_eq!(usage.input_tokens, Some(262_086));
+                    assert_eq!(usage.cache_read_tokens, Some(6_798_080));
+                    assert_eq!(usage.cache_write_tokens, Some(0));
+                    assert_eq!(usage.output_tokens, Some(32_842));
+                    assert_eq!(usage.reasoning_tokens, Some(15_163));
+                    assert_eq!(
+                        context.query_rows[&default_uuid].final_message.as_deref(),
+                        Some("<redacted text>")
+                    );
+                    assert!(context.query_rows[&default_uuid].model.is_none());
+                    assert_eq!(
+                        context.rows[&explicit_uuid]
+                            .adapter_options
+                            .model
+                            .as_deref(),
+                        Some("gpt-5.6-codex")
+                    );
+                }
+
+                let continued_default = restarted
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": default_id,
+                        "argv": ["continue default"],
+                    })))
+                    .await
+                    .unwrap();
+                let continued_default_uuid =
+                    Uuid::parse_str(continued_default["job_id"].as_str().unwrap()).unwrap();
+                let default_argv = restarted.handler.context.read().await.jobs
+                    [&continued_default_uuid]
+                    .invocation
+                    .argv
+                    .clone();
+                assert_eq!(
+                    default_argv,
+                    vec![
+                        program.to_string_lossy().into_owned(),
+                        "-C".to_owned(),
+                        cwd.to_string_lossy().into_owned(),
+                        "exec".to_owned(),
+                        "resume".to_owned(),
+                        "--json".to_owned(),
+                        "codex-usage-thread".to_owned(),
+                        "--".to_owned(),
+                        "continue default".to_owned(),
+                    ]
+                );
+                assert!(!default_argv.iter().any(|argument| argument == "--model"));
+                finish_next(&mut restarted).await;
+
+                let continued_explicit = restarted
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": explicit_id,
+                        "argv": ["continue explicit"],
+                    })))
+                    .await
+                    .unwrap();
+                let continued_explicit_uuid =
+                    Uuid::parse_str(continued_explicit["job_id"].as_str().unwrap()).unwrap();
+                let explicit_argv = restarted.handler.context.read().await.jobs
+                    [&continued_explicit_uuid]
+                    .invocation
+                    .argv
+                    .clone();
+                assert_eq!(
+                    explicit_argv,
+                    vec![
+                        program.to_string_lossy().into_owned(),
+                        "-C".to_owned(),
+                        cwd.to_string_lossy().into_owned(),
+                        "exec".to_owned(),
+                        "resume".to_owned(),
+                        "--json".to_owned(),
+                        "--model".to_owned(),
+                        "gpt-5.6-codex".to_owned(),
+                        "codex-usage-thread".to_owned(),
+                        "--".to_owned(),
+                        "continue explicit".to_owned(),
+                    ]
+                );
+                assert_eq!(
+                    explicit_argv
+                        .iter()
+                        .filter(|argument| argument.as_str() == "--model")
+                        .count(),
+                    1
+                );
+                finish_next(&mut restarted).await;
+            })
+            .await;
+    }
+
     /// #425. A harness that resolves a session by the directory it was
     /// launched in cannot reach that session from anywhere else, and pi's
     /// version of "cannot reach" is exit 0 with an interactive prompt on
@@ -6147,6 +6463,7 @@ mod tests {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..thread_id".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         )]),
@@ -6269,6 +6586,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..thread_id".to_owned(),
+                        counter_scope: None,
                         fields: Default::default(),
                     },
                 )]),
@@ -7112,6 +7430,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..usage".to_owned(),
+                        counter_scope: None,
                         fields: serde_json::from_str(
                             r#"{"inputTokens":["input_tokens"],"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"outputTokens":["output_tokens"]}"#,
                         )
@@ -7134,6 +7453,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..usage".to_owned(),
+                        counter_scope: None,
                         fields: serde_json::from_str(
                             r#"{"inputTokens":["input_tokens"],"cacheReadTokens":["cache_read_input_tokens_v2"],"cacheWriteTokens":["cache_creation_input_tokens"],"outputTokens":["output_tokens"]}"#,
                         )
@@ -8430,6 +8750,7 @@ mod tests {
                     stream: ScrapeStream::Stdout,
                     mode: ScrapeMode::JsonPath,
                     pattern: "$..usage".to_owned(),
+                    counter_scope: None,
                     fields: Default::default(),
                 },
             )]),
@@ -11557,6 +11878,7 @@ mod tests {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..usage".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         )]),

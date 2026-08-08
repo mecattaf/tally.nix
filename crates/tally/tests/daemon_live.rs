@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tally_client::{RequestFrame, RpcClient};
-use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
+use tally_core::adapters::{
+    AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream, UsageCounterScope,
+};
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
 };
@@ -486,6 +488,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.hook".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         ),
@@ -495,6 +498,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.hook_status".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         ),
@@ -504,6 +508,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.mode".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         ),
@@ -513,6 +518,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..model".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         ),
@@ -522,6 +528,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.socket".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         ),
@@ -531,6 +538,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..session_id".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         ),
@@ -540,10 +548,12 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..usage".to_owned(),
+                                counter_scope: None,
                                 fields: Default::default(),
                             },
                         ),
                     ]),
+                    usage_counter_scope: UsageCounterScope::Attempt,
                     trace: None,
                     yield_hook: Some(vec![
                         env!("CARGO_BIN_EXE_tally").to_owned(),

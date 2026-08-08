@@ -133,6 +133,7 @@ fn stall_config(root: &Path) -> Config {
         stream: ScrapeStream::Stdout,
         mode: ScrapeMode::Regex,
         pattern: pattern.to_owned(),
+        counter_scope: None,
         fields: Default::default(),
     };
     Config {

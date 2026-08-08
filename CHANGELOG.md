@@ -69,6 +69,22 @@ authorized.
 - Registration paths, validation, locking, atomic publication, and migration
   now live in the shared versioned `tally_core::campaign_registry` lifecycle.
 
+### Honest default-model Codex recovery (#443)
+
+- The stock Codex resume template no longer requires a scraped `model` or
+  synthesizes `--model` from one. Real default-model Codex JSONL captures do
+  not state a model, so those jobs now recover and continue with no model flag,
+  allowing Codex to select its default again.
+- An explicitly authorized per-job model remains durable in `adapterOptions`
+  and is inserted exactly once through the same typed `launch.model` override
+  on launch and resume. Codex declares the resume insertion point so that
+  provider options precede the positional thread ID.
+- The preset and daemon proofs now use the committed real Codex usage capture,
+  including its session, final message, five-field usage object, and absent
+  model. The usage capture also publishes its provider-facing
+  `counterScope = session-cumulative` declaration and validation keeps that
+  declaration aligned with adapter accounting.
+
 ### Pi option-like workload heads (#445)
 
 - `AdapterLaunchConfig` now carries the typed boolean
