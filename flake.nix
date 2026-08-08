@@ -5248,6 +5248,9 @@
             # argv could never produce the stream the trace declaration below
             # describes.
             test "$(jq -c '.adapters.pi.argv' ${adapterConfig})" = '["pi","--mode","json"]'
+            # Mutation guard: removing this Pi-only declaration falls back to
+            # opaque and makes the unsafe render commands below succeed.
+            test "$(jq -r '.adapters.pi.launch.rejectOptionLikeWorkloadHead' ${adapterConfig})" = true
             test "$(jq -c '.adapters.pi.resume' ${adapterConfig})" = '["pi","--mode","json","--session","%<sessionRef>%","--model","%<model>%"]'
             test "$(jq -c '.adapters["claude-code"].argv' ${adapterConfig})" = '["claude","--print","--verbose","--output-format","stream-json","--"]'
             test "$(jq -c '.adapters["claude-code"].resume' ${adapterConfig})" = '["claude","--resume","%<sessionRef>%","--model","%<model>%","--print","--verbose","--output-format","stream-json","--"]'
@@ -5345,6 +5348,20 @@
             test "$(printf '%s' "$launch" | jq -r '.hardening')" = production
             resume="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom --captures '{"sessionRef":"nix-session"}' -- '--option-looking')"
             test "$(printf '%s' "$resume" | jq -c '.argv')" = '["custom-agent","--resume","nix-session","--option-looking"]'
+            pi_launch="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi -- work)"
+            test "$(printf '%s' "$pi_launch" | jq -c '.argv')" = '["pi","--mode","json","work"]'
+            for unsafe_head in --version -p; do
+              if ${tally}/bin/tally --config ${adapterConfig} __adapter-render pi -- "$unsafe_head" >pi-unsafe.out 2>pi-unsafe.err; then
+                echo "pi launch admitted unsafe workload head $unsafe_head" >&2
+                exit 1
+              fi
+              grep -F "adapter \"pi\" pre-launch refusal option-like-workload-head at index 0: \"$unsafe_head\"" pi-unsafe.err >/dev/null
+              if ${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --captures '{"sessionRef":"pi-session","model":"Pi/Exact.Model"}' -- "$unsafe_head" >pi-unsafe.out 2>pi-unsafe.err; then
+                echo "pi resume admitted unsafe workload head $unsafe_head" >&2
+                exit 1
+              fi
+              grep -F "adapter \"pi\" pre-launch refusal option-like-workload-head at index 0: \"$unsafe_head\"" pi-unsafe.err >/dev/null
+            done
             : > empty.err
             # SYNTHETIC, and deliberately not pi's key set. This block
             # predates the real-capture block below and exists only to pin

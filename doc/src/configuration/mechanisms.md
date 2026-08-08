@@ -317,7 +317,9 @@ empty context for a session that is thousands of tokens full.
 
 `pi` is also the one preset with no trailing `--`: it has no end-of-options
 separator and exits 1 on one. A pi workload argv whose first element begins
-with `-` is therefore parsed by pi as a flag. `pi` additionally keys its
+with `-` would therefore be parsed by pi as a flag, so its
+`launch.rejectOptionLikeWorkloadHead` declaration makes tally return a typed
+pre-launch refusal before admission. `pi` additionally keys its
 session store by the directory it was launched in, so a resume from a
 different working directory prints `Session found in different project`,
 prompts on stderr, and exits 0 without doing any work; pinning

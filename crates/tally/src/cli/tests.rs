@@ -505,6 +505,7 @@ fn frozen_transport_exit_codes_are_stable() {
     for (wire_code, exit_code) in [
         (WireErrorCode::InvalidParams, 2),
         (WireErrorCode::NotFound, 4),
+        (WireErrorCode::PreLaunchRefusal, 1),
         (WireErrorCode::Internal, 1),
     ] {
         let error = anyhow::Error::new(WireIoError::Rpc(wire_code, "failure".to_owned(), None));

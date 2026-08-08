@@ -11,7 +11,8 @@ mod tests {
 
     use super::*;
     use crate::adapters::{
-        AdapterConfig, AdapterTrace, ScrapeCapture, ScrapeMode, ScrapeStream, TraceFraming,
+        AdapterConfig, AdapterLaunchConfig, AdapterTrace, ScrapeCapture, ScrapeMode, ScrapeStream,
+        TraceFraming,
     };
     use crate::config::{
         CoResidencyPredicate, ExecutionTargetConfig, JournaldConfig, MeterBudgetClass, PoolConfig,
@@ -596,6 +597,76 @@ mod tests {
         Daemon::open_with_executor(one_pool_config(), paths.clone(), settings(), executor)
             .await
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn option_like_workload_head_is_a_typed_pre_launch_refusal_without_a_job() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                config.adapters.insert(
+                    "probe".to_owned(),
+                    AdapterConfig {
+                        argv: vec!["provider".to_owned()],
+                        launch: AdapterLaunchConfig {
+                            reject_option_like_workload_head: true,
+                            ..AdapterLaunchConfig::default()
+                        },
+                        ..AdapterConfig::default()
+                    },
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config, paths, settings(), executor)
+                        .await
+                        .unwrap();
+
+                for argument in ["--version", "-p"] {
+                    let refused = daemon
+                        .handler
+                        .enqueue_as_client(Some(json!({
+                            "argv": [argument],
+                            "pool": "slot",
+                            "adapter": "probe",
+                            "source": "manual",
+                            "evidence": ["exit:0"],
+                        })))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(refused.code, WireErrorCode::PreLaunchRefusal);
+                    assert_eq!(
+                        refused.message,
+                        format!(
+                            "adapter \"probe\" pre-launch refusal option-like-workload-head at index 0: {argument:?}"
+                        )
+                    );
+                    assert_eq!(
+                        refused.data,
+                        Some(json!({
+                            "schemaVersion": 1,
+                            "phase": "pre-launch",
+                            "reason": "option-like-workload-head",
+                            "adapter": "probe",
+                            "index": 0,
+                            "argument": argument,
+                        }))
+                    );
+
+                    let context = daemon.handler.context.read().await;
+                    assert!(context.rows.is_empty(), "a refused render wrote a durable row");
+                    assert!(context.jobs.is_empty(), "a refused render created an executable job");
+                    assert!(
+                        context.query_rows.is_empty(),
+                        "a refused render created a query projection"
+                    );
+                }
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

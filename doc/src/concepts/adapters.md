@@ -30,6 +30,16 @@ Adapter environment follows the same boundary: names beginning `TALLY_` and
 `CREDENTIALS_DIRECTORY` are reserved, and NUL-containing names, values, or argv
 are rejected.
 
+The workload head is a typed part of that boundary.
+`launch.rejectOptionLikeWorkloadHead` defaults to false, preserving
+option-looking strings as opaque workload for adapters whose harness has an
+end-of-options separator. The `pi` preset declares it true instead: pi rejects
+`--` and keeps parsing a leading-dash first workload element as its own flag,
+so tally returns a typed `pre-launch-refusal` before admitting either a launch
+or resume. Its structured reason is `option-like-workload-head`, and it names
+workload index 0 plus the offending argument. Authorized pre-prompt adapter
+options remain part of the prefix and are not workload.
+
 ## Scraping is advisory
 
 After the canonical terminal acknowledgement, tally may read the selected
@@ -186,8 +196,9 @@ fields.
 ## Configuration and proof
 
 `nix/lib/adapters.nix` defines the helper and presets.
-`crates/tally-core/src/adapters.rs` validates the open registry, renders direct
-argv, and implements scraping. `crates/tally-core/src/trace.rs` owns the
+`crates/tally-core/src/adapters.rs` validates the open registry, enforces the
+workload-head policy, renders direct argv, and implements scraping.
+`crates/tally-core/src/trace.rs` owns the
 advisory trace projection. The `module-layer` flake check proves Nix-to-Rust
 rendering, while tests
 `open_adapter_dispatches_direct_argv_and_multi_capture_resume`,

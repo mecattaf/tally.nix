@@ -1,7 +1,6 @@
 { lib }:
 let
   validArgv = argv: builtins.isList argv && builtins.all builtins.isString argv;
-
   mkScrapeCapture =
     {
       stream ? "stdout",
@@ -76,6 +75,9 @@ let
       builtins.isAttrs env && builtins.all builtins.isString (builtins.attrValues env)
     ) "tally adapter env must be an attrset of strings";
     assert lib.assertMsg (builtins.isAttrs launch) "tally adapter launch must be an attrset";
+    assert lib.assertMsg (builtins.isBool (
+      launch.rejectOptionLikeWorkloadHead or false
+    )) "tally adapter launch.rejectOptionLikeWorkloadHead must be a boolean";
     assert lib.assertMsg (
       hardening == null
       || builtins.elem hardening [
@@ -160,21 +162,17 @@ let
       # No trailing `--`: pi has no end-of-options separator and rejects one
       # outright (`Error: Unknown option: --`, exit 1, zero bytes on stdout),
       # so the `--`-terminated argv this preset used to declare could never
-      # produce the stream the trace block above describes. The cost of
-      # dropping it is real and is not enforced anywhere: a workload argv
-      # whose first element begins with `-` is parsed by pi as a flag. That
-      # is a narrowing on leading-dash payloads; the alternative was an argv
-      # that failed on every payload. The narrowing has two halves and only
-      # one of them is loud: a leading-dash payload pi does not recognise
-      # fails outright, but one that happens to BE a pi flag (`-p`, say) is
-      # consumed as that flag and pi launches a fresh session with no work
-      # to do -- a successful attempt that did nothing, which is the quieter
-      # failure of the two.
+      # produce the stream the trace block above describes. Without a
+      # separator, a first workload element beginning with `-` is still parsed
+      # by pi as a provider flag; a valid flag such as `-p` can make pi exit 0
+      # without doing the requested work. The typed launch policy below makes
+      # that limitation executable for both fresh and resumed invocations.
       argv = [
         "pi"
         "--mode"
         "json"
       ];
+      launch.rejectOptionLikeWorkloadHead = true;
       # pi keys its session store by the directory it was launched in, and
       # `--session <id>` resolves against that key first. A resume from a
       # different cwd therefore does not fail: pi reports

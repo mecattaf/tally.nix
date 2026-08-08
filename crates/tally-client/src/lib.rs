@@ -145,6 +145,8 @@ pub enum WireErrorCode {
     StorageBudgetExceeded,
     #[serde(rename = "storage-monitor-unavailable")]
     StorageMonitorUnavailable,
+    #[serde(rename = "pre-launch-refusal")]
+    PreLaunchRefusal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

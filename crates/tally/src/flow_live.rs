@@ -1026,6 +1026,7 @@ fn client_error(error: WireIoError) -> ClientError {
                 WireErrorCode::FlowLineageUnusable => "flow-lineage-unusable",
                 WireErrorCode::StorageBudgetExceeded => "storage-budget-exceeded",
                 WireErrorCode::StorageMonitorUnavailable => "storage-monitor-unavailable",
+                WireErrorCode::PreLaunchRefusal => "pre-launch-refusal",
                 WireErrorCode::InvalidParams | WireErrorCode::NotFound => "admission-denied",
                 WireErrorCode::FrameTooLarge => "frame-too-large",
                 WireErrorCode::UnsupportedProtocol => "unsupported-protocol",

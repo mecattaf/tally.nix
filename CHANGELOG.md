@@ -40,6 +40,20 @@ authorized.
 - Registration paths, validation, locking, atomic publication, and migration
   now live in the shared versioned `tally_core::campaign_registry` lifecycle.
 
+### Pi option-like workload heads (#445)
+
+- `AdapterLaunchConfig` now carries the typed boolean
+  `rejectOptionLikeWorkloadHead`, false by default for opaque workload argv
+  and true for harnesses that cannot separate provider flags from workload.
+- The stock `pi` preset declares that refusal. Fresh launches and resumes now
+  fail before admission or execution with a typed pre-launch RPC error whose
+  structured detail names reason `option-like-workload-head`, workload index
+  0, and the offending argument such as `--version` or `-p`, instead of
+  letting pi consume it as a flag and potentially exit 0 without doing the
+  job.
+- Authorized pre-prompt options remain part of the adapter prefix. Pi still
+  has no trailing `--`, because its CLI rejects that separator.
+
 ### Campaign git-ai execution and terminal diagnostics (#441)
 
 - Campaign nodes may now carry the full closed git-ai correlation set of at

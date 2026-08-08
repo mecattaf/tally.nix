@@ -110,6 +110,11 @@ pub struct AdapterValueOverride {
 pub struct AdapterLaunchConfig {
     #[serde(default)]
     pub allow_pre_prompt_argv: bool,
+    /// Refuse a first workload element beginning with `-` before it can be
+    /// mistaken for provider argv. False preserves opaque workload argv for
+    /// adapters whose own end-of-options handling makes that safe.
+    #[serde(default)]
+    pub reject_option_like_workload_head: bool,
     #[serde(default)]
     pub cwd_argv: Option<Vec<String>>,
     #[serde(default)]
@@ -306,6 +311,14 @@ pub enum AdapterError {
     InvalidConfig { adapter: String, detail: String },
     #[error("adapter {0:?} has no resume template")]
     NoResume(String),
+    #[error(
+        "adapter {adapter:?} pre-launch refusal option-like-workload-head at index {index}: {argument:?}"
+    )]
+    UnsafeWorkloadHead {
+        adapter: String,
+        index: usize,
+        argument: String,
+    },
     #[error("resume capture {capture:?} is absent for adapter {adapter:?}")]
     MissingCapture { adapter: String, capture: String },
     #[error("reserved capture {0:?} must be a JSON string")]
@@ -381,7 +394,8 @@ impl<'a> AdapterEngine<'a> {
     ) -> Result<AdapterInvocation, AdapterError> {
         let adapter = self.adapter(name)?;
         let prefix = render_launch_prefix(name, adapter, &adapter.argv, options, cwd)?;
-        invocation(name, adapter, options, compose_argv(&prefix, workload_argv))
+        let argv = compose_argv(name, adapter, &prefix, workload_argv)?;
+        invocation(name, adapter, options, argv)
     }
 
     pub fn resume(
@@ -460,7 +474,8 @@ impl<'a> AdapterEngine<'a> {
             &inserted_options,
             (!template_has_cwd).then_some(cwd).flatten(),
         )?;
-        invocation(name, adapter, options, compose_argv(&prefix, workload_argv))
+        let argv = compose_argv(name, adapter, &prefix, workload_argv)?;
+        invocation(name, adapter, options, argv)
     }
 
     /// Refuse a resume that would run somewhere other than where the session
@@ -653,8 +668,25 @@ fn invocation(
     })
 }
 
-fn compose_argv(prefix: &[String], workload: &[String]) -> Vec<String> {
-    prefix.iter().chain(workload).cloned().collect()
+fn compose_argv(
+    name: &str,
+    adapter: &AdapterConfig,
+    prefix: &[String],
+    workload: &[String],
+) -> Result<Vec<String>, AdapterError> {
+    if adapter.launch.reject_option_like_workload_head {
+        if let Some(argument) = workload
+            .first()
+            .filter(|argument| !argument.is_empty() && argument.starts_with('-'))
+        {
+            return Err(AdapterError::UnsafeWorkloadHead {
+                adapter: name.to_owned(),
+                index: 0,
+                argument: argument.clone(),
+            });
+        }
+    }
+    Ok(prefix.iter().chain(workload).cloned().collect())
 }
 
 fn render_launch_prefix(
@@ -1437,6 +1469,111 @@ mod tests {
     }
 
     #[test]
+    fn option_like_workload_head_policy_refuses_launch_and_resume_at_the_shared_join() {
+        let pi = AdapterConfig {
+            argv: vec!["pi".to_owned(), "--mode".to_owned(), "json".to_owned()],
+            resume: Some(vec![
+                "pi".to_owned(),
+                "--mode".to_owned(),
+                "json".to_owned(),
+                "--session".to_owned(),
+                "%<sessionRef>%".to_owned(),
+            ]),
+            scrape: BTreeMap::from([(
+                "sessionRef".to_owned(),
+                ScrapeCapture {
+                    stream: ScrapeStream::Stdout,
+                    mode: ScrapeMode::JsonPath,
+                    pattern: "$.id".to_owned(),
+                    fields: BTreeMap::new(),
+                },
+            )]),
+            launch: AdapterLaunchConfig {
+                allow_pre_prompt_argv: true,
+                reject_option_like_workload_head: true,
+                ..AdapterLaunchConfig::default()
+            },
+            ..AdapterConfig::default()
+        };
+        let adapters = BTreeMap::from([("pi".to_owned(), pi)]);
+        let pi_engine = engine(&adapters);
+        pi_engine.validate_all().unwrap();
+        let captures = ScrapeResult {
+            captures: BTreeMap::from([(
+                "sessionRef".to_owned(),
+                Value::String("pi-session".to_owned()),
+            )]),
+        };
+
+        for argument in ["--version", "-p"] {
+            for refused in [
+                pi_engine.launch("pi", &[argument.to_owned()]),
+                pi_engine.resume("pi", &[argument.to_owned()], &captures),
+            ] {
+                let error = refused.unwrap_err();
+                assert!(matches!(
+                    &error,
+                    AdapterError::UnsafeWorkloadHead {
+                        adapter,
+                        index: 0,
+                        argument: found,
+                    } if adapter == "pi" && found == argument
+                ));
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "adapter \"pi\" pre-launch refusal option-like-workload-head at index 0: {argument:?}"
+                    )
+                );
+            }
+        }
+
+        assert_eq!(
+            pi_engine.launch("pi", &["work".to_owned()]).unwrap().argv,
+            ["pi", "--mode", "json", "work"]
+        );
+        assert_eq!(
+            pi_engine
+                .resume("pi", &["work".to_owned()], &captures)
+                .unwrap()
+                .argv,
+            ["pi", "--mode", "json", "--session", "pi-session", "work"]
+        );
+        // Authorized provider options are inserted into the prefix and are not
+        // reclassified as workload merely because they begin with `-`.
+        assert_eq!(
+            pi_engine
+                .launch_with_options(
+                    "pi",
+                    &["work".to_owned()],
+                    &AdapterJobOptions {
+                        pre_prompt_argv: vec!["--provider-option".to_owned()],
+                        ..AdapterJobOptions::default()
+                    },
+                    None,
+                )
+                .unwrap()
+                .argv,
+            ["pi", "--mode", "json", "--provider-option", "work"]
+        );
+
+        let opaque = BTreeMap::from([(
+            "opaque".to_owned(),
+            AdapterConfig {
+                argv: vec!["agent".to_owned()],
+                ..AdapterConfig::default()
+            },
+        )]);
+        assert_eq!(
+            engine(&opaque)
+                .launch("opaque", &["--version".to_owned()])
+                .unwrap()
+                .argv,
+            ["agent", "--version"]
+        );
+    }
+
+    #[test]
     fn hardening_name_defaults_to_none_and_propagates_without_directives() {
         let default: AdapterConfig = serde_json::from_value(serde_json::json!({
             "argv": ["agent"]
@@ -2008,6 +2145,7 @@ mod tests {
             ]),
             launch: AdapterLaunchConfig {
                 allow_pre_prompt_argv: true,
+                reject_option_like_workload_head: false,
                 cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
                 approval_policies: BTreeMap::from([("never".to_owned(), Vec::new())]),
                 sandbox_policies: BTreeMap::from([("danger-full-access".to_owned(), Vec::new())]),

@@ -208,6 +208,16 @@ let
           example = true;
           description = "Authorize direct per-job argv insertion before the adapter's final -- delimiter.";
         };
+        rejectOptionLikeWorkloadHead = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = ''
+            Refuse a non-empty first workload argv element beginning with a
+            dash before launch or resume composition. False preserves the
+            workload as opaque positional data.
+          '';
+        };
         cwdArgv = mkOption {
           type = types.nullOr (types.listOf types.str);
           default = null;
@@ -3355,6 +3365,7 @@ let
   renderAdapterLaunch = launch: {
     inherit (launch)
       allowPrePromptArgv
+      rejectOptionLikeWorkloadHead
       cwdArgv
       approvalPolicies
       sandboxPolicies

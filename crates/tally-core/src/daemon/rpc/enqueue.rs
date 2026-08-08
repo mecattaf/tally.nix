@@ -176,7 +176,7 @@ impl DaemonHandler {
                 row.effective_cwd(),
             )
         }
-        .map_err(|error| WireError::invalid(error.to_string()))?;
+        .map_err(adapter_wire)?;
         row.validate()
             .map_err(|error| WireError::invalid(error.to_string()))?;
 
@@ -729,7 +729,7 @@ impl DaemonHandler {
             Ok(invocation) => invocation,
             Err(error) => {
                 rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
-                return Err(WireError::invalid(error.to_string()));
+                return Err(adapter_wire(error));
             }
         };
 
@@ -1717,6 +1717,34 @@ fn dedup_conflict(
         code: WireErrorCode::DedupKeyConflict,
         message: format!("dedup-key-conflict for key {dedup_key:?}"),
         data: Some(data),
+    }
+}
+
+/// Preserve adapter refusals that are decisions, rather than malformed RPC
+/// input, at the daemon boundary. In particular, an option-looking Pi workload
+/// is refused while argv is rendered, before a durable row or executable job
+/// exists. Giving that decision its own wire code and structured reason keeps
+/// clients from reporting it as the generic exit-2 `invalid_params` class.
+fn adapter_wire(error: AdapterError) -> WireError {
+    let message = error.to_string();
+    match error {
+        AdapterError::UnsafeWorkloadHead {
+            adapter,
+            index,
+            argument,
+        } => WireError {
+            code: WireErrorCode::PreLaunchRefusal,
+            message,
+            data: Some(json!({
+                "schemaVersion": 1,
+                "phase": "pre-launch",
+                "reason": "option-like-workload-head",
+                "adapter": adapter,
+                "index": index,
+                "argument": argument,
+            })),
+        },
+        _ => WireError::invalid(message),
     }
 }
 
