@@ -6,6 +6,11 @@ authorized.
 
 ## [Unreleased]
 
+### Nix formatting (#495)
+
+- Wrapped the capture-archive assertion in `flake.nix` to restore the
+  `nixfmt-check` formatting check.
+
 ### Campaign quiescence and amendment pardons (#456)
 
 - Quiescent campaign actions now re-read durable merge, checkpoint, and

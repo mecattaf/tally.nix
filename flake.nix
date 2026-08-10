@@ -4587,7 +4587,8 @@
           # The continuation payload's directory exists before the first job
           # that names it starts, on this module too.
           assert pkgs.lib.hasInfix "/var/lib/tally/state/events" systemDaemon.serviceConfig.ExecStartPre;
-          assert pkgs.lib.hasInfix "/var/lib/tally/state/capture/archive" systemDaemon.serviceConfig.ExecStartPre;
+          assert pkgs.lib.hasInfix "/var/lib/tally/state/capture/archive"
+            systemDaemon.serviceConfig.ExecStartPre;
           assert pkgs.lib.hasInfix "/var/lib/tally/state/events"
             stockNixos.config.system.activationScripts.tallyRuntimeDirectories.text;
           assert pkgs.lib.hasInfix "/var/lib/tally/state/capture/archive"
