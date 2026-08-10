@@ -345,6 +345,22 @@ export const meta = {
           additionalProperties: false
         }
       },
+      // The exact arm-time authorization boundary used to build `steering`
+      // and `taskSteering`. The pre-dispatch re-check receives this list
+      // rather than inferring authority from whichever actors happened to
+      // comment before prep.
+      allowedActors: {
+        type: "array",
+        minItems: 1,
+        maxItems: 100,
+        uniqueItems: true,
+        items: {
+          type: "string",
+          minLength: 1,
+          maxLength: 39,
+          pattern: "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
+        }
+      },
       // Human steering collected from each task's own sub-issue thread, keyed
       // by sub-issue number. The master stays the campaign-wide channel and
       // still reaches every task; a task thread reaches exactly one.
@@ -414,7 +430,13 @@ export const meta = {
         ]
       },
       {
-        required: ["campaignIdentity", "campaignGraph", "steering", "tally"],
+        required: [
+          "campaignIdentity",
+          "campaignGraph",
+          "steering",
+          "allowedActors",
+          "tally"
+        ],
         properties: {
           worklist: {
             type: "object",
@@ -1196,6 +1218,70 @@ const steeringSchema = {
   additionalProperties: false
 };
 
+const authorizedSteeringCommentSchema = {
+  type: "object",
+  required: ["id", "url", "author", "body", "createdAt", "updatedAt"],
+  properties: {
+    id: { type: "integer", minimum: 1 },
+    url: { type: "string", minLength: 1 },
+    author: { type: "string", minLength: 1, maxLength: 39 },
+    body: { type: "string", maxLength: 64000 },
+    createdAt: { type: "string", minLength: 1 },
+    updatedAt: { type: "string", minLength: 1 }
+  },
+  additionalProperties: false
+};
+
+const steeringRecheckSchema = {
+  type: "object",
+  required: ["taskId", "authorizedComments", "receipt"],
+  properties: {
+    taskId: taskIdSchema,
+    authorizedComments: {
+      type: "array",
+      maxItems: 2000,
+      items: authorizedSteeringCommentSchema
+    },
+    receipt: {
+      type: "object",
+      required: [
+        "thread",
+        "rechecked",
+        "recheckTruncated",
+        "preparedCommentIds",
+        "lateRecheckCommentIds"
+      ],
+      properties: {
+        thread: {
+          type: "object",
+          required: ["number", "url"],
+          properties: {
+            number: { type: "string", pattern: "^[1-9][0-9]*$" },
+            url: { type: "string", minLength: 1 }
+          },
+          additionalProperties: false
+        },
+        rechecked: { const: true },
+        recheckTruncated: { type: "boolean" },
+        preparedCommentIds: {
+          type: "array",
+          maxItems: 2000,
+          uniqueItems: true,
+          items: { type: "integer", minimum: 1 }
+        },
+        lateRecheckCommentIds: {
+          type: "array",
+          maxItems: 1000,
+          uniqueItems: true,
+          items: { type: "integer", minimum: 1 }
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  additionalProperties: false
+};
+
 const escalationSchema = {
   type: "object",
   required: ["posted", "comment", "summary", "diagnosisCount", "retryCount"],
@@ -1526,7 +1612,22 @@ function failureClass(reconciliation, failure) {
   return "machinery";
 }
 
-function implementationBrief(task, prepared, reconciliation) {
+function preparedSteering(task) {
+  const comments = authorizedComments(task);
+  return {
+    taskId: task.id,
+    authorizedComments: comments,
+    receipt: {
+      thread: taskThread(task) || args.issue,
+      rechecked: false,
+      recheckTruncated: false,
+      preparedCommentIds: comments.map(comment => comment.id),
+      lateRecheckCommentIds: []
+    }
+  };
+}
+
+function implementationBrief(task, prepared, reconciliation, attemptSteering) {
   const ownershipBoundary = !Array.isArray(task.conflictDomains)
     ? "This serial task omits conflictDomains. Ownership will certify its committed paths, and the tree-delta gate will allow exactly those owned paths after ownership runs."
     : task.conflictDomains.length === 0
@@ -1548,7 +1649,11 @@ function implementationBrief(task, prepared, reconciliation) {
     steering: task.brief
       ? {
           channel: "locally-authorized-snapshot",
-          authorizedComments: authorizedComments(task),
+          authorizedComments: attemptSteering.authorizedComments,
+          // This task brief is the immutable attempt receipt. Keeping both ID
+          // sets here makes a late comment auditable without changing the
+          // comment object the agent consumes.
+          attemptReceipt: attemptSteering.receipt,
           machineDiagnoses: machineDiagnoses(reconciliation, task.id)
         }
       : {
@@ -2192,7 +2297,60 @@ function sweepDeferral(sweepNode) {
       return { task, prepared: prepared.result, checkpoint: recorded.result };
     }
 
-    const taskBrief = implementationBrief(task, prepared.result, reconciliation);
+    const prepSteering = preparedSteering(task);
+    const recheckBrief = withCapabilities({
+      campaign: effective.campaign,
+      repository: codeRepository,
+      repositoryConfig,
+      issue: args.issue,
+      taskId: task.id,
+      allowedActors: args.allowedActors,
+      preparedComments: prepSteering.authorizedComments
+    });
+    const recheckThread = taskThread(task);
+    if (recheckThread !== null) {
+      recheckBrief.taskIssue = recheckThread;
+    }
+    // The task thread is read once after lane preparation and immediately
+    // before adapter admission. This is the only mutable-forge window in an
+    // otherwise immutable attempt brief.
+    const recheckedSteering = await driverNode(
+      "steeringRecheck",
+      recheckBrief,
+      `steering-recheck-${task.id}`,
+      `steering-recheck-${task.id}`,
+      steeringRecheckSchema,
+      null,
+      true,
+      taskRef
+    );
+    if (!nodePassed(recheckedSteering)) {
+      const taskBrief = implementationBrief(
+        task,
+        prepared.result,
+        reconciliation,
+        prepSteering
+      );
+      return {
+        task,
+        prepared: prepared.result,
+        failure: taskFailure(
+          task,
+          "steering:recheck",
+          recheckedSteering,
+          taskBrief,
+          [],
+          prepared.result,
+          prepared.result.baseRev
+        )
+      };
+    }
+    const taskBrief = implementationBrief(
+      task,
+      prepared.result,
+      reconciliation,
+      recheckedSteering.result
+    );
     const agentSpec = applyAgentPolicies({
       argv: effective.agent.argv,
       adapter: effective.agent.adapter,

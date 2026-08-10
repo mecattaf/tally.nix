@@ -34,6 +34,7 @@ CAMPAIGN_END = "<!-- tally:campaign:v1:end -->"
 WORKLIST_BEGIN = "<!-- tally:campaign-worklist:v1 -->"
 WORKLIST_END = "<!-- tally:campaign-worklist:v1:end -->"
 TASK_MARKER_PREFIX = "<!-- tally:campaign-task:v1 id="
+SYSTEM_COMMENT_PREFIX = "<!-- tally:spec-build:"
 DIAGNOSIS_MARKER = re.compile(
     r"^<!-- tally:spec-build:diagnosis:v1 "
     r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
@@ -3888,15 +3889,274 @@ def steering_thread(
     for task T lands on T's sub-issue and T's retry brief reads it back from
     there. The master stays the campaign-wide channel.
     """
-    issue = campaign_issue(data.get("issue"))
+    thread = steering_thread_issue(data, capabilities)
     task_issue = data.get("taskIssue")
     if not capabilities["subIssueWalk"] or task_issue is None:
-        return issue["number"], None
-    thread = campaign_issue(task_issue)
+        return thread["number"], None
     if config["forge"] != "github":
         return thread["number"], None
     return thread["number"], {
         task_id: github_machine_comments(repository, thread["number"])
+    }
+
+
+def steering_thread_issue(
+    data: dict[str, Any], capabilities: dict[str, bool]
+) -> dict[str, str]:
+    """Resolve the one human/machine thread owned by this task.
+
+    Native campaigns use the task's sub-issue. A campaign armed without that
+    capability keeps the historical master-thread projection. Keeping this
+    routing in one helper means receipt reads, receipt writes, and the
+    pre-dispatch steering re-check cannot silently choose different doors.
+    """
+    issue = campaign_issue(data.get("issue"))
+    task_issue = data.get("taskIssue")
+    if not capabilities["subIssueWalk"] or task_issue is None:
+        return issue
+    return campaign_issue(task_issue)
+
+
+STEERING_RECHECK_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(last: 100) {
+        pageInfo { hasPreviousPage }
+        nodes { databaseId url body createdAt updatedAt author { login } }
+      }
+    }
+  }
+}
+"""
+
+
+def github_login(value: Any, context: str) -> str:
+    login = required_string(value, context, 39)
+    if (
+        not login.isascii()
+        or login.startswith("-")
+        or login.endswith("-")
+        or any(not (char.isalnum() or char == "-") for char in login)
+    ):
+        fail(f"{context} is not a valid GitHub login")
+    return login.casefold()
+
+
+def steering_comment(value: Any, context: str) -> dict[str, Any]:
+    comment = object_complete(
+        value,
+        {"id", "url", "author", "body", "createdAt", "updatedAt"},
+        context,
+    )
+    identifier = comment.get("id")
+    if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier < 1:
+        fail(f"{context}.id must be a positive integer")
+    body = comment.get("body")
+    if not isinstance(body, str) or "\0" in body:
+        fail(f"{context}.body must be text without NUL bytes")
+    if len(body) > 64_000:
+        fail(f"{context}.body exceeds 64000 characters")
+    return {
+        "id": identifier,
+        "url": required_string(comment.get("url"), f"{context}.url"),
+        "author": github_login(comment.get("author"), f"{context}.author"),
+        "body": body,
+        "createdAt": required_string(
+            comment.get("createdAt"), f"{context}.createdAt"
+        ),
+        "updatedAt": required_string(
+            comment.get("updatedAt"), f"{context}.updatedAt"
+        ),
+    }
+
+
+def authorized_steering_comments(
+    comments: Any, allowed_actors: set[str], context: str
+) -> list[dict[str, Any]]:
+    """Apply the arm-time steering authorization contract to one fresh read."""
+    if not isinstance(comments, list):
+        fail(f"{context} must be an array")
+    authorized: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for index, candidate in enumerate(comments):
+        if not isinstance(candidate, dict):
+            fail(f"{context}[{index}] must be an object")
+        body = candidate.get("body")
+        if not isinstance(body, str):
+            fail(f"{context}[{index}].body must be text")
+        # This is the same contains-marker rule as campaign.rs's prep-time
+        # `fetch_steering` and `task_steering` paths. A second read must not
+        # admit tally's own receipts as if they were human instructions.
+        if SYSTEM_COMMENT_PREFIX in body:
+            continue
+        author = candidate.get("user")
+        login = author.get("login") if isinstance(author, dict) else None
+        if not isinstance(login, str):
+            continue
+        actor = github_login(login, f"{context}[{index}].user.login")
+        if actor not in allowed_actors:
+            continue
+        if "\0" in body or len(body) > 64_000:
+            url = candidate.get("html_url")
+            if not isinstance(url, str):
+                url = candidate.get("url")
+            fail(
+                f"approved steering comment {url!r} exceeds the campaign comment contract"
+            )
+        identifier = candidate.get("id", candidate.get("databaseId"))
+        if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier < 1:
+            # GraphQL can redact an id or author. Prep-time task steering skips
+            # those comments, so the re-check does too.
+            continue
+        url = candidate.get("html_url", candidate.get("url"))
+        created_at = candidate.get("created_at", candidate.get("createdAt"))
+        updated_at = candidate.get("updated_at", candidate.get("updatedAt"))
+        normalized = steering_comment(
+            {
+                "id": identifier,
+                "url": url,
+                "author": actor,
+                "body": body,
+                "createdAt": created_at,
+                "updatedAt": updated_at,
+            },
+            f"{context}[{index}]",
+        )
+        if identifier in seen:
+            fail(f"{context} repeated comment id {identifier}")
+        seen.add(identifier)
+        authorized.append(normalized)
+    if len(authorized) > 1_000:
+        fail(f"{context} has more than 1000 approved steering comments")
+    return authorized
+
+
+def github_steering_thread_comments(
+    repository: str, issue_number: str, native: bool
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read the task thread once, in the same window shape used at prep."""
+    if not native:
+        return github_issue_comments(repository, issue_number), False
+    owner, name = repository.split("/", 1)
+    payload = github_json(
+        [
+            "api",
+            "graphql",
+            "-f",
+            f"query={STEERING_RECHECK_QUERY}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={issue_number}",
+        ],
+        "task steering re-check",
+    )
+    connection: Any = payload
+    for key in ("data", "repository", "issue", "comments"):
+        connection = connection.get(key) if isinstance(connection, dict) else None
+    if not isinstance(connection, dict):
+        fail("task steering re-check returned no comment connection")
+    comments = connection.get("nodes")
+    if not isinstance(comments, list):
+        fail("task steering re-check returned malformed comments")
+    page_info = connection.get("pageInfo")
+    if not isinstance(page_info, dict):
+        fail("task steering re-check returned no page information")
+    return comments, page_info.get("hasPreviousPage") is True
+
+
+def action_steering_recheck(brief: dict[str, Any]) -> dict[str, Any]:
+    """Fold steering that arrived after prep into this attempt's own brief."""
+    brief, capabilities = take_capabilities(brief)
+    fields = {
+        "campaign",
+        "repository",
+        "repositoryConfig",
+        "issue",
+        "taskId",
+        "allowedActors",
+        "preparedComments",
+    }
+    if "taskIssue" in brief:
+        fields.add("taskIssue")
+    data = object_exact(
+        brief,
+        seam_fields(brief, fields),
+        "steering re-check brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail("repository must use owner/name form")
+    task_id = required_string(data.get("taskId"), "taskId")
+    if not TASK_ID.fullmatch(task_id):
+        fail("taskId is not safe")
+    config = repo_config(data.get("repositoryConfig"))
+    target = campaign_coordinates(data, repository, config)["issue"]
+    thread = steering_thread_issue(data, capabilities)
+
+    actors = string_list(data.get("allowedActors"), "allowedActors", nonempty=True)
+    allowed_actors = {
+        github_login(actor, f"allowedActors[{index}]")
+        for index, actor in enumerate(actors)
+    }
+    if len(allowed_actors) != len(actors):
+        fail("allowedActors must not repeat a GitHub login")
+
+    prepared_value = data.get("preparedComments")
+    if not isinstance(prepared_value, list):
+        fail("preparedComments must be an array")
+    prepared: list[dict[str, Any]] = []
+    prepared_ids: set[int] = set()
+    for index, value in enumerate(prepared_value):
+        comment = steering_comment(value, f"preparedComments[{index}]")
+        if comment["author"] not in allowed_actors:
+            fail("preparedComments contains an actor outside allowedActors")
+        if SYSTEM_COMMENT_PREFIX in comment["body"]:
+            fail("preparedComments contains a system receipt")
+        if comment["id"] in prepared_ids:
+            fail(f"preparedComments repeated comment id {comment['id']}")
+        prepared_ids.add(comment["id"])
+        prepared.append(comment)
+
+    raw_comments, truncated = github_steering_thread_comments(
+        target["repository"],
+        thread["number"],
+        capabilities["subIssueWalk"] and data.get("taskIssue") is not None,
+    )
+    rechecked = authorized_steering_comments(
+        raw_comments, allowed_actors, "task steering re-check comments"
+    )
+
+    merged = list(prepared)
+    positions = {comment["id"]: index for index, comment in enumerate(merged)}
+    late_ids: list[int] = []
+    for comment in rechecked:
+        position = positions.get(comment["id"])
+        if position is None:
+            positions[comment["id"]] = len(merged)
+            merged.append(comment)
+            late_ids.append(comment["id"])
+        elif merged[position] != comment:
+            # An edit in the race window is steering that arrived late too.
+            merged[position] = comment
+            late_ids.append(comment["id"])
+
+    return {
+        "taskId": task_id,
+        "authorizedComments": merged,
+        "receipt": {
+            "thread": thread,
+            "rechecked": True,
+            "recheckTruncated": truncated,
+            "preparedCommentIds": [comment["id"] for comment in prepared],
+            "lateRecheckCommentIds": late_ids,
+        },
     }
 
 
@@ -8007,6 +8267,7 @@ def main() -> int:
             "sweep",
             "reconcile",
             "diff",
+            "steeringRecheck",
             "steer",
             "retry",
             "escalate",
@@ -8030,6 +8291,7 @@ def main() -> int:
         "sweep": action_sweep,
         "reconcile": action_reconcile,
         "diff": action_diff,
+        "steeringRecheck": action_steering_recheck,
         "steer": action_steer,
         "retry": action_retry,
         "escalate": action_escalate,
