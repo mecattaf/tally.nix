@@ -346,6 +346,7 @@ fn replies(task: Value, tree_delta: Reply) -> BTreeMap<String, Reply> {
     replies.insert(
         format!("steer-{TASK_ID}"),
         Reply::passed(json!({
+            "kind": "diagnosis",
             "taskId": TASK_ID,
             "attempt": 2,
             "comment": "local://acme/spec/diagnosis/build/2",

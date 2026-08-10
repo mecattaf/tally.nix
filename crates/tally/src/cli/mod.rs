@@ -102,7 +102,12 @@ pub(crate) fn main() {
     if environment.flow_runner.is_some() {
         sanitize_inherited_tally_environment();
     }
+    // Flow evaluation runs on `spawn_blocking`, and Boa recursively
+    // instantiates a roughly 100 KiB spec-build script. Tokio's 2 MiB default
+    // is already below the debug-engine requirement pinned by the direct flow
+    // tests; give runtime-created blocking threads the same bounded headroom.
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .thread_stack_size(4 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("tally tokio runtime must build");

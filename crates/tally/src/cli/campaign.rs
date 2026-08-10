@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::AdapterConfig;
 use tally_core::campaign_contract::{
-    admit_manifest_json, admit_manifest_value, validate_argv, validate_manifest, CampaignAgent,
-    CampaignManifest, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
+    admit_manifest_json, admit_manifest_value, task_completion_revision, validate_argv,
+    validate_manifest, CampaignAgent, CampaignManifest, CanonicalCampaignGraphV1,
+    CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
 };
 use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
@@ -102,6 +103,9 @@ pub(super) async fn run_campaign(
     match command {
         CampaignCommand::Arm(args) => {
             run_campaign_arm(socket, config_path, rpc_timeout, args).await
+        }
+        CampaignCommand::Resume(args) => {
+            run_campaign_resume(socket, config_path, rpc_timeout, args).await
         }
         CampaignCommand::Project(args) => run_campaign_project(args),
         CampaignCommand::Poll(args) => {
@@ -1660,6 +1664,137 @@ async fn run_campaign_arm(
     Ok(())
 }
 
+fn post_campaign_resume(graph: &CampaignGraph, actor: &str, reason: &str) -> Result<String> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.chars().count() > 4_000 || reason.contains('\0') {
+        return Err(invalid(
+            "campaign resume --reason must contain 1..=4000 characters without NUL bytes",
+        ));
+    }
+    let nonce = uuid::Uuid::now_v7();
+    let marker = format!(
+        "<!-- tally:spec-build:resume:v1 campaign={} issue={} nonce={} -->",
+        graph.canonical.manifest.name, graph.locator.number, nonce
+    );
+    let body = format!(
+        "{marker}\n\n### Campaign resumed\n\nPardoned prior machine-diagnosis, machinery-retry, and escalation receipts without deleting the audit trail.\n\nReason: {reason}\n\nRequested by `@{actor}`."
+    );
+    let output = run_gh(
+        &os_arguments(&[
+            "issue",
+            "comment",
+            &graph.locator.number.to_string(),
+            "--repo",
+            &graph.locator.repository,
+            "--body-file",
+            "-",
+        ]),
+        Some(&body),
+    )?;
+    output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("gh issue comment returned no campaign resume receipt URL"))
+}
+
+async fn run_campaign_resume(
+    socket: &Path,
+    config_path: Option<&Path>,
+    rpc_timeout: Duration,
+    args: CampaignResumeArgs,
+) -> Result<()> {
+    let locator = parse_issue_url(&args.issue)?;
+    let state_dir = resolve_state_dir(args.state_dir)?;
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let mut registration = registry.read_issue(&locator.url)?.ok_or_else(|| {
+        invalid(format!(
+            "campaign {} is not armed; arm it before attempting resume",
+            locator.url
+        ))
+    })?;
+    require_authenticated_actor(&registration)?;
+    let graph = fetch_campaign_graph(&locator)?;
+    require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
+    if graph.canonical.manifest.repository.forge != "github" {
+        return Err(invalid(
+            "campaign resume requires repository.forge=github; the local forge is test-only and has no GitHub comment boundary",
+        ));
+    }
+    let sub_issue_walk = probe_sub_issue_walk(&locator)?;
+    validate_host(
+        &graph,
+        config_path,
+        &registration.flow,
+        &registration.driver,
+        registration.allow_test_local_forge,
+    )?;
+
+    let next_arm_serial = registration
+        .arm_serial
+        .checked_add(1)
+        .ok_or_else(|| invalid("campaign resume counter is exhausted"))?;
+    let prior_digest = registration.approved_graph_digest.clone();
+    let receipt = post_campaign_resume(&graph, &registration.authenticated_actor, &args.reason)?;
+    registration.arm_serial = next_arm_serial;
+    registration.armed_at = Utc::now().to_rfc3339();
+    registration.approved_graph_digest = graph.canonical.executable_digest.clone();
+    registration.sub_issue_walk = sub_issue_walk;
+    registration.last_forge_observation = None;
+    // Publish the new authority before dispatch. Once this write succeeds, the
+    // timer can recover an interrupted dispatch without comment deletion or
+    // another manual state edit.
+    registry.write(&mut registration)?;
+
+    let steering = fetch_campaign_steering(
+        &graph,
+        &registration.allowed_actors,
+        registration.sub_issue_walk,
+    )?;
+    let repository_progress = repository_progress_value(&graph)?;
+    let result = dispatch_campaign(
+        CampaignHost {
+            socket,
+            config_path,
+            state_dir: &state_dir,
+            rpc_timeout,
+        },
+        &graph,
+        &steering,
+        &repository_progress,
+        &mut registration,
+        args.wait,
+    )
+    .await?;
+    registry.write(&mut registration)?;
+
+    let mut output = armed_projection(&result, registration.sub_issue_walk);
+    if let Some(object) = output.as_object_mut() {
+        object.insert("status".to_owned(), json!("resumed"));
+        object.insert("resumeReceipt".to_owned(), json!(receipt));
+        object.insert("reason".to_owned(), json!(args.reason.trim()));
+        object.insert("priorGraphDigest".to_owned(), json!(prior_digest));
+        object.insert(
+            "graphDigest".to_owned(),
+            json!(registration.approved_graph_digest),
+        );
+    }
+    outln!("{}", serde_json::to_string(&output)?);
+    if args.wait {
+        let code = waited_exit_code(&result);
+        if code != 0 {
+            return Err(anyhow::Error::new(ExitFailure {
+                code,
+                message: "campaign resumed, but its reconcile pass returned a non-zero verdict"
+                    .to_owned(),
+            }));
+        }
+    }
+    Ok(())
+}
+
 async fn run_campaign_poll(
     socket: &Path,
     config_path: Option<&Path>,
@@ -2390,10 +2525,20 @@ fn merged_project_tasks(
             }
             continue;
         }
-        let revision = sha256_json(&json!({
-            "source": graph_digest,
-            "task": task.id,
-        }))?;
+        let projected = tasks
+            .iter()
+            .find(|projected| projected.id == task.id)
+            .expect("validated manifest and projected tasks have the same ids");
+        let content = CanonicalCampaignTaskV1 {
+            number: projected.issue.expect("projection assigns every issue"),
+            title: projected.title.clone(),
+            body: format!(
+                "{TASK_MARKER_PREFIX}{} -->\n\n{}",
+                projected.id,
+                projected.body.trim()
+            ),
+        };
+        let revision = task_completion_revision(manifest, task, &content)?;
         let marker = format!(
             "<!-- tally:spec-build:v2 campaign={} issue={} task={} revision={} -->",
             manifest.name, issue_number, task.id, revision
@@ -3443,6 +3588,47 @@ mod tests {
     }
 
     #[test]
+    fn resume_posts_one_auditable_counter_boundary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let captured = temporary.path().join("resume-body");
+        let fake = fake_gh(
+            temporary.path(),
+            "gh-resume",
+            &format!(
+                "cat > '{}'; printf '%s\\n' 'https://github.com/acme/widgets/issues/42#issuecomment-99'",
+                captured.display()
+            ),
+        );
+        let gh_program = GhProgramGuard::acquire();
+        gh_program.use_program(&fake);
+
+        let receipt = post_campaign_resume(
+            &graph_for_forge_observation(),
+            "operator",
+            "  Corrected the unavailable external dependency.  ",
+        )
+        .unwrap();
+        assert_eq!(
+            receipt,
+            "https://github.com/acme/widgets/issues/42#issuecomment-99"
+        );
+        let body = fs::read_to_string(captured).unwrap();
+        assert!(
+            body.lines().next().unwrap().starts_with(
+                "<!-- tally:spec-build:resume:v1 campaign=night-build issue=42 nonce="
+            ),
+            "{body}"
+        );
+        assert!(body.contains("\n\n### Campaign resumed\n\n"), "{body}");
+        assert!(
+            body.contains("\n\nReason: Corrected the unavailable external dependency.\n\n"),
+            "{body}"
+        );
+        assert!(body.ends_with("Requested by `@operator`."), "{body}");
+        assert!(post_campaign_resume(&graph_for_forge_observation(), "operator", "   ").is_err());
+    }
+
+    #[test]
     fn a_registration_written_before_the_probe_reads_as_degraded() {
         let registration: CampaignRegistrationV2 = serde_json::from_value(json!({
             "schemaVersion": REGISTRY_SCHEMA_VERSION,
@@ -3830,12 +4016,17 @@ mod tests {
             ]
         });
         let mut config = manifest_value_for_test(json!([]));
+        config["repository"]["checkout"] =
+            json!(fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap());
         config.as_object_mut().unwrap().remove("tasks");
         config
             .as_object_mut()
             .unwrap()
             .insert("maxTasks".into(), json!(1));
-        assert!(validate_project_shape(&config, &project_tasks(&document).unwrap()).is_err());
+        let error = validate_project_shape(&config, &project_tasks(&document).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manifest.maxTasks permits 1..=1"), "{error}");
     }
 
     #[test]
@@ -4433,8 +4624,10 @@ print(json.dumps({
     "digest": decoded["executableDigest"],
     "checkout": str(worklist["config"]["repositoryConfig"]["checkout"]),
     "taskBody": worklist["tasks"][0]["brief"]["body"],
+    "taskRevision": worklist["tasks"][0]["revision"],
     "recoveredCheckout": str(recovered["config"]["repositoryConfig"]["checkout"]),
     "recoveredTaskBody": recovered["tasks"][0]["brief"]["body"],
+    "recoveredTaskRevision": recovered["tasks"][0]["revision"],
 }, sort_keys=True, separators=(",", ":")))
 "#;
             let output = std::process::Command::new("python3")
@@ -4453,16 +4646,24 @@ print(json.dumps({
             let observed: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(observed["canonical"], rust_bytes);
             assert_eq!(observed["digest"], graph.executable_digest);
+            let expected_task_revision = task_completion_revision(
+                &graph.manifest,
+                &graph.manifest.tasks[0],
+                &graph.tasks[0],
+            )
+            .unwrap();
             assert_eq!(
                 observed["checkout"],
                 canonical_checkout.to_str().expect("checkout must be UTF-8")
             );
             assert_eq!(observed["taskBody"], "Brief for task-a.");
+            assert_eq!(observed["taskRevision"], expected_task_revision);
             assert_eq!(
                 observed["recoveredCheckout"],
                 canonical_checkout.to_str().expect("checkout must be UTF-8")
             );
             assert_eq!(observed["recoveredTaskBody"], "Brief for task-a.");
+            assert_eq!(observed["recoveredTaskRevision"], expected_task_revision);
         }
 
         // #446: one mutation corpus owns the manifest acceptance language.

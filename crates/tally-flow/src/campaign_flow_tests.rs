@@ -14,6 +14,8 @@
 //! stays there. Nothing this harness calls performs I/O or reaches a host API.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsValue, Script, Source};
@@ -25,59 +27,142 @@ fn spec_build_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/flows/spec-build.js")
 }
 
+enum CampaignFlowRequest {
+    Call {
+        name: String,
+        arguments: Vec<Value>,
+        response: mpsc::SyncSender<Value>,
+    },
+}
+
 /// One evaluated `spec-build.js` realm bound to a fixed `args`.
+///
+/// Boa recursively instantiates the declarations in this roughly 100 KiB
+/// script. Keep its context on a dedicated, bounded large-stack test thread so
+/// ordinary additions to the flow do not make Rust's small default test-thread
+/// stack the accidental size limit for valid JavaScript.
 struct CampaignFlowRealm {
-    context: Context,
+    requests: Option<mpsc::Sender<CampaignFlowRequest>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl CampaignFlowRealm {
     fn new(args: &Value) -> Self {
-        let path = spec_build_path();
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-        // The engine strips the `meta` export before it evaluates a flow as a
-        // Script. Going through the same function is what keeps this harness
-        // reading the code the daemon actually runs.
-        let checked = check_script(&source, Some(&path), CheckOptions::default())
-            .expect("spec-build.js must satisfy the flow dialect");
-        let mut context = Context::default();
-        let args = JsValue::from_json(args, &mut context).expect("flow args must encode");
-        context
-            .register_global_property(js_string!("args"), args, Attribute::READONLY)
-            .expect("args is a fresh global");
-        let script = Script::parse(
-            Source::from_bytes(checked.script_source.as_bytes()),
-            None,
-            &mut context,
-        )
-        .expect("spec-build.js must parse as a Script");
-        script
-            .evaluate(&mut context)
-            .expect("evaluating spec-build.js must not throw synchronously");
-        Self { context }
+        let args = args.clone();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let worker = thread::Builder::new()
+            .name("campaign-flow-realm".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                let path = spec_build_path();
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+                // The engine strips the `meta` export before it evaluates a
+                // flow as a Script. Going through the same function is what
+                // keeps this harness reading the code the daemon actually runs.
+                let checked = check_script(&source, Some(&path), CheckOptions::default())
+                    .expect("spec-build.js must satisfy the flow dialect");
+                let mut context = Context::default();
+                let args = JsValue::from_json(&args, &mut context).expect("flow args must encode");
+                context
+                    .register_global_property(js_string!("args"), args, Attribute::READONLY)
+                    .expect("args is a fresh global");
+                let script = Script::parse(
+                    Source::from_bytes(checked.script_source.as_bytes()),
+                    None,
+                    &mut context,
+                )
+                .expect("spec-build.js must parse as a Script");
+                script
+                    .evaluate(&mut context)
+                    .expect("evaluating spec-build.js must not throw synchronously");
+                ready_tx
+                    .send(())
+                    .expect("realm creator must still be waiting");
+
+                while let Ok(CampaignFlowRequest::Call {
+                    name,
+                    arguments,
+                    response,
+                }) = request_rx.recv()
+                {
+                    let function = context
+                        .global_object()
+                        .get(js_string!(name.as_str()), &mut context)
+                        .unwrap_or_else(|error| panic!("cannot read global {name}: {error}"))
+                        .as_object()
+                        .unwrap_or_else(|| panic!("{name} is not a function declaration"))
+                        .clone();
+                    let arguments = arguments
+                        .iter()
+                        .map(|value| {
+                            JsValue::from_json(value, &mut context).expect("argument encodes")
+                        })
+                        .collect::<Vec<_>>();
+                    let result = function
+                        .call(&JsValue::undefined(), &arguments, &mut context)
+                        .unwrap_or_else(|error| panic!("calling {name} threw: {error}"));
+                    let result = result
+                        .to_json(&mut context)
+                        .unwrap_or_else(|error| {
+                            panic!("{name} returned an undecodable value: {error}")
+                        })
+                        .unwrap_or(Value::Null);
+                    response
+                        .send(result)
+                        .expect("campaign-flow test must still be waiting");
+                }
+            })
+            .expect("campaign flow test worker must start");
+        if ready_rx.recv().is_err() {
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+            panic!("campaign flow test worker stopped before realm initialization");
+        }
+        Self {
+            requests: Some(request_tx),
+            worker: Some(worker),
+        }
     }
 
     /// Call one top-level helper and decode its result.
     fn call(&mut self, name: &str, arguments: &[Value]) -> Value {
-        let function = self
-            .context
-            .global_object()
-            .get(js_string!(name), &mut self.context)
-            .unwrap_or_else(|error| panic!("cannot read global {name}: {error}"))
-            .as_object()
-            .unwrap_or_else(|| panic!("{name} is not a function declaration"))
-            .clone();
-        let arguments = arguments
-            .iter()
-            .map(|value| JsValue::from_json(value, &mut self.context).expect("argument encodes"))
-            .collect::<Vec<_>>();
-        let result = function
-            .call(&JsValue::undefined(), &arguments, &mut self.context)
-            .unwrap_or_else(|error| panic!("calling {name} threw: {error}"));
-        result
-            .to_json(&mut self.context)
-            .unwrap_or_else(|error| panic!("{name} returned an undecodable value: {error}"))
-            .unwrap_or(Value::Null)
+        let (response_tx, response_rx) = mpsc::sync_channel(0);
+        self.requests
+            .as_ref()
+            .expect("campaign flow realm is live")
+            .send(CampaignFlowRequest::Call {
+                name: name.to_owned(),
+                arguments: arguments.to_vec(),
+                response: response_tx,
+            })
+            .expect("campaign flow test worker must be live");
+        match response_rx.recv() {
+            Ok(value) => value,
+            Err(_) => {
+                self.requests.take();
+                if let Some(worker) = self.worker.take() {
+                    if let Err(panic) = worker.join() {
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+                panic!("campaign flow test worker stopped before returning {name}");
+            }
+        }
+    }
+}
+
+impl Drop for CampaignFlowRealm {
+    fn drop(&mut self) {
+        self.requests.take();
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !thread::panicking() {
+                result.expect("campaign flow test worker must stop cleanly");
+            }
+        }
     }
 }
 
@@ -206,6 +291,57 @@ fn an_implementation_lane_is_priced_by_its_stage_alone() {
     assert_eq!(
         realm.call("failureClass", &[deferred, failure]),
         json!("work")
+    );
+}
+
+/// #452: Codex 0.145 could terminate a session immediately after its tool
+/// router rejected a destructive command. The router refusal is adapter
+/// machinery, not evidence that the requested implementation is wrong, so it
+/// must buy the bounded machinery retry before it can consume steering.
+#[test]
+fn a_codex_tool_router_session_death_is_priced_as_machinery() {
+    let mut realm = CampaignFlowRealm::new(&json!({
+        "campaign": "fixture",
+        "repository": "acme/spec",
+        "repositories": {
+            "acme/spec": {
+                "checkout": "/tmp/fixture",
+                "baseBranch": "main",
+                "remote": "origin",
+                "forge": "local"
+            }
+        },
+        "worklist": "specs/*.json",
+        "maxParallel": 1,
+        "agent": {
+            "adapter": "codex",
+            "diagnosisSandboxPolicy": "read-only"
+        },
+        "gates": []
+    }));
+    let quiet = json!({"deferrals": []});
+    let router_death = json!({
+        "task": {"id": "build", "kind": "implementation"},
+        "stage": "agent",
+        "node": {
+            "verdict": "fail",
+            "stderrExcerpt": "ERROR codex_core::tools::router: tool call rejected"
+        }
+    });
+    assert_eq!(
+        realm.call("failureClass", &[quiet.clone(), router_death]),
+        json!("machinery")
+    );
+
+    let ordinary_agent_failure = json!({
+        "task": {"id": "build", "kind": "implementation"},
+        "stage": "agent",
+        "node": {"verdict": "fail", "stderrExcerpt": "tests failed"}
+    });
+    assert_eq!(
+        realm.call("failureClass", &[quiet, ordinary_agent_failure]),
+        json!("work"),
+        "ordinary Codex failures remain task evidence"
     );
 }
 
