@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import hashlib
 import json
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from typing import Any
 from unittest import mock
@@ -3040,6 +3042,56 @@ class NativeSubIssueTests(unittest.TestCase):
 
 
 class LaneLifecycleTests(unittest.TestCase):
+    def test_fresh_lane_cuts_serialize_on_the_checkout_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root)
+            worktree = root / "workspaces" / "task-1"
+            lock_path = WORKTREES.worktree_preparation_lock_path(checkout)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            attempted = threading.Event()
+            finished = threading.Event()
+            failures: list[Exception] = []
+            real_flock = fcntl.flock
+
+            def observed_flock(lock: object, operation: int) -> None:
+                attempted.set()
+                real_flock(lock, operation)
+
+            def add_lane() -> None:
+                try:
+                    WORKTREES.add(checkout, worktree, "lane-task-1", "HEAD")
+                except Exception as error:
+                    failures.append(error)
+                finally:
+                    finished.set()
+
+            descriptor = os.open(
+                lock_path,
+                os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+            with os.fdopen(descriptor, "a+", encoding="utf-8") as held_lock:
+                real_flock(held_lock, fcntl.LOCK_EX)
+                with mock.patch.object(WORKTREES.fcntl, "flock", side_effect=observed_flock):
+                    worker = threading.Thread(target=add_lane)
+                    worker.start()
+                    try:
+                        self.assertTrue(
+                            attempted.wait(2), "lane cut never attempted the metadata lock"
+                        )
+                        self.assertFalse(
+                            finished.wait(0.1),
+                            "lane cut mutated shared git metadata while its lock was held",
+                        )
+                    finally:
+                        real_flock(held_lock, fcntl.LOCK_UN)
+                        worker.join(5)
+
+            self.assertFalse(worker.is_alive(), "lane cut did not resume after lock release")
+            self.assertEqual(failures, [])
+            self.assertTrue(worktree.is_dir())
+
     def test_validated_completion_is_restamped_as_an_agent_free_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
