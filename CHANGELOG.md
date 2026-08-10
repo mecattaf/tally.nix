@@ -6,6 +6,17 @@ authorized.
 
 ## [Unreleased]
 
+### Steward diagnosis delivery (#455)
+
+- Failing-gate diagnosis prompts now state the literal-substring contract and
+  show the exact check id and offending path the steward must copy, so the
+  public validator no longer rejects correct diagnoses for an undisclosed
+  formatting requirement.
+- A diagnosis that still fails the unchanged grammar now publishes immediately
+  as marked `grammar-rejected` machine steering. Its deterministic valid wrapper
+  retains the rejection reason, required literals, and a bounded redacted
+  excerpt instead of withholding the steward's useful analysis as machinery.
+
 ### Spec-build two-repository fixtures (#471)
 
 - Direct pull-request fixtures now carry their repositories' real base revisions, so all 19
