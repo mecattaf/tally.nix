@@ -5665,7 +5665,15 @@
                 touch "$out"
               '';
           spec-build-task-steering-threads =
-            pkgs.runCommand "tally-spec-build-task-steering-threads" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+            pkgs.runCommand "tally-spec-build-task-steering-threads"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.ripgrep
+                ];
+                SPEC_BUILD_DRIVER_SOURCE = "${campaignDrivers}/spec_build_driver.py";
+                SPEC_BUILD_FLOW_SOURCE = "${./examples/flows/spec-build.js}";
+              }
               ''
                 # A task brief's authorizedComments must be composed by
                 # authorizedComments(task): the campaign-wide master thread
@@ -5687,6 +5695,9 @@
                   echo "spec-build.js dropped a capability-carrying brief (found $wrapped)" >&2
                   exit 1
                 fi
+                PYTHONDONTWRITEBYTECODE=1 \
+                  ${pkgs.python3}/bin/python3 \
+                  ${./test/spec_build_task_steering_threads_test.py}
                 touch "$out"
               '';
           campaign-timer-doc-drift =

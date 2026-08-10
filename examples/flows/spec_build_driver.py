@@ -3991,6 +3991,8 @@ def authorized_steering_comments(
         if SYSTEM_COMMENT_PREFIX in body:
             continue
         author = candidate.get("user")
+        if not isinstance(author, dict):
+            author = candidate.get("author")
         login = author.get("login") if isinstance(author, dict) else None
         if not isinstance(login, str):
             continue
