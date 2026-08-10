@@ -4507,6 +4507,7 @@
           assert
             campaignHome.config.services.tally.adapters.spec-build-driver.extraWritablePaths == [
               "/tmp/tally-campaign-home/.local/state/tally/events"
+              "/tmp/tally-campaign-home/.local/state/tally/capture/archive"
             ];
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
@@ -4570,6 +4571,7 @@
             campaignSystemConfig.adapters.spec-build-driver.extraWritablePaths == [
               "/var/lib/tally/forge"
               "/var/lib/tally/state/events"
+              "/var/lib/tally/state/capture/archive"
             ];
           assert
             campaignSystemConfig.adapters.spec-build-driver.scrape.finalMessage.pattern
@@ -4585,7 +4587,10 @@
           # The continuation payload's directory exists before the first job
           # that names it starts, on this module too.
           assert pkgs.lib.hasInfix "/var/lib/tally/state/events" systemDaemon.serviceConfig.ExecStartPre;
+          assert pkgs.lib.hasInfix "/var/lib/tally/state/capture/archive" systemDaemon.serviceConfig.ExecStartPre;
           assert pkgs.lib.hasInfix "/var/lib/tally/state/events"
+            stockNixos.config.system.activationScripts.tallyRuntimeDirectories.text;
+          assert pkgs.lib.hasInfix "/var/lib/tally/state/capture/archive"
             stockNixos.config.system.activationScripts.tallyRuntimeDirectories.text;
           # The poll units, with system-service paths.
           assert campaignSystemServices.tally-campaign-poll.serviceConfig.User == "tally";
@@ -5041,6 +5046,9 @@
                   $fixtureArgs.gitAiBinding == "advisory" and
                   $fixtureArgs.gitAiAwaitSec == 12 and
                   ($fixtureArgs.driverRuntimeMaxSec >= 2 * $fixtureArgs.gitAiAwaitSec) and
+                  ($fixtureArgs.captureRoot | endswith("/capture/archive")) and
+                  $fixtureArgs.postFailureEvidence == true and
+                  $fixtureArgs.postFailureStderr == true and
                   $fixtureArgs.steward.adapter == "narrator" and
                   $fixtureArgs.steward.argv == [
                     "/bin/sh", "/srv/campaign-fixtures/narrate", "--narrate"
@@ -5072,6 +5080,8 @@
                   $defaultedArgs.mergeMethod == "squash" and
                   $defaultedArgs.gitAiBinding == "off" and
                   $defaultedArgs.gitAiAwaitSec == 60 and
+                  $defaultedArgs.postFailureEvidence == false and
+                  $defaultedArgs.postFailureStderr == false and
                   $defaultedArgs.steward == null and
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "never" and

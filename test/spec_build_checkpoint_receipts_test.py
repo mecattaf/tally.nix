@@ -198,6 +198,67 @@ class CheckpointReceiptTests(unittest.TestCase):
             },
         }
 
+    def captured_checkpoint_brief(
+        self,
+        task_uuid: str,
+        *,
+        stdout: bytes,
+        stderr: bytes,
+        verdict: str = "failed",
+        exit_code: int | None = 1,
+    ) -> dict[str, Any]:
+        capture_root = self.root / "state/capture/archive"
+        current = capture_root.parent
+        current.mkdir(parents=True, mode=0o700, exist_ok=True)
+        stem = f"{task_uuid}.phase-checkpoint"
+        (current / f"{stem}.out").write_bytes(stdout)
+        (current / f"{stem}.adapter.err").write_bytes(stderr)
+        brief = self.checkpoint_brief()
+        brief.update(
+            {
+                "captureRoot": str(capture_root),
+                "execution": {
+                    "taskUuid": task_uuid,
+                    "verdict": verdict,
+                    "exitCode": exit_code,
+                },
+            }
+        )
+        return brief
+
+    def retry_brief(
+        self,
+        path: Path,
+        *,
+        post_failure_evidence: bool,
+        post_failure_stderr: bool,
+    ) -> dict[str, Any]:
+        return {
+            "campaign": "fixture",
+            "repository": "acme/spec",
+            "repositoryConfig": self.config,
+            "issue": {
+                "number": "7",
+                "url": "https://example.invalid/acme/spec/issues/7",
+            },
+            "taskId": "phase-checkpoint",
+            "stage": "checkpoint",
+            "detail": "The checkpoint command returned a failure verdict.",
+            "checkpointCapture": {
+                "path": str(path),
+                "postFailureEvidence": post_failure_evidence,
+                "postFailureStderr": post_failure_stderr,
+            },
+        }
+
+    def retry_reason(self, attempt: int) -> str:
+        prefix = driver.local_state_prefix("fixture", "7")
+        receipt = driver.read_local_blob(
+            driver.repo_config(self.config),
+            f"{prefix}/retry/phase-checkpoint/{attempt}",
+        )
+        return receipt["reason"]
+
     def test_worklist_reads_remote_base_and_pushed_edit_invalidates_receipt(self) -> None:
         self.push_receipt(self.base_rev)
         original_source = self.worklist["source"]
@@ -281,6 +342,148 @@ class CheckpointReceiptTests(unittest.TestCase):
         git("switch", "-c", "other", cwd=self.checkout)
         with self.assertRaisesRegex(driver.DriverError, "changed branches"):
             driver.action_checkpoint(self.checkpoint_brief())
+
+    def test_failed_checkpoint_attempts_persist_bounded_private_captures(self) -> None:
+        stdout = b"discarded stdout\n" * 700 + b"actionable stdout tail\n"
+        stderr = b"discarded stderr\n" * 700 + b"actionable stderr tail\n"
+        paths: list[Path] = []
+        for suffix in (1, 2):
+            task_uuid = f"00000000-0000-4000-8000-{suffix:012d}"
+            recorded = driver.action_checkpoint(
+                self.captured_checkpoint_brief(
+                    task_uuid,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            )
+            path = Path(recorded["capturePath"])
+            paths.append(path)
+            self.assertFalse(recorded["passed"])
+            self.assertIsNone(recorded["ref"])
+            self.assertTrue(recorded["stdoutTruncated"])
+            self.assertTrue(recorded["stderrTruncated"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            capture = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(capture["taskUuid"], task_uuid)
+            self.assertEqual(capture["verdict"], "failed")
+            self.assertLessEqual(
+                len(capture["stdout"].encode("utf-8")),
+                driver.CHECKPOINT_CAPTURE_MAX_BYTES,
+            )
+            self.assertLessEqual(
+                len(capture["stderr"].encode("utf-8")),
+                driver.CHECKPOINT_CAPTURE_MAX_BYTES,
+            )
+            self.assertTrue(capture["stdout"].endswith("actionable stdout tail\n"))
+            self.assertTrue(capture["stderr"].endswith("actionable stderr tail\n"))
+
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertTrue(paths[0].is_file(), "a later attempt must retain the first capture")
+
+    def test_retry_withholds_stderr_by_default_and_redacts_last_ten_lines_when_enabled(
+        self,
+    ) -> None:
+        secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+        lines = [f"checkpoint-line-{index:02d}" for index in range(1, 13)]
+        lines[7] = f"GITHUB_TOKEN={secret}"
+        stderr = ("discarded\n" * 1400 + "\n".join(lines) + "\n").encode()
+        recorded = driver.action_checkpoint(
+            self.captured_checkpoint_brief(
+                "00000000-0000-4000-8000-000000000003",
+                stdout=b"checkpoint stdout\n",
+                stderr=stderr,
+            )
+        )
+        path = Path(recorded["capturePath"])
+
+        withheld = driver.action_retry(
+            self.retry_brief(
+                path,
+                post_failure_evidence=False,
+                post_failure_stderr=False,
+            )
+        )
+        self.assertTrue(withheld["posted"])
+        withheld_reason = self.retry_reason(1)
+        self.assertIn(f"Checkpoint capture: {path}", withheld_reason)
+        self.assertNotIn("Checkpoint stderr", withheld_reason)
+        self.assertNotIn("checkpoint-line-12", withheld_reason)
+        self.assertNotIn(secret, withheld_reason)
+
+        published = driver.action_retry(
+            self.retry_brief(
+                path,
+                post_failure_evidence=True,
+                post_failure_stderr=True,
+            )
+        )
+        self.assertTrue(published["posted"])
+        self.assertTrue(published["redacted"])
+        published_reason = self.retry_reason(2)
+        self.assertIn(f"Checkpoint capture: {path}", published_reason)
+        self.assertIn("Checkpoint stderr (last 10 line(s)", published_reason)
+        self.assertNotIn("checkpoint-line-01", published_reason)
+        self.assertNotIn("checkpoint-line-02", published_reason)
+        self.assertIn("checkpoint-line-03", published_reason)
+        self.assertIn("checkpoint-line-12", published_reason)
+        self.assertIn("[redacted sensitive diagnosis line]", published_reason)
+        self.assertNotIn(secret, published_reason)
+
+    def test_escalation_comment_names_checkpoint_capture(self) -> None:
+        path = self.root / "state/capture/archive/attempt/checkpoint.json"
+        diagnosis = f"Observed the checkpoint fail.\n\nCheckpoint capture: {path}"
+        reconciliation = {
+            "complete": False,
+            "quiescent": True,
+            "escalation": None,
+            "campaign": "fixture",
+            "repository": "acme/spec",
+            "blocked": [
+                {
+                    "taskId": "phase-checkpoint",
+                    "blockedBy": ["phase-checkpoint"],
+                }
+            ],
+            "diagnoses": [
+                {
+                    "taskId": "phase-checkpoint",
+                    "attempt": 2,
+                    "diagnosis": diagnosis,
+                }
+            ],
+            "retries": [],
+            "warnings": [],
+        }
+        original_reconcile = driver.action_reconcile
+        original_digest = driver.campaign_digest
+        original_summary = driver.publish_closing_summary
+        driver.action_reconcile = lambda _brief: reconciliation
+        driver.campaign_digest = lambda _state, _outcome: {}
+        driver.publish_closing_summary = lambda *_args, **_kwargs: "local://summary"
+        try:
+            escalated = driver.action_escalate(
+                {
+                    **self.worklist_brief,
+                    "campaign": "fixture",
+                    "issue": {
+                        "number": "7",
+                        "url": "https://example.invalid/acme/spec/issues/7",
+                    },
+                }
+            )
+        finally:
+            driver.action_reconcile = original_reconcile
+            driver.campaign_digest = original_digest
+            driver.publish_closing_summary = original_summary
+
+        self.assertTrue(escalated["posted"])
+        prefix = driver.local_state_prefix("fixture", "7")
+        receipt = driver.read_local_blob(
+            driver.repo_config(self.config), f"{prefix}/escalation"
+        )
+        self.assertIn("Checkpoint captures:", receipt["body"])
+        self.assertIn(f"- {path}", receipt["body"])
 
     def advance_remote_base(self, name: str) -> str:
         """Land one mainline commit from outside this checkout."""

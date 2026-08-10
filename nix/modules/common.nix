@@ -3723,9 +3723,11 @@ let
         eventsDir = "${toString cfg.stateDir}/events";
       };
       workspaceRoot = "${toString cfg.stateDir}/campaigns/${name}";
+      captureRoot = "${toString cfg.stateDir}/capture/archive";
       tally = lib.getExe cfg.package;
       driver = "${specBuildDriver}/bin/spec-build-driver";
       inherit (campaign) driverRuntimeMaxSec;
+      inherit (campaign) postFailureEvidence postFailureStderr;
       inherit (campaign) mergeMethod;
       inherit (campaign) gitAiBinding;
       inherit (campaign) gitAiAwaitSec;
@@ -3915,16 +3917,18 @@ let
             pattern = defaultFinalMessagePattern;
           };
           # The continue node writes the next pass's enqueue payload into the
-          # daemon's events directory, so that directory is a hard write
-          # dependency of the driver adapter. Under the compatibility default
-          # (no hardening preset) nothing constrains the write and this list is
-          # inert; under `strict` or `production` the state directory stops
-          # being writable wholesale and only the paths named here survive.
-          # Declaring it means hardening this adapter cannot silently break a
-          # campaign's self-continuation. It is a plain definition rather than
-          # an mkDefault so an estate adding its own paths extends the list
-          # instead of replacing this one.
-          extraWritablePaths = [ "${toString cfg.stateDir}/events" ];
+          # daemon's events directory, and checkpoint recording writes its
+          # bounded per-attempt snapshot under the existing capture archive.
+          # Under the compatibility default (no hardening preset) nothing
+          # constrains either write and this list is inert; under `strict` or
+          # `production` the state directory stops being writable wholesale
+          # and only the paths named here survive. It is a plain definition
+          # rather than an mkDefault so an estate adding its own paths extends
+          # the list instead of replacing this one.
+          extraWritablePaths = [
+            "${toString cfg.stateDir}/events"
+            "${toString cfg.stateDir}/capture/archive"
+          ];
         };
       };
     };

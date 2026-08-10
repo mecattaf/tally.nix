@@ -425,7 +425,8 @@ in
             ${pkgs.coreutils}/bin/install -d -m 0700 -- \
               ${lib.escapeShellArg (toString cfg.dataDir)} \
               ${lib.escapeShellArg (toString cfg.stateDir)} \
-              ${lib.escapeShellArg "${toString cfg.stateDir}/events"}
+              ${lib.escapeShellArg "${toString cfg.stateDir}/events"} \
+              ${lib.escapeShellArg "${toString cfg.stateDir}/capture/archive"}
           '';
 
       xdg.configFile."tally/config.json" = {
@@ -472,9 +473,8 @@ in
             ];
             RuntimeDirectory = "tally";
             RuntimeDirectoryMode = "0700";
-            # The events directory is created here, not lazily by the first
-            # ingress write: a job whose adapter names it in
-            # extraWritablePaths cannot start at all while it is missing.
+            # Adapter write grants must exist before a hardened transient job
+            # starts, so create both campaign-owned state paths up front.
             ExecStartPre = lib.escapeShellArgs [
               "${pkgs.coreutils}/bin/install"
               "-d"
@@ -483,6 +483,7 @@ in
               (toString cfg.dataDir)
               (toString cfg.stateDir)
               "${toString cfg.stateDir}/events"
+              "${toString cfg.stateDir}/capture/archive"
             ];
             ExecStart = lib.escapeShellArgs daemonArgv;
             CPUWeight = 100;

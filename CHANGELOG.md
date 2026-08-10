@@ -6,6 +6,18 @@ authorized.
 
 ## [Unreleased]
 
+### Checkpoint attempt captures (#457)
+
+- Every campaign checkpoint attempt now retains the final 8 KiB of stdout and
+  stderr under the existing capture-archive lifecycle, including failed and
+  deferred attempts.
+- Retry and steering receipts name the local capture, terminal escalations
+  collect those paths, and explicitly enabled failure publication adds only a
+  conservatively redacted last-ten-line stderr excerpt.
+- Hardened campaign drivers receive the capture-archive write grant, while the
+  default-off `postFailureEvidence` and `postFailureStderr` policy continues to
+  withhold inline output.
+
 ### Pre-dispatch steering re-check (#461)
 
 - Forge-native implementation attempts now re-read their task thread once

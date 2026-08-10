@@ -12,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,14 @@ RESUME_MARKER = re.compile(
 # back from the forge: past it, the fault is treated as a failed attempt.
 MAX_MACHINE_RETRIES = 2
 MAX_RETRY_CHARS = 2_000
+# Checkpoint output is retained for diagnosis, not as a second unbounded raw
+# capture. Keep the tail, where command harnesses normally put the actionable
+# failure, under the daemon's existing capture-archive retention envelope.
+CHECKPOINT_CAPTURE_MAX_BYTES = 8 * 1024
+CHECKPOINT_CAPTURE_SCHEMA_VERSION = 1
+CHECKPOINT_CAPTURE_FILE = "checkpoint.json"
+CHECKPOINT_STDERR_LINES = 10
+CHECKPOINT_PUBLIC_NOTE_MAX_CHARS = 1_000
 # The closing summary is a bounded rendering of a bounded digest: past this
 # many rows a section says how many it dropped instead of growing without end.
 MAX_SUMMARY_ROWS = 40
@@ -1931,6 +1940,268 @@ def redact_public_text(value: str) -> tuple[str, bool]:
         if "-----end " in lower and "private key-----" in lower:
             private_key_block = False
     return "".join(output).strip(), redacted
+
+
+def read_capture_tail(path: Path) -> tuple[str, bool]:
+    """Read one private stream tail with the checkpoint's 8 KiB bound."""
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as error:
+        fail(f"cannot open checkpoint capture stream {path}: {error}")
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            fail(f"checkpoint capture stream is not a private regular file: {path}")
+        start = max(0, metadata.st_size - CHECKPOINT_CAPTURE_MAX_BYTES)
+        stream.seek(start)
+        captured = stream.read(CHECKPOINT_CAPTURE_MAX_BYTES)
+    if start:
+        # A tail can begin inside a UTF-8 scalar. Drop only continuation bytes;
+        # malformed bytes elsewhere remain visible as replacement characters.
+        prefix = 0
+        while prefix < len(captured) and captured[prefix] & 0b1100_0000 == 0b1000_0000:
+            prefix += 1
+        captured = captured[prefix:]
+    text = captured.decode("utf-8", errors="replace").replace("\0", "�")
+    encoded = text.encode("utf-8")
+    additionally_truncated = False
+    while len(encoded) > CHECKPOINT_CAPTURE_MAX_BYTES and text:
+        text = text[1:]
+        encoded = text.encode("utf-8")
+        additionally_truncated = True
+    return text, bool(start) or additionally_truncated
+
+
+def write_private_json(path: Path, value: dict[str, Any]) -> None:
+    parent = path.parent
+    parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if parent.is_symlink() or not parent.is_dir():
+        fail(f"checkpoint capture parent must be a real directory: {parent}")
+    os.chmod(parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    document = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(document)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        directory = os.open(parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as error:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        fail(f"cannot persist checkpoint capture {path}: {error}")
+
+
+def persist_checkpoint_capture(
+    capture_root_value: Any,
+    execution_value: Any,
+    campaign: str,
+    issue_number: str,
+    task_id: str,
+) -> dict[str, Any]:
+    capture_root = Path(required_string(capture_root_value, "captureRoot", 4096))
+    if (
+        not capture_root.is_absolute()
+        or capture_root.name != "archive"
+        or capture_root.parent.name != "capture"
+    ):
+        fail("captureRoot must name an absolute capture/archive directory")
+    if capture_root.exists() and (capture_root.is_symlink() or not capture_root.is_dir()):
+        fail("captureRoot must be a real directory")
+    execution = object_exact(
+        execution_value,
+        {"taskUuid", "verdict", "exitCode"},
+        "checkpoint execution",
+    )
+    task_uuid = required_string(execution.get("taskUuid"), "checkpoint execution.taskUuid")
+    try:
+        parsed_uuid = uuid.UUID(task_uuid)
+    except ValueError:
+        fail("checkpoint execution.taskUuid must be a UUID")
+    if str(parsed_uuid) != task_uuid.lower():
+        fail("checkpoint execution.taskUuid must be a canonical UUID")
+    verdict = required_string(execution.get("verdict"), "checkpoint execution.verdict")
+    if verdict not in {
+        "pass",
+        "substituted",
+        "failed",
+        "skipped",
+        "cancelled",
+        "pool-vanished",
+        "preempted",
+        "runtime-exceeded",
+        "clean-exit-no-artifact",
+    }:
+        fail("checkpoint execution.verdict is not a terminal verdict")
+    exit_code = execution.get("exitCode")
+    if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+        fail("checkpoint execution.exitCode must be an integer or null")
+
+    capture_stem = f"{task_uuid}.{task_id}"
+    current_root = capture_root.parent
+    stdout, stdout_truncated = read_capture_tail(current_root / f"{capture_stem}.out")
+    stderr, stderr_truncated = read_capture_tail(
+        current_root / f"{capture_stem}.adapter.err"
+    )
+    path = capture_root / capture_stem / CHECKPOINT_CAPTURE_FILE
+    write_private_json(
+        path,
+        {
+            "schemaVersion": CHECKPOINT_CAPTURE_SCHEMA_VERSION,
+            "campaign": campaign,
+            "issueNumber": issue_number,
+            "taskId": task_id,
+            "taskUuid": task_uuid,
+            "verdict": verdict,
+            "exitCode": exit_code,
+            "stdout": stdout,
+            "stdoutTruncated": stdout_truncated,
+            "stderr": stderr,
+            "stderrTruncated": stderr_truncated,
+        },
+    )
+    return {
+        "path": str(path),
+        "stdoutTruncated": stdout_truncated,
+        "stderrTruncated": stderr_truncated,
+    }
+
+
+def read_checkpoint_capture(path: Path, campaign: str, task_id: str) -> dict[str, Any]:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as error:
+        fail(f"cannot open checkpoint capture {path}: {error}")
+    with os.fdopen(descriptor, "rb") as capture:
+        metadata = os.fstat(capture.fileno())
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            # JSON escaping can expand an 8 KiB stream of control bytes sixfold.
+            # Both decoded streams remain independently bounded below; this
+            # outer cap only keeps the containing receipt finite.
+            or metadata.st_size > 128 * 1024
+        ):
+            fail(f"checkpoint capture is not a bounded private regular file: {path}")
+        try:
+            value = json.load(capture)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            fail(f"checkpoint capture is not valid JSON: {path}: {error}")
+    fields = {
+        "schemaVersion",
+        "campaign",
+        "issueNumber",
+        "taskId",
+        "taskUuid",
+        "verdict",
+        "exitCode",
+        "stdout",
+        "stdoutTruncated",
+        "stderr",
+        "stderrTruncated",
+    }
+    capture = object_complete(value, fields, "checkpoint capture")
+    if (
+        capture.get("schemaVersion") != CHECKPOINT_CAPTURE_SCHEMA_VERSION
+        or capture.get("campaign") != campaign
+        or capture.get("taskId") != task_id
+    ):
+        fail("checkpoint capture identity does not match the machine receipt")
+    stderr = capture.get("stderr")
+    if not isinstance(stderr, str) or len(stderr.encode("utf-8")) > CHECKPOINT_CAPTURE_MAX_BYTES:
+        fail("checkpoint capture stderr exceeds its 8 KiB bound")
+    return capture
+
+
+def checkpoint_capture_note(
+    value: Any,
+    campaign: str,
+    task_id: str,
+) -> str:
+    publication = object_exact(
+        value,
+        {"path", "postFailureEvidence", "postFailureStderr"},
+        "checkpointCapture",
+    )
+    path_text = required_string(publication.get("path"), "checkpointCapture.path", 700)
+    path = Path(path_text)
+    if not path.is_absolute():
+        fail("checkpointCapture.path must be absolute")
+    post_evidence = required_bool(
+        publication.get("postFailureEvidence"),
+        "checkpointCapture.postFailureEvidence",
+    )
+    post_stderr = required_bool(
+        publication.get("postFailureStderr"),
+        "checkpointCapture.postFailureStderr",
+    )
+    if post_stderr and not post_evidence:
+        fail("checkpointCapture.postFailureStderr requires postFailureEvidence")
+    note = f"Checkpoint capture: {path_text}"
+    if not (post_evidence and post_stderr):
+        return note
+    capture = read_checkpoint_capture(path, campaign, task_id)
+    lines = capture["stderr"].splitlines()[-CHECKPOINT_STDERR_LINES:]
+    if not lines:
+        return note
+    excerpt = "\n".join(f"    {line}" for line in lines)
+    heading = (
+        f"{note}\n\nCheckpoint stderr (last {len(lines)} line(s), before public redaction):"
+        "\n\n"
+    )
+    available = max(0, CHECKPOINT_PUBLIC_NOTE_MAX_CHARS - len(heading))
+    if len(excerpt) > available:
+        marker = "    [... earlier checkpoint stderr lines shortened ...]\n"
+        tail_width = max(0, available - len(marker))
+        excerpt = marker + excerpt[-tail_width:] if tail_width else marker[:available]
+    return heading + excerpt
+
+
+def checkpoint_capture_paths(values: list[str]) -> list[str]:
+    prefix = "Checkpoint capture: "
+    return list(
+        dict.fromkeys(
+            line[len(prefix) :]
+            for value in values
+            for line in value.splitlines()
+            if line.startswith(prefix) and line[len(prefix) :]
+        )
+    )
+
+
+def append_checkpoint_capture_note(value: str, note: str, maximum: int) -> str:
+    if not note:
+        return value
+    suffix = f"\n\n{note}"
+    if len(value) + len(suffix) <= maximum:
+        return value + suffix
+    marker = "\n[... earlier machine detail shortened for checkpoint capture ...]"
+    available = max(0, maximum - len(marker) - len(suffix))
+    return value[:available].rstrip() + marker + suffix
 
 
 def bound_public_diagnosis(value: str) -> str:
@@ -4400,6 +4671,8 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     }
     if "taskIssue" in brief:
         fields.add("taskIssue")
+    if "checkpointCapture" in brief:
+        fields.add("checkpointCapture")
     if "gateEvidence" in brief:
         fields.add("gateEvidence")
     if "breach" in brief:
@@ -4429,6 +4702,15 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     attempt = data.get("attempt")
     if attempt not in {1, 2}:
         fail("attempt must equal 1 or 2")
+
+    def public_checkpoint_capture() -> tuple[str, bool]:
+        """Prepare new public text lazily, after idempotency is established."""
+        if "checkpointCapture" not in data:
+            return "", False
+        return redact_public_text(
+            checkpoint_capture_note(data.get("checkpointCapture"), campaign, task_id)
+        )
+
     breach = bool(data.get("breach", False))
     # #424: which lane-aborting tree-delta verdict this receipt is for. Absent
     # is the #386 breach, which is what every caller before this sent.
@@ -4465,6 +4747,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
                 "posted": False,
                 "redacted": False,
             }
+        capture_note, capture_redacted = public_checkpoint_capture()
         diagnosis = required_text(
             data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS
         )
@@ -4483,6 +4766,11 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
             detail_text, redacted_detail = redact_public_text(detail)
             detail_text = bound_public_diagnosis(detail_text)
         composed = bounded_breach_note(diagnosis, detail_text, abort_reason)
+        composed = append_checkpoint_capture_note(
+            composed,
+            capture_note,
+            MAX_DIAGNOSIS_CHARS,
+        )
         posted_comment: str | None = None
         for post_attempt in (1, 2):
             if any(receipt["attempt"] == post_attempt for receipt in task_receipts):
@@ -4505,7 +4793,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
             "comment": posted_comment,
             "blocked": True,
             "posted": True,
-            "redacted": redacted_diagnosis or redacted_detail,
+            "redacted": redacted_diagnosis or redacted_detail or capture_redacted,
         }
 
     if any(receipt["attempt"] == attempt for receipt in task_receipts):
@@ -4527,6 +4815,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
             f"task {task_id!r} diagnosis attempt {attempt} is not next after "
             f"{len(task_receipts)} forge receipts"
         )
+    capture_note, capture_redacted = public_checkpoint_capture()
     diagnosis = required_text(
         data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS
     )
@@ -4537,6 +4826,11 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     # diagnosis receipt, so the already-redacted excerpt reaches the next
     # worker instead of being withheld behind machinery retry receipts.
     diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
+    diagnosis = append_checkpoint_capture_note(
+        diagnosis,
+        capture_note,
+        MAX_DIAGNOSIS_CHARS,
+    )
     comment = post_diagnosis_comment(
         config,
         repository,
@@ -4555,7 +4849,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         "comment": comment,
         "blocked": attempt == 2,
         "posted": True,
-        "redacted": redacted,
+        "redacted": redacted or capture_redacted,
     }
 
 
@@ -4579,6 +4873,8 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     }
     if "taskIssue" in brief:
         fields.add("taskIssue")
+    if "checkpointCapture" in brief:
+        fields.add("checkpointCapture")
     data = object_exact(brief, seam_fields(brief, fields), "retry brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -4616,7 +4912,21 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
             "redacted": False,
         }
     attempt = spent + 1
-    reason, redacted = redact_public_text(f"Stage `{stage}` faulted.\n\n{detail}")
+    capture_note = ""
+    if "checkpointCapture" in data:
+        capture_note = checkpoint_capture_note(
+            data.get("checkpointCapture"),
+            campaign,
+            task_id,
+        )
+    raw_reason = f"Stage `{stage}` faulted."
+    if capture_note:
+        raw_reason += f"\n\n{capture_note}"
+    raw_reason += f"\n\n{detail}"
+    # The optional checkpoint excerpt deliberately enters the existing public
+    # steering redaction with the stage detail. There is one reviewed
+    # conservative-v2 pass, not a checkpoint-specific redactor.
+    reason, redacted = redact_public_text(raw_reason)
     if len(reason) > MAX_RETRY_CHARS:
         reason = reason[: MAX_RETRY_CHARS - 3].rstrip() + "..."
     reason = required_text(reason, "retry reason", MAX_RETRY_CHARS)
@@ -4757,6 +5067,13 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
             f"{compact_summary(item['reason'])}"
             for item in reconciliation["retries"]
         )
+    capture_paths = checkpoint_capture_paths(
+        [item["diagnosis"] for item in reconciliation["diagnoses"]]
+        + [item["reason"] for item in reconciliation["retries"]]
+    )
+    if capture_paths:
+        lines.extend(["", "Checkpoint captures:"])
+        lines.extend(f"- {path}" for path in capture_paths)
     if reconciliation["warnings"]:
         lines.extend(["", "Reconciler warnings:"])
         lines.extend(
@@ -7959,6 +8276,11 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     }
     if "baseRevision" in brief:
         fields.add("baseRevision")
+    capture_fields = {"captureRoot", "execution"}
+    present_capture_fields = capture_fields.intersection(brief)
+    if present_capture_fields and present_capture_fields != capture_fields:
+        fail("checkpoint brief must carry captureRoot and execution together")
+    fields.update(present_capture_fields)
     data = object_exact(brief, seam_fields(brief, fields), "checkpoint brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -8044,6 +8366,26 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
     if not worktree.is_absolute() or not worktree.is_dir():
         fail("workspace.worktreePath must be an absolute existing directory")
+    capture: dict[str, Any] | None = None
+    if "execution" in data:
+        capture = persist_checkpoint_capture(
+            data.get("captureRoot"),
+            data.get("execution"),
+            campaign,
+            issue["number"],
+            task_id,
+        )
+        execution = data["execution"]
+        if execution["verdict"] != "pass":
+            return {
+                "taskId": task_id,
+                "passed": False,
+                "ref": None,
+                "revision": base_rev,
+                "capturePath": capture["path"],
+                "stdoutTruncated": capture["stdoutTruncated"],
+                "stderrTruncated": capture["stderrTruncated"],
+            }
     if git(worktree, "branch", "--show-current").stdout.strip() != branch:
         fail("checkpoint worktree changed branches during validation")
     if git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip() != base_rev:
@@ -8123,7 +8465,17 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
             source_sha256,
             coordinates["issue"]["repository"],
         )
-    return {"taskId": task_id, "ref": reference, "revision": base_rev}
+    result = {"taskId": task_id, "ref": reference, "revision": base_rev}
+    if capture is not None:
+        result.update(
+            {
+                "passed": True,
+                "capturePath": capture["path"],
+                "stdoutTruncated": capture["stdoutTruncated"],
+                "stderrTruncated": capture["stderrTruncated"],
+            }
+        )
+    return result
 
 
 def github_merge_checkbox_repair(data: dict[str, Any]) -> None:
