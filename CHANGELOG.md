@@ -6,6 +6,12 @@ authorized.
 
 ## [Unreleased]
 
+### Spec-build two-repository fixtures (#471)
+
+- Direct pull-request fixtures now carry their repositories' real base revisions, so all 19
+  two-repository driver tests reach their intended assertions while preserving marker-only title
+  detection.
+
 ### Campaign admission diagnostics (#460)
 
 - Over-cap errors now report the actual task count and configured `maxTasks`, then direct the
