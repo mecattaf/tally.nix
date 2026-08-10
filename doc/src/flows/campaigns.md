@@ -742,6 +742,14 @@ legacy debris. If a task commits a forbidden artifact, remediation must rewrite
 or squash the task branch so the offending commit is no longer reachable;
 adding a cleanup commit is intentionally still red.
 
+A rejection reports `N path(s) touched in lane history` and says explicitly
+that a later removal does not clear the failure; the check id and offending
+paths remain literal in that detail. The diagnosing steward receives the same
+rule in operational terms: the gate walks
+`changed_paths_in_history(union_base, head)`, so the only cure is to rewrite the
+lane until the path appears in no lane commit — for example, soft-reset to the
+merge base and recommit without it.
+
 Matching folds case over repository-relative POSIX paths, so `*.db` also rejects
 `build/TRANSIENT.DB`. A pattern without `/` matches a basename at any depth. A
 pattern with `/` is rooted at the repository; `*` and `?` stay within one path

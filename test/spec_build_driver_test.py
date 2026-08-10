@@ -4486,7 +4486,9 @@ class SteeringGrammarTests(unittest.TestCase):
 
     def test_gate_evidence_requires_the_failing_id_and_offending_path(self) -> None:
         detail = (
-            "forbidPaths gate 'forbid-secrets' rejected 1 changed path(s): "
+            "forbidPaths gate 'forbid-secrets' rejected 1 path(s) touched in lane "
+            "history (a later removal does not clear this; the path must never "
+            "appear in any lane commit): "
             '"secrets/key.pem" (matched "secrets/**")'
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -4510,7 +4512,9 @@ class SteeringGrammarTests(unittest.TestCase):
 
     def test_a_diagnosis_naming_the_required_evidence_is_accepted_verbatim(self) -> None:
         detail = (
-            "forbidPaths gate 'forbid-secrets' rejected 1 changed path(s): "
+            "forbidPaths gate 'forbid-secrets' rejected 1 path(s) touched in lane "
+            "history (a later removal does not clear this; the path must never "
+            "appear in any lane commit): "
             '"secrets/key.pem" (matched "secrets/**")'
         )
         diagnosis = (

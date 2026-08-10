@@ -3901,7 +3901,9 @@ def steering_thread(
 
 
 FORBID_PATHS_DETAIL = re.compile(
-    r'forbidPaths gate \S+ rejected \d+ changed path\(s\): "((?:[^"\\]|\\.)*)"'
+    r'forbidPaths gate \S+ rejected \d+ path\(s\) touched in lane history '
+    r'\(a later removal does not clear this; the path must never appear in any lane commit\): '
+    r'"((?:[^"\\]|\\.)*)"'
 )
 
 
@@ -6199,7 +6201,9 @@ def evaluate_forbid_paths(
         if len(violations) > 20:
             preview += f"; and {len(violations) - 20} more"
         fail(
-            f"forbidPaths gate {gate_id!r} rejected {len(violations)} changed path(s): {preview}"
+            f"forbidPaths gate {gate_id!r} rejected {len(violations)} path(s) touched "
+            "in lane history (a later removal does not clear this; the path must "
+            f"never appear in any lane commit): {preview}"
         )
     return len(changed_paths)
 

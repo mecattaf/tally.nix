@@ -32,7 +32,8 @@
       "dependencies": [],
       "conflictDomains": [
         "build/one.txt",
-        "build/checkpoint-red"
+        "build/checkpoint-red",
+        "build/transient.db"
       ]
     },
     {

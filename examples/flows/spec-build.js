@@ -1354,7 +1354,7 @@ function bounded(value, limit) {
 }
 
 const FORBID_PATHS_FAILURE =
-  /forbidPaths gate \S+ rejected \d+ changed path\(s\): "((?:[^"\\]|\\.)*)"/;
+  /forbidPaths gate \S+ rejected \d+ path\(s\) touched in lane history \(a later removal does not clear this; the path must never appear in any lane commit\): "((?:[^"\\]|\\.)*)"/;
 
 function gateEvidenceForFailure(failure) {
   const lastGate = failure.gateOutputs.length
@@ -1391,6 +1391,22 @@ function diagnosisLiteralSubstringRule(gateEvidence) {
     `${rule} For this failure, copy both exact strings unchanged into the ` +
     `diagnosis: failing check id ${JSON.stringify(gateEvidence.id)}; ` +
     `offending path ${JSON.stringify(matched[1])}.`
+  );
+}
+
+function forbidPathsHistoryRule(gateEvidence) {
+  if (
+    gateEvidence === null ||
+    FORBID_PATHS_FAILURE.exec(gateEvidence.detail) === null
+  ) {
+    return "";
+  }
+  return (
+    " forbidPaths history rule: the gate walks " +
+    "`changed_paths_in_history(union_base, head)`, so a later removal does not " +
+    "clear an earlier commit. The only cure is rewriting the lane so the path " +
+    "never appears in any commit: soft-reset to the merge base and recommit " +
+    "without it."
   );
 }
 
@@ -2707,6 +2723,7 @@ function sweepDeferral(sweepNode) {
       // correct paraphrases into silent steering loss.
       const gateEvidence = gateEvidenceForFailure(failure);
       const literalSubstringRule = diagnosisLiteralSubstringRule(gateEvidence);
+      const historyWalkRule = forbidPathsHistoryRule(gateEvidence);
       const diagnosisBrief = {
         schemaVersion: 1,
         role: "diagnosis",
@@ -2722,7 +2739,7 @@ function sweepDeferral(sweepNode) {
             : failure.breach
             ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise record of what the out-of-allowlist change(s) were and why they likely happened, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
             : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Begin with one outcome-first sentence whose first word is a past-tense verb, end it with a period or colon before any list, use no exclamation marks, and stay under 12,000 characters. Conforming example: “Observed the Codex session exit after its tool router rejected the command.” Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
-        ) + literalSubstringRule,
+        ) + literalSubstringRule + historyWalkRule,
         campaign: {
           name: effective.campaign,
           repository: codeRepository,
