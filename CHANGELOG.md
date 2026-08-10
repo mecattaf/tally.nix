@@ -6,6 +6,17 @@ authorized.
 
 ## [Unreleased]
 
+### Steward diagnosis delivery (#455)
+
+- Failing-gate diagnosis prompts now state the literal-substring contract and
+  show the exact check id and offending path the steward must copy, so the
+  public validator no longer rejects correct diagnoses for an undisclosed
+  formatting requirement.
+- A diagnosis that still fails the unchanged grammar now publishes immediately
+  as marked `grammar-rejected` machine steering. Its deterministic valid wrapper
+  retains the rejection reason, required literals, and a bounded redacted
+  excerpt instead of withholding the steward's useful analysis as machinery.
+
 ### Spec-build two-repository fixtures (#471)
 
 - Direct pull-request fixtures now carry their repositories' real base revisions, so all 19
@@ -19,10 +30,10 @@ authorized.
 
 ### Bounded campaign recovery (#451, #452)
 
-- Rejected diagnosis prose no longer consumes a steering attempt. The driver
-  posts a bounded machinery retry while budget remains, then emits a valid
-  deterministic wrapper that preserves a redacted excerpt and the rejection
-  reason instead of discarding the only failure evidence.
+- Rejected diagnosis prose retains its redacted excerpt and rejection reason
+  instead of discarding the only failure evidence. The later #455 delivery
+  rule above publishes that valid deterministic wrapper immediately as machine
+  steering rather than spending the machinery-retry budget first.
 - Added `tally campaign resume ISSUE --reason TEXT`: an authenticated,
   non-destructive recovery generation that retains prior comments as audit
   history, uses its marked GitHub comment as the counter boundary, revalidates

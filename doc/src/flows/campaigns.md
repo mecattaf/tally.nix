@@ -1738,13 +1738,20 @@ public redaction and becomes an authenticated, marked campaign comment; raw
 capture, gate output, brief, and diff remain private job inputs.
 
 The diagnosis prompt states the public outcome-first grammar and includes a
-conforming example. If the diagnosis agent still returns invalid grammar, that
-contract failure is campaign machinery: it posts a marked machinery retry and
-does not consume a task diagnosis attempt. Once the bounded machinery budget is
-spent, the driver posts a deterministic valid wrapper that names the validation
-failure and retains a bounded, redacted excerpt of the rejected proposal. A
-diagnosis rejection therefore cannot erase the only useful failure evidence or
-silently turn into a task attempt.
+conforming example. For a failing gate it also states the literal-substring
+contract explicitly: the response must contain the failing check id and, when
+the gate names one, the offending path without paraphrasing. The prompt renders
+the exact required strings for that failure before the diagnosis agent runs;
+the driver then supplies those same strings to the unchanged validator.
+
+If the diagnosis agent still returns invalid grammar, the rejected prose is not
+admitted as valid. The driver immediately posts a marked `grammar-rejected`
+machine-steering receipt: a deterministic, grammar-valid wrapper names the
+rejection reason and required literals, then carries a bounded excerpt after
+public redaction. The receipt is therefore visible in the next worker's
+`machineDiagnoses` just like compliant steering instead of being withheld as a
+machinery retry. A diagnosis rejection cannot erase useful failure evidence or
+weaken the public grammar.
 
 The pass then writes its continuation event even when nothing merged, and
 even when the diagnosis lane itself faulted: a transient adapter failure must

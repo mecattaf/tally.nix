@@ -1353,6 +1353,47 @@ function bounded(value, limit) {
   return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
+const FORBID_PATHS_FAILURE =
+  /forbidPaths gate \S+ rejected \d+ changed path\(s\): "((?:[^"\\]|\\.)*)"/;
+
+function gateEvidenceForFailure(failure) {
+  const lastGate = failure.gateOutputs.length
+    ? failure.gateOutputs[failure.gateOutputs.length - 1]
+    : null;
+  if (lastGate === null) {
+    return null;
+  }
+  return {
+    id: lastGate.gateId,
+    detail: bounded(
+      lastGate.node && lastGate.node.error ? lastGate.node.error : lastGate.node,
+      2000
+    )
+  };
+}
+
+function diagnosisLiteralSubstringRule(gateEvidence) {
+  const rule =
+    " Public diagnosis grammar requirement: a diagnosis for a failing gate " +
+    "MUST contain the failing check id and, when named by the gate, the " +
+    "offending path as literal substrings; paraphrases do not count.";
+  if (gateEvidence === null) {
+    return `${rule} This failure has no failing-gate literal to copy.`;
+  }
+  const matched = FORBID_PATHS_FAILURE.exec(gateEvidence.detail);
+  if (matched === null) {
+    return (
+      `${rule} For this failure, copy the exact failing check id ` +
+      `${JSON.stringify(gateEvidence.id)} unchanged into the diagnosis.`
+    );
+  }
+  return (
+    `${rule} For this failure, copy both exact strings unchanged into the ` +
+    `diagnosis: failing check id ${JSON.stringify(gateEvidence.id)}; ` +
+    `offending path ${JSON.stringify(matched[1])}.`
+  );
+}
+
 function failureReport(task, stage, node) {
   return {
     taskId: task.id,
@@ -2660,6 +2701,12 @@ function sweepDeferral(sweepNode) {
         diff = captured.result;
       }
       const previousDiagnoses = machineDiagnoses(reconciliation, task.id);
+      // The validator below requires literal gate evidence, so derive the
+      // exact same evidence before the model runs and put its required strings
+      // in the model's mission. A rule disclosed only to the validator turns
+      // correct paraphrases into silent steering loss.
+      const gateEvidence = gateEvidenceForFailure(failure);
+      const literalSubstringRule = diagnosisLiteralSubstringRule(gateEvidence);
       const diagnosisBrief = {
         schemaVersion: 1,
         role: "diagnosis",
@@ -2669,11 +2716,13 @@ function sweepDeferral(sweepNode) {
         // an unjudgeable pass is aborted for the same reason but is not the
         // same event, and asking a model to explain paths that were never
         // named would be asking it to invent them.
-        mission: failure.ungated
-          ? `Task ${task.id} could not be judged by the tree-delta permission gate and its lane is being aborted, not retried: its agent node failed, so the ownership node never ran and certified no paths, and the task declares no conflictDomains, leaving no allowlist to judge its worktree against. No out-of-allowlist change has been established. Return a concise record of what the failing attempt was doing, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
-          : failure.breach
-          ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise record of what the out-of-allowlist change(s) were and why they likely happened, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
-          : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Begin with one outcome-first sentence whose first word is a past-tense verb, end it with a period or colon before any list, use no exclamation marks, and stay under 12,000 characters. Conforming example: “Observed the Codex session exit after its tool router rejected the command.” Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
+        mission: (
+          failure.ungated
+            ? `Task ${task.id} could not be judged by the tree-delta permission gate and its lane is being aborted, not retried: its agent node failed, so the ownership node never ran and certified no paths, and the task declares no conflictDomains, leaving no allowlist to judge its worktree against. No out-of-allowlist change has been established. Return a concise record of what the failing attempt was doing, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
+            : failure.breach
+            ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise record of what the out-of-allowlist change(s) were and why they likely happened, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
+            : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Begin with one outcome-first sentence whose first word is a past-tense verb, end it with a period or colon before any list, use no exclamation marks, and stay under 12,000 characters. Conforming example: “Observed the Codex session exit after its tool router rejected the command.” Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
+        ) + literalSubstringRule,
         campaign: {
           name: effective.campaign,
           repository: codeRepository,
@@ -2730,23 +2779,6 @@ function sweepDeferral(sweepNode) {
       }
       const diagnosed = await job(diagnosisSpec, { settle: false });
       const attempt = previousDiagnoses.length + 1;
-      // #385: when the failure carries gate evidence, the steering note's
-      // validator requires the diagnosis name the failing check (and the
-      // offending path, for a forbidPaths rejection) rather than describe
-      // the failure in the abstract. The failing gate is always the last
-      // entry recorded before the task's own gate loop returned.
-      const lastGate = failure.gateOutputs.length
-        ? failure.gateOutputs[failure.gateOutputs.length - 1]
-        : null;
-      const gateEvidence = lastGate
-        ? {
-            id: lastGate.gateId,
-            detail: bounded(
-              lastGate.node && lastGate.node.error ? lastGate.node.error : lastGate.node,
-              2000
-            )
-          }
-        : null;
       // #386: a breach carries its own deterministic evidence -- the paths
       // the tree-delta gate named in its own failure -- straight into the
       // posted receipt, so the offending paths are witnessed regardless of
