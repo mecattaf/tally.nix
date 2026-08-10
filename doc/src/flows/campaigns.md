@@ -744,6 +744,18 @@ publication policy has been deliberately reviewed. These settings belong to the
 campaign's mention producer, which is now the only producer a campaign renders;
 the continuation carries no publication policy because it publishes nothing.
 
+Checkpoint output retention is separate from publication. Every checkpoint
+attempt, green or red, unconditionally snapshots the final 8 KiB of stdout and
+the final 8 KiB of raw stderr into
+`<stateDir>/capture/archive/<taskUuid>.<taskId>/checkpoint.json`. A retry or
+steering receipt names that local path, and the terminal escalation collects
+the checkpoint paths from its accumulated receipts. The retry includes roughly
+the last ten stderr lines only when both `postFailureEvidence` and
+`postFailureStderr` are enabled; those lines pass through the same
+`conservative-v2` public redaction as other failure stderr. With either switch
+off, the local path remains visible but no checkpoint output is copied into the
+comment.
+
 Every gate sets an `id`, an explicit `kind`, and the fields for that kind:
 `kind = "command"` requires `preflightArgv` and `argv`, while `kind =
 "forbidPaths"` requires `forbidPaths`. Gate commands are direct argv, not shell
@@ -857,11 +869,12 @@ which of the two timers won the race. `campaigns.<name>` refuses the reserved
 name `continuation` for the same reason: `campaigns.continuation` would render
 `producers.campaign-continuation` as a `gh` producer and replace the entry.
 
-The name is also why the campaign layer declares `${stateDir}/events` in the
-`spec-build-driver` adapter's `extraWritablePaths`. The continue node writes
-that file directly, which is a hard write dependency the compatibility default
-(no hardening preset) leaves unconstrained but `strict` or `production` would
-otherwise refuse.
+The name is also why the campaign layer declares `${stateDir}/events` and
+`${stateDir}/capture/archive` in the `spec-build-driver` adapter's
+`extraWritablePaths`. The continue node writes the former and checkpoint
+recording writes the latter. Those are hard write dependencies the
+compatibility default (no hardening preset) leaves unconstrained but `strict`
+or `production` would otherwise refuse.
 
 The producer posts its receipt and witnessed evidence. Under the degraded
 projection, each merge and passed checkpoint repairs its own worklist checkbox
@@ -1418,6 +1431,7 @@ serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
 parallel(checkpoint frontier, after this pass's merges):
   prepare isolated worktree -> run checkpoint argv
+    -> retain bounded stdout/stderr for this attempt under capture/archive
     -> record content-and-exact-base-bound completion ref
 parallel(machinery faults with retry budget left): marked retry comment
 parallel(remaining failed tasks): capture diff -> diagnosis agent
@@ -1454,11 +1468,17 @@ implementation work, and unrelated outstanding work still defers its verdict.
 
 A checkpoint prepares the exact current remote base in its own worktree and
 runs its argv as an ordinary settled `campaign-control` node with `exit:0`
-evidence, the declared deadline, and the checkpoint's `taskRef`. On success the
-driver verifies that `HEAD` is still the prepared base, no tracked file changed,
-and the prepared base still belongs to the current remote-base ancestry. It
-then publishes an immutable receipt for the exact revision that was tested,
-plus a progress comment where the degraded projection is in force. If the
+evidence, the declared deadline, and the checkpoint's `taskRef`. After every
+terminal verdict, a deterministic recording node copies bounded stdout and
+stderr tails into that attempt's private `capture/archive` directory before
+lane cleanup. These `checkpoint.json` files use the ordinary
+`captureArchiveHorizon` (30 days by default), so the existing `tally-retention`
+timer prunes them with the other per-attempt captures; see the
+[retention policy](../operating/retention.md). On success the driver verifies
+that `HEAD` is still the prepared base, no tracked file changed, and the
+prepared base still belongs to the current remote-base ancestry. It then
+publishes an immutable receipt for the exact revision that was tested, plus a
+progress comment where the degraded projection is in force. If the
 remote base advanced during validation, the receipt is still published — it
 remains truthful historical evidence and nothing will re-test that revision —
 but the lane then fails, because the receipt names a revision the next
@@ -1890,7 +1910,8 @@ never bricks the campaign.
 Escalation is a state transition, not the first failure: it occurs only when the
 worklist is incomplete and the recomputed unblocked frontier is empty. The
 driver posts one marked escalation containing compact summaries of all machine
-diagnoses and never posts it again for that campaign issue. Start investigation
+diagnoses, plus every checkpoint capture path retained in those diagnoses and
+machinery retries, and never posts it again for that campaign issue. Start investigation
 with `tally query run <runner-task-uuid>`, adding `--status blocked` on a large
 worklist: its task table identifies the blocked campaign task and failed stage,
 and its failure section carries the retained capture path — reading

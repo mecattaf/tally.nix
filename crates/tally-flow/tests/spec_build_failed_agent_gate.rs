@@ -261,6 +261,7 @@ fn args() -> Value {
             "eventsDir": "/srv/spec/events"
         },
         "workspaceRoot": "/srv/spec/worktrees",
+        "captureRoot": "/srv/spec/state/capture/archive",
         "tally": "/nix/store/tally/bin/tally",
         "driver": "/nix/store/driver/spec_build_driver.py",
         "driverRuntimeMaxSec": 900

@@ -16,6 +16,7 @@ let
   configPath = "/etc/tally/config.json";
   socketPath = "/run/tally/tally.sock";
   eventsDir = "${toString cfg.stateDir}/events";
+  captureArchiveDir = "${toString cfg.stateDir}/capture/archive";
   daemonArgv = [
     "${cfg.package}/bin/tally"
     "--config"
@@ -398,6 +399,7 @@ in
             (toString cfg.dataDir)
             (toString cfg.stateDir)
             eventsDir
+            captureArchiveDir
           ]}
           ${lib.escapeShellArgs [
             "${pkgs.coreutils}/bin/chown"
@@ -453,10 +455,8 @@ in
           StateDirectoryMode = "0700";
           LogsDirectory = "tally";
           LogsDirectoryMode = "0700";
-          # The events directory is created here, not lazily by the first
-          # ingress write: a job whose adapter names it in extraWritablePaths
-          # cannot start at all while it is missing, and the campaign
-          # continuation payload is written into it by name.
+          # Adapter write grants must exist before a hardened transient job
+          # starts, so create both campaign-owned state paths up front.
           ExecStartPre = lib.escapeShellArgs [
             "${pkgs.coreutils}/bin/install"
             "-d"
@@ -465,6 +465,7 @@ in
             (toString cfg.dataDir)
             (toString cfg.stateDir)
             eventsDir
+            captureArchiveDir
           ];
           ExecStart = daemonWrapper;
           CPUWeight = 100;

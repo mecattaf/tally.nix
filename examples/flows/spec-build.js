@@ -117,6 +117,7 @@ export const meta = {
       "worklist",
       "continuation",
       "workspaceRoot",
+      "captureRoot",
       "tally",
       "driver",
       "driverRuntimeMaxSec"
@@ -325,9 +326,14 @@ export const meta = {
         additionalProperties: false
       },
       workspaceRoot: { type: "string", pattern: "^/" },
+      // Bounded checkpoint attempt snapshots join the executor's existing
+      // per-attempt archive and therefore inherit its retention horizon.
+      captureRoot: { type: "string", pattern: "^/.*/capture/archive$" },
       tally: { type: "string", pattern: "^/" },
       driver: { type: "string", pattern: "^/" },
       driverRuntimeMaxSec: { type: "integer", minimum: 1 },
+      postFailureEvidence: { type: "boolean" },
+      postFailureStderr: { type: "boolean" },
       steering: {
         type: "array",
         maxItems: 1000,
@@ -1034,13 +1040,25 @@ const cleanupSchema = {
 
 const checkpointCompletionSchema = {
   type: "object",
-  required: ["taskId", "ref", "revision"],
+  required: [
+    "taskId",
+    "passed",
+    "ref",
+    "revision",
+    "capturePath",
+    "stdoutTruncated",
+    "stderrTruncated"
+  ],
   properties: {
     taskId: taskIdSchema,
+    passed: { type: "boolean" },
     // New receipts land in the hidden state namespace; already-published
     // visible tag receipts stay honored.
-    ref: { type: "string", pattern: "^refs/(tags/)?tally/spec-build/v1/" },
-    revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
+    ref: { type: ["string", "null"], pattern: "^refs/(tags/)?tally/spec-build/v1/" },
+    revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    capturePath: { type: "string", pattern: "^/" },
+    stdoutTruncated: { type: "boolean" },
+    stderrTruncated: { type: "boolean" }
   },
   additionalProperties: false
 };
@@ -1954,6 +1972,8 @@ function sweepDeferral(sweepNode) {
         mergeMethod: args.mergeMethod || "squash",
         gitAiBinding: args.gitAiBinding || "off",
         gitAiAwaitSec: args.gitAiAwaitSec || 60,
+        postFailureEvidence: args.postFailureEvidence === true,
+        postFailureStderr: args.postFailureStderr === true,
         agent: diagnosisSandboxed(args.agent),
         steward: args.steward || null,
         gates: args.gates
@@ -2006,7 +2026,15 @@ function sweepDeferral(sweepNode) {
   );
   const reconciliation = reconciliationNode.result;
   if (forgeNative) {
-    effective = reconciliation.config;
+    effective = {
+      ...reconciliation.config,
+      // Forge-native campaigns carry no public-failure publication grant.
+      // Absence is the conservative default; a future forge-native surface
+      // must add an explicit admitted switch before excerpts can leave local
+      // state.
+      postFailureEvidence: false,
+      postFailureStderr: false
+    };
   }
   if (!effective || !effective.repositoryConfig) {
     const error = new Error(`campaign repository ${codeRepository} is not configured`);
@@ -2231,21 +2259,14 @@ function sweepDeferral(sweepNode) {
       const gateOutputs = [
         { phase: "checkpoint", gateId: task.id, kind: "checkpoint", node: checkpoint }
       ];
-      if (checkpoint.verdict !== "pass") {
-        return {
-          task,
-          prepared: prepared.result,
-          failure: taskFailure(
-            task,
-            "checkpoint",
-            checkpoint,
-            taskBrief,
-            gateOutputs,
-            prepared.result,
-            prepared.result.baseRev
-          )
-        };
-      }
+      // Record every terminal attempt, red or green. The command node's raw
+      // files are private executor state; this deterministic node snapshots
+      // their final 8 KiB into capture/archive before cleanup removes the lane.
+      const execution = {
+        taskUuid: checkpoint.taskUuid,
+        verdict: checkpoint.verdict,
+        exitCode: checkpoint.exitCode === undefined ? null : checkpoint.exitCode
+      };
       const recorded = await driverNode(
         "checkpoint",
         withCapabilities(
@@ -2259,16 +2280,20 @@ function sweepDeferral(sweepNode) {
                   task,
                   source: reconciliation.source,
                   baseRevision: reconciliation.baseRevision,
-                  workspace: prepared.result
+                  workspace: prepared.result,
+                  captureRoot: args.captureRoot,
+                  execution
                 }
-              : {
+                : {
                   campaign: effective.campaign,
                   repository: codeRepository,
                   repositoryConfig,
                   issue: args.issue,
                   task,
                   source: reconciliation.source,
-                  workspace: prepared.result
+                  workspace: prepared.result,
+                  captureRoot: args.captureRoot,
+                  execution
                 }
           )
         ),
@@ -2293,6 +2318,38 @@ function sweepDeferral(sweepNode) {
             prepared.result.baseRev
           )
         };
+      }
+      const checkpointWithCapture = {
+        ...checkpoint,
+        capturePath: recorded.result.capturePath
+      };
+      if (checkpoint.verdict !== "pass") {
+        return {
+          task,
+          prepared: prepared.result,
+          failure: taskFailure(
+            task,
+            "checkpoint",
+            checkpointWithCapture,
+            taskBrief,
+            [
+              {
+                phase: "checkpoint",
+                gateId: task.id,
+                kind: "checkpoint",
+                node: checkpointWithCapture
+              }
+            ],
+            prepared.result,
+            prepared.result.baseRev
+          )
+        };
+      }
+      if (!recorded.result.passed || recorded.result.ref === null) {
+        const error = new Error("a passing checkpoint produced no completion ref");
+        error.name = "SpecBuildInvariantError";
+        error.code = "checkpoint-completion-missing";
+        throw error;
       }
       return { task, prepared: prepared.result, checkpoint: recorded.result };
     }
@@ -2820,6 +2877,17 @@ function sweepDeferral(sweepNode) {
           1500
         )
       }));
+      if (
+        task.kind === "checkpoint" &&
+        failure.node &&
+        typeof failure.node.capturePath === "string"
+      ) {
+        retryBrief.checkpointCapture = {
+          path: failure.node.capturePath,
+          postFailureEvidence: effective.postFailureEvidence,
+          postFailureStderr: effective.postFailureStderr
+        };
+      }
       const retryThread = taskThread(task);
       if (retryThread !== null) {
         retryBrief.taskIssue = retryThread;
@@ -2995,6 +3063,17 @@ function sweepDeferral(sweepNode) {
             }
           : {})
       }));
+      if (
+        task.kind === "checkpoint" &&
+        failure.node &&
+        typeof failure.node.capturePath === "string"
+      ) {
+        steerBrief.checkpointCapture = {
+          path: failure.node.capturePath,
+          postFailureEvidence: effective.postFailureEvidence,
+          postFailureStderr: effective.postFailureStderr
+        };
+      }
       const steerThread = taskThread(task);
       if (steerThread !== null) {
         steerBrief.taskIssue = steerThread;

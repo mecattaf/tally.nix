@@ -2862,6 +2862,9 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                         "eventsDir": continuation_events
                     },
                     "workspaceRoot": workspace_root,
+                    "captureRoot": daemon_paths.state_dir.join("capture/archive"),
+                    "postFailureEvidence": false,
+                    "postFailureStderr": false,
                     "tally": env!("CARGO_BIN_EXE_tally"),
                     "driver": driver,
                     "driverRuntimeMaxSec": 30,
@@ -3681,7 +3684,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let fourth_submitted = runner_events(&fourth, "node-submitted");
             // #386: `tree-delta-task-4` and `tree-delta-task-6` are new nodes
             // now that both tasks' ownership passes and each reaches the gate.
-            assert_eq!(fourth_submitted.len(), 31);
+            // A red checkpoint also snapshots its output before cleanup.
+            assert_eq!(fourth_submitted.len(), 32);
             assert!(fourth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
@@ -3690,8 +3694,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/phase-one-checkpoint")
                     .count(),
-                3,
-                "a deferred checkpoint prepares, runs, and cleans up without steering"
+                4,
+                "a deferred checkpoint prepares, runs, records, and cleans up without steering"
             );
             assert_eq!(
                 fourth_submitted
@@ -3720,8 +3724,11 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert!(fourth_submitted
                 .iter()
                 .any(|event| event["label"] == "checkpoint-phase-one-checkpoint"));
+            assert!(fourth_submitted
+                .iter()
+                .any(|event| event["label"] == "checkpoint-record-phase-one-checkpoint"));
 
-            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 31).await;
+            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 32).await;
             let failed_checkpoint = fourth_items
                 .iter()
                 .find(|item| {
@@ -4017,7 +4024,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(replayed.len(), 1);
             assert_eq!(replayed[0]["label"], "spec-build-sweep");
             assert_eq!(replayed[0]["disposition"], "reused");
-            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 31);
+            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 32);
 
             let seventh = runner(
                 &config_path,

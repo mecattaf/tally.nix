@@ -1469,6 +1469,9 @@ async fn dispatch_campaign(
         "allowedActors": &registration.allowed_actors,
         "capabilities": {"subIssueWalk": registration.sub_issue_walk},
         "workspaceRoot": &registration.workspace_root,
+        // Checkpoint snapshots join the executor's existing archive so the
+        // ordinary captureArchiveHorizon sweep owns their lifecycle.
+        "captureRoot": host.state_dir.join("capture/archive"),
         "tally": &executable,
         "driver": &registration.driver,
         "driverRuntimeMaxSec": manifest.driver_runtime_max_sec,
