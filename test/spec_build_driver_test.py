@@ -1045,6 +1045,54 @@ class GitHubForgeTests(unittest.TestCase):
                 self.assertIn("Campaign closed at frontier quiescence", summary_body)
                 self.assertIn("Spec-build escalation", escalation_body)
 
+    def test_pre_post_refresh_refuses_quiescence_after_the_frontier_reopens(self) -> None:
+        """A terminal decision may not publish from its earlier empty-frontier read."""
+        brief = {
+            "campaign": "fixture",
+            "repository": "acme/spec",
+            "repositoryConfig": {
+                "checkout": "/tmp/fixture",
+                "baseBranch": "main",
+                "remote": "origin",
+                "forge": "github",
+            },
+            "issue": issue(),
+            "worklist": "specs/*/tasks.json",
+            "maxTasks": 1,
+            "maxParallel": 1,
+        }
+        empty_frontier = {
+            "complete": False,
+            "quiescent": True,
+            "escalation": None,
+            "diagnoses": [{"taskId": "task-1"}],
+            "retries": [],
+        }
+        reopened_frontier = {
+            "complete": False,
+            "quiescent": False,
+            "escalation": None,
+            "frontier": [task("task-1")],
+        }
+        with (
+            mock.patch.object(
+                DRIVER,
+                "action_reconcile",
+                side_effect=[empty_frontier, reopened_frontier],
+            ) as reconcile,
+            mock.patch.object(DRIVER, "publish_closing_summary") as publish,
+            mock.patch.object(DRIVER, "run") as run,
+        ):
+            with self.assertRaisesRegex(
+                DRIVER.DriverError,
+                "pre-post durable refresh.*refusing to post outcome=quiescent",
+            ):
+                DRIVER.action_escalate(brief)
+
+        self.assertEqual(reconcile.call_count, 2)
+        publish.assert_not_called()
+        run.assert_not_called()
+
     def test_steering_escalation_and_the_closing_summary_are_always_fresh(self) -> None:
         """§9.1.3 holds a line: receipts upsert silently, these three never do.
 

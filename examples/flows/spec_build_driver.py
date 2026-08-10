@@ -5105,6 +5105,27 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
             "diagnosisCount": len(reconciliation["diagnoses"]),
             "retryCount": len(reconciliation["retries"]),
         }
+    # The pass that selected this node and the eligibility check above both
+    # observed an empty frontier, but a merge or checkpoint can settle while
+    # this terminal action is preparing its writes. Re-read every durable fact
+    # once more at the publication boundary. A stale quiescent digest is worse
+    # than a failed node: the marked escalation would make every later pass
+    # believe the campaign had stopped even though work was now dispatchable.
+    refreshed = action_reconcile(capability_brief)
+    if refreshed["complete"] or not refreshed["quiescent"]:
+        fail(
+            "campaign quiescence changed during the pre-post durable refresh; "
+            "refusing to post outcome=quiescent"
+        )
+    if refreshed["escalation"] is not None:
+        return {
+            "posted": False,
+            "comment": refreshed["escalation"],
+            "summary": None,
+            "diagnosisCount": len(refreshed["diagnoses"]),
+            "retryCount": len(refreshed["retries"]),
+        }
+    reconciliation = refreshed
     campaign = required_string(reconciliation.get("campaign"), "campaign")
     issue = campaign_issue(data.get("issue"))
     config_value = (
