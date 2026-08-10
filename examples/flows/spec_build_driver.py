@@ -2651,6 +2651,29 @@ def pull_request_marker(
     )
 
 
+def pull_request_marker_revisions(
+    body: str, campaign: str, issue_number: str, task_id: str
+) -> list[str | None]:
+    """Every exact marker revision this body carries for one campaign task.
+
+    A re-stamp may reason from an older marker only after the candidate has
+    come through the task's own sub-issue walk. Parsing the revision here lets
+    the ordinary completion validator derive the matching historical branch;
+    the marker itself still proves nothing.
+    """
+    revisions: list[str | None] = []
+    legacy = pull_request_marker(campaign, issue_number, task_id)
+    if legacy in body:
+        revisions.append(None)
+    prefix = (
+        "<!-- tally:spec-build:v2 "
+        f"campaign={campaign} issue={issue_number} task={task_id} revision="
+    )
+    pattern = re.compile(re.escape(prefix) + r"(sha256:[0-9a-f]{64}) -->")
+    revisions.extend(match.group(1) for match in pattern.finditer(body))
+    return list(dict.fromkeys(revisions))
+
+
 def checkpoint_identity(
     campaign: str, task_id: str, source_sha256: str, base_rev: str
 ) -> str:
@@ -2986,8 +3009,9 @@ def merged_github_tasks(
     base_rev: str | None,
     tasks: list[dict[str, Any]],
     walk: dict[int, dict[str, Any]] | None = None,
-) -> tuple[list[dict[str, str]], list[str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
     facts: list[dict[str, str]] = []
+    restamps: list[dict[str, str]] = []
     warnings: list[str] = []
     claimed_urls: set[str] = set()
     markers = {
@@ -3024,8 +3048,9 @@ def merged_github_tasks(
         return "json:" + json.dumps(candidate, sort_keys=True, default=str)
 
     def validated_candidate(
-        candidate: dict[str, Any], task_id: str, branch: str
+        candidate: dict[str, Any], task_id: str, revision: str | None
     ) -> tuple[dict[str, str] | None, str | None]:
+        branch = stable_publish_branch(campaign, issue_number, task_id, revision)
         url_value = candidate.get("url")
         url = url_value if isinstance(url_value, str) and url_value else "unidentifiable PR"
         problems: list[str] = []
@@ -3071,16 +3096,15 @@ def merged_github_tasks(
             "taskId": task_id,
             "pullRequest": url_value,
             "mergeCommit": oid,
-            **({"revision": revisions[task_id]} if revisions[task_id] is not None else {}),
+            **({"revision": revision} if revision is not None else {}),
         }, None
 
     for task in tasks:
         if task["kind"] != "implementation":
             continue
         marker = markers[task["id"]]
-        branch = stable_publish_branch(
-            campaign, issue_number, task["id"], task_revision(task)
-        )
+        revision = revisions[task["id"]]
+        branch = stable_publish_branch(campaign, issue_number, task["id"], revision)
         if walk is None:
             candidates = pull_requests_by_head(repository, branch, "closed", 20)
         else:
@@ -3097,33 +3121,72 @@ def merged_github_tasks(
         ]
 
         valid: list[dict[str, str]] = []
+        stale_valid: list[dict[str, str]] = []
         seen_candidates: set[str] = set()
         for candidate in candidates:
             key = candidate_key(candidate)
             if key in seen_candidates:
                 continue
             seen_candidates.add(key)
-            if not isinstance(candidate.get("body"), str) or marker not in candidate["body"]:
+            body = candidate.get("body")
+            if not isinstance(body, str):
                 warning = unnamed_marker_warning(candidate)
                 if warning is not None:
                     warnings.append(warning)
                 continue
-            fact, warning = validated_candidate(candidate, task["id"], branch)
+            if marker in body:
+                fact, warning = validated_candidate(candidate, task["id"], revision)
+                if warning is not None:
+                    warnings.append(warning)
+                if fact is not None:
+                    valid.append(fact)
+                continue
+
+            # Only the native task-thread walk exposes a bounded history whose
+            # relationship to this task is forge-authenticated. A global or
+            # branch-scoped search is not widened to find re-stamp evidence.
+            # Each historical marker is put through the exact same
+            # repository/base/head/merge-commit validator as a current one;
+            # the only changed input is the revision used to derive its head.
+            stale_revisions = (
+                [
+                    candidate_revision
+                    for candidate_revision in pull_request_marker_revisions(
+                        body, campaign, issue_number, task["id"]
+                    )
+                    if candidate_revision != revision
+                ]
+                if walk is not None and revision is not None
+                else []
+            )
+            if stale_revisions:
+                for candidate_revision in stale_revisions:
+                    fact, warning = validated_candidate(
+                        candidate, task["id"], candidate_revision
+                    )
+                    if warning is not None:
+                        warnings.append(warning)
+                    if fact is not None:
+                        stale_valid.append(fact)
+                continue
+            warning = unnamed_marker_warning(candidate)
             if warning is not None:
                 warnings.append(warning)
-            if fact is not None:
-                valid.append(fact)
         if len(valid) > 1:
             fail(f"multiple merged pull requests claim campaign task {task['id']!r}")
-        if not valid:
+        # The walk requests `first:`, so its candidate order is oldest first.
+        # Repeated task edits may leave several valid historical facts; use the
+        # newest one as the source without pretending any of them completes the
+        # current revision.
+        fact = valid[0] if valid else (stale_valid[-1] if stale_valid else None)
+        if fact is None:
             continue
-        fact = valid[0]
         url = fact["pullRequest"]
         if url in claimed_urls:
             fail(f"merged pull request {url} claims more than one campaign task")
         claimed_urls.add(url)
-        facts.append(fact)
-    return facts, list(dict.fromkeys(warnings))
+        (facts if valid else restamps).append(fact)
+    return facts, restamps, list(dict.fromkeys(warnings))
 
 
 def stable_publish_branch(
@@ -3783,11 +3846,11 @@ def closed_by_this_campaign(node: dict[str, Any], prefixes: tuple[str, ...]) -> 
     """Did this campaign's own merged pull request close the sub-issue?
 
     A task PR carries `Closes #<sub-issue>`, so the campaign closes its own
-    sub-issues as it merges. When a later graph edit rotates every task
-    revision, those merged pull requests stop proving anything — but the
-    closure they caused is still the campaign's, not a human's. The marker
-    prefix is revision-blind on purpose: it answers "did we do this?", which is
-    exactly the question the anomaly must not get wrong.
+    sub-issues as it merges. When this task or global execution policy later
+    changes its revision, that merged pull request stops completing the current
+    task — but the closure it caused is still the campaign's, not a human's.
+    The marker prefix is revision-blind on purpose: it answers "did we do
+    this?", which is exactly the question the anomaly must not get wrong.
     """
     for candidate in node["pullRequests"]:
         body = candidate.get("body")
@@ -3810,13 +3873,11 @@ def closed_subissue_anomalies(
     oracle. The task remains incomplete and the closure is surfaced rather than
     filed as a reconciler warning nobody reads.
 
-    A closure the campaign caused itself is not that signal. Editing one task
-    brief and re-arming rotates every task's revision, so every already-merged
-    task simultaneously loses its proof and keeps a sub-issue the campaign
-    closed. Reporting those as operator error would fire the loudest surface in
-    the status verb on the campaign's own documented workflow, once per merged
-    task, exactly when the board most needs to stay readable. Those pull
-    requests are already named in the reconciler's ignored-marker warnings.
+    A closure the campaign caused itself is not that signal. An older valid
+    task revision leaves the sub-issue closed while the current revision waits
+    for its deterministic re-stamp. Reporting that as operator error would
+    fire the loudest surface on the campaign's own documented workflow exactly
+    when the board most needs to stay readable.
     """
     anomalies: list[dict[str, Any]] = []
     for task in tasks:
@@ -3924,7 +3985,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     walk = None if walked is None else walked[0]
     walk_warnings = [] if walked is None else walked[1]
     if config["forge"] == "github":
-        merged, warnings = merged_github_tasks(
+        merged, restamps, warnings = merged_github_tasks(
             code["repository"],
             code["config"],
             campaign,
@@ -3943,6 +4004,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             base_rev,
             worklist["tasks"],
         )
+        restamps = []
         warnings = []
     checkpoints = completed_checkpoint_tasks(
         code["config"],
@@ -3953,8 +4015,8 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         merged,
         base_rev,
     )
-    merged_ids = {fact["taskId"] for fact in merged}
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
+    restamp_ids = {fact["taskId"] for fact in restamps}
     task_ids = {task["id"] for task in worklist["tasks"]}
     anomalies = (
         closed_subissue_anomalies(
@@ -3992,7 +4054,9 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     direct_blocked = {
         diagnosis["taskId"]
         for diagnosis in diagnoses
-        if diagnosis["attempt"] == 2 and diagnosis["taskId"] not in completed_ids
+        if diagnosis["attempt"] == 2
+        and diagnosis["taskId"] not in completed_ids
+        and diagnosis["taskId"] not in restamp_ids
     }
     blocked_by: dict[str, set[str]] = {}
     blocked: list[dict[str, Any]] = []
@@ -4044,6 +4108,11 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "baseRevision": base_rev,
         "tasks": worklist["tasks"],
         "merged": merged,
+        # A prior revision's merge remains evidence only for this deterministic
+        # marker lane. It is deliberately absent from `completed_ids`: current
+        # dependencies do not advance until the new revision's own pull
+        # request comes back through the ordinary completion oracle.
+        "restamps": restamps,
         "checkpoints": checkpoints,
         "remaining": [task["id"] for task in remaining],
         "frontier": frontier,
@@ -6215,6 +6284,129 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         "branch": branch,
         "publishBranch": publish_branch,
         "worktreePath": str(worktree),
+    }
+
+
+def action_restamp(brief: dict[str, Any]) -> dict[str, Any]:
+    """Create the empty commit that carries a new completion marker.
+
+    The source fact is selected by `merged_github_tasks`, through the ordinary
+    merged-PR validator. This node rechecks the git half of that fact against
+    the prepared lane before it acts. It changes no tree content; ownership,
+    tree-delta, configured gates, publication, rebase, and merge remain the
+    same nodes a substantive implementation traverses.
+    """
+    data = object_exact(brief, {"task", "completion", "workspace"}, "restamp brief")
+    task = data.get("task")
+    if not isinstance(task, dict):
+        fail("restamp task must be an object")
+    task_id = required_string(task.get("id"), "restamp task.id")
+    if not TASK_ID.fullmatch(task_id):
+        fail("restamp task.id is not safe")
+    revision = task_revision(task)
+    if revision is None:
+        fail("restamp task must carry a revision")
+
+    completion = object_exact(
+        data.get("completion"),
+        {"taskId", "pullRequest", "mergeCommit", "revision"},
+        "restamp completion",
+    )
+    if (
+        required_string(completion.get("taskId"), "restamp completion.taskId")
+        != task_id
+    ):
+        fail("restamp completion.taskId does not match task.id")
+    pull_request = required_string(
+        completion.get("pullRequest"), "restamp completion.pullRequest", 2_000
+    )
+    merge_commit = full_git_oid(
+        completion.get("mergeCommit"), "restamp completion.mergeCommit"
+    )
+    source_revision = completion.get("revision")
+    if source_revision is not None:
+        source_revision = required_string(
+            source_revision, "restamp completion.revision"
+        )
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_revision):
+            fail("restamp completion.revision must be a lowercase SHA-256 identity")
+        if source_revision == revision:
+            fail("restamp completion already names the current task revision")
+
+    workspace = object_exact(
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "restamp workspace",
+    )
+    if required_string(workspace.get("taskId"), "restamp workspace.taskId") != task_id:
+        fail("restamp workspace.taskId does not match task.id")
+    base_rev = full_git_oid(workspace.get("baseRev"), "restamp workspace.baseRev")
+    branch = required_string(workspace.get("branch"), "restamp workspace.branch")
+    required_string(workspace.get("publishBranch"), "restamp workspace.publishBranch")
+    worktree = Path(
+        required_string(workspace.get("worktreePath"), "restamp workspace.worktreePath")
+    )
+    if not worktree.is_absolute() or not worktree.is_dir():
+        fail("restamp workspace.worktreePath must be an absolute existing directory")
+    git(worktree, "rev-parse", "--git-dir")
+    if git(worktree, "branch", "--show-current").stdout.strip() != branch:
+        fail("restamp worktree is not on its prepared branch")
+    if git(worktree, "status", "--porcelain").stdout:
+        fail("restamp worktree carries uncommitted changes")
+    if git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        merge_commit,
+        base_rev,
+        check=False,
+    ).returncode:
+        fail("restamp completion merge commit is outside the prepared base")
+
+    head = git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+    if git(
+        worktree, "merge-base", "--is-ancestor", base_rev, head, check=False
+    ).returncode:
+        fail("restamp lane head is not descended from its prepared base")
+    touched = changed_paths_in_history(worktree, base_rev, head, include_deletions=True)
+    if touched:
+        fail("restamp lane history changes repository content")
+    if head == base_rev:
+        message = (
+            "chore(campaign): re-stamp completion\n\n"
+            f"Task: {task_id}\n"
+            f"Task-revision: {revision}\n"
+            f"Source-merge: {merge_commit}\n"
+        )
+        git(
+            worktree,
+            "-c",
+            "user.name=tally spec-build",
+            "-c",
+            "user.email=tally-spec-build@invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--no-verify",
+            "--file",
+            "-",
+            input_text=message,
+        )
+        head = git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+    if git(
+        worktree, "diff", "--quiet", base_rev, head, "--", check=False
+    ).returncode != 0:
+        fail("restamp commit changes repository content")
+    return {
+        "taskId": task_id,
+        "head": head,
+        "revision": revision,
+        "completion": {
+            "taskId": task_id,
+            "pullRequest": pull_request,
+            "mergeCommit": merge_commit,
+            **({"revision": source_revision} if source_revision is not None else {}),
+        },
     }
 
 
@@ -8640,6 +8832,7 @@ def main() -> int:
             "continue",
             "preflight",
             "prep",
+            "restamp",
             "cleanup",
             "ownership",
             "treeDelta",
@@ -8664,6 +8857,7 @@ def main() -> int:
         "continue": action_continue,
         "preflight": action_preflight,
         "prep": action_prep,
+        "restamp": action_restamp,
         "ownership": action_ownership,
         "treeDelta": action_tree_delta,
         "constraint": action_constraint,

@@ -6,6 +6,21 @@ authorized.
 
 ## [Unreleased]
 
+### Agent-free completion re-stamping (#459)
+
+- A prior-revision pull request reached through a task's native sub-issue walk
+  can now seed a deterministic marker re-stamp, but only after the ordinary
+  completion oracle validates its exact historical marker and stable branch,
+  merged state, code repository and base, full merge commit, and ancestry.
+- Re-stamp facts remain separate from current completion. Fresh lanes create
+  one empty commit and retain ownership, tree-delta, configured gates,
+  publication, rebase, and merge while skipping steering re-check,
+  implementation-agent dispatch, steward narration, and invented authorship.
+- The shipped per-task revision isolation is already effective: unrelated task
+  edits and capacity or scheduler changes leave existing task revisions and
+  their completion proofs intact, so no cross-digest carry-forward change was
+  needed.
+
 ### Checkpoint attempt captures (#457)
 
 - Every campaign checkpoint attempt now retains the final 8 KiB of stdout and
@@ -3605,9 +3620,10 @@ the `(task, attempt, leaseEpoch)`.
   prepare.
 - Fixed the campaign anomaly surface firing on the campaign's own work. A task
   pull request carries `Closes #<sub-issue>`, so the campaign closes its own
-  sub-issues as it merges; editing one task brief and re-arming rotates every
-  task's revision, so every already-merged task simultaneously lost its proof
-  and kept a sub-issue the campaign had closed. Each of those was reported as a
+  sub-issues as it merges; under the former graph-wide completion identity,
+  editing one task brief and re-arming rotated every task's revision, so every
+  already-merged task simultaneously lost its proof and kept a sub-issue the
+  campaign had closed. Each of those was reported as a
   `closed-without-merged-proof` anomaly asserting that a human had closed it,
   and `tally query run` pinned the run in `needs-attention` — one false alarm
   per merged task, on the campaign's own documented edit-and-re-arm workflow,

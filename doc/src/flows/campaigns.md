@@ -207,7 +207,8 @@ brief or dependencies, or changing global execution policy, cannot reuse the
 old PR as proof. Adding or editing an unrelated task, changing capacity, or
 changing scheduler fields leaves existing task revisions intact, so one graph
 edit invalidates only the affected completion proofs instead of redispatching
-the whole campaign.
+the whole campaign. This is the shipped identity on both sides of the
+Rust/Python admission parity boundary, not an aspirational projection rule.
 
 ### The sub-issue walk, and what a closed sub-issue does not prove
 
@@ -235,14 +236,36 @@ The probe answer is recorded once and never revisited, so re-arm to re-probe.
 
 The walk narrows **where** completion candidates come from; it never widens
 **what** counts as proof. A pull request reached through a task's sub-issue
-still completes that task only if its body carries the exact revision-bound
-marker for the admitted graph and it passes the same base branch, stable head
-branch, merge-commit and ancestry validation as before. A pull request from a
-pre-edit graph is named in the pass warnings and counts for nothing. It must not
+still completes that task only if its body carries the exact current
+revision-bound marker and it passes the same code repository, base branch,
+stable head branch, merge-commit and ancestry validation as before. It must not
 narrow proof either: a sub-issue that links more closing pull requests than one
 page returns fails the pass outright rather than reading completion from a
 truncated page whose newest reference — the likeliest current proof — is the one
 dropped.
+
+An older revision's pull request never completes the current revision. The
+native walk may expose it as a separate **re-stamp source**, but only if the
+ordinary completion validator accepts it at the revision it actually names:
+the exact historical marker and its derived stable head must match, the pull
+request must be merged into the configured base in the code repository, and
+its full merge-commit oid must be contained in the witnessed base. This is the
+same proof with a historical revision as input, reached through the narrower
+task-sub-issue surface. The degraded branch-scoped lookup does not search for
+older revisions, and an unmerged pull request, a wrong head or base, a foreign
+repository, a missing merge commit, or a commit outside the witnessed base
+admits no re-stamp.
+
+The reconciler reports those sources under `restamps`, not `merged`. The task
+therefore remains incomplete and its dependants remain blocked. Its lane then
+mints one deterministic empty commit when fresh (or verifies that resumed lane
+history remains content-empty) and rejoins the ordinary ownership, tree-delta,
+configured-gate, publication, rebase, and merge path. It skips the task-thread
+steering re-check, implementation agent, and steward narration; the template
+supplies the marker pull request text and no `Assisted-by:` trailer is invented.
+The pull request keeps the `[marker]` title prefix. Only a later reconcile that
+reads that merged pull request back with the exact current marker completes the
+task.
 
 A sub-issue is human-clickable, so its closure carries no authority at all.
 `pullRequest.merged` remains the only oracle. When the walk finds a sub-issue
@@ -255,13 +278,13 @@ warnings, because a reader who misses one debugs the wrong surface.
 
 A closure the campaign caused itself is not that signal and is never reported as
 one. A task pull request carries `Closes #<sub-issue>`, so the campaign closes
-its own sub-issues as it merges; editing one task brief and re-arming then
-rotates *every* task's revision, so every already-merged task simultaneously
-loses its proof and keeps a sub-issue the campaign closed. Those pull requests
-are named in the ignored-marker warnings, where they belong. The discriminator
-is the marker prefix, read revision-blind: a sub-issue closed by a merged pull
-request carrying this campaign's marker at any revision was closed by the
-campaign, and a hand closure has no such pull request.
+its own sub-issue as it merges. Editing that task or global execution policy
+may rotate its revision while the sub-issue stays closed; a valid historical
+pull request then becomes the re-stamp source above, without becoming current
+completion. The discriminator is the marker prefix, read revision-blind: a
+sub-issue closed by a merged pull request carrying this campaign's marker at
+any revision was closed by the campaign, and a hand closure has no such pull
+request.
 
 ### Per-task steering threads
 

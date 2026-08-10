@@ -25,7 +25,9 @@ use tally_flow::{
 const SOURCE: &str = include_str!("../../../examples/flows/spec-build.js");
 const TASK_ID: &str = "build";
 const REV: &str = "0123456789abcdef0123456789abcdef01234567";
+const RESTAMP_HEAD: &str = "1111111111111111111111111111111111111111";
 const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const OLD_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 #[derive(Clone)]
 struct Reply {
@@ -277,6 +279,7 @@ fn reconcile_result(task: Value) -> Value {
         "baseRevision": REV,
         "tasks": [task.clone()],
         "merged": [],
+        "restamps": [],
         "checkpoints": [],
         "remaining": [TASK_ID],
         "frontier": [task],
@@ -371,6 +374,142 @@ fn replies(task: Value, tree_delta: Reply) -> BTreeMap<String, Reply> {
             "blocked": true,
             "posted": true,
             "redacted": false
+        })),
+    );
+    replies.insert(
+        "spec-build-continue".to_owned(),
+        Reply::passed(json!({
+            "event": "/srv/spec/events/continuation.json",
+            "dedupKey": "campaign:acme/spec:7:run-424",
+            "runId": "continuation-run-424",
+            "created": true,
+            "receipt": null
+        })),
+    );
+    replies.insert(
+        format!("cleanup-{TASK_ID}"),
+        Reply::passed(json!({"taskId": TASK_ID, "cleaned": true})),
+    );
+    replies
+}
+
+/// One successful deterministic re-stamp lane. An unscripted submission is a
+/// test panic, so deliberately omitting every agent label is the executable
+/// assertion that the flow never tries to dispatch one.
+fn restamp_replies(task: Value) -> BTreeMap<String, Reply> {
+    let completion = json!({
+        "taskId": TASK_ID,
+        "pullRequest": "https://github.com/acme/spec/pull/8",
+        "mergeCommit": REV,
+        "revision": OLD_DIGEST
+    });
+    let ownership = json!({
+        "taskId": TASK_ID,
+        "domainsRequired": false,
+        "ownedPaths": [],
+        "baseRev": REV,
+        "head": RESTAMP_HEAD
+    });
+    let narration = json!({
+        "source": "template",
+        "subject": "chore(campaign): re-stamp completion",
+        "body": ""
+    });
+    let mut reconciled = reconcile_result(task.clone());
+    reconciled["restamps"] = json!([completion.clone()]);
+
+    let mut replies = BTreeMap::new();
+    replies.insert(
+        "spec-build-sweep".to_owned(),
+        Reply::passed(json!({
+            "currentRunHash": "0123456789ab",
+            "blockingJobs": [],
+            "cleaned": [],
+            "liveRuns": [],
+            "warnings": []
+        })),
+    );
+    replies.insert("spec-build-reconcile".to_owned(), Reply::passed(reconciled));
+    replies.insert(
+        format!("prep-{TASK_ID}"),
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "baseRev": REV,
+            "branch": "tally-work/fixture/build",
+            "publishBranch": "tally/fixture-issue-7/build-0123456789abcdef",
+            "worktreePath": "/srv/spec/worktrees/build"
+        })),
+    );
+    replies.insert(
+        format!("restamp-{TASK_ID}"),
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "head": RESTAMP_HEAD,
+            "revision": DIGEST,
+            "completion": completion
+        })),
+    );
+    replies.insert(
+        format!("ownership-{TASK_ID}"),
+        Reply::passed(ownership.clone()),
+    );
+    replies.insert(
+        format!("tree-delta-{TASK_ID}"),
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "checkedPaths": 0,
+            "allowlistBasis": "owned-paths-fallback",
+            "allowlist": [],
+            "ownershipRan": true
+        })),
+    );
+    replies.insert(
+        format!("gate-{TASK_ID}-no-db"),
+        Reply::passed(json!({
+            "gateId": "no-db",
+            "kind": "forbidPaths",
+            "patterns": ["*.db"],
+            "checkedPaths": 0,
+            "baseRev": REV,
+            "head": RESTAMP_HEAD
+        })),
+    );
+    replies.insert(
+        format!("publish-{TASK_ID}"),
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "branch": "tally/fixture-issue-7/build-0123456789abcdef",
+            "head": RESTAMP_HEAD,
+            "pullRequest": "https://github.com/acme/spec/pull/9",
+            "narration": narration.clone(),
+            "narrationAttempts": [],
+            "ownership": ownership.clone()
+        })),
+    );
+    replies.insert(
+        format!("rebase-{TASK_ID}"),
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "baseRev": REV,
+            "branch": "tally/fixture-issue-7/build-0123456789abcdef",
+            "head": RESTAMP_HEAD,
+            "pullRequest": "https://github.com/acme/spec/pull/9",
+            "narration": narration,
+            "regate": false,
+            "ownership": ownership.clone()
+        })),
+    );
+    replies.insert(
+        format!("merge-{TASK_ID}"),
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "head": RESTAMP_HEAD,
+            "mergeCommit": "2222222222222222222222222222222222222222",
+            "pullRequest": "https://github.com/acme/spec/pull/9",
+            "regated": false,
+            "ownership": ownership,
+            "authorship": null,
+            "trailer": null
         })),
     );
     replies.insert(
@@ -586,6 +725,45 @@ fn both_implementation_arms_preserve_an_omitted_conflict_domain_case() {
     assert_keyless_task_reaches_ungated_gate("forge-native issueTaskSchema", issue_task(None));
 }
 
+/// #459 tier 2. A historical fact admitted by the completion oracle takes the
+/// deterministic restamp node and rejoins the ordinary proof pipeline at
+/// ownership. It never submits steering, implementation, diagnosis, or
+/// narration agents.
+fn a_restamp_lane_never_dispatches_an_agent_case() {
+    let client = TestClient::new(restamp_replies(issue_task(None)));
+    let report = run(client.clone()).expect("the deterministic marker lane completes");
+    let labels = client.labels();
+    assert!(
+        client.submitted(&format!("restamp-{TASK_ID}")),
+        "{labels:?}"
+    );
+    assert!(
+        client.submitted(&format!("ownership-{TASK_ID}")),
+        "{labels:?}"
+    );
+    assert!(client.submitted(&format!("merge-{TASK_ID}")), "{labels:?}");
+    for forbidden in [
+        format!("steering-recheck-{TASK_ID}"),
+        format!("agent-{TASK_ID}"),
+        format!("diagnose-{TASK_ID}"),
+        format!("steer-{TASK_ID}"),
+    ] {
+        assert!(
+            !client.submitted(&forbidden),
+            "an agent-free restamp submitted {forbidden}: {labels:?}"
+        );
+    }
+    let publish = client.brief(&format!("publish-{TASK_ID}"));
+    assert_eq!(
+        publish["steward"],
+        Value::Null,
+        "the publish node must use deterministic narration: {publish}"
+    );
+    let merge = client.brief(&format!("merge-{TASK_ID}"));
+    assert_eq!(merge["assistedBy"], Value::Null, "{merge}");
+    assert_eq!(report.final_value.as_ref().unwrap()["state"], "advanced");
+}
+
 #[test]
 fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate() {
     on_flow_test_stack(a_failed_agent_pass_still_dispatches_the_tree_delta_gate_case);
@@ -599,4 +777,9 @@ fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure() {
 #[test]
 fn both_implementation_arms_preserve_an_omitted_conflict_domain() {
     on_flow_test_stack(both_implementation_arms_preserve_an_omitted_conflict_domain_case);
+}
+
+#[test]
+fn a_restamp_lane_never_dispatches_an_agent() {
+    on_flow_test_stack(a_restamp_lane_never_dispatches_an_agent_case);
 }
