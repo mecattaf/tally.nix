@@ -6,6 +6,14 @@ authorized.
 
 ## [Unreleased]
 
+### Document per-task revision isolation (#490)
+
+- Campaign documentation now enumerates the exact completion-revision field
+  set and explains why capacity, scheduler, and sibling-task edits preserve an
+  existing proof.
+- The August 10 campaign learnings now identify `bfc080a` as the change that
+  replaced the measured whole-graph rotation with per-task isolation.
+
 ### Serialized linked-worktree preparation (#494)
 
 - Fresh campaign lane cuts now hold a per-checkout file lock in Git's common

@@ -200,15 +200,25 @@ Where it does not, the driver recomputes the boxes at every reconcile from
 revision-bound merged pull requests and content-bound checkpoint refs, and a
 merge repairs its own box. Under either projection, closing a task issue or
 manually checking a box cannot complete a task. A GitHub task PR includes
-`Closes #<sub-issue>`. Completion identity includes that task's admitted
-reference and issue content plus the campaign's execution policy (checkout,
-agent, steward, gates, merge method, and git-ai policy). Editing that task's
-brief or dependencies, or changing global execution policy, cannot reuse the
-old PR as proof. Adding or editing an unrelated task, changing capacity, or
-changing scheduler fields leaves existing task revisions intact, so one graph
-edit invalidates only the affected completion proofs instead of redispatching
-the whole campaign. This is the shipped identity on both sides of the
-Rust/Python admission parity boundary, not an aspirational projection rule.
+`Closes #<sub-issue>`. The authoritative completion-identity contract is
+`task_completion_revision` in `crates/tally-core/src/campaign_contract.rs`;
+the Python driver mirrors it. Its revision-bearing members are
+`contractVersion`, `campaign`, `repository`, `mergeMethod`, `gitAiBinding`,
+`gitAiAwaitSec`, `agent`, `steward`, `gates`, `task`, and `content`. `task`
+contains `id`, `kind`, `issue`, `dependencies`, and `conflictDomains`; a
+checkpoint task also contains `argv` and `runtimeMaxSec`. `content` contains
+`number`, `title`, and `body`. Editing any of those inputs cannot reuse the old
+PR as proof.
+
+The contract deliberately excludes `maxTasks`, `maxParallel`, the
+campaign-level `runtimeMaxSec`, `pool`, all scheduler fields, and all sibling
+tasks. Capacity and scheduling decide when and where admitted work runs, while
+sibling fields describe other work; none changes this task's admitted content
+or the validation policy its completion proved. Those edits therefore leave
+existing task revisions intact, so one graph edit invalidates only the affected
+completion proofs instead of redispatching the whole campaign. This is the
+shipped identity on both sides of the Rust/Python admission parity boundary,
+not an aspirational projection rule.
 
 ### The sub-issue walk, and what a closed sub-issue does not prove
 
