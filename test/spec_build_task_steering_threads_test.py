@@ -184,9 +184,11 @@ class FlowWiringTests(unittest.TestCase):
         source = FLOW_SOURCE.read_text(encoding="utf-8")
         lane = source.index("const laneFor = task =>")
         prepared = source.index('"prep",', lane)
+        forge_native_guard = source.index("if (task.brief)", prepared)
         recheck = source.index('"steeringRecheck",', prepared)
         dispatch = source.index("const agent = await job(agentSpec", recheck)
         self.assertLess(prepared, recheck)
+        self.assertLess(forge_native_guard, recheck)
         self.assertLess(recheck, dispatch)
         self.assertIn("attemptReceipt: attemptSteering.receipt", source)
 

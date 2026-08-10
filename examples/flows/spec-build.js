@@ -2298,58 +2298,63 @@ function sweepDeferral(sweepNode) {
     }
 
     const prepSteering = preparedSteering(task);
-    const recheckBrief = withCapabilities({
-      campaign: effective.campaign,
-      repository: codeRepository,
-      repositoryConfig,
-      issue: args.issue,
-      taskId: task.id,
-      allowedActors: args.allowedActors,
-      preparedComments: prepSteering.authorizedComments
-    });
-    const recheckThread = taskThread(task);
-    if (recheckThread !== null) {
-      recheckBrief.taskIssue = recheckThread;
-    }
-    // The task thread is read once after lane preparation and immediately
-    // before adapter admission. This is the only mutable-forge window in an
-    // otherwise immutable attempt brief.
-    const recheckedSteering = await driverNode(
-      "steeringRecheck",
-      recheckBrief,
-      `steering-recheck-${task.id}`,
-      `steering-recheck-${task.id}`,
-      steeringRecheckSchema,
-      null,
-      true,
-      taskRef
-    );
-    if (!nodePassed(recheckedSteering)) {
-      const taskBrief = implementationBrief(
-        task,
-        prepared.result,
-        reconciliation,
-        prepSteering
+    let attemptSteering = prepSteering;
+    if (task.brief) {
+      const recheckBrief = withCapabilities({
+        campaign: effective.campaign,
+        repository: codeRepository,
+        repositoryConfig,
+        issue: args.issue,
+        taskId: task.id,
+        allowedActors: args.allowedActors,
+        preparedComments: prepSteering.authorizedComments
+      });
+      const recheckThread = taskThread(task);
+      if (recheckThread !== null) {
+        recheckBrief.taskIssue = recheckThread;
+      }
+      // The task thread is read once after lane preparation and immediately
+      // before adapter admission. This is the only mutable-forge window in an
+      // otherwise immutable attempt brief. Module-declared tasks keep their
+      // historical agent-owned GitHub channel and carry no local allowlist.
+      const recheckedSteering = await driverNode(
+        "steeringRecheck",
+        recheckBrief,
+        `steering-recheck-${task.id}`,
+        `steering-recheck-${task.id}`,
+        steeringRecheckSchema,
+        null,
+        true,
+        taskRef
       );
-      return {
-        task,
-        prepared: prepared.result,
-        failure: taskFailure(
+      if (!nodePassed(recheckedSteering)) {
+        const taskBrief = implementationBrief(
           task,
-          "steering:recheck",
-          recheckedSteering,
-          taskBrief,
-          [],
           prepared.result,
-          prepared.result.baseRev
-        )
-      };
+          reconciliation,
+          prepSteering
+        );
+        return {
+          task,
+          prepared: prepared.result,
+          failure: taskFailure(
+            task,
+            "steering:recheck",
+            recheckedSteering,
+            taskBrief,
+            [],
+            prepared.result,
+            prepared.result.baseRev
+          )
+        };
+      }
+      attemptSteering = recheckedSteering.result;
     }
     const taskBrief = implementationBrief(
       task,
       prepared.result,
       reconciliation,
-      recheckedSteering.result
+      attemptSteering
     );
     const agentSpec = applyAgentPolicies({
       argv: effective.agent.argv,
