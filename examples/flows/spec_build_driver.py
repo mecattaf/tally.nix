@@ -1968,9 +1968,15 @@ def read_capture_tail(path: Path) -> tuple[str, bool]:
     text = captured.decode("utf-8", errors="replace").replace("\0", "�")
     encoded = text.encode("utf-8")
     additionally_truncated = False
-    while len(encoded) > CHECKPOINT_CAPTURE_MAX_BYTES and text:
-        text = text[1:]
-        encoded = text.encode("utf-8")
+    if len(encoded) > CHECKPOINT_CAPTURE_MAX_BYTES:
+        encoded = encoded[-CHECKPOINT_CAPTURE_MAX_BYTES:]
+        prefix = 0
+        while (
+            prefix < len(encoded)
+            and encoded[prefix] & 0b1100_0000 == 0b1000_0000
+        ):
+            prefix += 1
+        text = encoded[prefix:].decode("utf-8")
         additionally_truncated = True
     return text, bool(start) or additionally_truncated
 
@@ -2039,7 +2045,7 @@ def persist_checkpoint_capture(
         parsed_uuid = uuid.UUID(task_uuid)
     except ValueError:
         fail("checkpoint execution.taskUuid must be a UUID")
-    if str(parsed_uuid) != task_uuid.lower():
+    if str(parsed_uuid) != task_uuid:
         fail("checkpoint execution.taskUuid must be a canonical UUID")
     verdict = required_string(execution.get("verdict"), "checkpoint execution.verdict")
     if verdict not in {
@@ -2131,9 +2137,15 @@ def read_checkpoint_capture(path: Path, campaign: str, task_id: str) -> dict[str
         or capture.get("taskId") != task_id
     ):
         fail("checkpoint capture identity does not match the machine receipt")
-    stderr = capture.get("stderr")
-    if not isinstance(stderr, str) or len(stderr.encode("utf-8")) > CHECKPOINT_CAPTURE_MAX_BYTES:
-        fail("checkpoint capture stderr exceeds its 8 KiB bound")
+    for stream in ("stdout", "stderr"):
+        content = capture.get(stream)
+        if (
+            not isinstance(content, str)
+            or len(content.encode("utf-8")) > CHECKPOINT_CAPTURE_MAX_BYTES
+        ):
+            fail(f"checkpoint capture {stream} exceeds its 8 KiB bound")
+    required_bool(capture.get("stdoutTruncated"), "checkpoint capture stdoutTruncated")
+    required_bool(capture.get("stderrTruncated"), "checkpoint capture stderrTruncated")
     return capture
 
 

@@ -358,6 +358,7 @@ class CheckpointReceiptTests(unittest.TestCase):
             )
             path = Path(recorded["capturePath"])
             paths.append(path)
+            self.assertEqual(path.parent.parent, self.root / "state/capture/archive")
             self.assertFalse(recorded["passed"])
             self.assertIsNone(recorded["ref"])
             self.assertTrue(recorded["stdoutTruncated"])
@@ -380,6 +381,29 @@ class CheckpointReceiptTests(unittest.TestCase):
 
         self.assertNotEqual(paths[0], paths[1])
         self.assertTrue(paths[0].is_file(), "a later attempt must retain the first capture")
+
+    def test_passing_checkpoint_persists_capture_and_completion_ref(self) -> None:
+        recorded = driver.action_checkpoint(
+            self.captured_checkpoint_brief(
+                "00000000-0000-4000-8000-000000000004",
+                stdout=b"checkpoint passed\n",
+                stderr=b"",
+                verdict="pass",
+                exit_code=0,
+            )
+        )
+
+        self.assertTrue(recorded["passed"])
+        self.assertIsNotNone(recorded["ref"])
+        capture = json.loads(
+            Path(recorded["capturePath"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(capture["stdout"], "checkpoint passed\n")
+        self.assertEqual(capture["stderr"], "")
+        self.assertEqual(
+            git("ls-remote", "origin", recorded["ref"], cwd=self.checkout).split()[0],
+            self.base_rev,
+        )
 
     def test_retry_withholds_stderr_by_default_and_redacts_last_ten_lines_when_enabled(
         self,

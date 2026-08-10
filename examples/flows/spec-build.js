@@ -2032,8 +2032,8 @@ function sweepDeferral(sweepNode) {
       // Absence is the conservative default; a future forge-native surface
       // must add an explicit admitted switch before excerpts can leave local
       // state.
-      postFailureEvidence: args.postFailureEvidence === true,
-      postFailureStderr: args.postFailureStderr === true
+      postFailureEvidence: false,
+      postFailureStderr: false
     };
   }
   if (!effective || !effective.repositoryConfig) {
