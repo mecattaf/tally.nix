@@ -4008,6 +4008,16 @@ mod tests {
 
     #[test]
     fn project_shape_is_validated_before_projection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
         let document = json!({
             "schemaVersion": 1,
             "tasks": [
@@ -4016,8 +4026,7 @@ mod tests {
             ]
         });
         let mut config = manifest_value_for_test(json!([]));
-        config["repository"]["checkout"] =
-            json!(fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap());
+        config["repository"]["checkout"] = json!(fs::canonicalize(&checkout).unwrap());
         config.as_object_mut().unwrap().remove("tasks");
         config
             .as_object_mut()
