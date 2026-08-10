@@ -354,6 +354,17 @@ explicit value to the sidecar, treats `null` as the absent/default
 representation, and rewrites the authority record. No other unknown authority
 member is admitted by that migration.
 
+The canonical graph used to interpret a later amendment is likewise outside
+the frozen authority object. Each successful arm writes a closed schema-1,
+digest-verified snapshot under
+`$XDG_STATE_HOME/tally/campaigns/approved-graphs/<issue-scope>/<arm-serial>.graph-v1.json`
+before publishing the matching authority generation. The path is generation
+scoped, so an interruption can leave an unreferenced future snapshot but can
+never make the current authority read a graph from another arm. A successful
+publication prunes older graph generations; disarm and closed-issue pruning
+remove the issue's snapshot directory. Missing snapshots on registrations from
+an older tally remain readable and simply cannot prove a dependency addition.
+
 Each successful arm also owns the exact flow and driver it admitted. Ownership
 lives under
 `$XDG_STATE_HOME/tally/campaigns/assets/<registration-id>/<arm-serial>/`, outside
@@ -398,6 +409,24 @@ whose reason is `rearm-required` and which names both the approved and live
 digests. Forge, registry, validation, and dispatch failures remain under
 `failures` and return nonzero.
 
+Re-arm also interprets one deliberately narrow amendment as structural
+steering. Tally compares the newly admitted graph with the prior arm's
+canonical graph. If a task is still escalated and this amendment added at least
+one dependency to that same task, `arm` pardons only that task's diagnosis and
+machinery-retry counters. Adding a dependency to a task that is not escalated,
+or changing any other field of an escalated task, does not pardon anything.
+Each pardon uses the ordinary marked resume receipt with a task scope, reason,
+requesting actor, and stable GitHub comment URL. The arm JSON records it under
+`autoPardons` with the task ID, added dependencies, and `resumeReceipt`.
+
+An escalated task that gained no dependency remains untouched. The arm JSON's
+`warnings` names it explicitly as `task X remains escalated; run tally campaign
+resume to unblock`. One amendment may therefore pardon the tasks it addresses
+while retaining the counters and shared escalation for every task it does not.
+A registration created before canonical graph snapshots existed has no trusted
+baseline for its first re-arm: tally cannot infer that a dependency was added,
+so it pardons nothing and emits the same warning for each active escalation.
+
 An escalated GitHub campaign has one non-destructive recovery verb:
 
 ```console
@@ -416,6 +445,16 @@ dispatch; once that write succeeds, the periodic poller can recover an
 interrupted dispatch without deleting comments or hand-editing state. `resume`
 is limited to `repository.forge=github`; the explicitly test-only local forge
 has no GitHub comment boundary.
+
+The public manual verb remains a campaign-wide pardon. An automatic re-arm
+pardon uses the same marker, heading, reason, actor attribution, and stable
+comment-ID boundary, with `tasks=...` added to the marker. Diagnosis and retry
+receipts at or before that boundary are ignored only for the named tasks. A
+campaign-wide escalation is pardoned only when those scoped boundaries cover
+every task whose two diagnosis receipts produced it; otherwise the escalation
+stays live for the unaddressed task. Scoped receipts therefore preserve the
+same append-only audit history without turning one amended task into a silent
+global budget reset.
 
 The default ad-hoc `workspaceRoot` is
 `$XDG_CACHE_HOME/tally/campaigns/workspaces` (or
@@ -1434,7 +1473,10 @@ frontier = first maxParallel ready nodes with disjoint implementation
   conflictDomains, deferred checkpoints considered last
 
 if remaining is nonempty and frontier is empty:
-  -> post the one marked escalation with accumulated diagnoses -> exit
+  -> re-read durable merge, checkpoint, receipt, and steering facts
+  -> recompute remaining, blocked, ready, and frontier
+  -> if complete or frontier is nonempty: refuse outcome=quiescent; a later pass continues
+  -> otherwise post the one marked escalation with accumulated diagnoses -> exit
 if implemented is empty, an implementation is in the frontier, and command gates exist:
   prepare an isolated worktree at current remote main
   -> run every command gate.preflightArgv (gating) on the pristine base
@@ -1932,7 +1974,10 @@ never bricks the campaign.
 
 Escalation is a state transition, not the first failure: it occurs only when the
 worklist is incomplete and the recomputed unblocked frontier is empty. The
-driver posts one marked escalation containing compact summaries of all machine
+terminal action re-reads all durable facts immediately before publication and
+refuses to post `outcome=quiescent` if that refresh completes the campaign or
+reopens any frontier. Only a still-empty refreshed frontier reaches the one
+marked escalation containing compact summaries of all machine
 diagnoses, plus every checkpoint capture path retained in those diagnoses and
 machinery retries, and never posts it again for that campaign issue. Start investigation
 with `tally query run <runner-task-uuid>`, adding `--status blocked` on a large

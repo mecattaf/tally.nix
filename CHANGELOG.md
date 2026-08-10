@@ -6,6 +6,18 @@ authorized.
 
 ## [Unreleased]
 
+### Campaign quiescence and amendment pardons (#456)
+
+- Quiescent campaign actions now re-read durable merge, checkpoint, and
+  machine-receipt facts immediately before publishing their terminal outcome;
+  a completed or newly dispatchable frontier aborts the stale escalation.
+- Re-arming a graph automatically pardons an escalated task only when that
+  amendment added a dependency to the same task. Each task-scoped pardon uses
+  the existing marked resume audit receipt and is reported in `autoPardons`.
+- Escalated tasks the amendment did not address retain their counters and the
+  shared escalation, and the arm receipt names each one with the manual
+  `tally campaign resume` recovery verb.
+
 ### Agent-free completion re-stamping (#459)
 
 - A prior-revision pull request reached through a task's native sub-issue walk
