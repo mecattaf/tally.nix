@@ -1303,6 +1303,11 @@ incomplete identity, which is what upgrading an estate across #312 over a live
 lane produces, is reported as incomplete and healed from the lane itself; it is
 never completed by inventing the missing fields.
 
+Parallel lane roots remain separate, but their linked-worktree records and refs
+share the checkout's Git common directory. Fresh lane creation therefore holds
+one per-common-directory file lock across `extensions.worktreeConfig` enablement
+and `git worktree add`, serializing only the shared metadata mutation.
+
 Resuming a lane means finding a recorded identity that matches; a lane whose
 branch outlived its worktree is re-adopted with its work, and a foreign
 identity at a lane path is a refusal, never a clobber. **A lane's prepared base

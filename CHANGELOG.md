@@ -6,6 +6,16 @@ authorized.
 
 ## [Unreleased]
 
+### Serialized linked-worktree preparation (#494)
+
+- Fresh campaign lane cuts now hold a per-checkout file lock in Git's common
+  directory while enabling worktree configuration and invoking
+  `git worktree add`, preventing parallel preparations from corrupting shared
+  metadata.
+- The spec-build fixture now reports a task-4 base mismatch explicitly when
+  task-1's checkpoint is absent, and the contribution guide records that
+  `flow_live` races are outside #419's `tally-core --lib` probe population.
+
 ### Nix formatting (#495)
 
 - Wrapped the capture-archive assertion in `flake.nix` to restore the

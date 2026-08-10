@@ -63,6 +63,9 @@ failing — every increment to that population so far had an unrelated cause, an
 tracked how hard anyone looked. Measure it with `test/flake-probe.sh`, so successive waves are
 comparable:
 
+Races in `tally --test flow_live` are tracked separately; that test binary is outside the
+`tally-core --lib` probe population.
+
 ```console
 $ nix develop --command test/flake-probe.sh 480 3
 ```
