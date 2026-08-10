@@ -1425,8 +1425,16 @@ implementation changes. Checkpoints are themselves executable validation nodes,
 not an additional operator-facing gate.
 
 Every worklist-specific node also carries the campaign-scoped reference
-`<campaign>/<task-id>` (for example `crm/customer-model`). It is additive
-provenance: the UUID remains the durable identity, while `taskRef` appears in
+`<campaign-identity>/<task-id>`. For a forge-native campaign, the identity is
+the durable `registrationId`, not the campaign's display name: for example,
+`0198f000-0000-7000-8000-000000000042/customer-model`, not
+`crm/customer-model`. `tally campaign list` prints each `registrationId` beside
+its issue URL and repository, and is the cross-walk from that prefix back to the
+campaign. `query.run` keeps the human-readable name in its separate `campaign`
+field while `tasks`, `currentNodes`, `failures`, and `anomalies` use the same
+registration-scoped refs. File-backed campaigns retain their configured
+campaign name as the identity prefix. The reference is additive provenance:
+the UUID remains the durable execution identity, while `taskRef` appears in
 node receipts, lifecycle and query output, `TALLY_TASK_REF`, unit names, and
 capture names. The worklist discovery node has no task ID and therefore no
 `taskRef`.
