@@ -4007,7 +4007,7 @@ mod tests {
     }
 
     #[test]
-    fn project_shape_is_validated_before_projection() {
+    fn project_shape_reports_the_configured_max_tasks_overflow() {
         let temporary = tempfile::tempdir().unwrap();
         let checkout = temporary.path().join("checkout");
         fs::create_dir(&checkout).unwrap();
@@ -4035,7 +4035,10 @@ mod tests {
         let error = validate_project_shape(&config, &project_tasks(&document).unwrap())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("manifest.maxTasks permits 1..=1"), "{error}");
+        assert_eq!(
+            error,
+            "campaign configuration cannot form a valid manifest: campaign contains 2 tasks but manifest maxTasks is 1 — raise \"maxTasks\" in the campaign manifest"
+        );
     }
 
     #[test]

@@ -369,8 +369,13 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
     }
     validate_gates(&manifest.gates)?;
     if manifest.tasks.is_empty() || manifest.tasks.len() > manifest.max_tasks {
+        let remedy = if manifest.tasks.is_empty() {
+            "add at least one task to the campaign manifest"
+        } else {
+            "raise \"maxTasks\" in the campaign manifest"
+        };
         return Err(invalid(format!(
-            "campaign contains {} tasks, but manifest.maxTasks permits 1..={}",
+            "campaign contains {} tasks but manifest maxTasks is {} — {remedy}",
             manifest.tasks.len(),
             manifest.max_tasks
         )));
