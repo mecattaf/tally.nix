@@ -392,6 +392,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
             "issue": {"number": "7", "url": "https://example.invalid/acme/board/7"},
             "workspace": {
                 "taskId": "task-1",
+                "baseRev": self.code_rev,
                 "publishBranch": driver.stable_publish_branch("fixture", "7", "task-1"),
             },
             "task": implementation_task("task-1", "one"),
@@ -406,7 +407,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
                     data,
                     driver.repo_config(self.code.config),
                     self.code.checkout,
-                    "a" * 40,
+                    self.code_rev,
                     {"source": "template", "subject": "task-1: Build", "body": ""},
                 )
         command = run.call_args_list[-1].args[0]
@@ -673,6 +674,7 @@ class SingleRepositoryControl(unittest.TestCase):
             "issue": {"number": "7", "url": "https://example.invalid/acme/solo/7"},
             "workspace": {
                 "taskId": "task-1",
+                "baseRev": self.base_rev,
                 "publishBranch": driver.stable_publish_branch("fixture", "7", "task-1"),
             },
             "task": implementation_task("task-1", "one"),
@@ -686,7 +688,7 @@ class SingleRepositoryControl(unittest.TestCase):
                     data,
                     driver.repo_config(self.repository.config),
                     self.repository.checkout,
-                    "a" * 40,
+                    self.base_rev,
                     {"source": "template", "subject": "task-1: Build", "body": ""},
                 )
         command = run.call_args_list[-1].args[0]
