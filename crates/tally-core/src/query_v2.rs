@@ -1409,6 +1409,16 @@ pub fn query_run(
                 .map(|task_ref| task_ref.campaign().to_owned())
                 .next()
         });
+    // A forge-native campaign's display name and task-ref prefix are different
+    // identities. The reconciler supplies the former, while durable node refs
+    // carry the registrationId prefix used at dispatch. Older file-backed runs
+    // use the campaign name for both, so keep that as the no-node fallback.
+    let task_ref_prefix = nodes
+        .iter()
+        .filter_map(|node| node.task_ref.as_ref())
+        .map(|task_ref| task_ref.campaign().to_owned())
+        .next()
+        .or_else(|| campaign.clone());
 
     let mut current_nodes = nodes
         .iter()
@@ -1510,7 +1520,9 @@ pub fn query_run(
     let mut pull_requests = BTreeMap::new();
     let mut done_ids = BTreeSet::new();
     let mut frontier_ids = BTreeSet::new();
-    if let (Some(reconciliation), Some(campaign)) = (reconciliation.as_ref(), campaign.as_deref()) {
+    if let (Some(reconciliation), Some(task_ref_prefix)) =
+        (reconciliation.as_ref(), task_ref_prefix.as_deref())
+    {
         for merged in &reconciliation.merged {
             done_ids.insert(merged.task_id.clone());
             pull_requests.insert(merged.task_id.clone(), merged.pull_request.clone());
@@ -1571,7 +1583,7 @@ pub fn query_run(
             })
             .collect::<BTreeMap<_, _>>();
         for task in &reconciliation.tasks {
-            let task_ref = TaskRef::new(format!("{campaign}/{}", task.id))
+            let task_ref = TaskRef::new(format!("{task_ref_prefix}/{}", task.id))
                 .map_err(|_| ObservabilityError::InvalidRunProjection(flow_run.to_owned()))?;
             let blocked_by = task
                 .dependencies
@@ -1618,7 +1630,7 @@ pub fn query_run(
             }
             anomalies.push(RunAnomalyProjection {
                 kind: anomaly.kind.clone(),
-                task_ref: TaskRef::new(format!("{campaign}/{}", anomaly.task_id))
+                task_ref: TaskRef::new(format!("{task_ref_prefix}/{}", anomaly.task_id))
                     .map_err(|_| ObservabilityError::InvalidRunProjection(flow_run.to_owned()))?,
                 issue: anomaly.issue.clone(),
                 url: anomaly.url.clone(),
@@ -3392,6 +3404,13 @@ mod tests {
     use crate::taskdb::EnqueueSource;
     use crate::witness::{build_record, Authorship, ChainHead, WitnessBody};
 
+    const FORGE_REGISTRATION_ID: &str = "0198f000-0000-7000-8000-000000000042";
+    const FORGE_TASK_T01: &str = "0198f000-0000-7000-8000-000000000042/t01";
+    const FORGE_TASK_T02: &str = "0198f000-0000-7000-8000-000000000042/t02";
+    const FORGE_TASK_T03: &str = "0198f000-0000-7000-8000-000000000042/t03";
+    const FORGE_TASK_T04: &str = "0198f000-0000-7000-8000-000000000042/t04";
+    const FORGE_TASK_T09: &str = "0198f000-0000-7000-8000-000000000042/t09";
+
     fn history() -> LifecycleSnapshot {
         LifecycleSnapshot {
             records: Vec::new(),
@@ -3569,7 +3588,7 @@ mod tests {
             flow_run,
             1,
             "agent-t02",
-            Some("crm/t02"),
+            Some(FORGE_TASK_T02),
         ));
         detail.runtime_max_sec = Some(60);
         detail
@@ -3950,7 +3969,7 @@ mod tests {
         let mut history = history();
         let mut started = lifecycle_record(1, TallyEvent::Started, 1, 7, &node.task_uuid);
         started.fields.task_uuid.clone_from(&node.task_uuid);
-        started.fields.task_ref = Some(TaskRef::new("crm/t02").unwrap());
+        started.fields.task_ref = Some(TaskRef::new(FORGE_TASK_T02).unwrap());
         started.observed_at = "2026-08-01T10:00:00.000Z".to_owned();
         history.records = vec![started];
         let live = LiveJobFact {
@@ -3975,6 +3994,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(view.flow_name.as_deref(), Some("spec-build"));
+        // The display name remains human-readable while every operational ref
+        // uses the forge registration identity carried by the live node.
         assert_eq!(view.campaign.as_deref(), Some("crm"));
         assert_eq!(view.repository.as_deref(), Some("mecattaf/tally.nix"));
         assert_eq!(view.state, RunState::Running);
@@ -4000,7 +4021,24 @@ mod tests {
             ]
         );
         assert_eq!(view.tasks[2].blocked_by, ["t02"]);
+        assert_eq!(view.tasks[0].task_ref.campaign(), FORGE_REGISTRATION_ID);
+        assert_eq!(
+            view.tasks
+                .iter()
+                .map(|task| task.task_ref.as_str())
+                .collect::<Vec<_>>(),
+            [
+                FORGE_TASK_T01,
+                FORGE_TASK_T02,
+                FORGE_TASK_T03,
+                FORGE_TASK_T04,
+            ]
+        );
         assert_eq!(view.current_nodes.len(), 1);
+        assert_eq!(
+            view.current_nodes[0].task_ref.as_ref().map(TaskRef::as_str),
+            Some(FORGE_TASK_T02)
+        );
         assert_eq!(view.current_nodes[0].label, "agent-t02");
         assert_eq!(view.current_nodes[0].elapsed_seconds, Some(12));
         assert_eq!(view.current_nodes[0].budget_remaining_seconds, Some(48));
@@ -4014,7 +4052,7 @@ mod tests {
         let mut history = history();
         let mut started = lifecycle_record(1, TallyEvent::Started, 1, 7, &node.task_uuid);
         started.fields.task_uuid.clone_from(&node.task_uuid);
-        started.fields.task_ref = Some(TaskRef::new("crm/t02").unwrap());
+        started.fields.task_ref = Some(TaskRef::new(FORGE_TASK_T02).unwrap());
         started.observed_at = "2026-08-01T10:00:00.000Z".to_owned();
         history.records = vec![started];
         let live = LiveJobFact {
@@ -4333,10 +4371,18 @@ mod tests {
             })
             .to_string(),
         );
+        let mut identity_node = flow_node_detail(flow_run, RowStatus::Completed);
+        identity_node.description = "agent-t01".to_owned();
+        identity_node.orchestration = Some(flow_orchestration(
+            flow_run,
+            1,
+            "agent-t01",
+            Some(FORGE_TASK_T01),
+        ));
 
         let view = query_run(
             flow_run,
-            &[reconciliation],
+            &[reconciliation, identity_node],
             &[],
             &history(),
             &[],
@@ -4349,7 +4395,8 @@ mod tests {
         // Closure completes nothing: the task stays off the done list and the
         // run reports that a human has to look.
         assert_eq!(view.anomalies.len(), 1);
-        assert_eq!(view.anomalies[0].task_ref.as_str(), "crm/t01");
+        assert_eq!(view.campaign.as_deref(), Some("crm"));
+        assert_eq!(view.anomalies[0].task_ref.as_str(), FORGE_TASK_T01);
         assert_eq!(view.anomalies[0].issue, "42");
         assert_eq!(view.state, RunState::NeedsAttention);
         assert_eq!(view.counts.done, 1);
@@ -4386,10 +4433,19 @@ mod tests {
             })
             .to_string(),
         );
+        let mut identity_node = flow_node_detail(flow_run, RowStatus::Completed);
+        identity_node.task_uuid = "00000000-0000-4000-8000-000000000253".to_owned();
+        identity_node.description = "agent-t09".to_owned();
+        identity_node.orchestration = Some(flow_orchestration(
+            flow_run,
+            10,
+            "agent-t09",
+            Some(FORGE_TASK_T09),
+        ));
 
         let view = query_run(
             flow_run,
-            &[stale, current],
+            &[stale, current, identity_node],
             &[],
             &history(),
             &[],
@@ -4402,7 +4458,7 @@ mod tests {
         assert_eq!(view.campaign.as_deref(), Some("current"));
         assert_eq!(view.repository.as_deref(), Some("mecattaf/current"));
         assert_eq!(view.tasks.len(), 1);
-        assert_eq!(view.tasks[0].task_ref.as_str(), "current/t09");
+        assert_eq!(view.tasks[0].task_ref.as_str(), FORGE_TASK_T09);
     }
 
     #[test]
@@ -4565,7 +4621,7 @@ mod tests {
         let node = flow_node_detail(flow_run, RowStatus::Completed);
         let mut failed = lifecycle_record(1, TallyEvent::Failed, 1, 7, &node.task_uuid);
         failed.fields.task_uuid.clone_from(&node.task_uuid);
-        failed.fields.task_ref = Some(TaskRef::new("crm/t02").unwrap());
+        failed.fields.task_ref = Some(TaskRef::new(FORGE_TASK_T02).unwrap());
         let witness = terminal_witness(
             &node.task_uuid,
             Verdict::Failed,
@@ -4591,7 +4647,7 @@ mod tests {
         assert_eq!(view.failures.len(), 1);
         assert_eq!(
             view.failures[0].task_ref.as_ref().unwrap().as_str(),
-            "crm/t02"
+            FORGE_TASK_T02
         );
         assert_eq!(view.failures[0].stage, "agent-t02");
         assert_eq!(
