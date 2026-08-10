@@ -6,6 +6,11 @@ authorized.
 
 ## [Unreleased]
 
+### Campaign admission diagnostics (#460)
+
+- Over-cap errors now report the actual task count and configured `maxTasks`, then direct the
+  operator to raise `maxTasks` in the campaign manifest.
+
 ### Bounded campaign recovery (#451, #452)
 
 - Rejected diagnosis prose no longer consumes a steering attempt. The driver
@@ -19,7 +24,7 @@ authorized.
 - Completion PR revisions are now task-local. Unrelated task and scheduler
   edits no longer rotate every merged proof; edits to the task itself or global
   execution policy still do. Marker-only pull requests gain a `[marker]` title
-  prefix, and `maxTasks` admission errors now name `manifest.maxTasks`.
+  prefix.
 - A Codex agent-stage failure whose captured stderr carries the tool-router
   signature is classified as bounded campaign machinery. The recorded bare
   Codex 0.147 probe completed after the same rejection, so no tally
