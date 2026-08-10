@@ -6,6 +6,11 @@ authorized.
 
 ## [Unreleased]
 
+### Require campaign-only merges (#489)
+
+- `main` changes now land only through witnessed tally campaign merges, with no
+  hand-merge exception.
+
 ### Document the campaign gate ladder (#488)
 
 - Campaign guidance now recommends the full cheap-fails-first Rust/Nix gate
