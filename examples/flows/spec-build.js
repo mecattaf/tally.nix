@@ -1183,8 +1183,9 @@ const diffSchema = {
 
 const steeringSchema = {
   type: "object",
-  required: ["taskId", "attempt", "comment", "blocked", "posted", "redacted"],
+  required: ["kind", "taskId", "attempt", "comment", "blocked", "posted", "redacted"],
   properties: {
+    kind: { enum: ["diagnosis", "retry"] },
     taskId: taskIdSchema,
     attempt: { type: "integer", minimum: 1, maximum: 2 },
     comment: { type: "string", minLength: 1 },
@@ -1403,6 +1404,19 @@ function machineDiagnoses(reconciliation, taskId) {
 // still outstanding is neither - its verdict is not yet meaningful.
 function failureClass(reconciliation, failure) {
   const stage = failure.stage;
+  // Bare codex 0.147 survives a tool-router rejection and finishes its JSONL
+  // turn. Older 0.145 sessions observed in #452 sometimes exited immediately
+  // after the same router ERROR. That is an adapter-session fault, not evidence
+  // about the task, so it spends the bounded machinery budget first.
+  if (
+    stage === "agent" &&
+    effective &&
+    effective.agent &&
+    effective.agent.adapter === "codex" &&
+    ((failure.node || {}).stderrExcerpt || "").includes("codex_core::tools::router")
+  ) {
+    return "machinery";
+  }
   // The whole deferred lane is unpriced, not just its checkpoint command. A
   // checkpoint lane fails at three stages -- `prep`, `checkpoint`, and
   // `checkpoint:record` -- and matching only the middle one left the other two
@@ -2659,7 +2673,7 @@ function sweepDeferral(sweepNode) {
           ? `Task ${task.id} could not be judged by the tree-delta permission gate and its lane is being aborted, not retried: its agent node failed, so the ownership node never ran and certified no paths, and the task declares no conflictDomains, leaving no allowlist to judge its worktree against. No out-of-allowlist change has been established. Return a concise record of what the failing attempt was doing, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
           : failure.breach
           ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise record of what the out-of-allowlist change(s) were and why they likely happened, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
-          : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
+          : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Begin with one outcome-first sentence whose first word is a past-tense verb, end it with a period or colon before any list, use no exclamation marks, and stay under 12,000 characters. Conforming example: “Observed the Codex session exit after its tool router rejected the command.” Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
         campaign: {
           name: effective.campaign,
           repository: codeRepository,
@@ -2780,9 +2794,11 @@ function sweepDeferral(sweepNode) {
     { settle: true }
   );
   const diagnosisFailure = diagnosisOutcomes.find(outcome => !outcome.ok);
-  const diagnoses = diagnosisOutcomes
+  const steeringResults = diagnosisOutcomes
     .filter(outcome => outcome.ok)
     .map(outcome => outcome.value);
+  const diagnoses = steeringResults.filter(result => result.kind === "diagnosis");
+  retries.push(...steeringResults.filter(result => result.kind === "retry"));
   let terminalError = diagnosisFailure ? diagnosisFailure.error : retryError;
   const advanced =
     merged.length > 0 ||

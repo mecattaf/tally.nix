@@ -6,6 +6,28 @@ authorized.
 
 ## [Unreleased]
 
+### Bounded campaign recovery (#451, #452)
+
+- Rejected diagnosis prose no longer consumes a steering attempt. The driver
+  posts a bounded machinery retry while budget remains, then emits a valid
+  deterministic wrapper that preserves a redacted excerpt and the rejection
+  reason instead of discarding the only failure evidence.
+- Added `tally campaign resume ISSUE --reason TEXT`: an authenticated,
+  non-destructive recovery generation that retains prior comments as audit
+  history, uses its marked GitHub comment as the counter boundary, revalidates
+  and approves the live graph, and dispatches the resumed pass.
+- Completion PR revisions are now task-local. Unrelated task and scheduler
+  edits no longer rotate every merged proof; edits to the task itself or global
+  execution policy still do. Marker-only pull requests gain a `[marker]` title
+  prefix, and `maxTasks` admission errors now name `manifest.maxTasks`.
+- A Codex agent-stage failure whose captured stderr carries the tool-router
+  signature is classified as bounded campaign machinery. The recorded bare
+  Codex 0.147 probe completed after the same rejection, so no tally
+  stdin-wrapper change is applied; normal Codex failures remain task evidence.
+- CLI-created flow workers now receive the same bounded 4 MiB stack allowance
+  as direct flow tests, preventing Boa from exhausting Tokio's default stack
+  while instantiating the spec-build campaign.
+
 ### Campaign re-arm is a blocked poll state
 
 - `campaign poll --once` still refuses to dispatch when the live executable

@@ -258,6 +258,10 @@ class FakeGitHub:
                     print(url)
                 elif args[:2] == ["pr", "view"]:
                     print(json.dumps(state.get("prView", {})))
+                elif args[:2] == ["pr", "create"]:
+                    state.setdefault("createdPullRequests", []).append(args)
+                    number = len(state["createdPullRequests"])
+                    print(f"https://github.com/acme/spec/pull/{number}")
                 elif args[:2] == ["api", "user"]:
                     print(state.get("actor", "tally-test"))
                 elif args[:2] == ["api", "graphql"]:
@@ -609,6 +613,67 @@ class RedactionVectorTests(unittest.TestCase):
 
 
 class GitHubForgeTests(unittest.TestCase):
+    def test_resume_receipt_resets_machine_counters_without_deleting_history(self) -> None:
+        def diagnosis(attempt: int, text: str) -> str:
+            return (
+                f"{DRIVER.diagnosis_marker('fixture', '7', 'task-1', attempt)}\n\n"
+                f"{DRIVER.diagnosis_heading('task-1', attempt)}\n\n{text}"
+            )
+
+        def retry(attempt: int, text: str) -> str:
+            return (
+                f"{DRIVER.retry_marker('fixture', '7', 'task-1', attempt)}\n\n"
+                f"{DRIVER.retry_heading('task-1', attempt)}\n\n{text}"
+            )
+
+        def comment(identifier: int, body: str) -> dict[str, object]:
+            return {
+                "id": identifier,
+                "body": body,
+                "html_url": f"https://github.com/acme/spec/issues/7#issuecomment-{identifier}",
+            }
+
+        comments = [
+            comment(10, diagnosis(1, "Observed the first failed attempt.")),
+            comment(11, diagnosis(2, "Observed the second failed attempt.")),
+            comment(12, retry(1, "adapter transport failed")),
+            comment(13, retry(2, "adapter transport failed again")),
+            comment(14, DRIVER.escalation_marker("fixture", "7") + "\n\n### Escalation"),
+            comment(
+                20,
+                "<!-- tally:spec-build:resume:v1 campaign=fixture issue=7 "
+                "nonce=018f47a0-7b9d-7cc2-92d6-2f7f19f505fd -->\n\n"
+                "### Campaign resumed\n\nPardoned prior receipts.\n\n"
+                "Reason: Corrected the external dependency.",
+            ),
+            comment(21, diagnosis(1, "Observed the first post-resume failure.")),
+        ]
+
+        with mock.patch.object(DRIVER, "github_machine_comments", return_value=comments):
+            diagnoses, retries, escalation, warnings = DRIVER.forge_campaign_state(
+                "acme/spec",
+                {"forge": "github"},
+                "fixture",
+                "7",
+                {"task-1"},
+                {},
+            )
+
+        self.assertEqual(
+            [(item["attempt"], item["diagnosis"]) for item in diagnoses],
+            [(1, "Observed the first post-resume failure.")],
+        )
+        self.assertEqual(retries, [])
+        self.assertIsNone(escalation)
+        self.assertEqual(
+            warnings,
+            [
+                "campaign resume https://github.com/acme/spec/issues/7#issuecomment-20 "
+                "pardoned 5 earlier machine receipt(s)"
+            ],
+        )
+        self.assertEqual(len(comments), 7, "resume must retain the public audit trail")
+
     def test_reconcile_requires_exact_marker_and_degrades_unusable_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1553,6 +1618,36 @@ class GitHubForgeTests(unittest.TestCase):
                     1,
                 )
 
+    def test_marker_only_pull_request_title_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root)
+            base = git(checkout, "rev-parse", "HEAD")
+            data = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": issue(),
+                "task": task("task-1"),
+                "workspace": {
+                    "baseRev": base,
+                    "publishBranch": "tally/fixture-issue-7/task-1",
+                },
+            }
+            config = DRIVER.repo_config(repository_config(checkout, "github"))
+            with FakeGitHub(root, {"pulls": [], "calls": []}) as github:
+                url = DRIVER.github_pull_request(
+                    data,
+                    config,
+                    checkout,
+                    base,
+                    DRIVER.template_narration(data["task"]),
+                )
+
+            self.assertEqual(url, "https://github.com/acme/spec/pull/1")
+            created = github.state()["createdPullRequests"][0]
+            title = created[created.index("--title") + 1]
+            self.assertEqual(title, "[marker] task-1: Task task-1")
+
     def test_continuation_event_is_derived_bounded_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2123,6 +2218,43 @@ class NativeSubIssueTests(unittest.TestCase):
         }
         return state, brief
 
+    def test_task_revision_survives_an_unrelated_graph_edit(self) -> None:
+        manifest = DRIVER.canonical_manifest(self.manifest(Path("/srv/fixture")))
+        content = {
+            "number": 8,
+            "title": "Task 1",
+            "body": "Implement task 1.",
+        }
+        revision = DRIVER.task_completion_revision(
+            manifest, manifest["tasks"][0], content
+        )
+
+        edited = json.loads(json.dumps(manifest))
+        edited["maxTasks"] = 3
+        edited["maxParallel"] = 3
+        edited["tasks"][1]["dependencies"] = ["task-1"]
+        edited["tasks"].append(
+            {
+                "id": "task-3",
+                "kind": "implementation",
+                "issue": 10,
+                "dependencies": ["task-2"],
+                "conflictDomains": ["src/three"],
+                "argv": None,
+                "runtimeMaxSec": None,
+            }
+        )
+        self.assertEqual(
+            DRIVER.task_completion_revision(edited, edited["tasks"][0], content),
+            revision,
+        )
+
+        own_edit = dict(content, body="Implement the edited task 1.")
+        self.assertNotEqual(
+            DRIVER.task_completion_revision(manifest, manifest["tasks"][0], own_edit),
+            revision,
+        )
+
     @staticmethod
     def walk_node(
         number: int,
@@ -2175,12 +2307,18 @@ class NativeSubIssueTests(unittest.TestCase):
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             state, brief = self.fixture(checkout)
-            digest = brief["campaignGraph"]["executableDigest"]
             base_revision = git(checkout, "rev-parse", "origin/main")
             completed_walk = []
-            for task, subissue in zip(self.MANIFEST_TASKS, state["subIssues"]):
-                revision = DRIVER.canonical_sha256(
-                    {"source": digest, "task": task["id"]}
+            graph = brief["campaignGraph"]
+            for task, subissue, reference, content in zip(
+                self.MANIFEST_TASKS,
+                state["subIssues"],
+                graph["manifest"]["tasks"],
+                graph["tasks"],
+                strict=True,
+            ):
+                revision = DRIVER.task_completion_revision(
+                    graph["manifest"], reference, content
                 )
                 branch = DRIVER.stable_publish_branch(
                     "fixture", "7", task["id"], revision
@@ -2226,13 +2364,18 @@ class NativeSubIssueTests(unittest.TestCase):
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             state, brief = self.fixture(checkout)
-            digest = brief["campaignGraph"]["executableDigest"]
             base_revision = git(checkout, "rev-parse", "origin/main")
             brief["capabilities"] = {"subIssueWalk": False}
             state["merged"] = []
-            for task in self.MANIFEST_TASKS:
-                revision = DRIVER.canonical_sha256(
-                    {"source": digest, "task": task["id"]}
+            graph = brief["campaignGraph"]
+            for task, reference, content in zip(
+                self.MANIFEST_TASKS,
+                graph["manifest"]["tasks"],
+                graph["tasks"],
+                strict=True,
+            ):
+                revision = DRIVER.task_completion_revision(
+                    graph["manifest"], reference, content
                 )
                 branch = DRIVER.stable_publish_branch(
                     "fixture", "7", task["id"], revision
@@ -2284,9 +2427,15 @@ class NativeSubIssueTests(unittest.TestCase):
             state, brief = self.fixture(checkout, "local")
             digest = brief["campaignGraph"]["executableDigest"]
             base_revision = git(checkout, "rev-parse", "origin/main")
-            for task in self.MANIFEST_TASKS:
-                revision = DRIVER.canonical_sha256(
-                    {"source": digest, "task": task["id"]}
+            graph = brief["campaignGraph"]
+            for task, reference, content in zip(
+                self.MANIFEST_TASKS,
+                graph["manifest"]["tasks"],
+                graph["tasks"],
+                strict=True,
+            ):
+                revision = DRIVER.task_completion_revision(
+                    graph["manifest"], reference, content
                 )
                 branch = DRIVER.stable_publish_branch(
                     "fixture", "7", task["id"], revision
@@ -4295,11 +4444,17 @@ class SteeringGrammarTests(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def posted_body(self, config: dict[str, object], steered: dict[str, object]) -> str:
+    def posted_blob(
+        self, config: dict[str, object], steered: dict[str, object]
+    ) -> dict[str, object]:
         ref = steered["comment"].split("acme/spec/", 1)[1]
-        return DRIVER.read_local_blob(config, ref)["diagnosis"]
+        return DRIVER.read_local_blob(config, ref)
 
-    def test_a_grammar_violating_diagnosis_falls_back_with_a_durable_fact(self) -> None:
+    def posted_body(self, config: dict[str, object], steered: dict[str, object]) -> str:
+        blob = self.posted_blob(config, steered)
+        return str(blob.get("diagnosis", blob.get("reason")))
+
+    def test_a_grammar_violating_diagnosis_buys_a_machinery_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
@@ -4308,11 +4463,19 @@ class SteeringGrammarTests(unittest.TestCase):
                 self.brief(root, checkout, diagnosis="narrow the failing gate")
             )
             self.assertTrue(steered["posted"])
-            body = self.posted_body(DRIVER.repo_config(config), steered)
-            # Never silent: the durable fact that the fallback fired, and why,
-            # rides in the same comment the rejected diagnosis would have.
-            self.assertIn("Rejected the steward's diagnosis", body)
+            self.assertEqual(steered["kind"], "retry")
+            blob = self.posted_blob(DRIVER.repo_config(config), steered)
+            self.assertEqual(blob["kind"], "retry")
+            body = str(blob["reason"])
+            # Never silent, but also not a diagnosis receipt: grammar machinery
+            # cannot advance the task's steering attempt counter.
+            self.assertIn("diagnosis-contract", body)
             self.assertIn("must end with a period", body)
+            diagnoses, retries, _, _ = DRIVER.forge_campaign_state(
+                "acme/spec", DRIVER.repo_config(config), "fixture", "7", {"task-1"}
+            )
+            self.assertEqual(diagnoses, [])
+            self.assertEqual(len(retries), 1)
 
     def test_gate_evidence_requires_the_failing_id_and_offending_path(self) -> None:
         detail = (
@@ -4332,8 +4495,36 @@ class SteeringGrammarTests(unittest.TestCase):
                 )
             )
             body = self.posted_body(DRIVER.repo_config(config), omitted)
+            self.assertEqual(omitted["kind"], "retry")
             self.assertIn("omits the failing check id", body)
             self.assertIn("gate:forbid-secrets", body)
+
+    def test_exhausted_diagnosis_retries_preserve_the_rejected_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+            brief = self.brief(
+                root,
+                checkout,
+                diagnosis="the router died after rejecting apply_patch",
+            )
+
+            first = DRIVER.action_steer(brief)
+            second = DRIVER.action_steer(brief)
+            third = DRIVER.action_steer(brief)
+
+            self.assertEqual(first["kind"], "retry")
+            self.assertEqual(second["kind"], "retry")
+            self.assertEqual(third["kind"], "diagnosis")
+            body = self.posted_body(config, third)
+            self.assertIn("machinery retry budget was exhausted", body)
+            self.assertIn("router died after rejecting apply_patch", body)
+            diagnoses, retries, _, _ = DRIVER.forge_campaign_state(
+                "acme/spec", config, "fixture", "7", {"task-1"}
+            )
+            self.assertEqual(len(diagnoses), 1)
+            self.assertEqual(len(retries), 2)
 
     def test_a_diagnosis_naming_the_required_evidence_is_accepted_verbatim(self) -> None:
         detail = (
@@ -4357,6 +4548,7 @@ class SteeringGrammarTests(unittest.TestCase):
                 )
             )
             body = self.posted_body(DRIVER.repo_config(config), steered)
+            self.assertEqual(steered["kind"], "diagnosis")
             self.assertEqual(body, diagnosis)
 
 
@@ -4524,8 +4716,8 @@ class BreachSteeringTests(unittest.TestCase):
             steered = DRIVER.action_steer(self.brief(checkout, diagnosis=bad))
 
             body = self.blob(config, 1)["diagnosis"]
-            self.assertNotIn("disaster", body)
-            self.assertIn("Rejected the steward's diagnosis", body)
+            self.assertIn("disaster", body)
+            self.assertIn("Validation rejected the proposal", body)
             self.assertIn("exclamation mark", body)
             # Rejection replaces the prose; it does not swallow the breach.
             self.assertTrue(steered["blocked"])

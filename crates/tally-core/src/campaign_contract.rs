@@ -370,7 +370,8 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
     validate_gates(&manifest.gates)?;
     if manifest.tasks.is_empty() || manifest.tasks.len() > manifest.max_tasks {
         return Err(invalid(format!(
-            "campaign must contain 1..={} tasks",
+            "campaign contains {} tasks, but manifest.maxTasks permits 1..={}",
+            manifest.tasks.len(),
             manifest.max_tasks
         )));
     }
@@ -722,6 +723,50 @@ pub fn executable_digest(
     Ok(format!("sha256:{:x}", Sha256::digest(bytes.as_bytes())))
 }
 
+/// Revision identity for one task's durable completion proof.
+///
+/// The campaign's full executable digest remains the admission boundary, but
+/// it is intentionally too broad for completion: adding an unrelated task or
+/// editing another brief must not invalidate every merged pull request. This
+/// contract includes the task itself plus the global execution policy that can
+/// change whether its proof is valid, and excludes scheduler/capacity fields.
+pub fn task_completion_revision(
+    manifest: &CampaignManifest,
+    reference: &CampaignTaskReference,
+    content: &CanonicalCampaignTaskV1,
+) -> Result<String, CampaignContractError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CompletionPolicy<'a> {
+        contract_version: u32,
+        campaign: &'a str,
+        repository: &'a CampaignRepository,
+        merge_method: &'a str,
+        git_ai_binding: &'a str,
+        git_ai_await_sec: u64,
+        agent: &'a CampaignAgent,
+        steward: &'a Option<CampaignSteward>,
+        gates: &'a [CampaignGate],
+        task: &'a CampaignTaskReference,
+        content: &'a CanonicalCampaignTaskV1,
+    }
+
+    let bytes = canonical_json(CompletionPolicy {
+        contract_version: 1,
+        campaign: &manifest.name,
+        repository: &manifest.repository,
+        merge_method: &manifest.merge_method,
+        git_ai_binding: &manifest.git_ai_binding,
+        git_ai_await_sec: manifest.git_ai_await_sec,
+        agent: &manifest.agent,
+        steward: &manifest.steward,
+        gates: &manifest.gates,
+        task: reference,
+        content,
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes.as_bytes())))
+}
+
 /// Compact recursively key-sorted JSON. This is deliberately independent of
 /// map insertion order so every consumer can reproduce the bytes.
 pub fn canonical_json(value: impl Serialize) -> Result<String, CampaignContractError> {
@@ -907,6 +952,92 @@ mod tests {
                 Sha256::digest(canonical_json(&value).unwrap().as_bytes())
             ),
             "sha256:356741b14061aca3cb3e9abc01fe332af042dfcd59d81c56ee9fb57832dc6429"
+        );
+    }
+
+    #[test]
+    fn task_completion_revision_ignores_unrelated_graph_edits() {
+        let manifest: CampaignManifest = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "name": "fixture",
+            "repository": {"checkout": "/srv/fixture", "forge": "github"},
+            "agent": {},
+            "gates": [],
+            "tasks": [{
+                "id": "build",
+                "kind": "implementation",
+                "issue": 8,
+                "dependencies": [],
+                "conflictDomains": ["src/build"]
+            }]
+        }))
+        .unwrap();
+        let content = CanonicalCampaignTaskV1 {
+            number: 8,
+            title: "Build the feature".to_owned(),
+            body: "Implement the admitted feature.".to_owned(),
+        };
+        let revision = task_completion_revision(&manifest, &manifest.tasks[0], &content).unwrap();
+
+        let mut unrelated = manifest.clone();
+        unrelated.max_tasks = 2;
+        unrelated.max_parallel = 2;
+        unrelated.pool = "larger-campaign-pool".to_owned();
+        unrelated.tasks.push(
+            serde_json::from_value(json!({
+                "id": "document",
+                "kind": "implementation",
+                "issue": 9,
+                "dependencies": [],
+                "conflictDomains": ["doc"]
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            task_completion_revision(&unrelated, &unrelated.tasks[0], &content).unwrap(),
+            revision,
+            "scheduler changes and a new sibling task must not invalidate a merged task"
+        );
+
+        let mut own_reference_changed = unrelated.clone();
+        own_reference_changed.tasks[0]
+            .dependencies
+            .push("document".to_owned());
+        assert_ne!(
+            task_completion_revision(
+                &own_reference_changed,
+                &own_reference_changed.tasks[0],
+                &content,
+            )
+            .unwrap(),
+            revision,
+            "the completed task's own dependency contract remains revision-bearing"
+        );
+
+        let mut own_content_changed = content.clone();
+        own_content_changed.body = "Implement the edited feature.".to_owned();
+        assert_ne!(
+            task_completion_revision(&manifest, &manifest.tasks[0], &own_content_changed).unwrap(),
+            revision,
+            "the completed task's admitted issue content remains revision-bearing"
+        );
+
+        let mut global_policy_changed = manifest.clone();
+        global_policy_changed.gates.push(CampaignGate::Command {
+            id: "tests".to_owned(),
+            preflight_argv: vec!["true".to_owned()],
+            argv: vec!["true".to_owned()],
+            runtime_max_sec: 60,
+        });
+        assert_ne!(
+            task_completion_revision(
+                &global_policy_changed,
+                &global_policy_changed.tasks[0],
+                &content,
+            )
+            .unwrap(),
+            revision,
+            "global execution policy changes must invalidate prior task proof"
         );
     }
 

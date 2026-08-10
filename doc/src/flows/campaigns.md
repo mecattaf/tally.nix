@@ -200,9 +200,14 @@ Where it does not, the driver recomputes the boxes at every reconcile from
 revision-bound merged pull requests and content-bound checkpoint refs, and a
 merge repairs its own box. Under either projection, closing a task issue or
 manually checking a box cannot complete a task. A GitHub task PR includes
-`Closes #<sub-issue>`. Completion identity includes the admitted graph digest:
-editing a brief, gate, checkout, agent policy, or DAG after a merge cannot reuse
-the old PR as proof.
+`Closes #<sub-issue>`. Completion identity includes that task's admitted
+reference and issue content plus the campaign's execution policy (checkout,
+agent, steward, gates, merge method, and git-ai policy). Editing that task's
+brief or dependencies, or changing global execution policy, cannot reuse the
+old PR as proof. Adding or editing an unrelated task, changing capacity, or
+changing scheduler fields leaves existing task revisions intact, so one graph
+edit invalidates only the affected completion proofs instead of redispatching
+the whole campaign.
 
 ### The sub-issue walk, and what a closed sub-issue does not prove
 
@@ -340,9 +345,32 @@ before executing. Checkbox/state/timestamp changes are observation signals, not
 executable changes. Agents receive a bounded authorized steering snapshot and
 are told not to refetch the public comment channel. Re-arming the same unchanged
 graph forces a fresh retry without invalidating matching completion facts;
-re-arming changed content creates new task revisions. `--no-enqueue` registers
-after validation without starting a pass, and `--wait` returns its terminal
-verdict.
+re-arming changed task content creates a new revision for that task.
+`--no-enqueue` registers after validation without starting a pass, and `--wait`
+returns its terminal verdict. A graph mismatch is a structured poll result, not
+a broken poller: `campaign poll --once` returns success with one `blocked` item
+whose reason is `rearm-required` and which names both the approved and live
+digests. Forge, registry, validation, and dispatch failures remain under
+`failures` and return nonzero.
+
+An escalated GitHub campaign has one non-destructive recovery verb:
+
+```console
+$ tally campaign resume https://github.com/OWNER/REPO/issues/42 \
+    --reason "Corrected the unavailable external dependency" --wait
+```
+
+`resume` requires an existing armed registration and the same authenticated
+actor, refetches and validates the live issue graph and host, posts a marked
+receipt containing the reason, advances the arm generation, approves the live
+graph, and dispatches a new pass. The receipt's stable GitHub comment id is the
+ledger boundary: earlier diagnosis, retry, and escalation comments remain on
+the issue as audit history but no longer spend the new generation's counters;
+later receipts count from attempt 1. The authority record is written before
+dispatch; once that write succeeds, the periodic poller can recover an
+interrupted dispatch without deleting comments or hand-editing state. `resume`
+is limited to `repository.forge=github`; the explicitly test-only local forge
+has no GitHub comment boundary.
 
 The default ad-hoc `workspaceRoot` is
 `$XDG_CACHE_HOME/tally/campaigns/workspaces` (or
@@ -1562,6 +1590,11 @@ node budget is the same with a steward as without one. With no steward
 configured the narration is the template, and the published text is byte for
 byte what it was before the seam existed.
 
+If publication finds that the task head has the same tree as its witnessed
+base, the pull request is an intentional campaign marker rather than a code
+change. Its title is prefixed with `[marker] ` so reviewers and automation can
+distinguish it from a substantive task PR without opening the diff.
+
 ### The provenance trailer and the post-merge git-ai binding
 
 The squash commit is where a campaign's authorship becomes repository-native
@@ -1704,6 +1737,15 @@ repeat secret-looking input. Only its concise output passes through conservative
 public redaction and becomes an authenticated, marked campaign comment; raw
 capture, gate output, brief, and diff remain private job inputs.
 
+The diagnosis prompt states the public outcome-first grammar and includes a
+conforming example. If the diagnosis agent still returns invalid grammar, that
+contract failure is campaign machinery: it posts a marked machinery retry and
+does not consume a task diagnosis attempt. Once the bounded machinery budget is
+spent, the driver posts a deterministic valid wrapper that names the validation
+failure and retains a bounded, redacted excerpt of the rejected proposal. A
+diagnosis rejection therefore cannot erase the only useful failure evidence or
+silently turn into a task attempt.
+
 The pass then writes its continuation event even when nothing merged, and
 even when the diagnosis lane itself faulted: a transient adapter failure must
 never leave a campaign stopped with neither steering nor a mention to resume
@@ -1722,6 +1764,15 @@ continuation event so the retry is actually taken. That retry
 budget is bounded at two per task and is read back from the forge like every
 other campaign fact, so a permanently broken lane still spends its two steering
 attempts and reaches escalation rather than retrying forever.
+
+The Codex adapter has one narrow additional classifier. A 2026-08-10 bare
+`codex exec --json` probe on Codex 0.147 survived a destructive tool-router
+rejection, emitted a completed turn, and exited zero; the 0.145 deaths reported
+in #452 are therefore treated as version-specific adapter session failures,
+not a tally stdin-wrapper failure. If an agent-stage failure's captured stderr
+carries the `codex_core::tools::router` signature, the campaign prices it as
+machinery first. Ordinary Codex nonzero exits remain task evidence and spend
+steering in the usual way.
 
 ### Daemon congestion and the advisory projection wait
 

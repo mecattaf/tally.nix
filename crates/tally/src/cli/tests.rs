@@ -41,6 +41,42 @@ fn legacy_campaign_continuation_token_remains_parseable() {
 }
 
 #[test]
+fn campaign_resume_requires_and_preserves_its_audit_reason() {
+    let options = Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "resume",
+        "https://github.com/acme/widgets/issues/42",
+        "--reason",
+        "Reviewed the escalation and corrected the external dependency.",
+        "--wait",
+        "--state-dir",
+        "/var/lib/tally/state",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Campaign {
+            command: CampaignCommand::Resume(CampaignResumeArgs {
+                issue,
+                reason,
+                wait: true,
+                state_dir: Some(state_dir),
+            })
+        }) if issue == "https://github.com/acme/widgets/issues/42"
+            && reason == "Reviewed the escalation and corrected the external dependency."
+            && state_dir == Path::new("/var/lib/tally/state")
+    ));
+    assert!(Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "resume",
+        "https://github.com/acme/widgets/issues/42",
+    ])
+    .is_err());
+}
+
+#[test]
 fn flow_run_jobs_lookup_conflicts_with_broad_archive_controls() {
     let flow_run = "00000000-0000-4000-8000-000000000415";
     assert!(Opts::try_parse_from(["tally", "query", "jobs", "--flow-run", flow_run]).is_ok());

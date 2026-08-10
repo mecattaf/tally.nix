@@ -48,6 +48,12 @@ RETRY_MARKER = re.compile(
     r"task=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?) "
     r"attempt=([12]) -->$"
 )
+RESUME_MARKER = re.compile(
+    r"^<!-- tally:spec-build:resume:v1 "
+    r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
+    r"issue=([1-9][0-9]*) "
+    r"nonce=([0-9a-fA-F-]{36}) -->$"
+)
 # A campaign machinery fault is not evidence that the task's work is wrong, so
 # it buys a retry instead of a steering attempt. The budget is bounded and read
 # back from the forge: past it, the fault is treated as a failed attempt.
@@ -1537,6 +1543,34 @@ FORGE_NATIVE_RECONCILE_FIELDS = {
 }
 
 
+def task_completion_revision(
+    manifest: dict[str, Any],
+    reference: dict[str, Any],
+    content: dict[str, Any],
+) -> str:
+    """Identity for one task proof, narrower than whole-graph admission.
+
+    Rust admits the complete graph with one digest. Completion must survive an
+    unrelated graph edit, so its revision covers only this task and the global
+    execution policy capable of changing the meaning of its proof.
+    """
+    return canonical_sha256(
+        {
+            "contractVersion": 1,
+            "campaign": manifest["name"],
+            "repository": manifest["repository"],
+            "mergeMethod": manifest["mergeMethod"],
+            "gitAiBinding": manifest["gitAiBinding"],
+            "gitAiAwaitSec": manifest["gitAiAwaitSec"],
+            "agent": manifest["agent"],
+            "steward": manifest["steward"],
+            "gates": manifest["gates"],
+            "task": reference,
+            "content": content,
+        }
+    )
+
+
 def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief, FORGE_NATIVE_RECONCILE_FIELDS, "reconcile brief"
@@ -1683,9 +1717,11 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
             common["argv"] = reference["argv"]
             common["runtimeMaxSec"] = reference["runtimeMaxSec"]
         tasks.append(common)
-    for task in tasks:
-        task["revision"] = canonical_sha256(
-            {"source": admitted_digest, "task": task["id"]}
+    for task, reference, content in zip(
+        tasks, references, canonical_tasks, strict=True
+    ):
+        task["revision"] = task_completion_revision(
+            normalized_manifest, reference, content
         )
     repository_config = repo_config(config["repositoryConfig"])
     checkout = repository_config["checkout"]
@@ -2056,6 +2092,16 @@ def forge_campaign_state(
         )
         return False
 
+    resume_boundary: int | None = None
+    resume_comment: str | None = None
+    pardoned = 0
+
+    def comment_database_id(comment: dict[str, Any], context: str) -> int:
+        value = comment.get("id", comment.get("databaseId"))
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            fail(f"{context} carries no stable GitHub comment id")
+        return value
+
     def ingest(
         comments: list[dict[str, Any]],
         *,
@@ -2076,6 +2122,7 @@ def forge_campaign_state(
         it is where the current receipt lives and where a reader should be
         pointed -- and the master copy is reported as the duplicate.
         """
+        nonlocal pardoned
         expected_escalation = escalation_marker(campaign, issue_number)
         for comment in comments:
             body = comment.get("body")
@@ -2084,6 +2131,16 @@ def forge_campaign_state(
             first_line = body.splitlines()[0]
             match = DIAGNOSIS_MARKER.fullmatch(first_line)
             retry_match = None if match is not None else RETRY_MARKER.fullmatch(first_line)
+            relevant = (
+                match is not None
+                or retry_match is not None
+                or (surface is None and first_line == expected_escalation)
+            )
+            if relevant and resume_boundary is not None:
+                identity = comment_database_id(comment, "campaign machine receipt")
+                if identity <= resume_boundary:
+                    pardoned += 1
+                    continue
             if match is not None or retry_match is not None:
                 kind = "diagnosis" if match is not None else "retry"
                 groups = (match or retry_match).groups()
@@ -2148,12 +2205,38 @@ def forge_campaign_state(
                 )
 
     if config["forge"] == "github":
+        master_comments = github_machine_comments(repository, issue_number)
+        resumes: list[tuple[int, str]] = []
+        for comment in master_comments:
+            body = comment.get("body")
+            if not isinstance(body, str) or not body:
+                continue
+            match = RESUME_MARKER.fullmatch(body.splitlines()[0])
+            if match is None:
+                continue
+            marker_campaign, marker_issue, nonce = match.groups()
+            if marker_campaign != campaign or marker_issue != issue_number:
+                continue
+            try:
+                uuid.UUID(nonce)
+            except ValueError:
+                fail("campaign resume marker carries an invalid nonce")
+            if "\n\n### Campaign resumed\n\n" not in body or "\n\nReason: " not in body:
+                fail("campaign resume receipt has malformed content")
+            resumes.append(
+                (
+                    comment_database_id(comment, "campaign resume receipt"),
+                    required_string(comment.get("html_url"), "campaign resume receipt URL"),
+                )
+            )
+        if resumes:
+            resume_boundary, resume_comment = max(resumes)
         # Task threads first: where a task owns one, that is where its current
         # receipts are posted, so the thread copy is the one a fact should
         # point at and a master copy of the same attempt is the older duplicate.
         for task_id in sorted(threaded):
             ingest(threads[task_id], surface=task_id)
-        ingest(github_machine_comments(repository, issue_number), surface=None)
+        ingest(master_comments, surface=None)
     else:
         prefix = local_state_prefix(campaign, issue_number)
         refs = local_remote_refs(config, f"{prefix}/*")
@@ -2230,6 +2313,10 @@ def forge_campaign_state(
 
     if len(escalations) > 1:
         fail("multiple machine escalations claim this campaign")
+    if resume_comment is not None:
+        warnings.append(
+            f"campaign resume {resume_comment} pardoned {pardoned} earlier machine receipt(s)"
+        )
     for kind, records in (("diagnosis", diagnoses), ("retry", retries)):
         seen: set[tuple[str, int]] = set()
         for record in records:
@@ -2388,7 +2475,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           }
           comments(last: 100) {
             pageInfo { hasPreviousPage }
-            nodes { url body author { login } }
+            nodes { databaseId url body author { login } }
           }
         }
       }
@@ -2515,6 +2602,7 @@ def subissue_walk(
                 login = author.get("login") if isinstance(author, dict) else None
                 machine.append(
                     {
+                        "id": comment.get("databaseId"),
                         "body": comment.get("body"),
                         "html_url": comment.get("url"),
                         "user": {"login": login} if isinstance(login, str) else None,
@@ -3842,7 +3930,12 @@ def gate_evidence_requirements(evidence: Any) -> tuple[str | None, str | None]:
     return gate_id, path
 
 
-def diagnosis_fallback_note(reason: str, gate_id: str | None, path: str | None) -> str:
+def diagnosis_fallback_note(
+    reason: str,
+    gate_id: str | None,
+    path: str | None,
+    rejected: str | None = None,
+) -> str:
     """The durable fact a steering note's validation failure fires (#385).
 
     Deterministic and never model-authored -- built only from the driver's
@@ -3855,7 +3948,12 @@ def diagnosis_fallback_note(reason: str, gate_id: str | None, path: str | None) 
     if gate_id:
         where = f" Investigate check {gate_id!r} directly"
         where += f", path {path!r}." if path else "."
-    note = f"Rejected the steward's diagnosis: {reason}.{where}"
+    note = f"Recorded a steward diagnosis after its machinery retry budget was exhausted. Validation rejected the proposal because {reason}.{where}"
+    if rejected:
+        excerpt = re.sub(r"\s+", " ", rejected).strip().replace("!", ".")
+        excerpt = excerpt[:2000].rstrip(" .:;?")
+        if excerpt:
+            note += f" Redacted proposal excerpt: {excerpt}."
     if len(note) > MAX_DIAGNOSIS_CHARS:
         note = note[: MAX_DIAGNOSIS_CHARS - 1].rstrip() + "…"
     return note
@@ -3919,8 +4017,23 @@ def post_diagnosis_comment(
     return f"local://{repository}/{ref}"
 
 
+def diagnosis_rejection_reason(
+    diagnosis: str, gate_evidence: Any
+) -> tuple[str | None, str | None, str | None]:
+    """Return the public-contract rejection without spending an attempt."""
+    required_id, required_path = gate_evidence_requirements(gate_evidence)
+    reason = validate_outcome_first(
+        diagnosis, max_chars=MAX_DIAGNOSIS_CHARS, context="diagnosis"
+    )
+    if not reason and required_id and required_id not in diagnosis:
+        reason = f"diagnosis omits the failing check id {required_id!r}"
+    if not reason and required_path and required_path not in diagnosis:
+        reason = f"diagnosis omits the offending path {required_path!r}"
+    return reason, required_id, required_path
+
+
 def validated_diagnosis(diagnosis: str, gate_evidence: Any) -> str:
-    """#385's content contract on one steering note, or its fallback.
+    """#385's content contract on a non-retryable steering surface.
 
     Total: returns either the diagnosis unchanged or a deterministic,
     grammar-compliant note naming the one reason it was refused. Both the
@@ -3930,16 +4043,11 @@ def validated_diagnosis(diagnosis: str, gate_evidence: Any) -> str:
     straight into a public forge comment on the single most severe campaign
     event, holding #385's own guarantee open from inside the same lane.
     """
-    required_id, required_path = gate_evidence_requirements(gate_evidence)
-    reason = validate_outcome_first(
-        diagnosis, max_chars=MAX_DIAGNOSIS_CHARS, context="diagnosis"
+    reason, required_id, required_path = diagnosis_rejection_reason(
+        diagnosis, gate_evidence
     )
-    if not reason and required_id and required_id not in diagnosis:
-        reason = f"diagnosis omits the failing check id {required_id!r}"
-    if not reason and required_path and required_path not in diagnosis:
-        reason = f"diagnosis omits the offending path {required_path!r}"
     if reason:
-        return diagnosis_fallback_note(reason, required_id, required_path)
+        return diagnosis_fallback_note(reason, required_id, required_path, diagnosis)
     return diagnosis
 
 
@@ -4013,6 +4121,7 @@ def bounded_breach_note(
 
 
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
+    capability_brief = brief
     brief, capabilities = take_capabilities(brief)
     fields = {
         "campaign",
@@ -4082,6 +4191,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         )
         if already_blocked is not None:
             return {
+                "kind": "diagnosis",
                 "taskId": task_id,
                 "attempt": 2,
                 "comment": already_blocked["comment"],
@@ -4123,6 +4233,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
                 composed,
             )
         return {
+            "kind": "diagnosis",
             "taskId": task_id,
             "attempt": 2,
             "comment": posted_comment,
@@ -4136,6 +4247,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
             receipt for receipt in task_receipts if receipt["attempt"] == attempt
         )
         return {
+            "kind": "diagnosis",
             "taskId": task_id,
             "attempt": attempt,
             "comment": receipt["comment"],
@@ -4154,14 +4266,48 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     )
     diagnosis, redacted = redact_public_text(diagnosis)
     diagnosis = bound_public_diagnosis(diagnosis)
-    # #385: the same content contract that governs PR prose governs a
-    # steering note, plus a constructive-correction shape -- it must name the
-    # failing check (and offending path, when the gate evidence names one)
-    # rather than describe the failure in the abstract. A validation failure
-    # spends the attempt exactly as an unusable steward proposal spends the
-    # narrate slot, and the fallback is never a silent template. The breach
-    # path above runs the identical check.
-    diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
+    # A steward grammar rejection is campaign machinery, not evidence about
+    # the task. Spend the same bounded machinery budget used by prep/publish
+    # faults and leave the diagnosis attempt number untouched. Once that
+    # budget is exhausted, publish a deterministic wrapper that retains a
+    # redacted excerpt so the campaign remains bounded and an escalation still
+    # contains diagnostic content.
+    reason, required_id, required_path = diagnosis_rejection_reason(
+        diagnosis, data.get("gateEvidence")
+    )
+    if reason:
+        detail = f"Steward diagnosis failed the public grammar: {reason}."
+        excerpt = re.sub(r"\s+", " ", diagnosis).strip()
+        if excerpt:
+            detail += f" Redacted proposal excerpt: {excerpt[:1200]}"
+        retry_brief = {
+            "campaign": campaign,
+            "repository": code_repository,
+            "repositoryConfig": data["repositoryConfig"],
+            "issue": data["issue"],
+            "taskId": task_id,
+            "stage": "diagnosis-contract",
+            "detail": detail[:MAX_RETRY_CHARS],
+            **carried_coordinates(data),
+        }
+        if "taskIssue" in data:
+            retry_brief["taskIssue"] = data["taskIssue"]
+        if isinstance(capability_brief, dict) and "capabilities" in capability_brief:
+            retry_brief["capabilities"] = capability_brief["capabilities"]
+        retry = action_retry(retry_brief)
+        if retry["posted"]:
+            return {
+                "kind": "retry",
+                "taskId": task_id,
+                "attempt": retry["attempt"],
+                "comment": retry["comment"],
+                "blocked": False,
+                "posted": True,
+                "redacted": redacted or retry["redacted"],
+            }
+        diagnosis = diagnosis_fallback_note(
+            reason, required_id, required_path, diagnosis
+        )
     comment = post_diagnosis_comment(
         config,
         repository,
@@ -4174,6 +4320,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         diagnosis,
     )
     return {
+        "kind": "diagnosis",
         "taskId": task_id,
         "attempt": attempt,
         "comment": comment,
@@ -6410,6 +6557,20 @@ def github_pull_request(
         f"Head: `{head}`"
         f"{closes}"
     )
+    delta = git(
+        worktree,
+        "diff",
+        "--quiet",
+        full_git_oid(workspace["baseRev"], "workspace.baseRev"),
+        head,
+        "--",
+        check=False,
+    )
+    if delta.returncode not in {0, 1}:
+        fail("could not determine whether the published task is a marker-only change")
+    title = narration["subject"]
+    if delta.returncode == 0:
+        title = f"[marker] {title}"
     created = run(
         [
             "gh",
@@ -6422,7 +6583,7 @@ def github_pull_request(
             "--head",
             branch,
             "--title",
-            narration["subject"],
+            title,
             "--body",
             body,
         ],
