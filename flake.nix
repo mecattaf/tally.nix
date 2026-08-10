@@ -4471,10 +4471,10 @@
           # implementations of one budget, and nothing else makes them agree.
           # The fixture campaign has the shape the CLI unit test uses --
           # maxParallel 3, two gates, one of them a command gate -- so both
-          # sides must land on 3 + (2 + 2*1) + 3*(11 + 2*2) = 52. Drift on
+          # sides must land on 3 + (2 + 2*1) + 3*(12 + 2*2) = 55. Drift on
           # either side breaks a test rather than silently capping a run below
           # its own worst case.
-          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 52;
+          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 55;
           # The generated producer's projection literals are mkDefault: an
           # ordinary estate override wins without mkForce, and every campaign
           # that states no opinion keeps the shipped defaults bit for bit.
@@ -5101,7 +5101,7 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "52"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "55"] and
                   ([.producers | keys[] | select(test("reconcile"))] == []) and
                   ([.producers | keys[] | select(startswith("campaign-"))]
                     == [
@@ -5527,7 +5527,7 @@
                   .maxTasks == 7 and
                   .maxParallel == 3 and
                   (.continuation.argv | index("--args-from-brief")) == 4 and
-                  .continuation.argv[6] == "52" and
+                  .continuation.argv[6] == "55" and
                   .continuation.pool == ["flow", "fixture-campaign"] and
                   .continuation.priority == "low" and
                   (.continuation.eventsDir | endswith("/events")) and
@@ -5665,7 +5665,15 @@
                 touch "$out"
               '';
           spec-build-task-steering-threads =
-            pkgs.runCommand "tally-spec-build-task-steering-threads" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+            pkgs.runCommand "tally-spec-build-task-steering-threads"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.ripgrep
+                ];
+                SPEC_BUILD_DRIVER_SOURCE = "${campaignDrivers}/spec_build_driver.py";
+                SPEC_BUILD_FLOW_SOURCE = "${./examples/flows/spec-build.js}";
+              }
               ''
                 # A task brief's authorizedComments must be composed by
                 # authorizedComments(task): the campaign-wide master thread
@@ -5687,6 +5695,9 @@
                   echo "spec-build.js dropped a capability-carrying brief (found $wrapped)" >&2
                   exit 1
                 fi
+                PYTHONDONTWRITEBYTECODE=1 \
+                  ${pkgs.python3}/bin/python3 \
+                  ${./test/spec_build_task_steering_threads_test.py}
                 touch "$out"
               '';
           campaign-timer-doc-drift =

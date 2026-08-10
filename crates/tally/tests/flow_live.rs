@@ -2854,7 +2854,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                             script,
                             "--args-from-brief",
                             "--max-nodes",
-                            "52"
+                            "55"
                         ],
                         "pool": ["flow", "fixture-campaign"],
                         "priority": "low",

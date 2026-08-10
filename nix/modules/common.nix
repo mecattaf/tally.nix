@@ -3655,7 +3655,7 @@ let
 
   # Sweep, reconcile, one optional pass-level continuation, optional
   # pristine-base preflight prep/gates/cleanup, and one frontier's worst-case
-  # implementation lanes: prep, agent, ownership check, initial gates,
+  # implementation lanes: prep, steering re-check, agent, ownership check, initial gates,
   # publication, rebase, optional re-gates, merge, machinery retry,
   # diff/diagnosis/steering, and cleanup. A machinery fault past its retry
   # budget records the retry node and is then steered, so one lane can spend
@@ -3674,7 +3674,7 @@ let
       commandGateCount = builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates);
       preflightNodes = if commandGateCount == 0 then 0 else 2 + 2 * commandGateCount;
     in
-    3 + preflightNodes + campaign.maxParallel * (11 + 2 * builtins.length campaign.gates);
+    3 + preflightNodes + campaign.maxParallel * (12 + 2 * builtins.length campaign.gates);
 
   mkCampaignArgs =
     cfg: name: campaign: repository: issueNumber: issueUrl: runId:

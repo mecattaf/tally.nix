@@ -1288,7 +1288,8 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
         2 * command_gates + 2
     };
     // Sweep, reconcile, one possible continuation, and each worst-case
-    // implementation lane: prep, agent, ownership, gates, publish, rebase,
+    // implementation lane: prep, steering re-check, agent, ownership, gates,
+    // publish, rebase,
     // optional re-gates, merge, then the failure path's machinery retry, diff,
     // diagnosis, and steering, and finally cleanup. A lane that fails at merge
     // is the expensive one, not a lane that merges: maxNodes counts cumulative
@@ -1297,7 +1298,7 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     // fault whose retry budget is already spent records the retry node and is
     // then steered, so both failure paths can land in one lane. Checkpoint
     // lanes are smaller.
-    (3 + preflight + manifest.max_parallel * (11 + 2 * manifest.gates.len())) as u32
+    (3 + preflight + manifest.max_parallel * (12 + 2 * manifest.gates.len())) as u32
 }
 
 /// The `--projection-wait-ms` an arm may record (#432).
@@ -1461,6 +1462,11 @@ async fn dispatch_campaign(
         "campaignGraph": &graph.canonical,
         "steering": steering.master,
         "taskSteering": steering.tasks,
+        // The pre-dispatch task-thread re-check must use the exact authority
+        // that produced both snapshots above. Inferring it from existing
+        // comments would silently exclude an allowed actor who had not yet
+        // commented -- precisely the late-arrival case this field serves.
+        "allowedActors": &registration.allowed_actors,
         "capabilities": {"subIssueWalk": registration.sub_issue_walk},
         "workspaceRoot": &registration.workspace_root,
         "tally": &executable,
@@ -4166,9 +4172,9 @@ mod tests {
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
         // The Nix module computes this budget independently in
         // campaignMaxNodes. Its fixture campaign has this exact shape and is
-        // asserted to be 52 too; change one side and the other must follow.
-        // 3 + (2 + 2*1) + 3*(11 + 2*2) = 52.
-        assert_eq!(max_flow_nodes(&manifest), 52);
+        // asserted to be 55 too; change one side and the other must follow.
+        // 3 + (2 + 2*1) + 3*(12 + 2*2) = 55.
+        assert_eq!(max_flow_nodes(&manifest), 55);
     }
 
     #[test]
@@ -4182,7 +4188,7 @@ mod tests {
         // prep and cleanup, plus a gating probe and a non-gating real-argv
         // witness for every command gate.
         const PASS_MAINTENANCE: usize = 3;
-        const LANE_SUCCESS_PATH: usize = 7;
+        const LANE_SUCCESS_PATH: usize = 8;
         const LANE_FAILURE_PATH: usize = 4;
         const PREFLIGHT_LANE: usize = 2;
         const PREFLIGHT_PER_COMMAND_GATE: usize = 2;

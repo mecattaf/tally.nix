@@ -320,6 +320,23 @@ fn replies(task: Value, tree_delta: Reply) -> BTreeMap<String, Reply> {
             "worktreePath": "/srv/spec/worktrees/build"
         })),
     );
+    replies.insert(
+        format!("steering-recheck-{TASK_ID}"),
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "authorizedComments": [],
+            "receipt": {
+                "thread": {
+                    "number": "7",
+                    "url": "local://acme/spec/issues/7"
+                },
+                "rechecked": true,
+                "recheckTruncated": false,
+                "preparedCommentIds": [],
+                "lateRecheckCommentIds": []
+            }
+        })),
+    );
     // The whole premise: the agent node did not pass.
     replies.insert(
         format!("agent-{TASK_ID}"),
