@@ -6,6 +6,19 @@ authorized.
 
 ## [Unreleased]
 
+### Campaign re-arm is a blocked poll state
+
+- `campaign poll --once` still refuses to dispatch when the live executable
+  graph differs from the explicitly armed digest, but now reports that
+  admission stop under a structured `blocked` result with reason
+  `rearm-required` and exits successfully when no actual poll failure occurred.
+- Periodic `tally-campaign-poll.service` runs therefore remain healthy while an
+  operator inspects and re-arms an edited campaign. Forge, registry, validation,
+  and dispatch errors remain in `failures` and still produce a non-zero exit.
+- The system-socket campaign test mutates a valid armed graph, proves that no
+  successor dispatch occurs, checks both digests in the blocked result, restores
+  the admitted graph, and then requires ordinary terminal convergence.
+
 ### Retired usage shape exemptions (#409)
 
 - Removed `total-only-attempts` from declared-field grading and deleted the

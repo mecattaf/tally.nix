@@ -3139,6 +3139,39 @@
             plain_poll = (
               campaign_cli + " campaign poll --once --wait --state-dir " + campaign_state
             )
+
+            # An operator edit changes the executable digest. Poll must still
+            # refuse to dispatch it, but that correct admission stop is a
+            # structured blocked state rather than a failed periodic service.
+            machine.succeed(
+              "grep -F '\"name\":\"sentinel-config\"' "
+              + campaign_root + "/master-body"
+            )
+            machine.succeed(
+              "sed -i 's/\"name\":\"sentinel-config\"/"
+              "\"name\":\"sentinel-config-edited\"/' "
+              + campaign_root + "/master-body"
+            )
+            blocked_poll = json.loads(machine.succeed(plain_poll))
+            assert blocked_poll["observed"] == 1, blocked_poll
+            assert blocked_poll["dispatched"] == 0, blocked_poll
+            assert blocked_poll["pruned"] == 0, blocked_poll
+            assert blocked_poll["failures"] == [], blocked_poll
+            assert len(blocked_poll["blocked"]) == 1, blocked_poll
+            blocked = blocked_poll["blocked"][0]
+            assert blocked["issue"] == issue, blocked
+            assert blocked["reason"] == "rearm-required", blocked
+            assert blocked["approvedGraphDigest"] != blocked["liveGraphDigest"], blocked
+            assert machine.succeed(
+              "wc -l < " + campaign_root + "/frame-probes"
+            ).strip() == "1"
+
+            # Restore the admitted graph; the ordinary poll path can now
+            # observe the local merge and drive terminal closeout.
+            machine.succeed(
+              "${pkgs.jq}/bin/jq -r .body ${campaignHostMaster} > "
+              + campaign_root + "/master-body"
+            )
             poll_results = []
             for _ in range(8):
               poll_results.append(json.loads(machine.succeed(plain_poll)))

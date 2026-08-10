@@ -82,6 +82,17 @@ struct CampaignGraph {
     tasks: Vec<GithubIssue>,
 }
 
+#[derive(Debug)]
+enum CampaignPollAttempt {
+    Dispatched,
+    Pruned,
+    Unchanged,
+    RearmRequired {
+        approved_graph_digest: String,
+        live_graph_digest: String,
+    },
+}
+
 pub(super) async fn run_campaign(
     socket: &Path,
     config_path: Option<&Path>,
@@ -1668,6 +1679,7 @@ async fn run_campaign_poll(
     let mut observed = 0usize;
     let mut dispatched = 0usize;
     let mut pruned = 0usize;
+    let mut blocked = Vec::new();
     let mut failures = Vec::new();
     for (path, mut registration) in entries {
         observed += 1;
@@ -1677,16 +1689,20 @@ async fn run_campaign_poll(
             let master = fetch_issue(&locator)?;
             if master.state != "open" {
                 registry.remove(&registration)?;
-                return Ok((false, true));
+                return Ok(CampaignPollAttempt::Pruned);
             }
             let graph = campaign_graph_from(&locator, master)?;
             require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
             if graph.canonical.executable_digest != registration.approved_graph_digest {
-                bail!(
-                    "executable graph changed from admitted {} to {}; explicit re-arm is required",
-                    registration.approved_graph_digest,
-                    graph.canonical.executable_digest
-                );
+                // Refusing an unapproved graph is the admission mechanism
+                // working, not a poll-process failure. Keep the refusal loud
+                // and structured without putting the periodic systemd unit in
+                // failed state on every tick while the operator inspects and
+                // explicitly re-arms the campaign.
+                return Ok(CampaignPollAttempt::RearmRequired {
+                    approved_graph_digest: registration.approved_graph_digest.clone(),
+                    live_graph_digest: graph.canonical.executable_digest.clone(),
+                });
             }
             let repository_progress = repository_progress_value(&graph)?;
             // The cheap comparison comes first. Reading the steering surfaces
@@ -1696,7 +1712,7 @@ async fn run_campaign_poll(
             // returned what the previous tick returned.
             let forge = forge_observation(&graph, &repository_progress, registration.arm_serial)?;
             if registration.last_forge_observation.as_deref() == Some(&forge) {
-                return Ok((false, false));
+                return Ok(CampaignPollAttempt::Unchanged);
             }
             let steering = fetch_campaign_steering(
                 &graph,
@@ -1712,7 +1728,7 @@ async fn run_campaign_poll(
             if registration.last_observation.as_deref() == Some(&observation) {
                 registration.last_forge_observation = Some(forge);
                 registry.write(&mut registration)?;
-                return Ok((false, false));
+                return Ok(CampaignPollAttempt::Unchanged);
             }
             registration.last_forge_observation = Some(forge);
             let result = dispatch_campaign(
@@ -1742,13 +1758,23 @@ async fn run_campaign_poll(
                     }));
                 }
             }
-            Ok::<_, anyhow::Error>((true, false))
+            Ok::<_, anyhow::Error>(CampaignPollAttempt::Dispatched)
         }
         .await;
         match attempt {
-            Ok((true, _)) => dispatched += 1,
-            Ok((_, true)) => pruned += 1,
-            Ok((false, false)) => {}
+            Ok(CampaignPollAttempt::Dispatched) => dispatched += 1,
+            Ok(CampaignPollAttempt::Pruned) => pruned += 1,
+            Ok(CampaignPollAttempt::Unchanged) => {}
+            Ok(CampaignPollAttempt::RearmRequired {
+                approved_graph_digest,
+                live_graph_digest,
+            }) => blocked.push(json!({
+                "registration": path.display().to_string(),
+                "issue": &registration.issue_url,
+                "reason": "rearm-required",
+                "approvedGraphDigest": approved_graph_digest,
+                "liveGraphDigest": live_graph_digest,
+            })),
             Err(error) => failures.push(format!("{}: {error:#}", path.display())),
         }
     }
@@ -1758,6 +1784,7 @@ async fn run_campaign_poll(
             "observed": observed,
             "dispatched": dispatched,
             "pruned": pruned,
+            "blocked": blocked,
             "failures": failures,
         }))?
     );
