@@ -83,19 +83,30 @@ if role == "diagnosis":
             raise SystemExit(
                 f"diagnosis mission omitted literal rule {required_prompt_text!r}"
             )
+    forbid_paths_history_rule = (
+        "changed_paths_in_history(union_base, head)",
+        "a later removal does not clear an earlier commit",
+        "The only cure is rewriting the lane so the path never appears in any commit",
+        "soft-reset to the merge base and recommit without it",
+    )
+    has_forbid_paths_history_rule = all(
+        statement in mission for statement in forbid_paths_history_rule
+    )
     if task == "task-1":
         if "build/transient.db" not in failure["captureStderr"]:
             raise SystemExit("task 1 diagnosis omitted constraint stderr")
-        # #385: outcome-first leading sentence naming the failing check id
-        # (`conflict-domains`, the ownership gate's own gateId) -- the
-        # constructive-correction shape the validator now requires. Also
-        # names a task id containing "sk-", a git object id, and prose about
-        # a token bug; redaction must keep all three and drop only the
-        # credential.
+        if not has_forbid_paths_history_rule:
+            raise SystemExit("forbidPaths diagnosis mission omitted the history-walk cure")
+        # #385: outcome-first leading sentence names the failing check id and
+        # path exactly. The steering follows the history-walk cure disclosed
+        # in the mission. It also names a task id containing "sk-", a git
+        # object id, and prose about a token bug; redaction must keep all three
+        # and drop only the credential.
         steering = (
-            "Diagnosed a conflict-domains breach: task-1 left build/transient.db "
-            "behind because the subtask-2 cleanup never ran.\n"
-            "Rebase onto 6347cbb9f4a2b1c0d5e6f70819a2b3c4d5e6f708 and rerun the gates.\n"
+            "Diagnosed no-db-artifacts: task-1 committed build/transient.db "
+            "because the subtask-2 cleanup never ran.\n"
+            "Soft-reset to merge base 6347cbb9f4a2b1c0d5e6f70819a2b3c4d5e6f708 "
+            "and recommit without build/transient.db so it never appears in any lane commit.\n"
             "The auth token bug is unrelated to this failure.\n"
             "Do not expose ghp_0123456789abcdefghijklmnopqrstuvwxyz in public output."
         )
@@ -128,6 +139,7 @@ if role == "diagnosis":
         "hasDiff": diff["available"],
         "hasPatch": bool(diff["patch"]),
         "hasStderr": bool(failure["captureStderr"]),
+        "hasForbidPathsHistoryRule": has_forbid_paths_history_rule,
     }
     with (control / "diagnosis-inputs.log").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(receipt, sort_keys=True) + "\n")

@@ -3300,7 +3300,10 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             // and says so rather than leaving the reader to guess.
             assert_eq!(second_value["merged"][0]["authorship"], Value::Null);
             assert_eq!(second_value["failures"][0]["taskId"], "task-1");
-            assert_eq!(second_value["failures"][0]["stage"], "ownership");
+            assert_eq!(
+                second_value["failures"][0]["stage"],
+                "gate:no-db-artifacts"
+            );
             assert_eq!(second_value["diagnoses"][0]["taskId"], "task-1");
             assert_eq!(second_value["diagnoses"][0]["attempt"], 1);
             assert_eq!(second_value["diagnoses"][0]["blocked"], false);
@@ -3348,24 +3351,20 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
 
             assert_eq!(
                 second_submitted.len(),
-                // #386: `tree-delta-task-3` is a new node in the chain
-                // between `ownership` and the campaign's own gates -- one
-                // more submitted node per implementation task that reaches
-                // it. task-1 never reaches it (its ownership fails first),
-                // so this pass gains exactly one.
-                27,
+                // task-1's declared domains admit the transient database so
+                // the tree-delta check passes and `no-db-artifacts` itself is
+                // the witnessed failure. Both nodes now run before diagnosis.
+                29,
                 "unexpected second-pass nodes: {:?}",
                 second_submitted
                     .iter()
                     .map(|event| event["label"].as_str().unwrap_or("<missing>"))
                     .collect::<Vec<_>>()
             );
-            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 27).await;
+            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 29).await;
             assert_eq!(
                 second_items.len(),
-                // #386: `tree-delta-task-3` (see the `second_submitted`
-                // count above).
-                27,
+                29,
                 "unexpected durable second-pass nodes: {:?}",
                 json!({
                     "durable": second_items
@@ -3383,14 +3382,14 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             // Four preflight nodes became six: prep, cleanup, and now a
             // gating probe plus a non-gating real-argv witness for each of the
             // two command gates -- all carrying the first frontier
-            // implementation's taskRef, on top of task-1's own seven lane
-            // nodes.
+            // implementation's taskRef, on top of task-1's own nine lane
+            // nodes through its failing forbidPaths check.
             assert_eq!(
                 second_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-1")
                     .count(),
-                13
+                15
             );
             assert_eq!(
                 second_submitted
@@ -3413,7 +3412,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-1")
                     .count(),
-                13
+                15
             );
             assert_eq!(
                 second_items
@@ -3429,13 +3428,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .call("query.job", Some(json!({"id": item["anchor"]})))
                     .await
                     .unwrap();
-                if projected["job"]["orchestration"]["nodeLabel"] == "ownership-task-1" {
+                if projected["job"]["orchestration"]["nodeLabel"]
+                    == "gate-task-1-no-db-artifacts"
+                {
                     failed_constraint = item["anchor"].as_str().map(str::to_owned);
                     break;
                 }
             }
             let failed_constraint =
-                failed_constraint.expect("the conflict-domain ownership check was not projected");
+                failed_constraint.expect("the forbidPaths gate was not projected");
             assert_eq!(
                 second_items
                     .iter()
@@ -3448,7 +3449,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 .await
                 .unwrap();
             assert_eq!(projected_constraint["job"]["taskRef"], "fixture/task-1");
-            assert_eq!(projected_constraint["job"]["runtimeMaxSec"], 30);
+            assert_eq!(projected_constraint["job"]["runtimeMaxSec"], 1);
             assert!(task_capture(&daemon_paths, &failed_constraint, "task-1")
                 .contains("build/transient.db"));
             assert_eq!(
@@ -4377,6 +4378,11 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(diagnosis_inputs[0]["task"], "task-1");
             assert_eq!(diagnosis_inputs[0]["previous"], 0);
             assert_eq!(diagnosis_inputs[0]["hasPatch"], true);
+            assert_eq!(
+                diagnosis_inputs[0]["hasForbidPathsHistoryRule"],
+                true,
+                "the forbidPaths steward context omitted its history-walk cure"
+            );
             assert_eq!(diagnosis_inputs[1]["task"], "phase-one-checkpoint");
             assert_eq!(diagnosis_inputs[1]["previous"], 0);
             assert_eq!(diagnosis_inputs[1]["hasPatch"], false);

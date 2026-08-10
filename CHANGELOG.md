@@ -6,6 +6,16 @@ authorized.
 
 ## [Unreleased]
 
+### History-scoped forbidPaths steering (#458)
+
+- `forbidPaths` failures now say that rejected paths were touched in lane
+  history and that a later removal cannot clear the failure, while retaining
+  the check id and every offending path as literal evidence.
+- The diagnosing steward is now told that the gate walks
+  `changed_paths_in_history(union_base, head)` and that remediation must
+  soft-reset to the merge base and recommit so the path appears in no lane
+  commit.
+
 ### Steward diagnosis delivery (#455)
 
 - Failing-gate diagnosis prompts now state the literal-substring contract and

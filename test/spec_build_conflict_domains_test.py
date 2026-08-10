@@ -681,6 +681,43 @@ class PublicationConflictDomainTests(PublicationHarness):
         self.assertEqual(published["head"], head)
         self.assertEqual(published["ownership"]["ownedPaths"], ["internal/contacts/model.go"])
 
+    def test_forbid_paths_failure_names_the_history_walk_and_later_removal_rule(
+        self,
+    ) -> None:
+        transient = self.checkout / "build/transient.db"
+        transient.parent.mkdir(parents=True)
+        transient.write_text("not a database\n", encoding="utf-8")
+        self.commit("fixture: add forbidden artifact")
+        transient.unlink()
+        contact = self.checkout / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        self.commit("fixture: remove artifact in a later commit")
+        gate = {
+            "kind": "forbidPaths",
+            "id": "no-db-artifacts",
+            "forbidPaths": ["*.db"],
+            "runtimeMaxSec": 11,
+        }
+        workspace = dict(self.brief()["workspace"])
+        workspace.pop("publishBranch")
+
+        with self.assertRaises(driver.DriverError) as rejected:
+            driver.action_constraint(
+                {
+                    "gate": gate,
+                    "repositoryConfig": self.brief()["repositoryConfig"],
+                    "workspace": workspace,
+                }
+            )
+
+        self.assertEqual(
+            str(rejected.exception),
+            "forbidPaths gate 'no-db-artifacts' rejected 1 path(s) touched in lane "
+            "history (a later removal does not clear this; the path must never "
+            'appear in any lane commit): "build/transient.db" (matched "*.db")',
+        )
+
     def test_a_forged_remote_tracking_ref_cannot_empty_the_union(self) -> None:
         """The lane's ref store is shared with the checkout and agent-writable.
 
