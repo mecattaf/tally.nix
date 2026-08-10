@@ -147,11 +147,15 @@ The runner writes a local transcript below
 transcript tail into the pull request. That worker-run transcript is the merge evidence; the runner
 does not publish evidence or write any merge-control state to GitHub.
 
-For the single-operator phase, #128 item 5's “independently enforced merge control” is
-**consciously rejected**. Trusted agents act under the operator's existing `gh`, Claude Code, and
-Codex authentication; a GitHub-side control those agents could bypass would add ceremony and
-credential cost without creating an independent boundary. Revisit this decision only at the first
-outside contributor or the first release tag, and only through a new ruling from Tom.
+## Merge control
+
+`main` changes only through a tally campaign merge. Hand merges are not permitted, including by the operator, and there are no exceptions.
+
+The campaign's witnessed gate ladder is the merge criterion. It cannot be skipped, fabricated, or accidentally omitted by the agent doing the work. The previous rule — a worker-pasted `test/fleet-gate.sh` transcript — was self-reported, and #471 is what that cost: `nix flake check` was red on `main` from #453 until it was found hours later, because the stage was never run.
+
+This supersedes the earlier rejection of #128 item 5. That rejection argued a GitHub-side control would not be a real boundary because agents hold the operator's credentials. That argument is sound against deliberate evasion and does not address accidental omission, which is the failure that actually occurred. The remedy chosen is not to add a control but to remove the unverified path.
+
+If a campaign cannot carry a change, that is a defect in the campaign machinery and is fixed as one. A campaign executes the *installed pin*, not the working tree, so a broken driver on `main` does not prevent a campaign from repairing it. A broken pin is resolved by generation rollback, which is a deploy operation and not a merge.
 
 ## Live-system tests
 
