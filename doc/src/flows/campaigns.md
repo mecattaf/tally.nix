@@ -98,9 +98,44 @@ that hand-maintained copy. Start from one JSON worklist:
     "gates": [
       {
         "kind": "command",
+        "id": "fmt",
+        "preflightArgv": ["nix", "develop", "--command", "sh", "-euc", "command -v rustfmt >/dev/null; printf '' | rustfmt --emit stdout >/dev/null"],
+        "argv": ["nix", "develop", "--command", "cargo", "fmt", "--all", "--check"],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "no-stubs",
+        "preflightArgv": ["sh", "-euc", "test -d crates; command -v grep >/dev/null"],
+        "argv": ["sh", "-euc", "! grep -R -n -E 'todo!|unimplemented!|TODO' crates/"],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "deny",
+        "preflightArgv": ["nix", "develop", "--command", "sh", "-euc", "command -v cargo-deny >/dev/null; test -x test/cargo-deny.sh"],
+        "argv": ["nix", "develop", "--command", "test/cargo-deny.sh"],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
         "id": "tests",
         "preflightArgv": ["nix", "develop", "--command", "sh", "-euc", "command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"],
         "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "clippy",
+        "preflightArgv": ["nix", "develop", "--command", "sh", "-euc", "command -v cargo >/dev/null; command -v clippy-driver >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"],
+        "argv": ["nix", "develop", "--command", "cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "flake-check",
+        "preflightArgv": ["sh", "-euc", "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix flake metadata --no-write-lock-file >/dev/null"],
+        "argv": ["sh", "-euc", "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix flake check -L"],
         "runtimeMaxSec": 900
       }
     ]
@@ -734,6 +769,33 @@ services.tally = {
       # preflight exists to replace.
       {
         kind = "command";
+        id = "fmt";
+        preflightArgv = [
+          "nix" "develop" "--command" "sh" "-euc"
+          "command -v rustfmt >/dev/null; printf '' | rustfmt --emit stdout >/dev/null"
+        ];
+        argv = [ "nix" "develop" "--command" "cargo" "fmt" "--all" "--check" ];
+        runtimeMaxSec = 900;
+      }
+      {
+        kind = "command";
+        id = "no-stubs";
+        preflightArgv = [ "sh" "-euc" "test -d crates; command -v grep >/dev/null" ];
+        argv = [ "sh" "-euc" "! grep -R -n -E 'todo!|unimplemented!|TODO' crates/" ];
+        runtimeMaxSec = 900;
+      }
+      {
+        kind = "command";
+        id = "deny";
+        preflightArgv = [
+          "nix" "develop" "--command" "sh" "-euc"
+          "command -v cargo-deny >/dev/null; test -x test/cargo-deny.sh"
+        ];
+        argv = [ "nix" "develop" "--command" "test/cargo-deny.sh" ];
+        runtimeMaxSec = 900;
+      }
+      {
+        kind = "command";
         id = "tests";
         preflightArgv = [
           "nix" "develop" "--command" "sh" "-euc"
@@ -744,12 +806,28 @@ services.tally = {
       }
       {
         kind = "command";
-        id = "format";
+        id = "clippy";
         preflightArgv = [
           "nix" "develop" "--command" "sh" "-euc"
-          "command -v rustfmt >/dev/null; printf '' | rustfmt --emit stdout >/dev/null"
+          "command -v cargo >/dev/null; command -v clippy-driver >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"
         ];
-        argv = [ "nix" "develop" "--command" "cargo" "fmt" "--all" "--check" ];
+        argv = [
+          "nix" "develop" "--command" "cargo" "clippy" "--workspace"
+          "--all-targets" "--all-features" "--" "-D" "warnings"
+        ];
+        runtimeMaxSec = 900;
+      }
+      {
+        kind = "command";
+        id = "flake-check";
+        preflightArgv = [
+          "sh" "-euc"
+          "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix flake metadata --no-write-lock-file >/dev/null"
+        ];
+        argv = [
+          "sh" "-euc"
+          "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix flake check -L"
+        ];
         runtimeMaxSec = 900;
       }
     ];
@@ -878,6 +956,72 @@ argv gate; it is not an operator audit after the merge.
 This mechanism constrains task branches advanced by this campaign. It does not
 turn the same rule into a repository-wide GitHub branch protection for unrelated
 pull requests.
+
+### Recommended gate ladder
+
+Declare the complete merge criterion before arming a campaign, in this
+cheap-fails-first order: `fmt` → `no-stubs` → `deny` → `tests` → `clippy` →
+`nix flake check -L`. The two examples above spell out that ladder as gate
+objects. The final flake check is not redundant with the narrower Rust gates: it
+also evaluates the Nix surface and runs the checks wired into the flake, so a
+task that leaves that surface red must fail before merge rather than at a later
+campaign checkpoint.
+
+The measurements from 2026-08-10 were `fmt` 1 s, `deny` 1 s, `tests` 286 s,
+`clippy` 28 s warm-inherited from the preceding Rust build, and
+`nix flake check -L` about 100 s. The no-stubs scan was not separately timed.
+All of these numbers assume both a warm Nix store and a warm Cargo registry;
+they are ordering evidence, not cold-host runtime budgets.
+
+Under the `strict` and `production` hardening tiers, give the flake gate writable
+cache and state roots in its private `/tmp`. This is the hermetic argv, expressed
+as the command it runs:
+
+```console
+sh -euc 'export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p "$XDG_CACHE_HOME" "$XDG_STATE_HOME"; exec nix flake check -L'
+```
+
+A bare `nix flake check -L` dies in about 1 s under
+`ProtectHome=read-only` when Nix tries to write
+`$HOME/.cache/nix/fetcher-cache-v4.sqlite`; opening all of home for that cache
+would weaken the tier instead of making the gate self-contained.
+
+Do not add this ladder piecemeal after arm. `gates` is a revision-bearing member
+of every task completion, so adding one gate to an armed campaign rotates every
+completed task's revision and requires a full marker re-stamp walk. Re-stamping
+has been agent-free since `c3b7ffc`, but it still opens one marker pull request
+for every completed task. Adopt the complete ladder at arm time.
+
+Repositories that require every content-bearing lane to update `CHANGELOG.md`
+can use this marker-safe command-gate predicate as `argv`:
+
+```
+sh -euc 'base="$(git config --get tally.baserev)"; git diff --quiet "$base" HEAD -- && exit 0;
+         git diff --name-only "$base" HEAD -- CHANGELOG.md | grep -qx CHANGELOG.md'
+```
+
+This exempts only an empty tree diff, which is what an agent-free completion
+re-stamp produces; marker pull requests are identified on GitHub only by the
+`[marker] ` title prefix, not by a label. A content-bearing lane passes only when
+`CHANGELOG.md` appears in its diff.
+
+The base cannot come from pull-request metadata. A command gate runs with the
+lane worktree as its current directory and only `CAMPAIGN_TASK_ID` added to its
+environment—there is no pull-request number or GitHub base SHA—so the predicate
+reads the `tally.baserev` per-worktree Git config that the driver writes for both
+task and preflight lanes. The empty-diff exemption cannot be manufactured by a
+re-stamp: `action_restamp` refuses any lane history that changes repository
+content, checks the resulting base-to-head diff again, and only then returns the
+empty commit. The re-stamp lane also genuinely runs the configured gates; after
+the driver creates that commit, the flow falls through to the same ownership,
+gate, publication, rebase, and merge path as substantive work.
+
+The predicate is **not post-rebase-safe yet**. `action_rebase` returns the new
+base revision to the flow, and the flow passes that value in the regate workspace
+object, but the driver does not rewrite the lane's `tally.baserev` worktree config
+before command gates run again. A post-rebase invocation therefore still diffs
+from the original prepared base. Treat this changelog gate as post-rebase-unsafe
+pending a driver fix that updates the per-worktree key before regating.
 
 The campaign runner follows the same rule. Its complete structured flow
 arguments travel in the producer enqueue's content-addressed brief and are read

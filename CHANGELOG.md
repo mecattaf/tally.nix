@@ -6,6 +6,15 @@ authorized.
 
 ## [Unreleased]
 
+### Document the campaign gate ladder (#488)
+
+- Campaign guidance now recommends the full cheap-fails-first Rust/Nix gate
+  ladder, including a hardened-tier-safe `nix flake check -L`, its measured
+  warm-cache costs, and the revision-rotation cost of adding gates after arm.
+- The documented changelog gate exempts empty completion re-stamps without
+  exempting content-bearing lanes, and records that its `tally.baserev`
+  predicate remains unsafe after a rebase until the driver rewrites that key.
+
 ### Document per-task revision isolation (#490)
 
 - Campaign documentation now enumerates the exact completion-revision field
