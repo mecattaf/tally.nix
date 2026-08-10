@@ -200,7 +200,12 @@ elif task == "task-3":
     (output / "three.txt").write_text("three\n", encoding="utf-8")
 elif task == "task-4":
     (output / "four.txt").write_text("four\n", encoding="utf-8")
-    (output / "checkpoint-red").unlink()
+    try:
+        (output / "checkpoint-red").unlink()
+    except FileNotFoundError:
+        raise SystemExit(
+            "task 4 base mismatch: build/checkpoint-red from task 1 is missing"
+        ) from None
 elif task == "task-6":
     (output / "six.txt").write_text("six\n", encoding="utf-8")
 else:

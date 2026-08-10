@@ -23,6 +23,7 @@ Nothing here posts, publishes, or decides policy. Callers translate
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -37,6 +38,11 @@ from typing import Any
 # are per-worktree git-dir state, both are irrelevant outside the lane's own
 # lifecycle, and neither is ever a campaign artifact a reader sees.
 CHANGE_SET_SNAPSHOT_NAME = "tally-changeset-snapshot.json"
+
+# Every linked worktree in one checkout mutates the same git common directory:
+# refs, config, and the `worktrees/` registry all live there even though lane
+# roots are separate. Fresh lane cuts therefore share this one lock.
+WORKTREE_PREPARATION_LOCK_NAME = "tally-worktree-preparation.lock"
 
 # Identity fields are written as `tally.<key>`. Git folds a configuration key
 # to lower case, so the keys are lower case here too and round-trip byte for
@@ -122,6 +128,19 @@ def check_branch_name(branch: str) -> None:
         raise WorktreeError(
             "branch-invalid", f"branch name {branch!r} is not a valid git branch", {"branch": branch}
         )
+
+
+def worktree_preparation_lock_path(checkout: Path) -> Path:
+    """The per-checkout lock beside git's shared linked-worktree metadata."""
+    common_dir = Path(
+        _git(
+            checkout,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ).stdout.strip()
+    )
+    return common_dir / WORKTREE_PREPARATION_LOCK_NAME
 
 
 def enable_worktree_config(checkout: Path) -> None:
@@ -393,22 +412,51 @@ def add(checkout: Path, worktree: Path, branch: str, start_rev: str) -> str:
     derived from the lane's position has to be derived from *that*.
     """
     check_branch_name(branch)
-    enable_worktree_config(checkout)
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    if branch_exists(checkout, branch):
-        _git(checkout, "worktree", "add", str(worktree), branch, code="worktree-create-failed")
-    else:
-        _git(
-            checkout,
-            "worktree",
-            "add",
-            "-b",
-            branch,
-            str(worktree),
-            start_rev,
-            code="worktree-create-failed",
+    lock_path = worktree_preparation_lock_path(checkout)
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
         )
-    return _git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+    except OSError as error:
+        raise WorktreeError(
+            "worktree-create-failed",
+            f"cannot open linked-worktree preparation lock {lock_path}: {error}",
+            {"lockPath": str(lock_path)},
+        ) from error
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError as error:
+            raise WorktreeError(
+                "worktree-create-failed",
+                f"cannot acquire linked-worktree preparation lock {lock_path}: {error}",
+                {"lockPath": str(lock_path)},
+            ) from error
+        enable_worktree_config(checkout)
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        if branch_exists(checkout, branch):
+            _git(
+                checkout,
+                "worktree",
+                "add",
+                str(worktree),
+                branch,
+                code="worktree-create-failed",
+            )
+        else:
+            _git(
+                checkout,
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(worktree),
+                start_rev,
+                code="worktree-create-failed",
+            )
+        return _git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
 
 
 def create(
