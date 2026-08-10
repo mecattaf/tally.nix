@@ -33,6 +33,11 @@ SPEC.loader.exec_module(DRIVER)
 # The shared worktree manager the driver resolves as a sibling module. Reading
 # lane identity back through it is what proves the round-trip.
 WORKTREES = DRIVER.worktrees
+MARKER_SAFE_CHANGELOG_PREDICATE = (
+    'base="$(git config --get tally.baserev)"; '
+    'git diff --quiet "$base" HEAD -- && exit 0;\n'
+    'git diff --name-only "$base" HEAD -- CHANGELOG.md | grep -qx CHANGELOG.md'
+)
 
 
 def command(*arguments: str, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -3177,6 +3182,69 @@ class LaneLifecycleTests(unittest.TestCase):
             created = github.state()["createdPullRequests"][0]
             title = created[created.index("--title") + 1]
             self.assertEqual(title, "[marker] task-1: Task task-1")
+
+    def test_marker_only_lane_passes_the_marker_safe_changelog_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            (checkout / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
+            git(checkout, "add", "CHANGELOG.md")
+            git(checkout, "commit", "--quiet", "-m", "add changelog")
+            git(checkout, "push", "--quiet", "origin", "main")
+            base = git(checkout, "rev-parse", "origin/main")
+            current_revision = "sha256:" + "2" * 64
+            brief = prep_brief(checkout, root / "workspaces", "changelog-marker-pass")
+            brief["task"]["revision"] = current_revision
+            prepared = DRIVER.action_prep(brief)
+
+            DRIVER.action_restamp(
+                {
+                    "task": brief["task"],
+                    "completion": {
+                        "taskId": "task-1",
+                        "pullRequest": "https://github.com/acme/spec/pull/8",
+                        "mergeCommit": base,
+                        "revision": "sha256:" + "1" * 64,
+                    },
+                    "workspace": prepared,
+                }
+            )
+            worktree = Path(prepared["worktreePath"])
+            gated = command(
+                "sh",
+                "-euc",
+                MARKER_SAFE_CHANGELOG_PREDICATE,
+                cwd=worktree,
+                check=False,
+            )
+
+            self.assertEqual(gated.returncode, 0, gated.stderr)
+
+    def test_content_lane_without_a_changelog_touch_fails_the_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            (checkout / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
+            git(checkout, "add", "CHANGELOG.md")
+            git(checkout, "commit", "--quiet", "-m", "add changelog")
+            git(checkout, "push", "--quiet", "origin", "main")
+            prepared = DRIVER.action_prep(
+                prep_brief(checkout, root / "workspaces", "changelog-content-fail")
+            )
+            worktree = Path(prepared["worktreePath"])
+            (worktree / "content.txt").write_text("content\n", encoding="utf-8")
+            git(worktree, "add", "content.txt")
+            git(worktree, "commit", "--quiet", "-m", "content without changelog")
+
+            gated = command(
+                "sh",
+                "-euc",
+                MARKER_SAFE_CHANGELOG_PREDICATE,
+                cwd=worktree,
+                check=False,
+            )
+
+            self.assertEqual(gated.returncode, 1, gated.stderr)
 
     def test_a_lane_base_that_left_the_witnessed_worklist_history_fails_closed(
         self,
