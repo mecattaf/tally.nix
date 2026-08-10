@@ -6,6 +6,17 @@ authorized.
 
 ## [Unreleased]
 
+### Pre-dispatch steering re-check (#461)
+
+- Forge-native implementation attempts now re-read their task thread once
+  after lane preparation and immediately before adapter dispatch, so an
+  authorized comment landing in that window reaches the current attempt.
+- The re-check carries the arm-time actor allowlist and applies the same
+  machine-marker exclusion as prep-time collection; unauthorized and
+  tally-authored late comments remain outside the agent brief.
+- Each immutable attempt brief records prep-time and late-recheck comment IDs,
+  the thread coordinate, and whether the bounded re-check window was truncated.
+
 ### History-scoped forbidPaths steering (#458)
 
 - `forbidPaths` failures now say that rejected paths were touched in lane

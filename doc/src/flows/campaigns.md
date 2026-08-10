@@ -277,6 +277,26 @@ reaching its task and nothing else would say so. The master issue stays
 the campaign-wide channel: campaign-level human steering reaches every task, and
 escalation and the closing summary are always posted there.
 
+That pass-start snapshot is not the last word for an implementation attempt.
+After its lane is prepared and immediately before its adapter is admitted, a
+deterministic driver node re-reads that task's thread once. In native mode this
+is the task sub-issue and uses the same newest-100 window; in degraded mode it
+is the master thread and uses the historical paginated REST read. The re-check
+uses the exact `allowedActors` recorded at arm and applies the same rule that
+excludes any comment containing the `<!-- tally:spec-build:` machine marker.
+It folds newly authorized comments into the immutable agent brief; an
+unauthorized or machine-marked late comment remains excluded. A read failure is
+campaign machinery and prevents the adapter from being dispatched under a
+possibly stale brief.
+
+The immutable brief is also the attempt receipt. Its
+`steering.attemptReceipt.preparedCommentIds` names comments already present in
+the prep snapshot, while `lateRecheckCommentIds` names comments first observed
+or updated by the pre-dispatch read. `rechecked`, `recheckTruncated`, and the
+exact thread coordinate make the provenance explicit even when no new comment
+arrived. The agent consumes the ordinary merged `authorizedComments` array and
+does not fetch either public thread itself.
+
 New receipts always go to the task's own thread, but the ledger reads both
 surfaces and counts one receipt per `(kind, task, attempt)`. A campaign armed
 before the walk capability existed — or re-armed into it mid-flight — has its
@@ -342,8 +362,10 @@ The poller may refetch projection state and allowed-actor comments, but it
 refuses any changed executable graph until the operator inspects it and runs
 `arm` again. The reconciler independently refetches and recomputes that digest
 before executing. Checkbox/state/timestamp changes are observation signals, not
-executable changes. Agents receive a bounded authorized steering snapshot and
-are told not to refetch the public comment channel. Re-arming the same unchanged
+executable changes. Each implementation attempt receives a bounded authorized
+steering snapshot: the pass-start value plus the one task-thread re-check
+immediately before agent dispatch. Agents are told not to refetch the public
+comment channel themselves. Re-arming the same unchanged
 graph forces a fresh retry without invalidating matching completion facts;
 re-arming changed task content creates a new revision for that task.
 `--no-enqueue` registers after validation without starting a pass, and `--wait`
@@ -1384,7 +1406,7 @@ if implemented is empty, an implementation is in the frontier, and command gates
        non-gating witness
   -> clean up the preflight lane
 parallel(implementation frontier):
-  prepare isolated worktree -> agent
+  prepare isolated worktree -> re-read authorized task-thread steering -> agent
     if the agent passed:
       -> witness ownership -> tree-delta permission gate
       -> each configured gate -> recheck ownership -> push stable task branch
@@ -1736,9 +1758,11 @@ its dependency descendants, so unrelated ready subtrees continue to advance.
 Recurring campaigns use their authenticated issue comment channel for steering.
 An ad-hoc issue campaign instead snapshots only comments authored by its local
 `allowedActors`; the agent receives that bounded value in its immutable brief
-and does not reread the public channel. tally never changes a running node's
-immutable brief. After a task node fails, a separate diagnosis agent receives
-four explicit inputs: the failed node's bounded capture stderr, every gate
+and does not reread the public channel. A deterministic node performs the one
+late task-thread re-check described above before the agent is admitted; tally
+never changes a running node's immutable brief. After a task node fails, a
+separate diagnosis agent receives four explicit inputs: the failed node's
+bounded capture stderr, every gate
 output collected for the task, the exact task brief, and a bounded diff against
 its witnessed base. The diagnosis agent is told not to modify the repository or
 repeat secret-looking input. Only its concise output passes through conservative
