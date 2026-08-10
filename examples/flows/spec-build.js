@@ -1363,12 +1363,20 @@ function gateEvidenceForFailure(failure) {
   if (lastGate === null) {
     return null;
   }
+  const node = lastGate.node;
+  let detail = node;
+  if (node && node.stderrExcerpt) {
+    detail = node.stderrExcerpt;
+  } else if (node && node.error) {
+    detail = node.error;
+  }
   return {
     id: lastGate.gateId,
-    detail: bounded(
-      lastGate.node && lastGate.node.error ? lastGate.node.error : lastGate.node,
-      2000
-    )
+    // A non-zero driver exit has no result to project, so its generic node
+    // error can obscure the stderr detail that names the forbidPaths breach.
+    // Prefer the captured gate output: the diagnosis prompt and validator must
+    // derive their literal path from the same failure the operator sees.
+    detail: bounded(detail, 2000)
   };
 }
 

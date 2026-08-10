@@ -3300,7 +3300,10 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             // and says so rather than leaving the reader to guess.
             assert_eq!(second_value["merged"][0]["authorship"], Value::Null);
             assert_eq!(second_value["failures"][0]["taskId"], "task-1");
-            assert_eq!(second_value["failures"][0]["stage"], "ownership");
+            assert_eq!(
+                second_value["failures"][0]["stage"],
+                "gate:no-db-artifacts"
+            );
             assert_eq!(second_value["diagnoses"][0]["taskId"], "task-1");
             assert_eq!(second_value["diagnoses"][0]["attempt"], 1);
             assert_eq!(second_value["diagnoses"][0]["blocked"], false);
