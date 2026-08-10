@@ -2,7 +2,8 @@ use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::{Command as ProcessCommand, Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ const WORKLIST_BEGIN: &str = "<!-- tally:campaign-worklist:v1 -->";
 const WORKLIST_END: &str = "<!-- tally:campaign-worklist:v1:end -->";
 const TASK_MARKER_PREFIX: &str = "<!-- tally:campaign-task:v1 id=";
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
+const APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const MAX_APPROVED_GRAPH_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct ProjectTask {
@@ -81,6 +84,55 @@ struct CampaignGraph {
     canonical: CanonicalCampaignGraphV1,
     master: GithubIssue,
     tasks: Vec<GithubIssue>,
+}
+
+/// The prior executable graph needed to interpret a later amendment.
+///
+/// Authority schema 2 stays frozen. This snapshot is generation-scoped beside
+/// it, so publishing arm N+1 cannot make an arm-N reader decode a new field or
+/// observe a graph that disagrees with its authority digest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ApprovedGraphSnapshotV1 {
+    schema_version: u32,
+    registration_id: String,
+    arm_serial: u64,
+    graph: CanonicalCampaignGraphV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedAutoPardon {
+    task_id: String,
+    added_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoPardonReceipt {
+    task_id: String,
+    added_dependencies: Vec<String>,
+    resume_receipt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PardonScope {
+    All,
+    Tasks(BTreeSet<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PardonBoundary {
+    id: u64,
+    scope: PardonScope,
+}
+
+impl PardonBoundary {
+    fn applies_to(&self, task_id: &str) -> bool {
+        match &self.scope {
+            PardonScope::All => true,
+            PardonScope::Tasks(tasks) => tasks.contains(task_id),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -326,16 +378,20 @@ fn require_allowed_issue_authors(graph: &CampaignGraph, allowed: &[String]) -> R
     Ok(())
 }
 
-fn fetch_steering(locator: &IssueLocator, allowed: &[String]) -> Result<Vec<Value>> {
+fn fetch_issue_comments(locator: &IssueLocator) -> Result<Vec<GithubComment>> {
     let endpoint = format!(
         "repos/{}/issues/{}/comments?per_page=100",
         locator.repository, locator.number
     );
     let pages: Vec<Vec<GithubComment>> =
         gh_json(&os_arguments(&["api", "--paginate", "--slurp", &endpoint]))?;
+    Ok(pages.into_iter().flatten().collect())
+}
+
+fn fetch_steering(locator: &IssueLocator, allowed: &[String]) -> Result<Vec<Value>> {
     let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut comments = Vec::new();
-    for comment in pages.into_iter().flatten() {
+    for comment in fetch_issue_comments(locator)? {
         if comment.body.contains(SYSTEM_COMMENT_PREFIX) {
             continue;
         }
@@ -672,6 +728,26 @@ fn armed_projection(result: &Value, sub_issue_walk: bool) -> Value {
     }
 }
 
+fn arm_receipt(
+    result: &Value,
+    sub_issue_walk: bool,
+    auto_pardons: &[AutoPardonReceipt],
+    warnings: &[String],
+) -> Value {
+    let mut value = armed_projection(result, sub_issue_walk);
+    let object = value
+        .as_object_mut()
+        .expect("armed_projection always returns an object");
+    object.insert("autoPardons".to_owned(), json!(auto_pardons));
+    let mut combined = object
+        .remove("warnings")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    combined.extend(warnings.iter().map(|warning| json!(warning)));
+    object.insert("warnings".to_owned(), Value::Array(combined));
+    value
+}
+
 /// Every steering surface a pass reads: the campaign-wide master thread, plus
 /// each task's own sub-issue thread where the forge serves one.
 #[derive(Debug, Clone, Default)]
@@ -763,6 +839,257 @@ fn task_steering(
         }
     }
     Ok(steering)
+}
+
+fn machine_marker_fields<'a>(body: &'a str, kind: &str) -> Option<BTreeMap<&'a str, &'a str>> {
+    let prefix = format!("<!-- tally:spec-build:{kind}:v1 ");
+    let content = body
+        .lines()
+        .next()?
+        .strip_prefix(&prefix)?
+        .strip_suffix(" -->")?;
+    let mut fields = BTreeMap::new();
+    for token in content.split(' ') {
+        let (name, value) = token.split_once('=')?;
+        if name.is_empty() || value.is_empty() || fields.insert(name, value).is_some() {
+            return None;
+        }
+    }
+    Some(fields)
+}
+
+fn diagnosis_marker_task(body: &str, campaign: &str, issue_number: u64) -> Option<(String, u8)> {
+    let fields = machine_marker_fields(body, "diagnosis")?;
+    if fields.len() != 4
+        || fields.get("campaign").copied() != Some(campaign)
+        || fields
+            .get("issue")
+            .and_then(|value| value.parse::<u64>().ok())
+            != Some(issue_number)
+    {
+        return None;
+    }
+    let task_id = fields.get("task").copied()?;
+    let attempt = fields.get("attempt")?.parse::<u8>().ok()?;
+    (safe_task_id(task_id) && matches!(attempt, 1 | 2)).then(|| (task_id.to_owned(), attempt))
+}
+
+fn escalation_comment(body: &str, campaign: &str, issue_number: u64) -> bool {
+    body.lines().next()
+        == Some(
+            format!(
+                "<!-- tally:spec-build:escalation:v1 campaign={campaign} issue={issue_number} -->"
+            )
+            .as_str(),
+        )
+}
+
+fn resume_marker_scope(
+    body: &str,
+    campaign: &str,
+    issue_number: u64,
+) -> Result<Option<PardonScope>> {
+    let Some(fields) = machine_marker_fields(body, "resume") else {
+        return Ok(None);
+    };
+    if !matches!(fields.len(), 3 | 4)
+        || fields
+            .keys()
+            .any(|field| !matches!(*field, "campaign" | "issue" | "nonce" | "tasks"))
+        || fields.get("campaign").copied() != Some(campaign)
+        || fields
+            .get("issue")
+            .and_then(|value| value.parse::<u64>().ok())
+            != Some(issue_number)
+    {
+        return Ok(None);
+    }
+    let Some(nonce) = fields.get("nonce") else {
+        return Ok(None);
+    };
+    if uuid::Uuid::parse_str(nonce).is_err() {
+        return Err(invalid("campaign resume marker carries an invalid nonce"));
+    }
+    if !body.contains("\n\n### Campaign resumed\n\n") || !body.contains("\n\nReason: ") {
+        return Err(invalid("campaign resume receipt has malformed content"));
+    }
+    let Some(tasks) = fields.get("tasks") else {
+        return Ok(Some(PardonScope::All));
+    };
+    let tasks = tasks.split(',').map(str::to_owned).collect::<Vec<_>>();
+    let unique = tasks.iter().cloned().collect::<BTreeSet<_>>();
+    if tasks.is_empty()
+        || tasks.len() != unique.len()
+        || tasks.iter().any(|task_id| !safe_task_id(task_id))
+    {
+        return Err(invalid(
+            "campaign resume receipt carries invalid scoped tasks",
+        ));
+    }
+    Ok(Some(PardonScope::Tasks(unique)))
+}
+
+fn active_escalated_tasks(
+    graph: &CampaignGraph,
+    authenticated_actor: &str,
+    sub_issue_walk: bool,
+) -> Result<BTreeSet<String>> {
+    let campaign = &graph.canonical.manifest.name;
+    let issue_number = graph.locator.number;
+    let mut boundaries = Vec::new();
+    let mut diagnoses: BTreeMap<String, Vec<(u64, u8)>> = BTreeMap::new();
+    let mut escalations = Vec::new();
+
+    let master_comments = fetch_issue_comments(&graph.locator)?;
+    for comment in &master_comments {
+        if !comment.user.login.eq_ignore_ascii_case(authenticated_actor) {
+            continue;
+        }
+        if let Some(scope) = resume_marker_scope(&comment.body, campaign, issue_number)? {
+            boundaries.push(PardonBoundary {
+                id: comment.id,
+                scope,
+            });
+        }
+        if let Some((task_id, attempt)) =
+            diagnosis_marker_task(&comment.body, campaign, issue_number)
+        {
+            diagnoses
+                .entry(task_id)
+                .or_default()
+                .push((comment.id, attempt));
+        }
+        if escalation_comment(&comment.body, campaign, issue_number) {
+            escalations.push(comment.id);
+        }
+    }
+
+    if sub_issue_walk {
+        let task_by_issue = graph
+            .canonical
+            .manifest
+            .tasks
+            .iter()
+            .map(|task| (task.issue, task.id.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let walked = sub_issue_threads(&graph.locator)?;
+        for (issue, comments) in walked.threads {
+            let Some(expected_task) = task_by_issue.get(&issue) else {
+                continue;
+            };
+            for comment in comments {
+                let Some(author) = comment.author.as_ref() else {
+                    continue;
+                };
+                if !author.login.eq_ignore_ascii_case(authenticated_actor) {
+                    continue;
+                }
+                let Some((task_id, attempt)) =
+                    diagnosis_marker_task(&comment.body, campaign, issue_number)
+                else {
+                    continue;
+                };
+                if task_id != *expected_task {
+                    continue;
+                }
+                if let Some(id) = comment.database_id {
+                    diagnoses.entry(task_id).or_default().push((id, attempt));
+                }
+            }
+        }
+    }
+
+    let current_tasks = graph
+        .canonical
+        .manifest
+        .tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut active = BTreeSet::new();
+    for (task_id, receipts) in diagnoses {
+        if !current_tasks.contains(task_id.as_str()) {
+            continue;
+        }
+        let boundary = boundaries
+            .iter()
+            .filter(|candidate| candidate.applies_to(&task_id))
+            .map(|candidate| candidate.id)
+            .max()
+            .unwrap_or(0);
+        let current = receipts
+            .into_iter()
+            .filter(|(id, _)| *id > boundary)
+            .collect::<Vec<_>>();
+        let attempts = current
+            .iter()
+            .map(|(_, attempt)| *attempt)
+            .collect::<BTreeSet<_>>();
+        let last_diagnosis = current.iter().map(|(id, _)| *id).max().unwrap_or(0);
+        if attempts == BTreeSet::from([1, 2])
+            && escalations
+                .iter()
+                .any(|escalation| *escalation > boundary && *escalation > last_diagnosis)
+        {
+            active.insert(task_id);
+        }
+    }
+    Ok(active)
+}
+
+fn amendment_pardon_plan(
+    prior: Option<&CanonicalCampaignGraphV1>,
+    current: &CanonicalCampaignGraphV1,
+    escalated: &BTreeSet<String>,
+) -> (Vec<PlannedAutoPardon>, Vec<String>) {
+    let prior_dependencies = prior
+        .map(|graph| {
+            graph
+                .manifest
+                .tasks
+                .iter()
+                .map(|task| {
+                    (
+                        task.id.as_str(),
+                        task.dependencies
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<BTreeSet<_>>(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut pardons = Vec::new();
+    let mut addressed = BTreeSet::new();
+    for task in &current.manifest.tasks {
+        if !escalated.contains(&task.id) {
+            continue;
+        }
+        let Some(previous) = prior_dependencies.get(task.id.as_str()) else {
+            continue;
+        };
+        let added_dependencies = task
+            .dependencies
+            .iter()
+            .filter(|dependency| !previous.contains(dependency.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !added_dependencies.is_empty() {
+            addressed.insert(task.id.clone());
+            pardons.push(PlannedAutoPardon {
+                task_id: task.id.clone(),
+                added_dependencies,
+            });
+        }
+    }
+    let warnings = escalated
+        .difference(&addressed)
+        .map(|task_id| {
+            format!("task {task_id} remains escalated; run tally campaign resume to unblock")
+        })
+        .collect();
+    (pardons, warnings)
 }
 
 fn extract_managed_section<'a>(body: &'a str, start: &str, end: &str) -> Result<&'a str> {
@@ -1038,6 +1365,171 @@ fn resolve_state_dir(value: Option<PathBuf>) -> Result<PathBuf> {
         return Err(invalid("campaign state directory must be absolute"));
     }
     Ok(path)
+}
+
+fn approved_graph_directory(state_dir: &Path, issue_url: &str) -> PathBuf {
+    let scope = format!("{:x}", Sha256::digest(issue_url.as_bytes()));
+    state_dir
+        .join("campaigns/approved-graphs")
+        .join(&scope[..32])
+}
+
+fn approved_graph_path(state_dir: &Path, registration: &CampaignRegistration) -> PathBuf {
+    approved_graph_directory(state_dir, &registration.issue_url)
+        .join(format!("{}.graph-v1.json", registration.arm_serial))
+}
+
+fn validated_graph_snapshot(
+    snapshot: ApprovedGraphSnapshotV1,
+    registration: &CampaignRegistration,
+    path: &Path,
+) -> Result<CanonicalCampaignGraphV1> {
+    if snapshot.schema_version != APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION
+        || snapshot.registration_id != registration.registration_id
+        || snapshot.arm_serial != registration.arm_serial
+        || snapshot.graph.executable_digest != registration.approved_graph_digest
+    {
+        bail!(
+            "campaign approved-graph snapshot {} disagrees with registration {} arm {}",
+            path.display(),
+            registration.registration_id,
+            registration.arm_serial
+        );
+    }
+    let rebuilt = CanonicalCampaignGraphV1::new(
+        snapshot.graph.manifest.clone(),
+        snapshot.graph.tasks.clone(),
+    )?;
+    if rebuilt != snapshot.graph {
+        bail!(
+            "campaign approved-graph snapshot {} fails canonical digest verification",
+            path.display()
+        );
+    }
+    Ok(snapshot.graph)
+}
+
+fn read_approved_graph_snapshot(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> Result<Option<CanonicalCampaignGraphV1>> {
+    let path = approved_graph_path(state_dir, registration);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot inspect campaign approved graph {}", path.display())
+            })
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_APPROVED_GRAPH_SNAPSHOT_BYTES {
+        bail!(
+            "campaign approved-graph snapshot {} is not a bounded regular file",
+            path.display()
+        );
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("cannot read campaign approved graph {}", path.display()))?;
+    let snapshot: ApprovedGraphSnapshotV1 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("campaign approved graph {} is invalid", path.display()))?;
+    validated_graph_snapshot(snapshot, registration, &path).map(Some)
+}
+
+fn write_approved_graph_snapshot(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+    graph: &CanonicalCampaignGraphV1,
+) -> Result<()> {
+    if graph.executable_digest != registration.approved_graph_digest {
+        bail!("cannot snapshot a campaign graph that disagrees with arm authority");
+    }
+    let directory = approved_graph_directory(state_dir, &registration.issue_url);
+    fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "cannot create campaign approved-graph directory {}",
+            directory.display()
+        )
+    })?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "cannot secure campaign approved-graph directory {}",
+            directory.display()
+        )
+    })?;
+    let path = approved_graph_path(state_dir, registration);
+    let temporary = directory.join(format!(
+        ".{}.{}.tmp",
+        registration.arm_serial,
+        uuid::Uuid::now_v7()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .with_context(|| {
+            format!(
+                "cannot create campaign approved-graph snapshot {}",
+                temporary.display()
+            )
+        })?;
+    let snapshot = ApprovedGraphSnapshotV1 {
+        schema_version: APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+        registration_id: registration.registration_id.clone(),
+        arm_serial: registration.arm_serial,
+        graph: graph.clone(),
+    };
+    serde_json::to_writer(&mut file, &snapshot)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path).with_context(|| {
+        format!(
+            "cannot publish campaign approved-graph snapshot {}",
+            path.display()
+        )
+    })?;
+    fs::File::open(&directory)?.sync_all()?;
+    Ok(())
+}
+
+fn prune_approved_graph_snapshots(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> Result<()> {
+    let directory = approved_graph_directory(state_dir, &registration.issue_url);
+    let expected = approved_graph_path(state_dir, registration);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path != expected && path.is_file() {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "cannot prune obsolete campaign approved graph {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_approved_graph_snapshots(state_dir: &Path, issue_url: &str) -> Result<()> {
+    let directory = approved_graph_directory(state_dir, issue_url);
+    match fs::remove_dir_all(&directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot remove campaign approved graphs {}",
+                directory.display()
+            )
+        }),
+    }
 }
 
 fn default_campaign_workspace_root() -> Result<PathBuf> {
@@ -1575,6 +2067,18 @@ async fn run_campaign_arm(
     let sub_issue_walk = probe_sub_issue_walk(&locator)?;
     let steering = fetch_campaign_steering(&graph, &allowed_actors, sub_issue_walk)?;
     let prior = registry.read_issue(&locator.url)?;
+    let prior_graph = prior
+        .as_ref()
+        .map(|registration| read_approved_graph_snapshot(&state_dir, registration))
+        .transpose()?
+        .flatten();
+    let escalated = if prior.is_some() && graph.canonical.manifest.repository.forge == "github" {
+        active_escalated_tasks(&graph, &authenticated_actor, sub_issue_walk)?
+    } else {
+        BTreeSet::new()
+    };
+    let (pardon_plan, arm_warnings) =
+        amendment_pardon_plan(prior_graph.as_ref(), &graph.canonical, &escalated);
     let flow = resolve_flow(args.flow)?;
     let driver = resolve_driver(args.driver)?;
     let workspace_root = args
@@ -1607,7 +2111,9 @@ async fn run_campaign_arm(
             allowed_actors,
             allow_test_local_forge: args.allow_test_local_forge,
             sub_issue_walk,
-            last_observation: prior.and_then(|value| value.last_observation.clone()),
+            last_observation: prior
+                .as_ref()
+                .and_then(|value| value.last_observation.clone()),
             // Arming always dispatches, so the cheap precondition starts empty
             // and the first poll after an arm re-establishes it.
             last_forge_observation: None,
@@ -1624,20 +2130,35 @@ async fn run_campaign_arm(
         &registration.driver,
         registration.allow_test_local_forge,
     )?;
+    let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
+    for pardon in &pardon_plan {
+        let receipt = post_campaign_auto_pardon(&graph, &registration.authenticated_actor, pardon)?;
+        auto_pardons.push(AutoPardonReceipt {
+            task_id: pardon.task_id.clone(),
+            added_dependencies: pardon.added_dependencies.clone(),
+            resume_receipt: receipt,
+        });
+    }
+    write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
+    prune_approved_graph_snapshots(&state_dir, &registration)?;
     if args.no_enqueue {
+        let receipt = json!({
+            "status": "armed",
+            "issue": locator.url,
+            "tasks": graph.tasks.len(),
+            "graphDigest": graph.canonical.executable_digest,
+            "allowedActors": registration.allowed_actors,
+            "enqueued": false,
+        });
         outln!(
             "{}",
-            serde_json::to_string(&json!({
-                "status": "armed",
-                "issue": locator.url,
-                "tasks": graph.tasks.len(),
-                "graphDigest": graph.canonical.executable_digest,
-                "allowedActors": registration.allowed_actors,
-                "subIssueWalk": registration.sub_issue_walk,
-                "projection": projection_label(registration.sub_issue_walk),
-                "enqueued": false,
-            }))?
+            serde_json::to_string(&arm_receipt(
+                &receipt,
+                registration.sub_issue_walk,
+                &auto_pardons,
+                &arm_warnings,
+            ))?
         );
         return Ok(());
     }
@@ -1659,7 +2180,12 @@ async fn run_campaign_arm(
     registry.write(&mut registration)?;
     outln!(
         "{}",
-        serde_json::to_string(&armed_projection(&result, registration.sub_issue_walk))?
+        serde_json::to_string(&arm_receipt(
+            &result,
+            registration.sub_issue_walk,
+            &auto_pardons,
+            &arm_warnings,
+        ))?
     );
     if args.wait {
         let code = waited_exit_code(&result);
@@ -1673,7 +2199,12 @@ async fn run_campaign_arm(
     Ok(())
 }
 
-fn post_campaign_resume(graph: &CampaignGraph, actor: &str, reason: &str) -> Result<String> {
+fn post_campaign_pardon(
+    graph: &CampaignGraph,
+    actor: &str,
+    reason: &str,
+    scope: PardonScope,
+) -> Result<String> {
     let reason = reason.trim();
     if reason.is_empty() || reason.chars().count() > 4_000 || reason.contains('\0') {
         return Err(invalid(
@@ -1685,8 +2216,35 @@ fn post_campaign_resume(graph: &CampaignGraph, actor: &str, reason: &str) -> Res
         "<!-- tally:spec-build:resume:v1 campaign={} issue={} nonce={} -->",
         graph.canonical.manifest.name, graph.locator.number, nonce
     );
+    let (marker, pardon) = match scope {
+        PardonScope::All => (
+            marker,
+            "Pardoned prior machine-diagnosis, machinery-retry, and escalation receipts without deleting the audit trail."
+                .to_owned(),
+        ),
+        PardonScope::Tasks(tasks) => {
+            if tasks.is_empty() || tasks.iter().any(|task_id| !safe_task_id(task_id)) {
+                return Err(invalid("campaign pardon scope must name safe task ids"));
+            }
+            let joined = tasks.iter().cloned().collect::<Vec<_>>().join(",");
+            let marker = marker
+                .strip_suffix(" -->")
+                .expect("resume marker has a fixed suffix");
+            let rendered = tasks
+                .iter()
+                .map(|task_id| format!("`{task_id}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                format!("{marker} tasks={joined} -->"),
+                format!(
+                    "Pardoned prior machine-diagnosis, machinery-retry, and escalation receipts for {rendered} without deleting the audit trail."
+                ),
+            )
+        }
+    };
     let body = format!(
-        "{marker}\n\n### Campaign resumed\n\nPardoned prior machine-diagnosis, machinery-retry, and escalation receipts without deleting the audit trail.\n\nReason: {reason}\n\nRequested by `@{actor}`."
+        "{marker}\n\n### Campaign resumed\n\n{pardon}\n\nReason: {reason}\n\nRequested by `@{actor}`."
     );
     let output = run_gh(
         &os_arguments(&[
@@ -1707,6 +2265,42 @@ fn post_campaign_resume(graph: &CampaignGraph, actor: &str, reason: &str) -> Res
         .map(str::trim)
         .map(str::to_owned)
         .ok_or_else(|| invalid("gh issue comment returned no campaign resume receipt URL"))
+}
+
+fn post_campaign_resume(graph: &CampaignGraph, actor: &str, reason: &str) -> Result<String> {
+    post_campaign_pardon(graph, actor, reason, PardonScope::All)
+}
+
+fn auto_pardon_reason(pardon: &PlannedAutoPardon) -> String {
+    let shown = pardon
+        .added_dependencies
+        .iter()
+        .take(12)
+        .map(|dependency| format!("`{dependency}`"))
+        .collect::<Vec<_>>();
+    let remainder = pardon.added_dependencies.len().saturating_sub(shown.len());
+    let dependencies = if remainder == 0 {
+        shown.join(", ")
+    } else {
+        format!("{}, and {remainder} more", shown.join(", "))
+    };
+    format!(
+        "Re-armed graph added dependency {} to escalated task `{}`; the amendment is the operator's structural steering response.",
+        dependencies, pardon.task_id
+    )
+}
+
+fn post_campaign_auto_pardon(
+    graph: &CampaignGraph,
+    actor: &str,
+    pardon: &PlannedAutoPardon,
+) -> Result<String> {
+    post_campaign_pardon(
+        graph,
+        actor,
+        &auto_pardon_reason(pardon),
+        PardonScope::Tasks(BTreeSet::from([pardon.task_id.clone()])),
+    )
 }
 
 async fn run_campaign_resume(
@@ -1755,7 +2349,9 @@ async fn run_campaign_resume(
     // Publish the new authority before dispatch. Once this write succeeds, the
     // timer can recover an interrupted dispatch without comment deletion or
     // another manual state edit.
+    write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
+    prune_approved_graph_snapshots(&state_dir, &registration)?;
 
     let steering = fetch_campaign_steering(
         &graph,
@@ -1833,6 +2429,7 @@ async fn run_campaign_poll(
             let master = fetch_issue(&locator)?;
             if master.state != "open" {
                 registry.remove(&registration)?;
+                remove_approved_graph_snapshots(&state_dir, &registration.issue_url)?;
                 return Ok(CampaignPollAttempt::Pruned);
             }
             let graph = campaign_graph_from(&locator, master)?;
@@ -1956,6 +2553,9 @@ fn run_campaign_disarm(args: CampaignDisarmArgs) -> Result<()> {
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
     let removed = registry.remove_issue(&locator.url)?;
+    if removed {
+        remove_approved_graph_snapshots(&state_dir, &locator.url)?;
+    }
     outln!(
         "{}",
         serde_json::to_string(&json!({"issue": locator.url, "disarmed": removed}))?
@@ -3638,6 +4238,164 @@ mod tests {
     }
 
     #[test]
+    fn amendment_pardons_only_escalated_tasks_that_gained_a_dependency() {
+        let prior = canonical_graph_for_pardon(&[]);
+        let amended = canonical_graph_for_pardon(&["prerequisite"]);
+        let escalated = BTreeSet::from(["task-a".to_owned(), "task-b".to_owned()]);
+
+        let (pardons, warnings) = amendment_pardon_plan(Some(&prior), &amended, &escalated);
+        assert_eq!(
+            pardons,
+            [PlannedAutoPardon {
+                task_id: "task-a".to_owned(),
+                added_dependencies: vec!["prerequisite".to_owned()],
+            }]
+        );
+        assert_eq!(
+            warnings,
+            ["task task-b remains escalated; run tally campaign resume to unblock"]
+        );
+
+        let receipt = arm_receipt(
+            &json!({"status": "armed"}),
+            true,
+            &[AutoPardonReceipt {
+                task_id: pardons[0].task_id.clone(),
+                added_dependencies: pardons[0].added_dependencies.clone(),
+                resume_receipt: "https://github.com/acme/widgets/issues/42#issuecomment-100"
+                    .to_owned(),
+            }],
+            &warnings,
+        );
+        assert_eq!(receipt["autoPardons"][0]["taskId"], json!("task-a"));
+        assert_eq!(
+            receipt["autoPardons"][0]["addedDependencies"],
+            json!(["prerequisite"])
+        );
+        assert_eq!(
+            receipt["autoPardons"][0]["resumeReceipt"],
+            json!("https://github.com/acme/widgets/issues/42#issuecomment-100")
+        );
+        assert_eq!(receipt["warnings"], json!(warnings));
+    }
+
+    #[test]
+    fn auto_pardon_uses_the_resume_audit_receipt_with_a_task_scope() {
+        let temporary = tempfile::tempdir().unwrap();
+        let captured = temporary.path().join("auto-pardon-body");
+        let fake = fake_gh(
+            temporary.path(),
+            "gh-auto-pardon",
+            &format!(
+                "cat > '{}'; printf '%s\\n' 'https://github.com/acme/widgets/issues/42#issuecomment-100'",
+                captured.display()
+            ),
+        );
+        let gh_program = GhProgramGuard::acquire();
+        gh_program.use_program(&fake);
+        let pardon = PlannedAutoPardon {
+            task_id: "foundation".to_owned(),
+            added_dependencies: vec!["prerequisite".to_owned()],
+        };
+
+        let receipt =
+            post_campaign_auto_pardon(&graph_for_forge_observation(), "operator", &pardon).unwrap();
+        assert!(receipt.ends_with("#issuecomment-100"));
+        let body = fs::read_to_string(captured).unwrap();
+        let marker = body.lines().next().unwrap();
+        assert!(
+            marker.starts_with(
+                "<!-- tally:spec-build:resume:v1 campaign=night-build issue=42 nonce="
+            ),
+            "{body}"
+        );
+        assert!(marker.ends_with(" tasks=foundation -->"), "{body}");
+        assert!(body.contains("\n\n### Campaign resumed\n\n"), "{body}");
+        assert!(
+            body.contains("receipts for `foundation` without deleting the audit trail."),
+            "{body}"
+        );
+        assert!(
+            body.contains("Reason: Re-armed graph added dependency `prerequisite`"),
+            "{body}"
+        );
+        assert!(body.ends_with("Requested by `@operator`."), "{body}");
+    }
+
+    #[test]
+    fn active_escalation_detection_honors_scoped_resume_boundaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let comments_path = temporary.path().join("comments.json");
+        let diagnosis = |id: u64, attempt: u8| {
+            json!({
+                "id": id,
+                "body": format!(
+                    "<!-- tally:spec-build:diagnosis:v1 campaign=night-build issue=42 task=foundation attempt={attempt} -->\n\nreceipt"
+                ),
+                "html_url": format!("https://github.com/acme/widgets/issues/42#issuecomment-{id}"),
+                "created_at": "2026-08-10T10:00:00Z",
+                "updated_at": "2026-08-10T10:00:00Z",
+                "user": {"login": "operator"},
+            })
+        };
+        let mut comments = vec![
+            diagnosis(10, 1),
+            diagnosis(11, 2),
+            json!({
+                "id": 12,
+                "body": "<!-- tally:spec-build:escalation:v1 campaign=night-build issue=42 -->\n\n### Spec-build escalation: frontier quiescent",
+                "html_url": "https://github.com/acme/widgets/issues/42#issuecomment-12",
+                "created_at": "2026-08-10T10:01:00Z",
+                "updated_at": "2026-08-10T10:01:00Z",
+                "user": {"login": "operator"},
+            }),
+        ];
+        fs::write(
+            &comments_path,
+            serde_json::to_vec(&json!([comments])).unwrap(),
+        )
+        .unwrap();
+        let fake = fake_gh(
+            temporary.path(),
+            "gh-active-escalation",
+            &format!(
+                r#"case "$*" in
+  "api --paginate --slurp repos/acme/widgets/issues/42/comments?per_page=100") cat '{}' ;;
+  *) echo "unexpected gh call: $*" >&2; exit 97 ;;
+esac"#,
+                comments_path.display()
+            ),
+        );
+        let gh_program = GhProgramGuard::acquire();
+        gh_program.use_program(&fake);
+        let graph = graph_for_forge_observation();
+        assert_eq!(
+            active_escalated_tasks(&graph, "operator", false).unwrap(),
+            BTreeSet::from(["foundation".to_owned()])
+        );
+
+        comments.push(json!({
+            "id": 13,
+            "body": "<!-- tally:spec-build:resume:v1 campaign=night-build issue=42 nonce=018f47a0-7b9d-7cc2-92d6-2f7f19f505fd tasks=foundation -->\n\n### Campaign resumed\n\nPardoned prior receipts.\n\nReason: The amendment added a dependency.",
+            "html_url": "https://github.com/acme/widgets/issues/42#issuecomment-13",
+            "created_at": "2026-08-10T10:02:00Z",
+            "updated_at": "2026-08-10T10:02:00Z",
+            "user": {"login": "operator"},
+        }));
+        fs::write(
+            &comments_path,
+            serde_json::to_vec(&json!([comments])).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            active_escalated_tasks(&graph, "operator", false)
+                .unwrap()
+                .is_empty(),
+            "the task-scoped resume marker must pardon only that task's active generation"
+        );
+    }
+
+    #[test]
     fn a_registration_written_before_the_probe_reads_as_degraded() {
         let registration: CampaignRegistrationV2 = serde_json::from_value(json!({
             "schemaVersion": REGISTRY_SCHEMA_VERSION,
@@ -3868,6 +4626,54 @@ mod tests {
             },
             tasks: vec![task],
         }
+    }
+
+    fn canonical_graph_for_pardon(task_a_dependencies: &[&str]) -> CanonicalCampaignGraphV1 {
+        let manifest: CampaignManifest = serde_json::from_value(manifest_value_for_test(json!([
+            {
+                "id": "prerequisite",
+                "kind": "implementation",
+                "issue": 43,
+                "dependencies": [],
+                "conflictDomains": []
+            },
+            {
+                "id": "task-a",
+                "kind": "implementation",
+                "issue": 44,
+                "dependencies": task_a_dependencies,
+                "conflictDomains": []
+            },
+            {
+                "id": "task-b",
+                "kind": "implementation",
+                "issue": 45,
+                "dependencies": [],
+                "conflictDomains": []
+            }
+        ])))
+        .unwrap();
+        CanonicalCampaignGraphV1::new(
+            manifest,
+            vec![
+                CanonicalCampaignTaskV1 {
+                    number: 43,
+                    title: "Prerequisite".to_owned(),
+                    body: "Prepare the dependency.".to_owned(),
+                },
+                CanonicalCampaignTaskV1 {
+                    number: 44,
+                    title: "Task A".to_owned(),
+                    body: "Implement task A.".to_owned(),
+                },
+                CanonicalCampaignTaskV1 {
+                    number: 45,
+                    title: "Task B".to_owned(),
+                    body: "Implement task B.".to_owned(),
+                },
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5212,6 +6018,65 @@ print(json.dumps({
         // what makes `campaign poll` dispatch later passes with the same
         // widened window the operator armed with.
         assert_eq!(loaded.projection_wait_ms, Some(240_000));
+    }
+
+    #[test]
+    fn approved_graph_snapshots_are_generation_scoped_and_digest_checked() {
+        let temporary = tempfile::tempdir().unwrap();
+        let prior = canonical_graph_for_pardon(&[]);
+        let amended = canonical_graph_for_pardon(&["prerequisite"]);
+        let mut registration = CampaignRegistration::new(
+            CampaignRegistrationV2 {
+                schema_version: REGISTRY_SCHEMA_VERSION,
+                registration_id: uuid::Uuid::now_v7().to_string(),
+                issue_url: "https://github.com/acme/widgets/issues/42".to_owned(),
+                repository: "acme/widgets".to_owned(),
+                issue_number: 42,
+                armed_at: "2026-08-01T00:00:00Z".to_owned(),
+                arm_serial: 1,
+                approved_graph_digest: prior.executable_digest.clone(),
+                authenticated_actor: "operator".to_owned(),
+                allowed_actors: vec!["operator".to_owned()],
+                allow_test_local_forge: false,
+                sub_issue_walk: true,
+                last_observation: None,
+                last_forge_observation: None,
+                flow: PathBuf::from("/nix/store/flow.js"),
+                driver: PathBuf::from("/nix/store/driver"),
+                workspace_root: PathBuf::from("/srv/tally-campaigns"),
+            },
+            None,
+        );
+
+        assert!(
+            read_approved_graph_snapshot(temporary.path(), &registration)
+                .unwrap()
+                .is_none(),
+            "a pre-snapshot registration remains readable and simply cannot prove an amendment"
+        );
+        write_approved_graph_snapshot(temporary.path(), &registration, &prior).unwrap();
+        assert_eq!(
+            read_approved_graph_snapshot(temporary.path(), &registration)
+                .unwrap()
+                .unwrap(),
+            prior
+        );
+        let old_path = approved_graph_path(temporary.path(), &registration);
+
+        registration.arm_serial = 2;
+        registration.approved_graph_digest = amended.executable_digest.clone();
+        write_approved_graph_snapshot(temporary.path(), &registration, &amended).unwrap();
+        assert_eq!(
+            read_approved_graph_snapshot(temporary.path(), &registration)
+                .unwrap()
+                .unwrap(),
+            amended
+        );
+        prune_approved_graph_snapshots(temporary.path(), &registration).unwrap();
+        assert!(
+            !old_path.exists(),
+            "the superseded graph generation must be pruned"
+        );
     }
 
     /// #432 acceptance 2, the DELIVERY half of the seam.

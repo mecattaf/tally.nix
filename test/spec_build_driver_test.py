@@ -676,6 +676,84 @@ class GitHubForgeTests(unittest.TestCase):
         )
         self.assertEqual(len(comments), 7, "resume must retain the public audit trail")
 
+    def test_scoped_rearm_pardon_resets_only_the_addressed_escalated_task(self) -> None:
+        def diagnosis(identifier: str, attempt: int) -> str:
+            return (
+                f"{DRIVER.diagnosis_marker('fixture', '7', identifier, attempt)}\n\n"
+                f"{DRIVER.diagnosis_heading(identifier, attempt)}\n\n"
+                f"Observed {identifier} attempt {attempt}."
+            )
+
+        def comment(identifier: int, body: str) -> dict[str, object]:
+            return {
+                "id": identifier,
+                "body": body,
+                "html_url": f"https://github.com/acme/spec/issues/7#issuecomment-{identifier}",
+            }
+
+        comments = [
+            comment(10, diagnosis("task-a", 1)),
+            comment(11, diagnosis("task-a", 2)),
+            comment(12, diagnosis("task-b", 1)),
+            comment(13, diagnosis("task-b", 2)),
+            comment(
+                14,
+                DRIVER.escalation_marker("fixture", "7")
+                + "\n\n### Spec-build escalation: frontier quiescent",
+            ),
+            comment(
+                20,
+                "<!-- tally:spec-build:resume:v1 campaign=fixture issue=7 "
+                "nonce=018f47a0-7b9d-7cc2-92d6-2f7f19f505fd tasks=task-a -->\n\n"
+                "### Campaign resumed\n\nPardoned prior receipts for `task-a`.\n\n"
+                "Reason: The amendment added a dependency to task-a.",
+            ),
+        ]
+
+        with mock.patch.object(DRIVER, "github_machine_comments", return_value=comments):
+            diagnoses, retries, escalation, warnings = DRIVER.forge_campaign_state(
+                "acme/spec",
+                {"forge": "github"},
+                "fixture",
+                "7",
+                {"task-a", "task-b"},
+                {},
+            )
+
+        self.assertEqual(
+            [(item["taskId"], item["attempt"]) for item in diagnoses],
+            [("task-b", 1), ("task-b", 2)],
+        )
+        self.assertEqual(retries, [])
+        self.assertEqual(
+            escalation,
+            "https://github.com/acme/spec/issues/7#issuecomment-14",
+            "the unaddressed task must keep the shared escalation live",
+        )
+        self.assertEqual(
+            warnings,
+            [
+                "campaign resume https://github.com/acme/spec/issues/7#issuecomment-20 "
+                "pardoned 2 earlier machine receipt(s) for task(s) 'task-a'"
+            ],
+        )
+
+        only_addressed = [comment for comment in comments if "task-b" not in comment["body"]]
+        with mock.patch.object(
+            DRIVER, "github_machine_comments", return_value=only_addressed
+        ):
+            diagnoses, _, escalation, warnings = DRIVER.forge_campaign_state(
+                "acme/spec",
+                {"forge": "github"},
+                "fixture",
+                "7",
+                {"task-a"},
+                {},
+            )
+        self.assertEqual(diagnoses, [])
+        self.assertIsNone(escalation)
+        self.assertIn("pardoned 3 earlier machine receipt(s)", warnings[0])
+
     def test_reconcile_requires_exact_marker_and_degrades_unusable_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

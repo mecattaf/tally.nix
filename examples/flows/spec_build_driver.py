@@ -54,7 +54,9 @@ RESUME_MARKER = re.compile(
     r"^<!-- tally:spec-build:resume:v1 "
     r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
     r"issue=([1-9][0-9]*) "
-    r"nonce=([0-9a-fA-F-]{36}) -->$"
+    r"nonce=([0-9a-fA-F-]{36})"
+    r"(?: tasks=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+    r"(?:,[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*))? -->$"
 )
 # A campaign machinery fault is not evidence that the task's work is wrong, so
 # it buys a retry instead of a steering attempt. The budget is bounded and read
@@ -2363,6 +2365,12 @@ def forge_campaign_state(
     threaded = set(threads or {})
     # One ledger entry per (kind, task, attempt) whichever surface carries it.
     counted: set[tuple[str, str, int]] = set()
+    # Scoped re-arm pardons need the original diagnosis chronology to decide
+    # whether a campaign-wide escalation is still live for any unpardoned
+    # task. These IDs never leave this parser.
+    diagnosis_events: list[tuple[int, str, int]] = []
+    escalation_events: list[tuple[int, str]] = []
+    resume_boundaries: list[dict[str, Any]] = []
 
     def accept(kind: str, task_id: str) -> bool:
         # A worklist edit that renames or drops a task leaves receipts naming a
@@ -2376,15 +2384,20 @@ def forge_campaign_state(
         )
         return False
 
-    resume_boundary: int | None = None
-    resume_comment: str | None = None
-    pardoned = 0
-
     def comment_database_id(comment: dict[str, Any], context: str) -> int:
         value = comment.get("id", comment.get("databaseId"))
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             fail(f"{context} carries no stable GitHub comment id")
         return value
+
+    def pardon_boundary(identity: int, task_id: str) -> dict[str, Any] | None:
+        applicable = [
+            boundary
+            for boundary in resume_boundaries
+            if boundary["id"] >= identity
+            and (boundary["tasks"] is None or task_id in boundary["tasks"])
+        ]
+        return max(applicable, key=lambda boundary: boundary["id"], default=None)
 
     def ingest(
         comments: list[dict[str, Any]],
@@ -2406,7 +2419,6 @@ def forge_campaign_state(
         it is where the current receipt lives and where a reader should be
         pointed -- and the master copy is reported as the duplicate.
         """
-        nonlocal pardoned
         expected_escalation = escalation_marker(campaign, issue_number)
         for comment in comments:
             body = comment.get("body")
@@ -2415,16 +2427,6 @@ def forge_campaign_state(
             first_line = body.splitlines()[0]
             match = DIAGNOSIS_MARKER.fullmatch(first_line)
             retry_match = None if match is not None else RETRY_MARKER.fullmatch(first_line)
-            relevant = (
-                match is not None
-                or retry_match is not None
-                or (surface is None and first_line == expected_escalation)
-            )
-            if relevant and resume_boundary is not None:
-                identity = comment_database_id(comment, "campaign machine receipt")
-                if identity <= resume_boundary:
-                    pardoned += 1
-                    continue
             if match is not None or retry_match is not None:
                 kind = "diagnosis" if match is not None else "retry"
                 groups = (match or retry_match).groups()
@@ -2440,6 +2442,18 @@ def forge_campaign_state(
                 if not accept(kind, task_id):
                     continue
                 attempt = int(attempt_text)
+                identity = (
+                    comment_database_id(comment, "campaign machine receipt")
+                    if resume_boundaries
+                    else None
+                )
+                if match is not None and identity is not None:
+                    diagnosis_events.append((identity, task_id, attempt))
+                if identity is not None:
+                    boundary = pardon_boundary(identity, task_id)
+                    if boundary is not None:
+                        boundary["pardoned"] += 1
+                        continue
                 where = (
                     "master thread"
                     if surface is None
@@ -2484,13 +2498,21 @@ def forge_campaign_state(
                 )
             elif surface is None and first_line == expected_escalation:
                 # Escalation is campaign-wide and always stays on the master.
-                escalations.append(
-                    required_string(comment.get("html_url"), "machine escalation comment URL")
+                url = required_string(
+                    comment.get("html_url"), "machine escalation comment URL"
                 )
+                if resume_boundaries:
+                    escalation_events.append(
+                        (
+                            comment_database_id(comment, "campaign escalation receipt"),
+                            url,
+                        )
+                    )
+                else:
+                    escalations.append(url)
 
     if config["forge"] == "github":
         master_comments = github_machine_comments(repository, issue_number)
-        resumes: list[tuple[int, str]] = []
         for comment in master_comments:
             body = comment.get("body")
             if not isinstance(body, str) or not body:
@@ -2498,7 +2520,7 @@ def forge_campaign_state(
             match = RESUME_MARKER.fullmatch(body.splitlines()[0])
             if match is None:
                 continue
-            marker_campaign, marker_issue, nonce = match.groups()
+            marker_campaign, marker_issue, nonce, scoped_tasks = match.groups()
             if marker_campaign != campaign or marker_issue != issue_number:
                 continue
             try:
@@ -2507,14 +2529,20 @@ def forge_campaign_state(
                 fail("campaign resume marker carries an invalid nonce")
             if "\n\n### Campaign resumed\n\n" not in body or "\n\nReason: " not in body:
                 fail("campaign resume receipt has malformed content")
-            resumes.append(
-                (
-                    comment_database_id(comment, "campaign resume receipt"),
-                    required_string(comment.get("html_url"), "campaign resume receipt URL"),
-                )
+            tasks = None if scoped_tasks is None else frozenset(scoped_tasks.split(","))
+            if tasks is not None and len(tasks) != len(scoped_tasks.split(",")):
+                fail("campaign resume receipt repeats a scoped task")
+            resume_boundaries.append(
+                {
+                    "id": comment_database_id(comment, "campaign resume receipt"),
+                    "comment": required_string(
+                        comment.get("html_url"), "campaign resume receipt URL"
+                    ),
+                    "tasks": tasks,
+                    "pardoned": 0,
+                }
             )
-        if resumes:
-            resume_boundary, resume_comment = max(resumes)
+        resume_boundaries.sort(key=lambda boundary: boundary["id"])
         # Task threads first: where a task owns one, that is where its current
         # receipts are posted, so the thread copy is the one a fact should
         # point at and a master copy of the same attempt is the older duplicate.
@@ -2595,11 +2623,80 @@ def forge_campaign_state(
             required_text(receipt.get("body"), "local forge escalation body", 60_000)
             escalations.append(f"local://{repository}/{escalation_ref}")
 
+    # A global manual resume pardons every earlier escalation. A scoped re-arm
+    # receipt pardons a campaign-wide escalation only when the union of scoped
+    # receipts covers every task whose two diagnosis attempts led to it. That
+    # keeps an unaddressed task escalated while allowing an amended task's
+    # counters to restart independently.
+    for identity, url in escalation_events:
+        global_cover = [
+            boundary
+            for boundary in resume_boundaries
+            if boundary["tasks"] is None and boundary["id"] >= identity
+        ]
+        covering_boundary = max(
+            global_cover, key=lambda boundary: boundary["id"], default=None
+        )
+        if covering_boundary is None:
+            escalated_tasks: set[str] = set()
+            for task_id in {event[1] for event in diagnosis_events}:
+                prior = max(
+                    (
+                        boundary["id"]
+                        for boundary in resume_boundaries
+                        if boundary["id"] < identity
+                        and (
+                            boundary["tasks"] is None
+                            or task_id in boundary["tasks"]
+                        )
+                    ),
+                    default=0,
+                )
+                attempts = {
+                    attempt
+                    for receipt_id, receipt_task, attempt in diagnosis_events
+                    if receipt_task == task_id and prior < receipt_id < identity
+                }
+                if attempts == {1, 2}:
+                    escalated_tasks.add(task_id)
+            scoped_cover = [
+                boundary
+                for boundary in resume_boundaries
+                if boundary["id"] >= identity
+                and boundary["tasks"] is not None
+            ]
+            if escalated_tasks and all(
+                any(task_id in boundary["tasks"] for boundary in scoped_cover)
+                for task_id in escalated_tasks
+            ):
+                # The last contributing receipt is the point at which the
+                # shared escalation became fully pardoned.
+                covering_boundary = max(
+                    (
+                        boundary
+                        for boundary in scoped_cover
+                        if any(task_id in boundary["tasks"] for task_id in escalated_tasks)
+                    ),
+                    key=lambda boundary: boundary["id"],
+                )
+        if covering_boundary is None:
+            escalations.append(url)
+        else:
+            covering_boundary["pardoned"] += 1
+
     if len(escalations) > 1:
         fail("multiple machine escalations claim this campaign")
-    if resume_comment is not None:
+    for boundary in resume_boundaries:
+        if boundary["pardoned"] == 0:
+            continue
+        scope = ""
+        if boundary["tasks"] is not None:
+            scope = " for task(s) " + ", ".join(
+                repr(task_id) for task_id in sorted(boundary["tasks"])
+            )
         warnings.append(
-            f"campaign resume {resume_comment} pardoned {pardoned} earlier machine receipt(s)"
+            f"campaign resume {boundary['comment']} pardoned "
+            f"{boundary['pardoned']} earlier machine receipt(s){scope}"
         )
     for kind, records in (("diagnosis", diagnoses), ("retry", retries)):
         seen: set[tuple[str, int]] = set()
