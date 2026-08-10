@@ -830,6 +830,7 @@ const reconcileSchema = {
     "baseRevision",
     "tasks",
     "merged",
+    "restamps",
     "checkpoints",
     "remaining",
     "frontier",
@@ -863,6 +864,9 @@ const reconcileSchema = {
       items: taskSchema
     },
     merged: { type: "array", items: mergedFactSchema },
+    // Prior-revision facts admitted only for deterministic marker lanes. They
+    // are not completion facts for the current revision.
+    restamps: { type: "array", items: mergedFactSchema },
     checkpoints: { type: "array", items: checkpointFactSchema },
     remaining: { type: "array", items: taskIdSchema },
     frontier: { type: "array", maxItems: 128, items: taskSchema },
@@ -943,6 +947,18 @@ const workspaceSchema = {
     branch: { type: "string", minLength: 1 },
     publishBranch: { type: "string", minLength: 1 },
     worktreePath: { type: "string", pattern: "^/" }
+  },
+  additionalProperties: false
+};
+
+const restampResultSchema = {
+  type: "object",
+  required: ["taskId", "head", "revision", "completion"],
+  properties: {
+    taskId: taskIdSchema,
+    head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+    completion: mergedFactSchema
   },
   additionalProperties: false
 };
@@ -1645,6 +1661,33 @@ function preparedSteering(task) {
   };
 }
 
+function restampFor(reconciliation, task) {
+  const matches = reconciliation.restamps.filter(fact => fact.taskId === task.id);
+  if (matches.length > 1) {
+    const error = new Error(`multiple re-stamp facts claim task ${task.id}`);
+    error.name = "SpecBuildInvariantError";
+    error.code = "multiple-restamp-facts";
+    throw error;
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function restampBrief(task, prepared, completion) {
+  return {
+    schemaVersion: 1,
+    mission: `Re-stamp completion for ${task.id} from its validated durable merged-pull-request fact. This is a deterministic marker lane: no implementation or narration agent is dispatched, and no repository content may change.`,
+    campaign: {
+      name: effective.campaign,
+      repository: codeRepository,
+      issue: args.issue,
+      runId: args.runId
+    },
+    task,
+    workspace: prepared,
+    completion
+  };
+}
+
 function implementationBrief(task, prepared, reconciliation, attemptSteering) {
   const ownershipBoundary = !Array.isArray(task.conflictDomains)
     ? "This serial task omits conflictDomains. Ownership will certify its committed paths, and the tree-delta gate will allow exactly those owned paths after ownership runs."
@@ -1781,6 +1824,7 @@ function reconciledProjection(reconciliation) {
   return {
     anomalies: reconciliation.anomalies,
     merged: reconciliation.merged,
+    restamps: reconciliation.restamps,
     checkpoints: reconciliation.checkpoints,
     remaining: reconciliation.remaining,
     frontier: reconciliation.frontier.map(task => task.id),
@@ -2122,6 +2166,7 @@ function sweepDeferral(sweepNode) {
   if (
     !reconciliation.complete &&
     reconciliation.merged.length === 0 &&
+    reconciliation.restamps.length === 0 &&
     commandGates.length > 0
   ) {
     const preflightTask = reconciliation.frontier.find(task => task.kind === "implementation");
@@ -2354,50 +2399,33 @@ function sweepDeferral(sweepNode) {
       return { task, prepared: prepared.result, checkpoint: recorded.result };
     }
 
-    const prepSteering = preparedSteering(task);
-    let attemptSteering = prepSteering;
-    if (task.brief) {
-      const recheckBrief = withCapabilities({
-        campaign: effective.campaign,
-        repository: codeRepository,
-        repositoryConfig,
-        issue: args.issue,
-        taskId: task.id,
-        allowedActors: args.allowedActors,
-        preparedComments: prepSteering.authorizedComments
-      });
-      const recheckThread = taskThread(task);
-      if (recheckThread !== null) {
-        recheckBrief.taskIssue = recheckThread;
-      }
-      // The task thread is read once after lane preparation and immediately
-      // before adapter admission. This is the only mutable-forge window in an
-      // otherwise immutable attempt brief. Module-declared tasks keep their
-      // historical agent-owned GitHub channel and carry no local allowlist.
-      const recheckedSteering = await driverNode(
-        "steeringRecheck",
-        recheckBrief,
-        `steering-recheck-${task.id}`,
-        `steering-recheck-${task.id}`,
-        steeringRecheckSchema,
-        null,
+    const completion = restampFor(reconciliation, task);
+    let taskBrief = null;
+    let assistedBy = null;
+    if (completion !== null) {
+      taskBrief = restampBrief(task, prepared.result, completion);
+      const restamped = await driverNode(
+        "restamp",
+        {
+          task,
+          completion,
+          workspace: prepared.result
+        },
+        `restamp-${task.id}`,
+        `restamp-${task.id}`,
+        restampResultSchema,
+        workspace,
         true,
         taskRef
       );
-      if (!nodePassed(recheckedSteering)) {
-        const taskBrief = implementationBrief(
-          task,
-          prepared.result,
-          reconciliation,
-          prepSteering
-        );
+      if (!nodePassed(restamped)) {
         return {
           task,
           prepared: prepared.result,
           failure: taskFailure(
             task,
-            "steering:recheck",
-            recheckedSteering,
+            "restamp",
+            restamped,
             taskBrief,
             [],
             prepared.result,
@@ -2405,92 +2433,154 @@ function sweepDeferral(sweepNode) {
           )
         };
       }
-      attemptSteering = recheckedSteering.result;
-    }
-    const taskBrief = implementationBrief(
-      task,
-      prepared.result,
-      reconciliation,
-      attemptSteering
-    );
-    const agentSpec = applyAgentPolicies({
-      argv: effective.agent.argv,
-      adapter: effective.agent.adapter,
-      pools: ["campaign-agent"],
-      priority: effective.agent.priority,
-      workspace,
-      evidence: ["exit:0"],
-      brief: taskBrief,
-      key: `agent-${task.id}`,
-      label: `agent-${task.id}`,
-      taskRef
-    });
-    const agent = await job(agentSpec, { settle: true });
-    if (agent.verdict !== "pass") {
-      // #424: the pass still runs the tree-delta gate before it ends. A
-      // failing agent is the single most likely context for a rogue write and
-      // it was the one context this gate was silent in: the lane used to
-      // return here, and the next pass's `prep` re-snapshotted the worktree
-      // with the stray write already in it, so nothing could ever see it
-      // again. `ownership` never ran, so the gate has no certified
-      // `ownedPaths` and only a declared allowlist can govern.
-      //
-      // The stage is chosen from what this lane already knows, so the receipt
-      // it produces is true either way: a task that declares conflictDomains
-      // can only fail this node by breaching them, and an admitted serial task
-      // that omits them is unjudgeable because ownership did not run. Both
-      // implementation schema arms preserve that omission into this call.
-      const declaresDomains = Array.isArray(task.conflictDomains);
-      const strayStage = declaresDomains ? "treeDelta" : "treeDelta:ungated";
-      const strayDelta = await driverNode(
-        "treeDelta",
-        {
-          task,
-          workspace: prepared.result,
-          ownershipRan: false
-        },
-        `tree-delta-${task.id}`,
-        `tree-delta-${task.id}`,
-        treeDeltaSchema,
-        workspace,
-        true,
-        taskRef
+    } else {
+      const prepSteering = preparedSteering(task);
+      let attemptSteering = prepSteering;
+      if (task.brief) {
+        const recheckBrief = withCapabilities({
+          campaign: effective.campaign,
+          repository: codeRepository,
+          repositoryConfig,
+          issue: args.issue,
+          taskId: task.id,
+          allowedActors: args.allowedActors,
+          preparedComments: prepSteering.authorizedComments
+        });
+        const recheckThread = taskThread(task);
+        if (recheckThread !== null) {
+          recheckBrief.taskIssue = recheckThread;
+        }
+        // The task thread is read once after lane preparation and immediately
+        // before adapter admission. This is the only mutable-forge window in an
+        // otherwise immutable attempt brief. Module-declared tasks keep their
+        // historical agent-owned GitHub channel and carry no local allowlist.
+        const recheckedSteering = await driverNode(
+          "steeringRecheck",
+          recheckBrief,
+          `steering-recheck-${task.id}`,
+          `steering-recheck-${task.id}`,
+          steeringRecheckSchema,
+          null,
+          true,
+          taskRef
+        );
+        if (!nodePassed(recheckedSteering)) {
+          const failedTaskBrief = implementationBrief(
+            task,
+            prepared.result,
+            reconciliation,
+            prepSteering
+          );
+          return {
+            task,
+            prepared: prepared.result,
+            failure: taskFailure(
+              task,
+              "steering:recheck",
+              recheckedSteering,
+              failedTaskBrief,
+              [],
+              prepared.result,
+              prepared.result.baseRev
+            )
+          };
+        }
+        attemptSteering = recheckedSteering.result;
+      }
+      taskBrief = implementationBrief(
+        task,
+        prepared.result,
+        reconciliation,
+        attemptSteering
       );
-      if (!nodePassed(strayDelta)) {
+      const agentSpec = applyAgentPolicies({
+        argv: effective.agent.argv,
+        adapter: effective.agent.adapter,
+        pools: ["campaign-agent"],
+        priority: effective.agent.priority,
+        workspace,
+        evidence: ["exit:0"],
+        brief: taskBrief,
+        key: `agent-${task.id}`,
+        label: `agent-${task.id}`,
+        taskRef
+      });
+      const agent = await job(agentSpec, { settle: true });
+      if (agent.verdict !== "pass") {
+        // #424: the pass still runs the tree-delta gate before it ends. A
+        // failing agent is the single most likely context for a rogue write and
+        // it was the one context this gate was silent in: the lane used to
+        // return here, and the next pass's `prep` re-snapshotted the worktree
+        // with the stray write already in it, so nothing could ever see it
+        // again. `ownership` never ran, so the gate has no certified
+        // `ownedPaths` and only a declared allowlist can govern.
+        //
+        // The stage is chosen from what this lane already knows, so the receipt
+        // it produces is true either way: a task that declares conflictDomains
+        // can only fail this node by breaching them, and an admitted serial task
+        // that omits them is unjudgeable because ownership did not run. Both
+        // implementation schema arms preserve that omission into this call.
+        const declaresDomains = Array.isArray(task.conflictDomains);
+        const strayStage = declaresDomains ? "treeDelta" : "treeDelta:ungated";
+        const strayDelta = await driverNode(
+          "treeDelta",
+          {
+            task,
+            workspace: prepared.result,
+            ownershipRan: false
+          },
+          `tree-delta-${task.id}`,
+          `tree-delta-${task.id}`,
+          treeDeltaSchema,
+          workspace,
+          true,
+          taskRef
+        );
+        if (!nodePassed(strayDelta)) {
+          return {
+            task,
+            prepared: prepared.result,
+            failure: taskFailure(
+              task,
+              strayStage,
+              strayDelta,
+              taskBrief,
+              [
+                {
+                  phase: "treeDelta",
+                  gateId: "tree-delta",
+                  kind: "treeDelta",
+                  node: strayDelta
+                }
+              ],
+              prepared.result,
+              prepared.result.baseRev
+            )
+          };
+        }
         return {
           task,
           prepared: prepared.result,
           failure: taskFailure(
             task,
-            strayStage,
-            strayDelta,
+            "agent",
+            agent,
             taskBrief,
-            [
-              {
-                phase: "treeDelta",
-                gateId: "tree-delta",
-                kind: "treeDelta",
-                node: strayDelta
-              }
-            ],
+            [],
             prepared.result,
             prepared.result.baseRev
           )
         };
       }
-      return {
-        task,
-        prepared: prepared.result,
-        failure: taskFailure(
-          task,
-          "agent",
-          agent,
-          taskBrief,
-          [],
-          prepared.result,
-          prepared.result.baseRev
-        )
-      };
+      assistedBy =
+        agent.model === undefined || agent.model === null
+          ? null
+          : {
+              adapter: effective.agent.adapter,
+              model: agent.model,
+              taskUuid: agent.taskUuid,
+              witnessSeq: agent.witnessSeq
+            };
     }
 
     const ownership = await driverNode(
@@ -2614,7 +2704,9 @@ function sweepDeferral(sweepNode) {
         task,
         domainsRequired,
         gates: effective.gates,
-        steward: effective.steward || null,
+        // A re-stamp is deterministic machinery all the way through: its PR
+        // uses the validated template rather than spending a narration turn.
+        steward: completion === null ? effective.steward || null : null,
         workspace: prepared.result,
         constraints: constraintResults
       }),
@@ -2645,18 +2737,8 @@ function sweepDeferral(sweepNode) {
       prepared: prepared.result,
       publication: publication.result,
       // Who assisted this task, straight off the settled implementation node.
-      // The model is the daemon's canonical one and is absent when the estate
-      // never named it; the merge node refuses to invent one, so an absent
-      // model means no trailer rather than a fabricated one.
-      assistedBy:
-        agent.model === undefined || agent.model === null
-          ? null
-          : {
-              adapter: effective.agent.adapter,
-              model: agent.model,
-              taskUuid: agent.taskUuid,
-              witnessSeq: agent.witnessSeq
-            },
+      // A deterministic re-stamp has no such node and therefore no trailer.
+      assistedBy,
       constraints: constraintResults,
       taskBrief,
       gateOutputs

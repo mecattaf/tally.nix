@@ -459,7 +459,9 @@ class ForgeNativeReconcileTests(unittest.TestCase):
             }
             with (
                 mock.patch.object(DRIVER, "issue_graph_worklist", return_value=worklist),
-                mock.patch.object(DRIVER, "merged_github_tasks", return_value=([], [])) as merged,
+                mock.patch.object(
+                    DRIVER, "merged_github_tasks", return_value=([], [], [])
+                ) as merged,
                 mock.patch.object(DRIVER, "forge_campaign_state", return_value=([], [], None, [])),
                 mock.patch.object(DRIVER, "sync_issue_checkboxes"),
             ):
@@ -1960,24 +1962,28 @@ class GitHubForgeTests(unittest.TestCase):
             return subprocess.CompletedProcess([], 0, json.dumps([candidate]), "")
 
         with mock.patch.object(DRIVER, "run", side_effect=listed):
-            facts, _ = DRIVER.merged_github_tasks(
+            facts, restamps, _ = DRIVER.merged_github_tasks(
                 "acme/spec", {}, "fixture", "7", "main", None, [task_value]
             )
             self.assertEqual(facts[0]["revision"], revision)
+            self.assertEqual(restamps, [])
             task_value["revision"] = "sha256:" + "2" * 64
-            stale, warnings = DRIVER.merged_github_tasks(
+            stale, restamps, warnings = DRIVER.merged_github_tasks(
                 "acme/spec", {}, "fixture", "7", "main", None, [task_value]
             )
             self.assertEqual(stale, [])
+            # A branch-scoped degraded read cannot discover historical proof;
+            # re-stamping is admitted only by the task's native sub-issue walk.
+            self.assertEqual(restamps, [])
             self.assertTrue(any("pull/8" in warning for warning in warnings))
 
     def test_the_walk_binds_completion_to_the_admitted_task_revision(self) -> None:
-        """A stale-revision pull request reached through the walk proves nothing.
+        """A stale-revision pull request is only a source for a new marker.
 
         The walk narrows where candidates come from; it never widens what
         counts. A pull request linked to the task's own sub-issue, merged, and
-        on the right base and head still fails to complete the task when its
-        marker names a pre-edit revision.
+        on the right base and head still does not complete the current task
+        revision; it admits the deterministic re-stamp lane instead.
         """
         revision = "sha256:" + "1" * 64
         task_value = {
@@ -2022,27 +2028,77 @@ class GitHubForgeTests(unittest.TestCase):
                 ],
             }
         }
-        facts, warnings = DRIVER.merged_github_tasks(
+        facts, restamps, warnings = DRIVER.merged_github_tasks(
             "acme/spec", {}, "fixture", "7", "main", None, [task_value], walk
         )
         self.assertEqual([fact["taskId"] for fact in facts], ["task-1"])
         self.assertEqual(facts[0]["revision"], revision)
+        self.assertEqual(restamps, [])
         self.assertEqual(warnings, [])
 
         # The graph was edited after that pull request merged: the task now
         # carries a different revision, so its stable branch and marker moved.
         stale_task = dict(task_value, revision="sha256:" + "2" * 64)
-        stale, warnings = DRIVER.merged_github_tasks(
+        stale, restamps, warnings = DRIVER.merged_github_tasks(
             "acme/spec", {}, "fixture", "7", "main", None, [stale_task], walk
         )
         self.assertEqual(stale, [])
         self.assertEqual(
-            warnings,
+            restamps,
             [
-                "ignored https://github.com/acme/spec/pull/8: its campaign marker "
-                "names no task in the witnessed worklist"
+                {
+                    "taskId": "task-1",
+                    "pullRequest": "https://github.com/acme/spec/pull/8",
+                    "mergeCommit": "a" * 40,
+                    "revision": revision,
+                }
             ],
         )
+        self.assertEqual(warnings, [])
+
+    def test_restamp_refuses_a_stale_marker_without_valid_merged_proof(self) -> None:
+        old_revision = "sha256:" + "1" * 64
+        current_revision = "sha256:" + "2" * 64
+        task_value = {
+            "id": "task-1",
+            "kind": "implementation",
+            "revision": current_revision,
+            "brief": {
+                "issue": {
+                    "number": "8",
+                    "url": "https://github.com/acme/spec/issues/8",
+                }
+            },
+        }
+        candidate = {
+            "url": "https://github.com/acme/spec/pull/8",
+            "body": DRIVER.pull_request_marker(
+                "fixture", "7", "task-1", old_revision
+            ),
+            "merged": True,
+            "baseRefName": "main",
+            # The marker names the old revision, but the PR does not use the
+            # stable branch derived from it. The ordinary oracle must refuse
+            # it before the agent-free path can see a fact.
+            "headRefName": "untrusted/head",
+            "mergeCommit": {"oid": "a" * 40},
+        }
+        walk = {
+            8: {
+                "number": 8,
+                "state": "closed",
+                "url": "https://github.com/acme/spec/issues/8",
+                "comments": [],
+                "pullRequests": [candidate],
+            }
+        }
+        merged, restamps, warnings = DRIVER.merged_github_tasks(
+            "acme/spec", {}, "fixture", "7", "main", None, [task_value], walk
+        )
+        self.assertEqual(merged, [])
+        self.assertEqual(restamps, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("not stable branch", warnings[0])
 
     def test_issue_campaign_checkbox_repair_and_closeout_are_separate(self) -> None:
         tasks = [
@@ -2530,23 +2586,22 @@ class NativeSubIssueTests(unittest.TestCase):
             self.assertEqual(final["comments"], [])
             self.assertEqual(final["master"]["body"], state["master"]["body"])
 
-    def test_the_campaigns_own_closure_is_a_warning_not_an_anomaly(self) -> None:
+    def test_the_campaigns_own_closure_is_a_restamp_not_an_anomaly(self) -> None:
         """A graph edit must not turn every merged task into operator error.
 
         A task pull request carries `Closes #<sub-issue>`, so the campaign
-        closes its own sub-issues as it merges. Editing one task brief and
-        re-arming rotates every task's revision, so every already-merged task
-        loses its proof while keeping a sub-issue the campaign closed. Those
-        are already named in the ignored-marker warnings; reporting them as
-        hand closures would fire the status verb's loudest surface once per
-        merged task on the campaign's own documented workflow.
+        closes its own sub-issue as it merges. If that task later acquires a
+        new revision, its durable old merge admits a deterministic re-stamp;
+        the campaign-authored closure is still not a hand-closure anomaly.
         """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             state, brief = self.fixture(checkout)
+            base_revision = git(checkout, "rev-parse", "origin/main")
+            old_revision = "sha256:" + "1" * 64
             pre_edit = DRIVER.pull_request_marker(
-                "fixture", "7", "task-1", "sha256:" + "1" * 64
+                "fixture", "7", "task-1", old_revision
             )
             state["walk"] = [
                 self.walk_node(
@@ -2557,7 +2612,7 @@ class NativeSubIssueTests(unittest.TestCase):
                             "https://github.com/acme/spec/pull/8",
                             pre_edit,
                             "tally/fixture-issue-7/task-1-1111111111111111",
-                            "a" * 40,
+                            base_revision,
                         )
                     ],
                 ),
@@ -2572,11 +2627,18 @@ class NativeSubIssueTests(unittest.TestCase):
             self.assertEqual(
                 [anomaly["taskId"] for anomaly in result["anomalies"]], ["task-2"]
             )
-            self.assertIn(
-                "ignored https://github.com/acme/spec/pull/8: its campaign marker "
-                "names no task in the witnessed worklist",
-                result["warnings"],
+            self.assertEqual(
+                result["restamps"],
+                [
+                    {
+                        "taskId": "task-1",
+                        "pullRequest": "https://github.com/acme/spec/pull/8",
+                        "mergeCommit": base_revision,
+                        "revision": old_revision,
+                    }
+                ],
             )
+            self.assertEqual(result["warnings"], [])
 
     def test_a_truncated_reference_page_fails_the_pass(self) -> None:
         """`first:` returns the oldest references, so truncation drops the newest.
@@ -2852,6 +2914,92 @@ class NativeSubIssueTests(unittest.TestCase):
 
 
 class LaneLifecycleTests(unittest.TestCase):
+    def test_validated_completion_is_restamped_as_an_agent_free_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            base = git(checkout, "rev-parse", "origin/main")
+            current_revision = "sha256:" + "2" * 64
+            source_revision = "sha256:" + "1" * 64
+            brief = prep_brief(checkout, root / "workspaces", "restamp-pass")
+            brief["task"]["revision"] = current_revision
+            prepared = DRIVER.action_prep(brief)
+
+            restamped = DRIVER.action_restamp(
+                {
+                    "task": brief["task"],
+                    "completion": {
+                        "taskId": "task-1",
+                        "pullRequest": "https://github.com/acme/spec/pull/8",
+                        "mergeCommit": base,
+                        "revision": source_revision,
+                    },
+                    "workspace": prepared,
+                }
+            )
+            worktree = Path(prepared["worktreePath"])
+            self.assertNotEqual(restamped["head"], prepared["baseRev"])
+            self.assertEqual(
+                git(worktree, "rev-list", "--count", f"{prepared['baseRev']}..HEAD"),
+                "1",
+            )
+            self.assertEqual(
+                git(worktree, "diff", "--name-only", prepared["baseRev"], "HEAD"),
+                "",
+            )
+            self.assertIn(
+                "chore(campaign): re-stamp completion",
+                git(worktree, "log", "-1", "--format=%B"),
+            )
+
+            ownership = DRIVER.action_ownership(
+                {
+                    "task": brief["task"],
+                    "domainsRequired": True,
+                    "repositoryConfig": repository_config(checkout, "github"),
+                    "workspace": prepared,
+                }
+            )
+            self.assertEqual(ownership["ownedPaths"], [])
+            delta = DRIVER.action_tree_delta(
+                {
+                    "task": brief["task"],
+                    "workspace": prepared,
+                    "ownedPaths": ownership["ownedPaths"],
+                }
+            )
+            self.assertEqual(delta["checkedPaths"], 0)
+
+            with FakeGitHub(root, {"pulls": [], "calls": []}) as github:
+                publication = DRIVER.action_publish(
+                    {
+                        "campaign": "fixture",
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout, "github"),
+                        "issue": issue(),
+                        "runId": "restamp-pass",
+                        "workspaceRoot": str(root / "workspaces"),
+                        "task": brief["task"],
+                        "domainsRequired": True,
+                        "gates": [
+                            {
+                                "kind": "command",
+                                "id": "tests",
+                                "preflightArgv": ["true"],
+                                "argv": ["true"],
+                                "runtimeMaxSec": 60,
+                            }
+                        ],
+                        "steward": None,
+                        "workspace": prepared,
+                        "constraints": [],
+                    }
+                )
+            self.assertEqual(publication["head"], restamped["head"])
+            created = github.state()["createdPullRequests"][0]
+            title = created[created.index("--title") + 1]
+            self.assertEqual(title, "[marker] task-1: Task task-1")
+
     def test_a_lane_base_that_left_the_witnessed_worklist_history_fails_closed(
         self,
     ) -> None:

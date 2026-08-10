@@ -174,6 +174,32 @@ fn checkpoint_failure(stage: &str) -> Value {
     })
 }
 
+/// A validated historical completion fact selects the deterministic branch
+/// that bypasses implementation-agent admission. `restampFor` is the exact
+/// predicate the live lane uses before it constructs `agentSpec`.
+#[test]
+fn a_restamp_fact_selects_only_its_own_agent_free_lane() {
+    let mut realm = CampaignFlowRealm::new(&json!({}));
+    let fact = json!({
+        "taskId": "build",
+        "pullRequest": "https://github.com/acme/spec/pull/8",
+        "mergeCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "revision": format!("sha256:{}", "1".repeat(64)),
+    });
+    let reconciliation = json!({"restamps": [fact.clone()]});
+    assert_eq!(
+        realm.call(
+            "restampFor",
+            &[reconciliation.clone(), json!({"id": "build"})]
+        ),
+        fact
+    );
+    assert_eq!(
+        realm.call("restampFor", &[reconciliation, json!({"id": "unrelated"})]),
+        Value::Null
+    );
+}
+
 /// #337: the deferral arm has to cover the whole deferred lane.
 ///
 /// A checkpoint lane can fail at `prep`, at the checkpoint command itself, and

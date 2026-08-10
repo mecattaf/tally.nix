@@ -571,7 +571,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
         }
         task = dict(implementation_task("task-1", "one"))
         task["brief"] = {"issue": {"number": "11", "url": "https://example.invalid/11"}}
-        facts, warnings = driver.merged_github_tasks(
+        facts, restamps, warnings = driver.merged_github_tasks(
             self.code.name,
             driver.repo_config(self.code.config),
             "fixture",
@@ -582,6 +582,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
             walk,
         )
         self.assertEqual(facts, [])
+        self.assertEqual(restamps, [])
         self.assertEqual(len(warnings), 1)
         self.assertIn("acme/elsewhere", warnings[0])
         self.assertIn("not campaign code repository", warnings[0])
