@@ -4454,28 +4454,35 @@ class SteeringGrammarTests(unittest.TestCase):
         blob = self.posted_blob(config, steered)
         return str(blob.get("diagnosis", blob.get("reason")))
 
-    def test_a_grammar_violating_diagnosis_buys_a_machinery_retry(self) -> None:
+    def test_a_grammar_rejected_excerpt_is_published_as_machine_steering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             config = repository_config(checkout, "local")
+            secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+            rejected = f"narrow the failing gate without exposing {secret}"
+            reason, _, _ = DRIVER.diagnosis_rejection_reason(rejected, None)
+            self.assertIsNotNone(reason)
             steered = DRIVER.action_steer(
-                self.brief(root, checkout, diagnosis="narrow the failing gate")
+                self.brief(root, checkout, diagnosis=rejected)
             )
             self.assertTrue(steered["posted"])
-            self.assertEqual(steered["kind"], "retry")
+            self.assertEqual(steered["kind"], "diagnosis")
             blob = self.posted_blob(DRIVER.repo_config(config), steered)
-            self.assertEqual(blob["kind"], "retry")
-            body = str(blob["reason"])
-            # Never silent, but also not a diagnosis receipt: grammar machinery
-            # cannot advance the task's steering attempt counter.
-            self.assertIn("diagnosis-contract", body)
+            self.assertEqual(blob["kind"], "diagnosis")
+            body = str(blob["diagnosis"])
+            self.assertIn("grammar-rejected", body)
             self.assertIn("must end with a period", body)
+            self.assertIn("Redacted proposal excerpt:", body)
+            self.assertIn("[redacted-token]", body)
+            self.assertNotIn(secret, body)
+            published_reason, _, _ = DRIVER.diagnosis_rejection_reason(body, None)
+            self.assertIsNone(published_reason)
             diagnoses, retries, _, _ = DRIVER.forge_campaign_state(
                 "acme/spec", DRIVER.repo_config(config), "fixture", "7", {"task-1"}
             )
-            self.assertEqual(diagnoses, [])
-            self.assertEqual(len(retries), 1)
+            self.assertEqual(len(diagnoses), 1)
+            self.assertEqual(retries, [])
 
     def test_gate_evidence_requires_the_failing_id_and_offending_path(self) -> None:
         detail = (
@@ -4495,36 +4502,11 @@ class SteeringGrammarTests(unittest.TestCase):
                 )
             )
             body = self.posted_body(DRIVER.repo_config(config), omitted)
-            self.assertEqual(omitted["kind"], "retry")
+            self.assertEqual(omitted["kind"], "diagnosis")
+            self.assertIn("grammar-rejected", body)
             self.assertIn("omits the failing check id", body)
             self.assertIn("gate:forbid-secrets", body)
-
-    def test_exhausted_diagnosis_retries_preserve_the_rejected_content(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            config = DRIVER.repo_config(repository_config(checkout, "local"))
-            brief = self.brief(
-                root,
-                checkout,
-                diagnosis="the router died after rejecting apply_patch",
-            )
-
-            first = DRIVER.action_steer(brief)
-            second = DRIVER.action_steer(brief)
-            third = DRIVER.action_steer(brief)
-
-            self.assertEqual(first["kind"], "retry")
-            self.assertEqual(second["kind"], "retry")
-            self.assertEqual(third["kind"], "diagnosis")
-            body = self.posted_body(config, third)
-            self.assertIn("machinery retry budget was exhausted", body)
-            self.assertIn("router died after rejecting apply_patch", body)
-            diagnoses, retries, _, _ = DRIVER.forge_campaign_state(
-                "acme/spec", config, "fixture", "7", {"task-1"}
-            )
-            self.assertEqual(len(diagnoses), 1)
-            self.assertEqual(len(retries), 2)
+            self.assertIn("secrets/key.pem", body)
 
     def test_a_diagnosis_naming_the_required_evidence_is_accepted_verbatim(self) -> None:
         detail = (
@@ -4548,8 +4530,13 @@ class SteeringGrammarTests(unittest.TestCase):
                 )
             )
             body = self.posted_body(DRIVER.repo_config(config), steered)
+            reason, _, _ = DRIVER.diagnosis_rejection_reason(
+                diagnosis, {"id": "gate:forbid-secrets", "detail": detail}
+            )
+            self.assertIsNone(reason)
             self.assertEqual(steered["kind"], "diagnosis")
             self.assertEqual(body, diagnosis)
+            self.assertNotIn("grammar-rejected", body)
 
 
 class BreachSteeringTests(unittest.TestCase):

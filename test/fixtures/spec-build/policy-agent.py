@@ -71,6 +71,18 @@ if role == "diagnosis":
         raise SystemExit(f"diagnosis diff omitted {expected}")
     if not gates:
         raise SystemExit("diagnosis did not receive gate outputs")
+    mission = brief["mission"]
+    failing_check_id = gates[-1]["gateId"]
+    for required_prompt_text in (
+        "MUST contain the failing check id",
+        "offending path as literal substrings",
+        "paraphrases do not count",
+        failing_check_id,
+    ):
+        if required_prompt_text not in mission:
+            raise SystemExit(
+                f"diagnosis mission omitted literal rule {required_prompt_text!r}"
+            )
     if task == "task-1":
         if "build/transient.db" not in failure["captureStderr"]:
             raise SystemExit("task 1 diagnosis omitted constraint stderr")

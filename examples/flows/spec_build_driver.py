@@ -3941,14 +3941,17 @@ def diagnosis_fallback_note(
     Deterministic and never model-authored -- built only from the driver's
     own rejection reason and the gate evidence it was already given -- and
     itself outcome-first shaped, so it survives being posted in the same
-    comment the rejected diagnosis would have occupied. AUGUST-02: refusing
-    loudly beats degrading silently, so this is never a silent template.
+    comment the rejected diagnosis would have occupied. The rejected prose is
+    an explicitly marked excerpt, not prose admitted through the grammar.
     """
-    where = ""
+    note = (
+        "Recorded a grammar-rejected steward diagnosis. "
+        f"Validation rejected the proposal because {reason}."
+    )
     if gate_id:
-        where = f" Investigate check {gate_id!r} directly"
-        where += f", path {path!r}." if path else "."
-    note = f"Recorded a steward diagnosis after its machinery retry budget was exhausted. Validation rejected the proposal because {reason}.{where}"
+        note += f" Required literal check id: {gate_id!r}."
+    if path:
+        note += f" Required literal offending path: {path!r}."
     if rejected:
         excerpt = re.sub(r"\s+", " ", rejected).strip().replace("!", ".")
         excerpt = excerpt[:2000].rstrip(" .:;?")
@@ -4121,7 +4124,6 @@ def bounded_breach_note(
 
 
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
-    capability_brief = brief
     brief, capabilities = take_capabilities(brief)
     fields = {
         "campaign",
@@ -4266,48 +4268,11 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     )
     diagnosis, redacted = redact_public_text(diagnosis)
     diagnosis = bound_public_diagnosis(diagnosis)
-    # A steward grammar rejection is campaign machinery, not evidence about
-    # the task. Spend the same bounded machinery budget used by prep/publish
-    # faults and leave the diagnosis attempt number untouched. Once that
-    # budget is exhausted, publish a deterministic wrapper that retains a
-    # redacted excerpt so the campaign remains bounded and an escalation still
-    # contains diagnostic content.
-    reason, required_id, required_path = diagnosis_rejection_reason(
-        diagnosis, data.get("gateEvidence")
-    )
-    if reason:
-        detail = f"Steward diagnosis failed the public grammar: {reason}."
-        excerpt = re.sub(r"\s+", " ", diagnosis).strip()
-        if excerpt:
-            detail += f" Redacted proposal excerpt: {excerpt[:1200]}"
-        retry_brief = {
-            "campaign": campaign,
-            "repository": code_repository,
-            "repositoryConfig": data["repositoryConfig"],
-            "issue": data["issue"],
-            "taskId": task_id,
-            "stage": "diagnosis-contract",
-            "detail": detail[:MAX_RETRY_CHARS],
-            **carried_coordinates(data),
-        }
-        if "taskIssue" in data:
-            retry_brief["taskIssue"] = data["taskIssue"]
-        if isinstance(capability_brief, dict) and "capabilities" in capability_brief:
-            retry_brief["capabilities"] = capability_brief["capabilities"]
-        retry = action_retry(retry_brief)
-        if retry["posted"]:
-            return {
-                "kind": "retry",
-                "taskId": task_id,
-                "attempt": retry["attempt"],
-                "comment": retry["comment"],
-                "blocked": False,
-                "posted": True,
-                "redacted": redacted or retry["redacted"],
-            }
-        diagnosis = diagnosis_fallback_note(
-            reason, required_id, required_path, diagnosis
-        )
+    # Validation still distinguishes admitted prose from a rejected proposal.
+    # Rejection now degrades to a marked, driver-authored wrapper in this same
+    # diagnosis receipt, so the already-redacted excerpt reaches the next
+    # worker instead of being withheld behind machinery retry receipts.
+    diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
     comment = post_diagnosis_comment(
         config,
         repository,
