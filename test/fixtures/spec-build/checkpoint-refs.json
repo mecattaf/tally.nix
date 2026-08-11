@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "comment": "Shared checkpoint-receipt ref vectors. examples/flows/spec_build_driver.py writes and reads the full ref; crates/tally/src/cli/campaign.rs projects completion without knowing the base revision and therefore builds the prefix. Both languages assert against this file so the two ref layouts cannot drift apart again.",
+  "comment": "Shared checkpoint-receipt ref vectors. drivers/spec_build_driver.py writes and reads the full ref; crates/tally/src/cli/campaign.rs projects completion without knowing the base revision and therefore builds the prefix. Both languages assert against this file so the two ref layouts cannot drift apart again.",
   "vectors": [
     {
       "campaign": "night-build",

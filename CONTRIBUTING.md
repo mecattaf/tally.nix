@@ -186,6 +186,11 @@ for features that are not implemented.
 New producer behavior must not silently expand the closed kind set. New agent integrations should
 normally be data-only adapters built with `lib.adapters.mkAdapter`.
 
+## Language charter
+
+Python campaign drivers live under `drivers/`, use only the standard library, and have their tests
+under `test/`.
+
 ## Changelog discipline
 
 Every behavior-affecting pull request must add a concise entry under the appropriate heading in

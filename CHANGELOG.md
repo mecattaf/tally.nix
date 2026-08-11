@@ -6,6 +6,12 @@ authorized.
 
 ## [Unreleased]
 
+### Recharter Python campaign drivers (#485)
+
+- Campaign driver Python now lives under `drivers/`, with every packaging, runtime, and test path
+  updated to follow it.
+- Contributor guidance now records the stdlib-only driver remit and its test location.
+
 ### Warn about hardened campaign argvs (#484)
 
 - `campaign arm` now emits non-blocking, surface-named warnings for checkpoint

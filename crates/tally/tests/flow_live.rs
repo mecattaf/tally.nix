@@ -2700,7 +2700,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &driver,
                 format!(
                     "#!/bin/sh\nexec python3 '{}' \"$@\"\n",
-                    repository_fixture("examples/flows/spec_build_driver.py").display()
+                    repository_fixture("drivers/spec_build_driver.py").display()
                 ),
             );
             let agent = repository_fixture("test/fixtures/spec-build/policy-agent.py");
@@ -4861,7 +4861,7 @@ async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicat
 
             let run_continue = || {
                 let output = StdCommand::new("python3")
-                    .arg(repository_fixture("examples/flows/spec_build_driver.py"))
+                    .arg(repository_fixture("drivers/spec_build_driver.py"))
                     .arg("continue")
                     .env("PATH", &stubbed_path)
                     .env("TALLY_BRIEF", &brief_path)

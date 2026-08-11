@@ -14,7 +14,7 @@ from typing import Any
 DRIVER = Path(
     os.environ.get(
         "SPEC_BUILD_DRIVER",
-        Path(__file__).parents[1] / "examples/flows/spec_build_driver.py",
+        Path(__file__).parents[1] / "drivers/spec_build_driver.py",
     )
 )
 SPEC = importlib.util.spec_from_file_location("spec_build_driver", DRIVER)

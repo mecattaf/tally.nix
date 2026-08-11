@@ -15,7 +15,7 @@ from pathlib import Path
 DRIVER = Path(
     os.environ.get(
         "AGENCY_NIGHTLY_DRIVER",
-        Path(__file__).parents[1] / "examples/flows/agency_nightly_driver.py",
+        Path(__file__).parents[1] / "drivers/agency_nightly_driver.py",
     )
 )
 SPEC = importlib.util.spec_from_file_location("agency_nightly_driver", DRIVER)
