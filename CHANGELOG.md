@@ -6,6 +6,13 @@ authorized.
 
 ## [Unreleased]
 
+### Audit campaign reconciliation and integration doctrine (#498)
+
+- A 72-claim modality record now checks the reconciliation, checkpoint, conflict-domain,
+  ownership, and ordered-integration doctrine against shipped code and focused tests.
+- The audit records ten divergences: six pseudocode/output vocabulary mismatches, omitted restamp
+  state, forge-mode sweep ordering, restamp-dependent preflight admission, and squash topology.
+
 ### Audit campaign admission and execution doctrine (#491)
 
 - A claim-by-claim modality record now checks the first two campaign-doctrine blocks against
