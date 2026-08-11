@@ -1877,6 +1877,25 @@ base, the pull request is an intentional campaign marker rather than a code
 change. Its title is prefixed with `[marker] ` so reviewers and automation can
 distinguish it from a substantive task PR without opening the diff.
 
+An implementation brief may ask the worker to report a judgement, trade-off,
+or other finding. The honored reporting surface is the worker's final message:
+when the resolved agent adapter declares `scrape.finalMessage`, a completed
+implementation lane carries that capture into publication and posts it as a
+marked comment on the task's sub-issue thread. A campaign without native
+sub-issues uses its campaign issue as the historical fallback. The driver
+applies the public redactor and bounds the complete UTF-8 comment to 8 KiB;
+an absent or blank capture posts nothing. Module-declared campaigns refuse an
+agent adapter without that capture, while `tally campaign arm` also warns that
+“worker findings will not be retained” for direct or older resolved configs.
+
+The implementation worker still does not author pull-request text. A brief
+request to “put this in the PR body” is not honored: from the worker's point of
+view the title and body are template-only and its finding lands in the comment
+above. With no steward, the driver template is the whole pull-request body; a
+configured steward may alter only the separately proposed, validated narration
+described in this section. It does not turn the implementation worker's final
+message into pull-request prose.
+
 ### The provenance trailer and the post-merge git-ai binding
 
 The squash commit is where a campaign's authorship becomes repository-native

@@ -1639,13 +1639,22 @@ fn validate_agent_policies(agent: &CampaignAgent, adapter: &AdapterConfig) -> Re
     Ok(())
 }
 
+fn worker_findings_warning(agent: &CampaignAgent, adapter: &AdapterConfig) -> Option<String> {
+    (!adapter.scrape.contains_key("finalMessage")).then(|| {
+        format!(
+            "campaign agent adapter {:?} declares no scrape.finalMessage; worker findings will not be retained",
+            agent.adapter
+        )
+    })
+}
+
 fn validate_host(
     graph: &CampaignGraph,
     config_path: Option<&Path>,
     flow: &Path,
     driver: &Path,
     allow_test_local_forge: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let manifest = &graph.canonical.manifest;
     let config = load_client_config(config_path)?;
     let required_nodes = max_flow_nodes(manifest);
@@ -1752,7 +1761,10 @@ fn validate_host(
             );
         }
     }
-    Ok(())
+    Ok(worker_findings_warning(
+        &manifest.agent,
+        &config.adapters[&manifest.agent.adapter],
+    ))
 }
 
 fn priority(value: &str) -> Priority {
@@ -1917,7 +1929,7 @@ async fn dispatch_campaign(
             registration.issue_url
         );
     }
-    validate_host(
+    let _ = validate_host(
         graph,
         config_path,
         &registration.flow,
@@ -2077,7 +2089,7 @@ async fn run_campaign_arm(
     } else {
         BTreeSet::new()
     };
-    let (pardon_plan, arm_warnings) =
+    let (pardon_plan, mut arm_warnings) =
         amendment_pardon_plan(prior_graph.as_ref(), &graph.canonical, &escalated);
     let flow = resolve_flow(args.flow)?;
     let driver = resolve_driver(args.driver)?;
@@ -2123,13 +2135,15 @@ async fn run_campaign_arm(
         },
         projection_wait_ms,
     );
-    validate_host(
+    if let Some(warning) = validate_host(
         &graph,
         config_path,
         &registration.flow,
         &registration.driver,
         registration.allow_test_local_forge,
-    )?;
+    )? {
+        arm_warnings.push(warning);
+    }
     let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
     for pardon in &pardon_plan {
         let receipt = post_campaign_auto_pardon(&graph, &registration.authenticated_actor, pardon)?;
@@ -2327,7 +2341,7 @@ async fn run_campaign_resume(
         ));
     }
     let sub_issue_walk = probe_sub_issue_walk(&locator)?;
-    validate_host(
+    let _ = validate_host(
         &graph,
         config_path,
         &registration.flow,
@@ -6275,6 +6289,28 @@ print(json.dumps({
             ..agent_with(Some("danger-full-access"))
         };
         validate_agent_policies(&workaround, &adapter).unwrap();
+    }
+
+    #[test]
+    fn missing_agent_final_message_capture_warns_before_worker_findings_are_lost() {
+        let agent = agent_with(Some(DEFAULT_AGENT_SANDBOX_POLICY));
+        let mut adapter = codex_shaped_adapter(&["danger-full-access"]);
+        let warning = worker_findings_warning(&agent, &adapter).unwrap();
+        assert!(warning.contains("scrape.finalMessage"), "{warning}");
+        assert!(
+            warning.contains("worker findings will not be retained"),
+            "{warning}"
+        );
+
+        adapter.scrape.insert(
+            "finalMessage".to_owned(),
+            serde_json::from_value(json!({
+                "mode": "jsonPathLast",
+                "pattern": "$[?@.type == 'item.completed'].item.text"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(worker_findings_warning(&agent, &adapter), None);
     }
 
     #[test]

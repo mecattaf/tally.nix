@@ -3183,6 +3183,103 @@ class LaneLifecycleTests(unittest.TestCase):
             title = created[created.index("--title") + 1]
             self.assertEqual(title, "[marker] task-1: Task task-1")
 
+    def test_publish_posts_bounded_redacted_worker_findings_or_stays_silent(self) -> None:
+        agent_task_uuid = "019fecc0-bbad-7153-969b-51174cf064ca"
+        secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+        cases = (
+            (
+                "present",
+                {
+                    "taskUuid": agent_task_uuid,
+                    "message": f"GITHUB_TOKEN={secret}\nJudgement: " + "é" * 10_000,
+                },
+            ),
+            ("absent", None),
+        )
+        for name, findings in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkout, _ = initialize_repository(root, remote=True)
+                campaign_task = {
+                    **task("task-1"),
+                    "brief": {
+                        "issue": {
+                            "number": "8",
+                            "url": "https://github.com/acme/spec/issues/8",
+                        },
+                        "body": "Implement task 1 and report the judgement.",
+                    },
+                }
+                prepared_brief = prep_brief(
+                    checkout,
+                    root / "workspaces",
+                    f"findings-{name}",
+                )
+                prepared_brief["task"] = campaign_task
+                prepared = DRIVER.action_prep(prepared_brief)
+                worktree = Path(prepared["worktreePath"])
+                (worktree / "task-1").write_text("implemented\n", encoding="utf-8")
+                git(worktree, "add", "task-1")
+                git(worktree, "commit", "--quiet", "-m", "implement task 1")
+
+                state = {
+                    "actor": "tally-bot",
+                    "pulls": [],
+                    "comments": [],
+                    "calls": [],
+                }
+                with FakeGitHub(root, state) as github:
+                    DRIVER.action_publish(
+                        {
+                            "campaign": "fixture",
+                            "repository": "acme/spec",
+                            "repositoryConfig": repository_config(checkout, "github"),
+                            "issue": issue(),
+                            "runId": f"findings-{name}",
+                            "workspaceRoot": str(root / "workspaces"),
+                            "task": campaign_task,
+                            "domainsRequired": True,
+                            "gates": [],
+                            "steward": None,
+                            "workspace": prepared,
+                            "constraints": [],
+                            "workerFindings": findings,
+                            "capabilities": {"subIssueWalk": True},
+                            "taskIssue": campaign_task["brief"]["issue"],
+                        }
+                    )
+                    published = github.state()
+
+                if findings is None:
+                    self.assertEqual(published["comments"], [])
+                    self.assertFalse(
+                        any(call[:2] == ["issue", "comment"] for call in published["calls"])
+                    )
+                    continue
+
+                self.assertEqual(len(published["comments"]), 1)
+                comment = published["comments"][0]
+                marker = DRIVER.worker_findings_marker(
+                    "fixture", "7", "task-1", agent_task_uuid
+                )
+                self.assertTrue(comment.startswith(marker + "\n\n### Worker findings"))
+                self.assertIn("[redacted sensitive diagnosis line]", comment)
+                self.assertIn(DRIVER.WORKER_FINDINGS_TRUNCATION.strip(), comment)
+                self.assertNotIn(secret, comment)
+                self.assertLessEqual(
+                    len(comment.encode("utf-8")), DRIVER.MAX_WORKER_FINDINGS_BYTES
+                )
+                comment_calls = [
+                    call
+                    for call in published["calls"]
+                    if call[:2] == ["issue", "comment"]
+                ]
+                self.assertEqual([call[2] for call in comment_calls], ["8"])
+                pull_request = published["createdPullRequests"][0]
+                pull_request_body = pull_request[pull_request.index("--body") + 1]
+                self.assertNotIn("Worker findings", pull_request_body)
+                self.assertNotIn(secret, pull_request_body)
+
     def test_marker_only_lane_passes_the_marker_safe_changelog_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
