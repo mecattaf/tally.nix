@@ -87,9 +87,9 @@
             ./examples/flows/academic-ocr.js
             ./examples/flows/agency-nightly.js
             ./examples/flows/monthly-review.js
-            ./examples/flows/campaign_worktrees.py
+            ./drivers/campaign_worktrees.py
             ./examples/flows/spec-build.js
-            ./examples/flows/spec_build_driver.py
+            ./drivers/spec_build_driver.py
             ./test/fixtures/flows
             ./test/fixtures/gh-login
             ./test/fixtures/git-ai

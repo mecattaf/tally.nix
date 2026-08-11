@@ -10,7 +10,7 @@
 
 pkgs.runCommand "tally-campaign-drivers" { } ''
   mkdir -p "$out"
-  cp ${../../examples/flows/campaign_worktrees.py} "$out/campaign_worktrees.py"
-  cp ${../../examples/flows/spec_build_driver.py} "$out/spec_build_driver.py"
-  cp ${../../examples/flows/agency_nightly_driver.py} "$out/agency_nightly_driver.py"
+  cp ${../../drivers/campaign_worktrees.py} "$out/campaign_worktrees.py"
+  cp ${../../drivers/spec_build_driver.py} "$out/spec_build_driver.py"
+  cp ${../../drivers/agency_nightly_driver.py} "$out/agency_nightly_driver.py"
 ''

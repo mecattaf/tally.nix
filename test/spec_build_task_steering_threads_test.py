@@ -13,7 +13,7 @@ from unittest import mock
 DRIVER_SOURCE = Path(
     os.environ.get(
         "SPEC_BUILD_DRIVER_SOURCE",
-        Path(__file__).resolve().parents[1] / "examples/flows/spec_build_driver.py",
+        Path(__file__).resolve().parents[1] / "drivers/spec_build_driver.py",
     )
 )
 FLOW_SOURCE = Path(

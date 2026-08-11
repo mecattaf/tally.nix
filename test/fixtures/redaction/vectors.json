@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "note": "Shared public-redaction vector. crates/tally-core/src/producers/engine.rs redacts failure stderr and examples/flows/spec_build_driver.py redacts machine steering; both are hand-written and must not drift. Each side substitutes its own whole-line marker for %LINE% before comparing.",
+  "note": "Shared public-redaction vector. crates/tally-core/src/producers/engine.rs redacts failure stderr and drivers/spec_build_driver.py redacts machine steering; both are hand-written and must not drift. Each side substitutes its own whole-line marker for %LINE% before comparing.",
   "cases": [
     {
       "name": "campaign task ids survive",

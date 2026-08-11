@@ -1510,7 +1510,7 @@ fn redact_public_stderr(stderr: &str) -> (String, usize, bool) {
 
 /// Markers that hide a whole line, but only where they stand in key position.
 /// Substring matching alone redacted ordinary prose: a failure report about a
-/// token bug collapsed to nothing. `examples/flows/spec_build_driver.py` runs
+/// token bug collapsed to nothing. `drivers/spec_build_driver.py` runs
 /// the same rules, and `test/fixtures/redaction/vectors.json` holds the shared
 /// vector both sides assert against.
 const SENSITIVE_LINE_MARKERS: [&str; 21] = [

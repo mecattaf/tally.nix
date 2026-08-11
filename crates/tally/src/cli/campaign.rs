@@ -1589,7 +1589,7 @@ fn resolve_driver(value: Option<PathBuf>) -> Result<PathBuf> {
         value,
         "TALLY_CAMPAIGN_DRIVER",
         "libexec/tally/spec-build-driver",
-        "examples/flows/spec_build_driver.py",
+        "drivers/spec_build_driver.py",
     )
 }
 
@@ -5522,7 +5522,7 @@ esac"#,
     #[test]
     fn graph_digest_is_byte_identical_between_the_cli_and_the_packaged_driver() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let driver = repo_root.join("examples/flows/spec_build_driver.py");
+        let driver = repo_root.join("drivers/spec_build_driver.py");
         assert!(
             driver.is_file(),
             "packaged driver missing: {}",
@@ -6074,7 +6074,7 @@ esac"#,
     #[test]
     fn digest_mismatch_receipt_names_both_digests_and_the_first_divergent_path() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let driver = repo_root.join("examples/flows/spec_build_driver.py");
+        let driver = repo_root.join("drivers/spec_build_driver.py");
         assert!(
             driver.is_file(),
             "packaged driver missing: {}",
