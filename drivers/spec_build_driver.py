@@ -734,6 +734,108 @@ def assisted_by_trailer(record: dict[str, Any] | None) -> str | None:
     return trailer
 
 
+def portable_steward_pattern(pattern: str, context: str) -> None:
+    """Defensively enforce the portable Rust/Python regular-expression subset."""
+    characters = list(pattern)
+    index = 0
+    in_class = False
+    portable_escapes = {
+        "\\",
+        ".",
+        "^",
+        "$",
+        "|",
+        "?",
+        "*",
+        "+",
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        "-",
+        "/",
+        "d",
+        "D",
+        "s",
+        "S",
+        "w",
+        "W",
+        "n",
+        "r",
+        "t",
+        "f",
+    }
+    while index < len(characters):
+        character = characters[index]
+        if character == "\\":
+            index += 1
+            if index == len(characters):
+                fail(f"internal campaign contract violation: {context} ends in an escape")
+            escaped = characters[index]
+            if (escaped.isascii() and escaped.isdigit()) or escaped in {"k", "g"}:
+                fail(f"internal campaign contract violation: {context} contains a backreference")
+            if escaped == "x":
+                hexadecimal = characters[index + 1 : index + 3]
+                if len(hexadecimal) != 2 or any(
+                    digit not in "0123456789abcdefABCDEF" for digit in hexadecimal
+                ):
+                    fail(
+                        f"internal campaign contract violation: "
+                        f"{context} contains an invalid hexadecimal escape"
+                    )
+                index += 2
+            elif escaped not in portable_escapes:
+                fail(
+                    f"internal campaign contract violation: "
+                    f"{context} contains a non-portable escape"
+                )
+        elif character == "[":
+            if in_class:
+                fail(
+                    f"internal campaign contract violation: "
+                    f"{context} contains a nested character class"
+                )
+            in_class = True
+        elif character == "]":
+            in_class = False
+        elif (
+            in_class
+            and index + 1 < len(characters)
+            and (character, characters[index + 1])
+            in {("&", "&"), ("-", "-"), ("~", "~"), ("|", "|")}
+        ):
+            fail(
+                f"internal campaign contract violation: "
+                f"{context} contains a non-portable character-class operation"
+            )
+        elif (
+            not in_class
+            and character == "("
+            and characters[index + 1 : index + 2] == ["?"]
+            and characters[index + 2 : index + 3] != [":"]
+        ):
+            fail(
+                f"internal campaign contract violation: "
+                f"{context} contains a non-portable group"
+            )
+        index += 1
+
+    try:
+        compiled = re.compile(pattern)
+    except re.error as error:
+        fail(
+            "internal campaign contract violation: "
+            f"{context} did not compile in Python: {error}"
+        )
+    if compiled.groups != 1:
+        fail(
+            "internal campaign contract violation: "
+            f"{context} does not have exactly one capture group"
+        )
+
+
 def steward_role(value: Any, context: str = "campaign steward") -> dict[str, Any] | None:
     """Decode the fully normalized §2 steward catalog role.
 
@@ -768,18 +870,7 @@ def steward_role(value: Any, context: str = "campaign steward") -> dict[str, Any
         required_string(item, f"{context}.env.{key}", 4096)
     pattern = role["finalMessagePattern"]
     pattern = required_string(pattern, f"{context}.finalMessagePattern", 1024)
-    try:
-        compiled = re.compile(pattern)
-    except re.error as error:
-        fail(
-            "internal campaign contract violation: "
-            f"{context}.finalMessagePattern did not compile in Python: {error}"
-        )
-    if compiled.groups != 1:
-        fail(
-            "internal campaign contract violation: "
-            f"{context}.finalMessagePattern does not have exactly one capture group"
-        )
+    portable_steward_pattern(pattern, f"{context}.finalMessagePattern")
     runtime = role["runtimeMaxSec"]
     if runtime is not None:
         runtime = positive_integer(runtime, f"{context}.runtimeMaxSec")
@@ -1312,9 +1403,23 @@ def canonical_gate_list(value: Any, context: str) -> list[dict[str, Any]]:
             )
             if len(patterns) > 128:
                 fail(f"{gate_context}.forbidPaths exceeds 128 entries")
+            seen: set[str] = set()
             for pattern_index, pattern in enumerate(patterns):
                 if len(pattern) > 1024:
                     fail(f"{gate_context}.forbidPaths[{pattern_index}] exceeds 1024 characters")
+                components = pattern.split("/")
+                if (
+                    pattern.startswith("/")
+                    or pattern.endswith("/")
+                    or ".." in components
+                    or any("**" in component and component != "**" for component in components)
+                    or pattern in seen
+                ):
+                    fail(
+                        f"internal campaign contract violation: "
+                        f"{gate_context}.forbidPaths[{pattern_index}] is not canonical"
+                    )
+                seen.add(pattern)
             positive_integer(gate["runtimeMaxSec"], f"{gate_context}.runtimeMaxSec")
         else:
             fail(f"{gate_context}.kind must be command or forbidPaths")
