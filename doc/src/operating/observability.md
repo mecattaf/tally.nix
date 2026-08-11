@@ -437,6 +437,27 @@ For a campaign node, every journal/lifecycle record carries
 `query log` projection exposes `taskRef: "crm/t07"`. The same value is exported
 to the child as `TALLY_TASK_REF`.
 
+### Do not identify a self-hosted campaign by journal fields
+
+When tally's own repository is the campaign workload, journal filters on
+`TALLY_*` fields are not a sound campaign-membership test. The native field
+emission in `crates/tally-core/src/journal.rs` is shared by all tasks, and the
+campaign fixture in `crates/tally/tests/flow_live.rs` dispatches
+`fixture/task-6` through the `codex` adapter in the `campaign-agent` pool. Its
+successful evidence therefore emits `TALLY_POOL=campaign-agent`,
+`TALLY_AGENT=codex`, and `TALLY_EVENT=evidence_pass`, just like the campaign
+dispatch running the suite. The resulting `tally-job-fixture-*.service`
+entries are journal-indistinguishable from campaign dispatch.
+
+This is a legibility defect, not a containment failure. The test suites bind
+their daemons to sockets below their own temporary directories:
+`crates/tally/tests/flow_live.rs` derives `run/tally.sock` from a `tempfile`
+root, while direct suites such as `crates/tally/tests/cli_rpc.rs` use
+`temp.path().join("tally.sock")`. Test clients connect to those sockets and
+cannot reach the live daemon. For self-hosted campaigns, corroborate progress
+with `tally query run` and forge state—merged pull requests and issue
+comments—not journal filters.
+
 A `failed` log item carries `stderrTail` and `stderrTruncated`. The tail is a
 lossy UTF-8 rendering bounded to 2 KiB including the omission marker; it is a
 diagnostic projection, not evidence. Read it first. Inspect the retained raw

@@ -6,6 +6,12 @@ authorized.
 
 ## [Unreleased]
 
+### Document self-hosted journal ambiguity (#483)
+
+- Observability guidance now explains why lane-test journal fields can match
+  campaign dispatch fields even though temporary test sockets isolate the live
+  daemon, and names durable query output and forge state as sound corroboration.
+
 ### Unify forge campaign task references (#482)
 
 - `query run` now uses the durable campaign `registrationId` prefix consistently
