@@ -6,6 +6,15 @@ authorized.
 
 ## [Unreleased]
 
+### Retain campaign worker findings (#481)
+
+- Campaign publication now posts the implementation agent's captured final
+  message as a marked, redacted, 8 KiB-bounded comment on the task thread while
+  leaving pull-request bodies under the existing template/steward contract.
+- Enabled module campaigns require their agent adapter to declare
+  `scrape.finalMessage`; direct or older configs receive an arm-receipt warning
+  that worker findings will not be retained.
+
 ### Document self-hosted journal ambiguity (#483)
 
 - Observability guidance now explains why lane-test journal fields can match
