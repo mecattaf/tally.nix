@@ -1,0 +1,232 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "corpus-divergence-vectors",
+      "kind": "implementation",
+      "title": "Close the two live Rust/Python contract divergences under the corpus",
+      "goal": "Align drivers/spec_build_driver.py normalize_conflict_domains (lines 926-946) with Rust campaign_contract.rs dedup semantics (exact BTreeSet, not casefold), merge the third forbidPaths copy normalize_forbid_paths_gate (lines 6909-6935) into the canonical normalize path (line 1411) so the trailing-slash check is enforced everywhere, and add rejection vectors for conflictDomains and forbidPaths to crates/tally-core/tests/campaign_contract_corpus.rs so test/fixtures/spec-build/contract-corpus.json covers both fields. The corpus currently has zero conflictDomains rejection vectors; both divergences ship today.",
+      "deliveredBehaviors": [
+        "Python and Rust reject and accept byte-identical conflictDomains inputs",
+        "A single forbidPaths normalizer serves both the contract decode and the constraint gate",
+        "contract-corpus.json carries rejection vectors for conflictDomains and forbidPaths"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D38",
+          "final-plan-A.md Part 3 Chapter 1"
+        ],
+        "styleReferences": [
+          "crates/tally-core/tests/campaign_contract_corpus.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "corpus-regenerated",
+          "description": "The corpus regenerates from Rust and the Python decoder test passes against it, including the new conflictDomains and forbidPaths rejection vectors.",
+          "argv": [
+            "python3",
+            "test/spec_build_contract_corpus_test.py"
+          ]
+        },
+        {
+          "id": "single-forbidpaths-copy",
+          "description": "normalize_forbid_paths_gate no longer carries an independent grammar; the constraint-gate path calls the canonical normalizer.",
+          "argv": [
+            "bash",
+            "-lc",
+            "test \"$(grep -c 'def normalize_forbid_paths_gate' drivers/spec_build_driver.py)\" -eq 0 || ! grep -q 'endswith' <(sed -n '/def normalize_forbid_paths_gate/,/^def /p' drivers/spec_build_driver.py)"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "drivers",
+        "crates/tally-core",
+        "test/fixtures/spec-build"
+      ]
+    },
+    {
+      "id": "squash-legacy-checkpoint-tag",
+      "kind": "implementation",
+      "title": "Delete the legacy checkpoint tag namespace",
+      "goal": "Remove the pre-#307 refs/tags/tally checkpoint fallback: drivers/spec_build_driver.py legacy_checkpoint_tag (line 2992) and its dual-read call sites (3561-3574, 9030-9047), crates/tally/src/cli/campaign.rs legacy_checkpoint_tag_prefix (3339, 3563-3600), the legacyTag/legacyTagPrefix vectors in test/fixtures/spec-build/checkpoint-refs.json and test/spec_build_checkpoint_receipts_test.py (678, 758). Precondition already verified: git ls-remote origin 'refs/tags/tally/*' returns zero entries.",
+      "deliveredBehaviors": [
+        "Checkpoint receipts read from exactly one namespace",
+        "The operator rule 'checkpoint receipts may live in two namespaces' is deleted"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D39-D40",
+          "final-plan-A.md Part 3 Chapter 1"
+        ],
+        "styleReferences": [
+          "doc/audit/campaigns-worklist-checkpoints.md"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-legacy-tag-symbol",
+          "description": "No source file references the legacy checkpoint tag helpers.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'legacy_checkpoint_tag' drivers crates test"
+          ]
+        },
+        {
+          "id": "checkpoint-suite-green",
+          "description": "The checkpoint receipts suite passes with the single namespace.",
+          "argv": [
+            "python3",
+            "test/spec_build_checkpoint_receipts_test.py"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "drivers",
+        "crates/tally",
+        "test/fixtures/spec-build"
+      ]
+    },
+    {
+      "id": "worklist-task-revision",
+      "kind": "implementation",
+      "title": "Give file-worklist tasks a completion revision",
+      "goal": "normalize_task (drivers/spec_build_driver.py line 976) admits file-worklist tasks with no revision, so pull_request_marker (line 2911) emits the tally:spec-build:v1 spelling for exactly the mode the silent factory promotes to default. Compute a revision for file-worklist tasks the way task_completion_revision does for issue tasks, thread it through source construction (line 1155), and cover it with a driver test asserting a file-worklist task now yields a v2-revision marker.",
+      "deliveredBehaviors": [
+        "File-worklist tasks carry a completion revision",
+        "pull_request_marker never emits the v1 spelling for file-worklist tasks"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D40",
+          "final-plan-A.md Part 4 impedance 3"
+        ],
+        "styleReferences": [
+          "test/spec_build_driver_test.py"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes including the new file-worklist revision test.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "drivers"
+      ]
+    },
+    {
+      "id": "marker-single-arm",
+      "kind": "implementation",
+      "title": "Collapse the PR marker readers and writers to one arm",
+      "goal": "With every task now carrying a revision, delete the revision-is-None v1 builder branch in pull_request_marker (drivers/spec_build_driver.py 2906-2921), the legacy probe in pull_request_marker_revisions (2922-2940), and the second prefix in campaign_marker_prefixes plus the crates/tally/src/cli/campaign.rs acceptance counterpart (around line 3266). Estate fact: zero v1-marker PRs exist; 25 v2 PRs are merged history no future campaign re-parses.",
+      "deliveredBehaviors": [
+        "One marker grammar with one reader and one writer",
+        "The completion oracle keys on a single marker spelling"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D40",
+          "final-plan-A.md Part 3 Chapter 1"
+        ],
+        "styleReferences": [
+          "test/spec_build_driver_test.py"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-v1-spelling",
+          "description": "The v1 marker spelling appears nowhere in source (fixtures for historical parsing excepted only if a test names why).",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'tally:spec-build:v1' drivers crates"
+          ]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes with the single-arm marker.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [
+        "worklist-task-revision"
+      ],
+      "conflictDomains": [
+        "drivers",
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "drop-polluted-v2-migration",
+      "kind": "implementation",
+      "title": "Delete migrate_polluted_v2 and relax registry read locking",
+      "goal": "Delete the v1-polluted-to-v2 repair arm in crates/tally-core/src/campaign_registry.rs (dispatch at line 259, body at 705-748) and its pin tests (1446, 1503), then relax the exclusive read lock to shared (line 198). Estate fact: all local stores are at current versions; the repair guards data that does not exist. This must land before the authority v3 bump (Chapter 2) so the bump never enters a ladder carrying a repair arm.",
+      "deliveredBehaviors": [
+        "Registry reads take shared locks",
+        "The armed-record repair arm and the operator rule 'an armed record may be polluted' are deleted"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D39-D41",
+          "final-plan-A.md Part 3 Chapter 1"
+        ],
+        "styleReferences": [
+          "crates/tally-core/src/campaign_registry.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-polluted-symbol",
+          "description": "migrate_polluted_v2 is gone from the crate.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'migrate_polluted_v2' crates"
+          ]
+        },
+        {
+          "id": "core-tests-green",
+          "description": "tally-core test suite passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Chapter 1 gate: full workspace check",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "corpus-divergence-vectors",
+        "squash-legacy-checkpoint-tag",
+        "marker-single-arm",
+        "drop-polluted-v2-migration"
+      ]
+    }
+  ]
+}

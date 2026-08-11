@@ -1,0 +1,650 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "relocate-assisted-by",
+      "kind": "implementation",
+      "title": "Relocate the Assisted-by trailer builder out of producers",
+      "goal": "Move assisted_by_from_evidence and AssistedBy::trailer from crates/tally-core/src/producers/gh_intake.rs (lines 101-154) and their uses in producers/engine.rs (986, 1049) into a neutral module owned by the ledger-rendering path, so the surviving trailer (Decision D31/D32) does not depend on the producers stack. The driver's own builder (spec_build_driver.py 145-165, 696-735) stays where it is.",
+      "deliveredBehaviors": [
+        "Assisted-by trailer rendering has no producers dependency",
+        "gh_intake.rs can be deleted later without touching the trailer"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D31-D33"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "trailer-out-of-gh-intake",
+          "description": "No trailer-building symbol remains in gh_intake.rs.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n 'assisted_by_from_evidence' crates/tally-core/src/producers/gh_intake.rs"
+          ]
+        },
+        {
+          "id": "core-tests-green",
+          "description": "tally-core test suite passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core"
+      ]
+    },
+    {
+      "id": "authority-schema-v3",
+      "kind": "implementation",
+      "title": "Campaign authority schema v3: local-first registration",
+      "goal": "Bump CampaignRegistrationV2 (crates/tally-core/src/campaign_registry.rs 30-56) to v3: drop issue_url, issue_number, sub_issue_walk, last_forge_observation, allow_test_local_forge; add the worklist pattern, the code repository coordinate, and the local operator actor recorded at arm time and re-checked on every verb. Move the N/N-1 compatibility tests with the schema; the pre-v3 refusal message names the remedy: disarm and re-arm. Depends on Chapter 1's drop-polluted-v2-migration having landed.",
+      "deliveredBehaviors": [
+        "A campaign arms with no issue coordinates",
+        "Arm-time local actor identity replaces gh-resolved identity"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D41",
+          "final-plan-A.md Part 3 Chapter 2"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-issue-fields",
+          "description": "The v3 authority record carries no issue_url or issue_number.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n 'issue_url' crates/tally-core/src/campaign_registry.rs"
+          ]
+        },
+        {
+          "id": "core-tests-green",
+          "description": "tally-core test suite passes including the v2-to-v3 refusal test.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "local-steering-source",
+      "kind": "implementation",
+      "title": "Local steering log and tally campaign steer verb",
+      "goal": "Ship the append-only steering JSONL under XDG state and the tally campaign steer verb; repoint action_steering_recheck (spec_build_driver.py 4693) from github_steering_thread_comments to the local source. The record shape consumed by authorized_steering_comments (4594) is preserved byte-for-byte; github_login (4554) is replaced by the arm-recorded local actor validator. Implement the embargo plus high-water cursor contract (ingesting an entry pushes a do-not-dispatch-before timestamp; the cursor advances transactionally with dispatch), sitting where preparedComments and lateRecheckCommentIds already sit. Design the off-host read path (Decision D12) into the verb's contract.",
+      "deliveredBehaviors": [
+        "Steering works with no forge and no gh on PATH",
+        "The steering-race class is closed by embargo plus cursor",
+        "The prepared-union-rechecked fold and late-ID witnessing move unchanged"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D11-D12"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes with the local steering source.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        },
+        {
+          "id": "no-gh-in-recheck",
+          "description": "action_steering_recheck no longer calls the GitHub steering reader.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! sed -n '/def action_steering_recheck/,/^def /p' drivers/spec_build_driver.py | grep -q github_steering_thread_comments"
+          ]
+        }
+      ],
+      "dependencies": [
+        "authority-schema-v3"
+      ],
+      "conflictDomains": [
+        "drivers",
+        "crates/tally",
+        "crates/tally/src/cli"
+      ]
+    },
+    {
+      "id": "attempt-receipts-jsonl",
+      "kind": "implementation",
+      "title": "Attempt counters move to an append-only receipts log",
+      "goal": "Create the campaign-scoped attempt-receipts JSONL with the witness ledger's flock-and-fsync discipline; port contiguous_receipts and the pardon-boundary arithmetic (spec_build_driver.py 2496, 2797-2895) to a fold over the ordered log; DELETE the hidden-ref blob writers for diagnosis, retry, and escalation receipts (writers at 4968, 5399, 5588) in this same task, or the added store is unpaid (Decision D13/D50). Checkpoint and merge receipts stay as refs: they must remain reachable from the integration branch.",
+      "deliveredBehaviors": [
+        "Scheduler state re-derives identically from the log after a crash",
+        "The ref-namespace walk for attempt counters is deleted"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D13"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes with the receipts log.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        },
+        {
+          "id": "no-attempt-ref-writers",
+          "description": "No diagnosis/retry/escalation receipt is written to a hidden ref.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n 'refs/tally/spec-build' drivers/spec_build_driver.py | grep -Ei 'diagnosis|retry|escalation'"
+          ]
+        }
+      ],
+      "dependencies": [
+        "authority-schema-v3"
+      ],
+      "conflictDomains": [
+        "drivers"
+      ]
+    },
+    {
+      "id": "integration-branch-merge",
+      "kind": "implementation",
+      "title": "Integration branch as the merge target; local completion oracle",
+      "goal": "Retarget merge_local (spec_build_driver.py 8593) from the shared remote base to a campaign-local integration branch, dropping the temp-clone dance while KEEPING the actual_base/actual_head re-verification (8619-8632) as the race guard. action_publish (7746) loses its forge branch; publication URLs become local://repo/branch (7838). The completion oracle is merged_local_tasks (3468): marker commit reachable from the integration branch. Re-key stable_publish_branch's issue argument (3460) to the campaign id.",
+      "deliveredBehaviors": [
+        "Lane merges land on a local integration branch under witnessed gates",
+        "Completion is a local git reachability fact"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D14-D15"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes with integration-branch merges.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "drivers"
+      ]
+    },
+    {
+      "id": "port-local-semantics",
+      "kind": "implementation",
+      "title": "Re-home worklist validation and escalation/pardon semantics",
+      "goal": "Extract the worklist-ingestion half of campaign project (crates/tally/src/cli/campaign.rs 2781-3697: JSON worklist to validated manifest, project_tasks, brief validation) into the local arm path -- it is the only worklist validator. Port escalation/pardon semantics (active_escalated_tasks, amendment_pardon_plan, 844-931 marker parsing counterparts) to read the local receipts log. This must precede the forge-layer deletion.",
+      "deliveredBehaviors": [
+        "Arming validates the worklist without the projection renderer",
+        "Escalation and pardon fold from local receipts"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 3 Chapter 2 task 2.5"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "campaign-tests-green",
+          "description": "tally CLI campaign tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [
+        "authority-schema-v3",
+        "attempt-receipts-jsonl"
+      ],
+      "conflictDomains": [
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "remove-gate-a",
+      "kind": "implementation",
+      "title": "Remove git-ai gate A: executor, daemon, core, nix, flake",
+      "goal": "Delete the gate A stack per the merged shed ledger: executor wiring (lifecycle.rs 285-330, 408-417, 469-530, 610-640; launch.rs; types.rs git_ai fields; mod.rs GitAiRequired; remote.rs passthrough), daemon plumbing (completion.rs 553, 576, 985-1052; run.rs 424-430, 493, 679-680; startup.rs 538), then git_ai.rs whole (2,255 LOC), GitAiConfig/GitAiMode in config.rs, the six nix leaf options (services.tally.gitAi x4, campaigns gitAiBinding/gitAiAwaitSec) plus the await-coupling assertion (common.nix 2631-2635), the d12 flake scenario and fixtures (flake.nix 1457-1520, ~4130-4235, fixtures/git-ai). daemon/barriers.rs is NOT git-ai -- do not touch it.",
+      "deliveredBehaviors": [
+        "No git-ai process, socket, or config exists anywhere in tally",
+        "Six nix leaf options and the coupling assertion are gone"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D31"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-git-ai-module",
+          "description": "git_ai.rs is deleted and nothing references it.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! test -f crates/tally-core/src/git_ai.rs && ! grep -rn 'git_ai::' crates"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace builds and tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [
+        "relocate-assisted-by"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally-core/src/executor",
+        "nix/modules",
+        "flake.nix",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "remove-gate-b-and-contract",
+      "kind": "implementation",
+      "title": "Remove git-ai gate B and the contract fields at the digest-rotation moment",
+      "goal": "Delete the driver's gate B block (spec_build_driver.py 8146-8592: git_ai_available, reconstruct_squash, note_blob, remote_note, publish_authorship_note, bind_authorship, settle_binding, bind_authorship_into; validators 670-695; GIT_AI_PROGRAM; binding-receipt call sites in merge paths), the campaign contract fields gitAiBinding/gitAiAwaitSec and the 2x coupling check (campaign_contract.rs 172-175, 317-333, 750-765, 930-936), their corpus vectors, and the spec-build.js argsSchema entries (157-158, 196-197, 410-415, 715-716, 739). Contract-field removal changes the canonical manifest digest -- it lands in this chapter, when digests rotate anyway (authority v3).",
+      "deliveredBehaviors": [
+        "The driver performs no authorship binding",
+        "The campaign contract carries no git-ai fields; corpus regenerated"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D31",
+          "final-plan-A.md Part 3 Chapter 2 task 2.G3"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-gate-b",
+          "description": "No gate B symbol remains in the driver.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -nE 'reconstruct_squash|bind_authorship|gitAiBinding' drivers/spec_build_driver.py"
+          ]
+        },
+        {
+          "id": "corpus-suite-green",
+          "description": "Contract corpus decoder test passes.",
+          "argv": [
+            "python3",
+            "test/spec_build_contract_corpus_test.py"
+          ]
+        }
+      ],
+      "dependencies": [
+        "remove-gate-a",
+        "authority-schema-v3"
+      ],
+      "conflictDomains": [
+        "drivers",
+        "crates/tally-core/src/campaign_contract.rs",
+        "examples/flows",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "remove-verify-authorship",
+      "kind": "implementation",
+      "title": "Remove the verify-authorship surface and query projection",
+      "goal": "Delete authorship.rs (855 LOC), the tally witness verify-authorship verb (args.rs 956-1010, cli/mod.rs 976-1010, cli/tests.rs 142/180), and AuthorshipProjection in query_v2.rs (253-270, 379, 2215, 2330-2340, 2697, 2734-2810 including the witness-ledger:git-ai-note source tag). Witness authorship field EMISSION and required-validation go here too; read-side ACCEPTANCE of the authorship fields on historical chain-hashed records STAYS (Decision D33) -- removing it breaks chain re-verification. Leave an explicit comment naming the retirement condition.",
+      "deliveredBehaviors": [
+        "No CLI or query surface speaks authorship",
+        "Historical ledger records still hash-verify"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D31, D33"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-authorship-module",
+          "description": "authorship.rs is deleted.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! test -f crates/tally-core/src/authorship.rs"
+          ]
+        },
+        {
+          "id": "ledger-verify-green",
+          "description": "Witness chain verification passes over the live fixture ledger carrying authorship fields.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core",
+            "witness"
+          ]
+        }
+      ],
+      "dependencies": [
+        "remove-gate-a"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally/src/cli"
+      ]
+    },
+    {
+      "id": "delete-forge-io-python",
+      "kind": "implementation",
+      "title": "Delete the driver's forge I/O layer",
+      "goal": "Delete the [A] block per the shed ledgers: subissue_walk (3083-3257), issue_graph_worklist (1695), merged_github_tasks (3271), sync_issue_checkboxes (3623), github_merge_checkbox_repair (9088), github_checkpoint_progress_comment (8792), post_diagnosis_comment (4949), GH comment plumbing (2399-2460), closed_subissue_anomalies (4131), steering thread GH stack (4499-4692), merge_github (8690), marker mint/parse for comments (1915-2110), campaign_capabilities/take_capabilities (1891), forge==github branches, and the matching test bodies including test/spec_build_task_steering_threads_test.py and test/campaign-github-e2e.sh plus its agent fixture and the flake campaign-host fake-gh simulation. The narration validator, template fallback, and redaction survive (they serve local receipts and the release renderer).",
+      "deliveredBehaviors": [
+        "The driver runs no gh subprocess in any code path",
+        "Eight operator rules from the residue ledger are deleted"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D3-D5",
+          "final-plan-A.md Part 3 Chapter 2 task 2.6"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-gh-invocation",
+          "description": "No bare gh invocation remains in the driver.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n '\"gh\"' drivers/spec_build_driver.py"
+          ]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes with gh absent from PATH.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [
+        "local-steering-source",
+        "attempt-receipts-jsonl",
+        "integration-branch-merge",
+        "remove-gate-b-and-contract"
+      ],
+      "conflictDomains": [
+        "drivers",
+        "test",
+        "flake.nix"
+      ]
+    },
+    {
+      "id": "delete-forge-io-rust",
+      "kind": "implementation",
+      "title": "Delete the Rust forge layer",
+      "goal": "Delete campaign.rs arm-time forge reads (fetch_issue 425, fetch_subissues 439, fetch_campaign_graph, parse_manifest 1113, gh runners 250-330), forge_observation and last_forge_observation plumbing (1331, 2669), the projection renderer and campaign project verb (3093-3963, args.rs 195/257-281), probe_sub_issue_walk (646), marker/escalation comment parsing and posting (844-931, 2417-2540), and their in-file tests. Registration store I/O, dispatch, argv-hazard warnings, and policy validation survive (~1,800 LOC).",
+      "deliveredBehaviors": [
+        "tally campaign project no longer exists",
+        "Arming reads the registry and worklist only"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 3 Chapter 2 task 2.7"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-campaign-project",
+          "description": "The Project subcommand is gone.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n 'CampaignCommand::Project' crates/tally/src/cli/args.rs"
+          ]
+        },
+        {
+          "id": "campaign-tests-green",
+          "description": "tally CLI tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [
+        "port-local-semantics",
+        "authority-schema-v3"
+      ],
+      "conflictDomains": [
+        "crates/tally",
+        "crates/tally/src/cli"
+      ]
+    },
+    {
+      "id": "skills-rewrite",
+      "kind": "implementation",
+      "title": "Rewrite both operator skills from scratch",
+      "goal": "Replace skills/campaign-operator/SKILL.md and skills/assign-tally/SKILL.md with silent-factory operator manuals: arm (worklist, merge, tally campaign arm), observe (tally query, no corroboration ritual), steer (tally campaign steer), release (one idempotent verb). Every GH-narration rule dies; the diff is the acceptance test (Decision D51). Coordinate with the uncommitted local edits noted in the working tree.",
+      "deliveredBehaviors": [
+        "Skills describe only the local lifecycle plus the one release act",
+        "No rule instructs checking forge projections for drift"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D51"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-mention-rules",
+          "description": "The skills contain no mention-doorbell or checkbox instructions.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rniE 'mention|checkbox|sub-issue' skills/"
+          ]
+        }
+      ],
+      "dependencies": [
+        "delete-forge-io-python",
+        "delete-forge-io-rust"
+      ],
+      "conflictDomains": [
+        "skills"
+      ]
+    },
+    {
+      "id": "marker-respell-trailers",
+      "kind": "implementation",
+      "title": "Respell completion markers as git trailers (atomic)",
+      "goal": "Replace the HTML-comment completion marker grammar with Tally-Task:/Tally-Revision: git trailers on layer commits; the completion oracle keys on trailers of commits reachable from the integration branch. Single atomic task: writer, reader, oracle, and fixtures flip together (the marker is the oracle's key -- splitting this invalidates completion mid-flight). Trailer block validated as one contiguous block (Decision D19-D21).",
+      "deliveredBehaviors": [
+        "One public schema: conventional subject plus trailer block",
+        "The completion oracle reads trailers, not HTML comments"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D21"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-html-markers",
+          "description": "No spec-build HTML-comment marker is minted anywhere.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'tally:spec-build:v' drivers crates"
+          ]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes on the trailer oracle.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [
+        "delete-forge-io-python",
+        "delete-forge-io-rust"
+      ],
+      "conflictDomains": [
+        "drivers",
+        "crates/tally",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "drop-local-forge-escape-hatches",
+      "kind": "implementation",
+      "title": "Delete --allow-test-local-forge and the resume refusal",
+      "goal": "Delete the --allow-test-local-forge gate (campaign.rs 1932, args.rs 234-236) and campaign resume's repository.forge=github refusal (2541). Ordered last: authority v3 and the local canon have made both refusals meaningless; this is the bootstrap paradox resolving (Decision D49).",
+      "deliveredBehaviors": [
+        "forge:local is a first-class production mode",
+        "Resume works on local campaigns"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D49"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-escape-hatch",
+          "description": "The flag is gone from args and campaign.rs.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'allow_test_local_forge' crates"
+          ]
+        },
+        {
+          "id": "campaign-tests-green",
+          "description": "tally CLI tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [
+        "marker-respell-trailers"
+      ],
+      "conflictDomains": [
+        "crates/tally",
+        "crates/tally/src/cli/args.rs"
+      ]
+    },
+    {
+      "id": "git-ai-test-doc-sweep",
+      "kind": "implementation",
+      "title": "Sweep git-ai tests, fixtures, and dead-subject docs",
+      "goal": "Delete test/git-ai-squash-fidelity.sh (326), doc/src/flows/git-ai-squash-fidelity.md + SUMMARY entry, doc/git-ai-authorship.md, test/final-bar/cases/git_ai.py plus its registration in run.py/cases.json/manifest.py/pipeline.py, and the git-ai test bodies across daemon/tests.rs, executor/tests.rs, executor_live.rs, flow_live.rs, cli_rpc.rs, engine/tests.rs, spec_build_driver_test.py, spec_build_two_repo_test.py (Assisted-by trailer tests are kept/moved, per Decision D31). Doc REWRITES are out of scope (D53); only these dead-subject file deletions ride.",
+      "deliveredBehaviors": [
+        "No test or fixture exercises git-ai",
+        "final-bar runs green without the git-ai case"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D31, D53"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-git-ai-refs",
+          "description": "No git-ai reference outside historical ledger fixtures.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rln 'git-ai' crates test doc | grep -v 'test/fixtures/ledger'"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [
+        "remove-gate-b-and-contract",
+        "remove-verify-authorship"
+      ],
+      "conflictDomains": [
+        "test",
+        "test/fixtures",
+        "doc"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Chapter gate: full gate ladder",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "skills-rewrite",
+        "drop-local-forge-escape-hatches",
+        "git-ai-test-doc-sweep"
+      ]
+    }
+  ]
+}

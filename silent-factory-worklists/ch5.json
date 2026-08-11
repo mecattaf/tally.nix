@@ -1,0 +1,231 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "argv-seam-reseat",
+      "kind": "implementation",
+      "title": "Reseat the driver tests at the argv seam",
+      "goal": "Add a run_driver(action, brief) helper that writes TALLY_BRIEF, execs the driver binary, and parses TALLY_FINAL_MESSAGE=; migrate the 49 action-only tests onto it; add coverage for main(), load_brief(), emit(), and the DriverError-to-exit-1 path, none of which is tested today. This converts the port from a month to a week and is worth doing on its own merits (Decision D36).",
+      "deliveredBehaviors": [
+        "The production entrypoint has test coverage",
+        "49 action tests run out-of-process"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D36-D37"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "driver-suite-green",
+          "description": "Reseated suite passes.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "test"
+      ]
+    },
+    {
+      "id": "spec-build-driver-crate",
+      "kind": "implementation",
+      "title": "New spec-build-driver crate behind the same seam",
+      "goal": "Create the spec-build-driver crate in the workspace, compiled to its own binary, behind the exact argv seam (TALLY_BRIEF in, one TALLY_FINAL_MESSAGE= line out, DriverError to stderr + exit 1), separately pinned: the registry keeps modeling flow and driver as two store paths (campaign_registry.rs 1325-1326); never folded into the tally CLI. It imports campaign_contract directly -- no mirror.",
+      "deliveredBehaviors": [
+        "A Rust driver binary answers the worklist action end to end",
+        "Flow and driver remain independently pinned"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D35"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "crate-builds",
+          "description": "The crate builds and its worklist action round-trips a fixture brief.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "spec-build-driver"
+          ]
+        }
+      ],
+      "dependencies": [
+        "argv-seam-reseat"
+      ],
+      "conflictDomains": [
+        "crates/spec-build-driver"
+      ]
+    },
+    {
+      "id": "port-worktrees",
+      "kind": "implementation",
+      "title": "Port campaign_worktrees with the driver",
+      "goal": "Port campaign_worktrees.py (638 LOC: flock lane preparation locking, git-config identity round-trip, add/resume/remove/prune, change_set_fingerprint) into the driver crate. Never ported first (Decision D35); the flock-interleaving lane-serialization property gets a Rust test equivalent.",
+      "deliveredBehaviors": [
+        "Lane worktree lifecycle is Rust",
+        "Lane-cut serialization is proven in Rust"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D35"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "worktrees-tests-green",
+          "description": "Worktree module tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "spec-build-driver",
+            "worktrees"
+          ]
+        }
+      ],
+      "dependencies": [
+        "spec-build-driver-crate"
+      ],
+      "conflictDomains": [
+        "crates/spec-build-driver"
+      ]
+    },
+    {
+      "id": "port-actions",
+      "kind": "implementation",
+      "title": "Port the surviving driver actions",
+      "goal": "Port the ~6,700 surviving lines: the pure fold half (reconcile, pardon arithmetic, gate normalization/enforcement, canonical decoders -- where the type system pays) and the effectful half (git choreography via std::process::Command, distinguishing ref-absent from command-failed). The reseated Python suite runs against the Rust binary during the port as the migration oracle; parity on the full suite is the exit criterion.",
+      "deliveredBehaviors": [
+        "The Rust driver passes the reseated suite",
+        "Python and Rust drivers are behaviorally identical at the seam"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D35-D37"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "parity-green",
+          "description": "The reseated suite passes against the Rust binary.",
+          "argv": [
+            "bash",
+            "-lc",
+            "TALLY_DRIVER_BIN=target/debug/spec-build-driver python3 test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [
+        "port-worktrees"
+      ],
+      "conflictDomains": [
+        "crates/spec-build-driver",
+        "drivers"
+      ]
+    },
+    {
+      "id": "single-source-js-argsschema",
+      "kind": "implementation",
+      "title": "Single-source the spec-build.js argsSchema from Rust",
+      "goal": "Generate or golden-verify the spec-build.js inline argsSchema (the second and larger hand-copy, examples/flows/spec-build.js 141-249) from the Rust contract, in the direction #520 names, so the JS copy can never skew. With the Python mirror deleted next task, contract copies go from four toward one (Rust authority) plus the nix module (Chapter P territory).",
+      "deliveredBehaviors": [
+        "The JS argsSchema cannot drift from the Rust contract"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D36"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "schema-golden-green",
+          "description": "The argsSchema golden check passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-flow"
+          ]
+        }
+      ],
+      "dependencies": [
+        "port-actions"
+      ],
+      "conflictDomains": [
+        "examples/flows",
+        "crates/tally-core/src/campaign_contract.rs"
+      ]
+    },
+    {
+      "id": "delete-python-and-corpus",
+      "kind": "implementation",
+      "title": "Delete Python and the corpus machinery (victory lap)",
+      "goal": "Delete drivers/spec_build_driver.py, drivers/campaign_worktrees.py, the contract-corpus generator (campaign_contract_corpus.rs emitter), the Python byte-compare decoder test, and the regex that re-parses Rust source -- the verification scaffolding that existed solely to keep Python honest. Flag agency_nightly_driver.py explicitly: it rides the same port or is grandfathered by name in the chapter record, never by silence. Update the flake stdlib-only check scope accordingly.",
+      "deliveredBehaviors": [
+        "Zero Python in the campaign path",
+        "One contract source with one generated JS golden"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D34-D36"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-python-driver",
+          "description": "The Python drivers are gone.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! test -f drivers/spec_build_driver.py"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Full workspace passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [
+        "port-actions",
+        "single-source-js-argsschema"
+      ],
+      "conflictDomains": [
+        "drivers",
+        "test",
+        "test/fixtures",
+        "flake.nix"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Chapter gate: full gate ladder",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "delete-python-and-corpus"
+      ]
+    }
+  ]
+}

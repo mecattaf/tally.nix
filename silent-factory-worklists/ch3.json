@@ -1,0 +1,187 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "release-issue-create",
+      "kind": "implementation",
+      "title": "One-shot sparse issue create",
+      "goal": "The release renderer opens exactly one issue: title plus the operator's project-document intent prose rendered verbatim (render_project_task_body/project_tasks lineage, campaign.rs 2827/2899) -- no manifest section, no worklist section, no markers in the human surface. Falsifiable test: the issue could exist unchanged in a repository that never heard of tally (Decision D4, D46). Idempotent: re-running creates nothing.",
+      "deliveredBehaviors": [
+        "One sparse issue per campaign, created once",
+        "No fenced machine sections in issue bodies"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D4, D46"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "renderer-tests-green",
+          "description": "Renderer unit tests pass including the idempotency case.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally",
+            "release"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "release-stack-projection",
+      "kind": "implementation",
+      "title": "Stack-as-projection renderer",
+      "goal": "Render the release as a stack of per-layer PRs over stable_publish_branch names and dependency levels (the frontier loop is already a level-by-level cut), pushed fast-forward from the local integration branch under the merge-control ruling. The stack is a review projection; merged-bottom-up is presentation. Squash-merge is refused on projection repos (it destroys the trailer block, Decision D23, D28-D29). Commit messages render from the ledger: type from task kind, scope from conflict domain, subject from brief, body from receipts, trailer block per Decision D19.",
+      "deliveredBehaviors": [
+        "The public stack is a projection of the local integration",
+        "Every layer commit carries the validated trailer block"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D16-D23, D28-D30"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes with the stack renderer.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [
+        "release-issue-create"
+      ],
+      "conflictDomains": [
+        "drivers",
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "commit-validator-lint-history",
+      "kind": "implementation",
+      "title": "Commit grammar validator and tally lint-history",
+      "goal": "Implement the ~150-line Rust validator holding authority at the render: type-enum (feat fix refactor docs build chore), scope-enum (closed per-repo subsystem list), subject-case, subject-full-stop, header-max-length 72, body-leading-blank, footer-leading-blank, trailer-block-wellformed (one contiguous block, BREAKING-CHANGE hyphenated). Expose tally lint-history <range> for on-demand audit. git-cliff may be run externally as a conformance oracle; it is not a dependency (Decision D25-D26).",
+      "deliveredBehaviors": [
+        "No commit reaches the projection without passing the validator",
+        "tally lint-history audits any range on demand"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D26"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "validator-tests-green",
+          "description": "Validator unit tests pass, including a trailer-block-poisoning negative case.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally",
+            "lint"
+          ]
+        }
+      ],
+      "dependencies": [
+        "release-stack-projection"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally/src/cli/args.rs"
+      ]
+    },
+    {
+      "id": "release-receipts-close",
+      "kind": "implementation",
+      "title": "Receipts summary and close, idempotent terminal pass",
+      "goal": "Render the closing receipts summary from campaign_digest (3715) / render_campaign_summary (3805) into the single closing comment (60,000-char bound survives as a renderer constraint), close the issue, and prove the terminal pass idempotent: re-running creates nothing (markers/closing_summary_marker discipline).",
+      "deliveredBehaviors": [
+        "One closing summary rendered from the ledger",
+        "Terminal pass re-run creates nothing"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 3 Chapter 3"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes including terminal idempotency.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [
+        "release-stack-projection"
+      ],
+      "conflictDomains": [
+        "drivers"
+      ]
+    },
+    {
+      "id": "probe-repo-lifecycle",
+      "kind": "implementation",
+      "title": "tally-probe scratch repo lifecycle",
+      "goal": "Implement the probe lifecycle per Decision D9: tally-probe-<date>-<short> creation and deletion by one verb; the renderer mechanically refuses any repository that is not the armed code repository unless a probe flag is set, and the probe flag refuses any repo not matching tally-probe-*; a TTL sweep deletes probes older than 7 days; probes are private, never forks; no probe state is read back except a pass/fail witness line. Run one end-to-end probe campaign (sparse issue, stack, merges, summary, close, re-run-creates-nothing) and one stack-renderer probe against a resettable scratch repo.",
+      "deliveredBehaviors": [
+        "The release act is exercised off the production repo",
+        "Teardown is a glob plus a TTL, not a list"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D9"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "probe-green",
+          "description": "The probe harness reports a green end-to-end release act.",
+          "argv": [
+            "bash",
+            "-lc",
+            "test -x test/release-probe.sh && test/release-probe.sh"
+          ]
+        }
+      ],
+      "dependencies": [
+        "release-receipts-close",
+        "commit-validator-lint-history"
+      ],
+      "conflictDomains": [
+        "crates/tally",
+        "test"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Chapter gate: full gate ladder",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "probe-repo-lifecycle"
+      ]
+    }
+  ]
+}

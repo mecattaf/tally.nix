@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "declare-canonical-derived",
+      "kind": "implementation",
+      "title": "Declare canonical vs derived in one tested place",
+      "goal": "One source-level declaration: canonical = the five JSONL stores + events/ + captures (+ registry snapshots); derived = every query/query_v2 return type. A test asserts the declaration matches the stores durable_run_view actually reads.",
+      "deliveredBehaviors": [
+        "The split is declared and tested, not folklore"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D44"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "core-tests-green",
+          "description": "tally-core tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core"
+      ]
+    },
+    {
+      "id": "node-role-typing",
+      "kind": "implementation",
+      "title": "Type the orchestration capsule: nodeRole and subjectTaskId",
+      "goal": "Add nodeRole (agent|merge|checkpoint-record|reconcile|prep|cleanup|sweep|continue) and subjectTaskId as additive capsule keys written by the flow; switch the completion seams (query_v2.rs 1534, 1550, 1385-1388) to read them; delete NodeLabelIndex arbitration; keep the node_label fallback chain for historical rows. This is the #482 killer (Decision D44b, the load-bearing piece).",
+      "deliveredBehaviors": [
+        "Completion recognition is typed data, not label grammar",
+        "#482's bug class is closed at the source"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D44"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "query-tests-green",
+          "description": "query_v2 tests pass with typed roles.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core",
+            "query"
+          ]
+        }
+      ],
+      "dependencies": [
+        "declare-canonical-derived"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "examples/flows"
+      ]
+    },
+    {
+      "id": "journal-scope",
+      "kind": "implementation",
+      "title": "Campaign-scoped journal records",
+      "goal": "Emit a journalScope field carrying the flowRunId on early flow nodes and add the matching JournalFilter field, making campaign-scoped journal reads expressible (closes the #483/#519 unsoundness: a workspace test run is currently journal-indistinguishable from the campaign dispatching it).",
+      "deliveredBehaviors": [
+        "Self-hosted campaign journal reads are sound"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D44"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "journal-tests-green",
+          "description": "journal tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core",
+            "journal"
+          ]
+        }
+      ],
+      "dependencies": [
+        "declare-canonical-derived"
+      ],
+      "conflictDomains": [
+        "crates/tally-core"
+      ]
+    },
+    {
+      "id": "tally-rebuild-verb",
+      "kind": "implementation",
+      "title": "Name the verb: tally rebuild",
+      "goal": "Promote durable_run_view to the primary read path, widen its inputs with unit-liveness facts (the one corroboration leg a ledger cannot hold), and expose it as tally rebuild. The skills' corroboration ritual text dies with it. No new storage of any kind (Decision D43).",
+      "deliveredBehaviors": [
+        "One read surface, provably regenerable, with unit facts"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D43-D44"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "cli-tests-green",
+          "description": "CLI tests pass including the rebuild verb.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [
+        "node-role-typing",
+        "journal-scope"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally/src/cli/args.rs"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Chapter gate: full gate ladder",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "tally-rebuild-verb"
+      ]
+    }
+  ]
+}

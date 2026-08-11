@@ -1,0 +1,200 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "squash-gh-origin-schema",
+      "kind": "implementation",
+      "title": "Delete GhOrigin/GhContextSnapshot v0/v1 acceptance",
+      "goal": "Delete the legacy acceptance arms: wire.rs 845-847 (flat ghOrigin), 893-905 (schema_version 0 actorExclude), 2070-2075 (ghActor alias test), gh_intake.rs 288-301 sticky-comment v1-only check, taskdb.rs 275-281/357-400 GhOriginWire defaults, and the legacy-gh-origin enqueue fixture. Estate: 0 of 1,775 rows carry ghOrigin at all. Subsumed by Chapter P if the producers ruling deletes the stack; land here only if that ruling has not arrived.",
+      "deliveredBehaviors": [
+        "Only the current GhOrigin schema is accepted"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D39"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "core-tests-green",
+          "description": "Workspace tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core/src/taskdb.rs",
+        "crates/tally-core/src/wire.rs",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "squash-migration-modules",
+      "kind": "implementation",
+      "title": "Delete the one-shot migration modules and the tally migrate verb",
+      "goal": "Relocate the unit_exit_migration::fixtures helpers used by recovery.rs identity tests (1489-1672) into recovery's own test module FIRST; then delete capture_migration.rs (474), unit_exit_migration.rs (627), the MigrateCommand surface (args.rs 88-91, 158-186; cli/mod.rs 350-380), and migrate_cli.rs (368). Rewrite the strict-read error strings that name tally migrate as the documented remedy. Gate: one tally migrate --plan run returning isClean true, recorded as a witness line before deletion.",
+      "deliveredBehaviors": [
+        "No migration verb; strict reads name the real remedy"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D39"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-migrate-verb",
+          "description": "The migrate subcommand is gone.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n 'MigrateCommand' crates/tally/src/cli/args.rs"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core/src/taskdb.rs",
+        "crates/tally/src/cli/args.rs",
+        "crates/tally-core/src/executor"
+      ]
+    },
+    {
+      "id": "squash-err-fallbacks",
+      "kind": "implementation",
+      "title": "Delete pre-split .err read fallbacks",
+      "goal": "Delete the legacy .err-as-stderr dual-read arms (executor/captures.rs 140-172) and normalize_legacy_stderr_capture (331-352) plus the two lifecycle.rs call sites. Estate: captures all current-named.",
+      "deliveredBehaviors": [
+        "Captures are read under one naming scheme"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D39"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "executor-tests-green",
+          "description": "Executor tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core",
+            "executor"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core/src/executor"
+      ]
+    },
+    {
+      "id": "squash-rowversion-ladder",
+      "kind": "implementation",
+      "title": "Squash the rowVersion ladder to a floor refusal",
+      "goal": "Collapse the four migration entries (taskdb/migrations.rs 17-38) to a single floor=5 refusal ('predates this binary; disarm and re-arm'), KEEPING the migration frame (walk loop, order/version refusals, 39-70) per the untouchables. Delete the 7 legacy-*.enqueue.json fixtures and their inclusion (taskdb.rs 1801-1824) and the N_MINUS_1 usage fixture (usage.rs 1183).",
+      "deliveredBehaviors": [
+        "One refusal replaces four dead migrations; the frame survives"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D39, D42"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "taskdb-tests-green",
+          "description": "taskdb tests pass with the floor refusal.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core",
+            "taskdb"
+          ]
+        }
+      ],
+      "dependencies": [
+        "squash-gh-origin-schema"
+      ],
+      "conflictDomains": [
+        "crates/tally-core/src/taskdb.rs",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "dead-cuts",
+      "kind": "implementation",
+      "title": "Dead and duplicate surface cuts",
+      "goal": "Delete: campaign poll --continuation-token (args.rs 288-291; discarded at campaign.rs 2630); the pre-#312 legacy_state_markers/reclaim_legacy_markers sweep (driver 6096-6165 + call 6493); the tally --mode daemon compatibility spelling (args.rs 3-7,17; cli/mod.rs 252-254 -- keep --mode check-config, it is live); the duplicate top-level enqueue verb (args.rs 42; cli/mod.rs 302-308; docs teach queue enqueue). Delete the superseded CONTRIBUTING paste-transcript clause (129-148), keeping test/fleet-gate.sh itself.",
+      "deliveredBehaviors": [
+        "Dead flags and duplicate spellings are gone"
+      ],
+      "readFirst": {
+        "specSections": [
+          "final-plan-A.md Part 1 D39, twins D1-D3"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally/src/cli/args.rs",
+        "drivers"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Chapter gate: full gate ladder",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "squash-migration-modules",
+        "squash-err-fallbacks",
+        "squash-rowversion-ladder",
+        "dead-cuts"
+      ]
+    }
+  ]
+}
