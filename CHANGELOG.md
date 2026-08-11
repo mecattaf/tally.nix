@@ -6,6 +6,12 @@ authorized.
 
 ## [Unreleased]
 
+### Enforce the repository language-entry policy (#487)
+
+- A whole-tree flake check now admits Python only under `drivers/` and `test/`, enforces the tracked
+  file-extension and extensionless-script charter, and rejects non-standard-library driver imports.
+- Contributor guidance now makes `flake.nix` the required entry point for adding a language.
+
 ### Single-source campaign contract vectors (#486)
 
 - `tally-core` now generates a checked corpus of canonical manifests, graphs,

@@ -189,7 +189,10 @@ normally be data-only adapters built with `lib.adapters.mkAdapter`.
 ## Language charter
 
 Python campaign drivers live under `drivers/`, use only the standard library, and have their tests
-under `test/`.
+under `test/`. New languages enter through `flake.nix`, not through stray scripts:
+`checks.language-entry-policy` admits Python only under `drivers/` and `test/`, restricts tracked
+file extensions and extensionless executables, and rejects non-standard-library driver imports
+other than the first-party `campaign_worktrees` sibling.
 
 ## Changelog discipline
 
