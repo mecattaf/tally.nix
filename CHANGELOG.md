@@ -6,6 +6,13 @@ authorized.
 
 ## [Unreleased]
 
+### Audit campaign admission and execution doctrine (#491)
+
+- A claim-by-claim modality record now checks the first two campaign-doctrine blocks against
+  implementation and automated-test evidence.
+- The audit records six divergences and distinguishes verified behavior from matching behavior
+  that still lacks focused coverage, without rewriting the doctrine under audit.
+
 ### Enforce the repository language-entry policy (#487)
 
 - A whole-tree flake check now admits Python only under `drivers/` and `test/`, enforces the tracked
