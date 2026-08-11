@@ -173,7 +173,7 @@ canonicalized into ascending order and duplicates are rejected.
 | `source` | source enum; default `manual` | `manual`, `orchestrator`, `calendar`, `events-dir`, `gh`, `build-effect`, or `pool-reachability`. |
 | `dedupKey` | string, optional | Submission identity key. |
 | `submission` | `{"mode":"full"}`, optional | Selects full disposition semantics. Absence is legacy mode; there are no other mode values. |
-| `orchestration` | object, optional | Opaque flow capsule. `flowRunId` must be a UUID; `maxNodes`, when present, is positive; `nodeOrdinal`, when present, is a non-negative integer. Optional `taskRef` is a validated `<campaign>/<task-id>` scalar. |
+| `orchestration` | object, optional | Opaque flow capsule. `flowRunId` must be a UUID; `maxNodes`, when present, is positive; `nodeOrdinal`, when present, is a non-negative integer. Optional `taskRef` is a validated `<campaign-identity>/<task-id>` scalar. For forge-native campaigns the identity prefix is the durable `registrationId`, not the campaign name. |
 | `parent` | UUID string, optional | Durable parent task. |
 | `evidence` | string array; default `[]` | Canonical evidence specifications. |
 | `drv` | object, optional | `{drvPath, outputs:[{name,path}, ...]}` for derivation-aware admission. |
@@ -419,6 +419,9 @@ reduction (`advisory-attestation`), including its `fresh`/`delta` basis,
 `exact`/`partial`/`unavailable` state, predecessor identity, unavailable fields,
 and typed reason. Consumers must not present raw `usage` as the attempt charge.
 
+For forge-native task refs, `tally campaign list` is the operator cross-walk: it prints each
+`registrationId` beside the campaign issue and repository.
+
 `query.run` accepts a flow-run UUID as `id` and returns the compact state needed during an
 operator check. `items` is the exact durable member-identity list and therefore contains every
 resolved `taskUuid`, including a member that has no row, lifecycle event, or witness of its own.
@@ -435,6 +438,10 @@ receive `items`, current nodes, and failures but omit the reconciliation-only `t
 keeps `items` authoritative for durable membership instead of letting an empty task board shadow
 it for consumers that prefer `tasks` when present. For those runs `state` reaches `complete` when
 every admitted node holds a passing terminal verdict on its current attempt.
+
+For a forge-native `spec-build` run, the top-level `campaign` field is the human-readable campaign
+name. It is deliberately separate from task identity: `taskRef` values in `tasks`, `currentNodes`,
+`failures`, and `anomalies` all use the registration-scoped prefix shown by `tally campaign list`.
 
 `query.run` also returns `usage`: what the run cost, summed from the exact
 per-attempt `usageEvidence.accounting` in the advisory attestation ledger —

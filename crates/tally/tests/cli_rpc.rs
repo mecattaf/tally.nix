@@ -14,6 +14,12 @@ use tokio::process::Command;
 #[path = "support/shell_program.rs"]
 mod shell_program;
 
+const FORGE_TASK_T01: &str = "0198f000-0000-7000-8000-000000000042/t01";
+const FORGE_TASK_T02: &str = "0198f000-0000-7000-8000-000000000042/t02";
+const FORGE_TASK_T03: &str = "0198f000-0000-7000-8000-000000000042/t03";
+const FORGE_TASK_T04: &str = "0198f000-0000-7000-8000-000000000042/t04";
+const FORGE_TASK_T05: &str = "0198f000-0000-7000-8000-000000000042/t05";
+
 #[derive(Clone, Copy)]
 struct CliHandler;
 
@@ -401,40 +407,40 @@ impl RpcHandler for HumanQueryHandler {
                         "isComplete": false
                     },
                     "tasks": [
-                        {"taskRef": "crm/t01", "title": "Done task", "status": "done", "blockedBy": [], "pullRequest": "https://example.test/pr/1"},
-                        {"taskRef": "crm/t02", "title": "Failed task", "status": "blocked", "blockedBy": [], "failureStage": "agent-t02"}
+                        {"taskRef": FORGE_TASK_T01, "title": "Done task", "status": "done", "blockedBy": [], "pullRequest": "https://example.test/pr/1"},
+                        {"taskRef": FORGE_TASK_T02, "title": "Failed task", "status": "blocked", "blockedBy": [], "failureStage": "agent-t02"}
                     ],
                     "anomalies": [{
                         "kind": "closed-without-merged-proof",
-                        "taskRef": "crm/t02",
+                        "taskRef": FORGE_TASK_T02,
                         "issue": "42",
                         "url": "https://example.test/issues/42",
                         "detail": "sub-issue #42 is closed but task 't02' holds no revision-valid merged pull request"
                     }],
                     "currentNodes": [{
                         "taskUuid": "00000000-0000-4000-8000-000000000263",
-                        "taskRef": "crm/t02", "ordinal": 3, "label": "cleanup-t02", "state": "running",
+                        "taskRef": FORGE_TASK_T02, "ordinal": 3, "label": "cleanup-t02", "state": "running",
                         "startedAt": "2026-08-01T10:00:00Z", "elapsedSeconds": 9,
                         "runtimeMaxSec": 60, "budgetRemainingSeconds": 51
                     }, {
                         "taskUuid": "00000000-0000-4000-8000-000000000265",
-                        "taskRef": "crm/t03", "ordinal": 4, "label": "gate-t03", "state": "running",
+                        "taskRef": FORGE_TASK_T03, "ordinal": 4, "label": "gate-t03", "state": "running",
                         "startedAt": "2026-08-01T09:00:00Z", "elapsedSeconds": 460,
                         "runtimeMaxSec": 60, "budgetRemainingSeconds": -400
                     }, {
                         "taskUuid": "00000000-0000-4000-8000-000000000266",
-                        "taskRef": "crm/t04", "ordinal": 5, "label": "gate-t04", "state": "queued"
+                        "taskRef": FORGE_TASK_T04, "ordinal": 5, "label": "gate-t04", "state": "queued"
                     }],
                     "failures": [{
                         "taskUuid": "00000000-0000-4000-8000-000000000264",
-                        "taskRef": "crm/t02", "ordinal": 2, "stage": "agent-t02", "verdict": "failed",
+                        "taskRef": FORGE_TASK_T02, "ordinal": 2, "stage": "agent-t02", "verdict": "failed",
                         "attempt": 1, "leaseEpoch": 4, "timestamp": "2026-08-01T10:00:03Z",
                         "capturePath": "/tmp/tally/crm.t02.err",
                         "stderrTail": "\u{1b}[2Jactionable failure\n    at gate.rs:1\n",
                         "stderrTruncated": false
                     }, {
                         "taskUuid": "00000000-0000-4000-8000-000000000267",
-                        "taskRef": "crm/t05", "ordinal": 6, "stage": "agent-t05", "verdict": "failed",
+                        "taskRef": FORGE_TASK_T05, "ordinal": 6, "stage": "agent-t05", "verdict": "failed",
                         "attempt": 1, "leaseEpoch": 2, "timestamp": "2026-08-01T10:00:05Z",
                         "error": {
                             "code": "executor-validation-failed",
@@ -1394,8 +1400,11 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
             for expected in [
                 "spec-build crm",
                 "needs-attention",
-                "crm/t01",
-                "crm/t02",
+                FORGE_TASK_T01,
+                FORGE_TASK_T02,
+                FORGE_TASK_T03,
+                FORGE_TASK_T04,
+                FORGE_TASK_T05,
                 "budget=51s",
                 "/tmp/tally/crm.t02.err",
                 "actionable failure",
@@ -1431,6 +1440,8 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
             ] {
                 assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
             }
+            assert!(!text.contains("crm/t01"), "campaign name forged a taskRef:\n{text}");
+            assert!(!text.contains("crm/t02"), "campaign name forged a taskRef:\n{text}");
             let anomaly_line = text.find("!! ANOMALIES").expect("anomaly banner");
             assert!(
                 anomaly_line < text.find("STATUS").expect("task table"),
@@ -1471,8 +1482,8 @@ async fn query_run_status_filter_narrows_the_board_but_not_the_counts() {
             assert!(output.status.success(), "{output:?}");
             let text = String::from_utf8(output.stdout).unwrap();
             assert!(text.contains("1 done, 0 running, 1 blocked, 0 pending"));
-            assert!(text.contains("crm/t02"), "{text}");
-            assert!(!text.contains("crm/t01"), "{text}");
+            assert!(text.contains(FORGE_TASK_T02), "{text}");
+            assert!(!text.contains(FORGE_TASK_T01), "{text}");
             server.await.unwrap();
         })
         .await;

@@ -6,6 +6,14 @@ authorized.
 
 ## [Unreleased]
 
+### Unify forge campaign task references (#482)
+
+- `query run` now uses the durable campaign `registrationId` prefix consistently
+  across reconciled tasks, current nodes, failures, and anomalies while keeping
+  the human-readable campaign name as a separate summary field.
+- Campaign and RPC documentation now identify `tally campaign list` as the
+  cross-walk from registration-scoped task references to campaign names.
+
 ### Require campaign-only merges (#489)
 
 - `main` changes now land only through witnessed tally campaign merges, with no
