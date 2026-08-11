@@ -832,7 +832,7 @@ fn location(span: Span) -> SourceLocation {
     SourceLocation::new(span.start().line_number(), span.start().column_number())
 }
 
-fn parse_error(error: ParseError) -> FlowError {
+pub(crate) fn parse_error(error: ParseError) -> FlowError {
     let location = match &error {
         ParseError::Expected { span, .. } | ParseError::Unexpected { span, .. } => {
             Some(location(*span))

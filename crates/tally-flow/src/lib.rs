@@ -15,6 +15,7 @@ mod engine;
 mod error;
 mod executor;
 mod model;
+mod render;
 
 pub use catalog::{
     catalog_schema, load_catalog, resolve_members, Catalog, CatalogMember, CatalogSelection,
@@ -36,6 +37,7 @@ pub use model::{
     RunReport, RunSupersede, SelectionProvenance, TaskRef, Verdict, FLOW_ENQUEUE_FIELD_PARITY,
     NODE_SPEC_FIELD_CONTRACT, RESULT_PROJECTION_TIMEOUT_CODE, RETRYABLE_PROJECTION_CODE,
 };
+pub use render::render_script;
 
 /// The one prompt-delivery argument used by every agent adapter sugar.
 pub const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
