@@ -815,6 +815,94 @@
                 | xargs -0 nixfmt --check
               touch "$out"
             '';
+        languageEntryPolicy =
+          pkgs.runCommand "tally-language-entry-policy"
+            {
+              src = self;
+              nativeBuildInputs = [
+                pkgs.findutils
+                pkgs.python3
+                pkgs.ripgrep
+              ];
+            }
+            ''
+              failed=0
+              while IFS= read -r -d "" file; do
+                relative="''${file#"$src"/}"
+                basename="''${relative##*/}"
+
+                case "$relative" in
+                  drivers/*.py | test/*.py) ;;
+                  *.py)
+                    echo "Python files must live under drivers/ or test/: $relative" >&2
+                    failed=1
+                    ;;
+                esac
+
+                case "$basename" in
+                  LICENSE | .gitignore | *.rs | *.nix | *.js | *.py | *.sh | *.md | *.toml | *.json | *.jsonl | *.lock | *.txt | *.pub | *.inc | *.pem) ;;
+                  *.*)
+                    echo "file extension is not admitted by the language charter: $relative" >&2
+                    failed=1
+                    ;;
+                  *)
+                    case "$relative" in
+                      test/fixtures/ssh/fs7_coordinator_ed25519 | test/fixtures/ssh/fs7_worker_host_ed25519 | test/fixtures/ssh/fs7_worker_known_hosts) ;;
+                      *)
+                        if test "$(head -c 2 "$file")" != '#!'; then
+                          echo "extensionless file must have a shebang: $relative" >&2
+                          failed=1
+                        fi
+                        ;;
+                    esac
+                    ;;
+                esac
+              done < <(find "$src" -type f -print0 | sort -z)
+
+              stdlib_modules="$PWD/python-stdlib-modules"
+              ${pkgs.python3}/bin/python3 - <<'PY' > "$stdlib_modules"
+              import sys
+              print(*sorted(sys.stdlib_module_names), sep="\n")
+              PY
+
+              imports="$PWD/python-imports"
+              ${pkgs.ripgrep}/bin/rg --line-number --no-heading \
+                '^(from\s+\S+\s+import\b|import\s+)' \
+                "$src/drivers" --glob '*.py' > "$imports" || test "$?" -eq 1
+              while IFS= read -r match; do
+                file="''${match%%:*}"
+                remainder="''${match#*:}"
+                line="''${remainder%%:*}"
+                statement="''${remainder#*:}"
+                read -r keyword module _ <<< "$statement"
+                if test "$keyword" = import; then
+                  module="''${statement#*import}"
+                  while IFS= read -r imported; do
+                    read -r imported _ <<< "$imported"
+                    root="''${imported%%.*}"
+                    if test "$root" != campaign_worktrees \
+                      && ! ${pkgs.ripgrep}/bin/rg --fixed-strings --line-regexp --quiet -- \
+                        "$root" "$stdlib_modules"; then
+                      echo "non-stdlib Python import: ''${file#"$src"/}:$line: $root" >&2
+                      failed=1
+                    fi
+                  done < <(printf '%s\n' "$module" | tr ',' '\n')
+                else
+                  root="''${module%%.*}"
+                  if test "$root" != campaign_worktrees \
+                    && ! ${pkgs.ripgrep}/bin/rg --fixed-strings --line-regexp --quiet -- \
+                      "$root" "$stdlib_modules"; then
+                    echo "non-stdlib Python import: ''${file#"$src"/}:$line: $root" >&2
+                    failed=1
+                  fi
+                fi
+              done < "$imports"
+
+              if test "$failed" -ne 0; then
+                exit 1
+              fi
+              touch "$out"
+            '';
         optionsJson = optionsDoc: "${optionsDoc.optionsJSON}/share/doc/nixos/options.json";
         transformTallyOption =
           option:
@@ -4951,6 +5039,7 @@
           rustfmt = rustfmtCheck;
           clippy = clippyCheck;
           nixfmt-check = nixfmtCheck;
+          language-entry-policy = languageEntryPolicy;
           doc = documentation;
           hardening-doc-drift = hardeningDocDrift;
           stock-home-activation = stockHome.activationPackage;
