@@ -1751,6 +1751,15 @@
                     pattern = "^NARRATOR_RESULT=(.*)$";
                   };
                 };
+                # Keep the campaign's implementation role separate from the
+                # shell adapter used by deterministic flow nodes: declaring a
+                # result projection on shell would make every ordinary command
+                # wait for a final message it never emits.
+                adapters.fixture-agent.scrape.finalMessage = {
+                  stream = "stdout";
+                  mode = "regex";
+                  pattern = "^TALLY_FINAL_MESSAGE=(.*)$";
+                };
                 campaigns.fixture = {
                   enable = true;
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
@@ -1803,7 +1812,7 @@
                       runtimeMaxSec = 11;
                     }
                   ];
-                  agent = "shell";
+                  agent = "fixture-agent";
                   agentArgv = [ "/bin/true" ];
                   agentApprovalPolicy = null;
                   agentSandboxPolicy = null;
@@ -5546,7 +5555,7 @@
                   .tally == "${tally}/bin/tally" and
                   .repositories["acme/spec"].baseBranch == "main" and
                   .repositories["acme/spec"].forge == "github" and
-                  .agent.adapter == "shell" and
+                  .agent.adapter == "fixture-agent" and
                   .agent.argv == ["/bin/true"] and
                   .agent.approvalPolicy == null and
                   .agent.sandboxPolicy == null and
@@ -6196,6 +6205,8 @@
             test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
             test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'
+            test "$(jq -r '.adapters.codex.scrape.finalMessage.mode' ${adapterConfig})" = jsonPathLast
+            test "$(jq -r '.adapters.codex.scrape.finalMessage.pattern' ${adapterConfig})" = "\$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text"
             test "$(jq -r '.adapters.codex.extraConfig.modelFlag' ${adapterConfig})" = '--model'
             jq -e '.adapters["nix-custom"].skillBundle == "review protocol α\n"' ${adapterConfig} >/dev/null
             test "$(jq -r '.adapters["nix-custom"].env.CUSTOM_AGENT_MODE' ${adapterConfig})" = batch

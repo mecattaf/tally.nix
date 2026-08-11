@@ -3236,6 +3236,10 @@ let
             mode = "jsonPath";
             pattern = "$..thread_id";
           };
+          scrape.finalMessage = {
+            mode = "jsonPathLast";
+            pattern = "$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text";
+          };
         };
         description = "Open map of structured direct-argv adapters; extra adapters require no recompile.";
       };
@@ -4065,6 +4069,18 @@ let
         {
           assertion = !campaign.enable || builtins.hasAttr campaign.agent cfg.adapters;
           message = "tally campaign ${name} references unknown agent adapter ${campaign.agent}";
+        }
+        {
+          # A campaign brief may ask its implementation worker for a judgement,
+          # but the live runner can only carry that answer into the publish node
+          # when the resolved adapter declares the advisory projection. Refuse
+          # an enabled module campaign that would silently discard it; the CLI
+          # repeats this as a warning for configs that did not pass this module.
+          assertion =
+            !campaign.enable
+            || !(builtins.hasAttr campaign.agent cfg.adapters)
+            || builtins.hasAttr "finalMessage" (cfg.adapters.${campaign.agent}.scrape or { });
+          message = "tally campaign ${name} agent adapter ${campaign.agent} must declare scrape.finalMessage; worker findings would not be retained";
         }
         {
           # The steward is a catalog role, so the catalog is what has to carry
