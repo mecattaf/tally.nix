@@ -6,6 +6,16 @@ authorized.
 
 ## [Unreleased]
 
+### Audit campaign steering and failure doctrine (#516)
+
+- A 159-claim modality record now checks task-thread steering, arm authority and asset ownership,
+  pardon/resume behavior, terminal summaries, failure classification, advisory projection waits,
+  escalation, and fresh-run re-entry against shipped code and focused tests.
+- The audit records four divergences: arm omits diagnosis-sandbox policy lookup, a diagnosis-lane
+  fault can suppress continuation when no other outcome advances, failed-exit projection timeout
+  is rewritten as a schema mismatch, and resume permits a later escalation marker on the same
+  issue.
+
 ### Audit campaign worklist and checkpoint doctrine (#515)
 
 - A 141-claim modality record now checks recurring worklist parsing, conflict-domain ownership,
