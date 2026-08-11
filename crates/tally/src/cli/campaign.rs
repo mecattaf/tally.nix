@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tally_core::adapters::AdapterConfig;
 use tally_core::campaign_contract::{
     admit_manifest_json, admit_manifest_value, task_completion_revision, validate_argv,
-    validate_manifest, CampaignAgent, CampaignManifest, CanonicalCampaignGraphV1,
+    validate_manifest, CampaignAgent, CampaignGate, CampaignManifest, CanonicalCampaignGraphV1,
     CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
 };
 use tally_core::campaign_registry::{
@@ -1648,13 +1648,213 @@ fn worker_findings_warning(agent: &CampaignAgent, adapter: &AdapterConfig) -> Op
     })
 }
 
+const CACHE_USING_TOOLS: [&str; 6] = ["nix", "go", "cargo", "npm", "pip", "uv"];
+const COMMON_CACHE_REDIRECTS: [&str; 2] = ["XDG_CACHE_HOME", "XDG_STATE_HOME"];
+const CACHE_REDIRECTS: [&str; 9] = [
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "GOCACHE",
+    "GOMODCACHE",
+    "CARGO_HOME",
+    "NPM_CONFIG_CACHE",
+    "npm_config_cache",
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+];
+
+fn argv_mentions_command(argv: &[String], command: &str) -> bool {
+    argv.iter().any(|argument| {
+        argument
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/'))
+            })
+            .filter(|token| !token.is_empty())
+            .any(|token| token.rsplit('/').next() == Some(command))
+    })
+}
+
+fn has_nonempty_assignment(argument: &str, name: &str) -> bool {
+    let assignment = format!("{name}=");
+    argument.match_indices(&assignment).any(|(index, _)| {
+        let boundary = argument[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !(character.is_ascii_alphanumeric() || character == '_'));
+        let value = argument[index + assignment.len()..].trim_start_matches(['\'', '"']);
+        boundary
+            && value.chars().next().is_some_and(|character| {
+                !character.is_ascii_whitespace() && !matches!(character, ';' | '&' | '|')
+            })
+    })
+}
+
+fn argv_has_assignment(argv: &[String], names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        argv.iter()
+            .any(|argument| has_nonempty_assignment(argument, name))
+    })
+}
+
+fn tool_cache_redirects(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "go" => &["GOCACHE", "GOMODCACHE"],
+        "cargo" => &["CARGO_HOME"],
+        "npm" => &["NPM_CONFIG_CACHE", "npm_config_cache"],
+        "pip" => &["PIP_CACHE_DIR"],
+        "uv" => &["UV_CACHE_DIR"],
+        _ => &[],
+    }
+}
+
+fn has_cache_redirect(argv: &[String], tool: &str) -> bool {
+    argv_has_assignment(argv, &COMMON_CACHE_REDIRECTS)
+        || argv_has_assignment(argv, tool_cache_redirects(tool))
+}
+
+fn tmp_reference_is_cache_assignment(argument: &str, tmp_index: usize) -> bool {
+    CACHE_REDIRECTS.iter().any(|name| {
+        let assignment = format!("{name}=");
+        argument[..tmp_index]
+            .rmatch_indices(&assignment)
+            .next()
+            .is_some_and(|(index, _)| {
+                let boundary = argument[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| {
+                        !(character.is_ascii_alphanumeric() || character == '_')
+                    });
+                let value_prefix = &argument[index + assignment.len()..tmp_index];
+                boundary
+                    && value_prefix
+                        .chars()
+                        .all(|character| matches!(character, '\'' | '"'))
+            })
+    })
+}
+
+fn argument_has_staged_tmp_reference(argument: &str) -> bool {
+    argument.match_indices("/tmp").any(|(index, _)| {
+        let before = argument[..index].chars().next_back();
+        let after = argument[index + "/tmp".len()..].chars().next();
+        let starts_path = before.is_none_or(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/'))
+        });
+        let ends_root = after.is_none_or(|character| {
+            character == '/'
+                || character.is_ascii_whitespace()
+                || matches!(character, '\'' | '"' | ';' | ':' | ',' | ')')
+        });
+        starts_path && ends_root && !tmp_reference_is_cache_assignment(argument, index)
+    })
+}
+
+fn argument_has_home_reference(argument: &str) -> bool {
+    argument.match_indices("$HOME").any(|(index, _)| {
+        argument[index + "$HOME".len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| !(character.is_ascii_alphanumeric() || character == '_'))
+    }) || argument.contains("${HOME}")
+}
+
+fn argv_appears_to_write_home(argv: &[String]) -> bool {
+    if !argv
+        .iter()
+        .any(|argument| argument_has_home_reference(argument))
+    {
+        return false;
+    }
+    const WRITE_COMMANDS: [&str; 11] = [
+        "chmod", "chown", "cp", "install", "ln", "mkdir", "mv", "tee", "touch", "truncate",
+        "unlink",
+    ];
+    const WRITE_OPTIONS: [&str; 8] = [
+        "-o",
+        "--cache-dir",
+        "--destination",
+        "--out-dir",
+        "--output",
+        "--prefix",
+        "--root",
+        "--target-dir",
+    ];
+    argv.iter().any(|argument| argument.contains('>'))
+        || WRITE_COMMANDS
+            .iter()
+            .any(|command| argv_mentions_command(argv, command))
+        || argv.windows(2).any(|pair| {
+            WRITE_OPTIONS.contains(&pair[0].as_str()) && argument_has_home_reference(&pair[1])
+        })
+        || argv.iter().any(|argument| {
+            argument_has_home_reference(argument)
+                && WRITE_OPTIONS
+                    .iter()
+                    .any(|option| argument.starts_with(&format!("{option}=")))
+        })
+}
+
+fn argv_hazard_warnings(manifest: &CampaignManifest) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut scan = |context: String, argv: &[String]| {
+        let unredirected_tools = CACHE_USING_TOOLS
+            .iter()
+            .copied()
+            .filter(|tool| argv_mentions_command(argv, tool) && !has_cache_redirect(argv, tool))
+            .collect::<Vec<_>>();
+        if !unredirected_tools.is_empty() {
+            warnings.push(format!(
+                "{context} invokes {} without an in-argv cache/state redirect (XDG_CACHE_HOME, XDG_STATE_HOME, or a tool-specific equivalent such as GOCACHE); it may fail under the resolved adapter's hardened tier",
+                unredirected_tools.join(", ")
+            ));
+        }
+        if argv
+            .iter()
+            .any(|argument| argument_has_staged_tmp_reference(argument))
+        {
+            warnings.push(format!(
+                "{context} references a /tmp path; PrivateTmp hides paths staged outside the transient unit"
+            ));
+        }
+        if argv_appears_to_write_home(argv) {
+            warnings.push(format!(
+                "{context} appears to write through $HOME; ProtectHome=read-only can reject that write"
+            ));
+        }
+    };
+
+    for task in &manifest.tasks {
+        if task.kind == "checkpoint" {
+            if let Some(argv) = task.argv.as_deref() {
+                scan(format!("checkpoint task {:?} argv", task.id), argv);
+            }
+        }
+    }
+    for gate in &manifest.gates {
+        if let CampaignGate::Command {
+            id,
+            preflight_argv,
+            argv,
+            ..
+        } = gate
+        {
+            scan(
+                format!("campaign gate {id:?} preflightArgv"),
+                preflight_argv,
+            );
+            scan(format!("campaign gate {id:?} argv"), argv);
+        }
+    }
+    warnings
+}
+
 fn validate_host(
     graph: &CampaignGraph,
     config_path: Option<&Path>,
     flow: &Path,
     driver: &Path,
     allow_test_local_forge: bool,
-) -> Result<Option<String>> {
+) -> Result<Vec<String>> {
     let manifest = &graph.canonical.manifest;
     let config = load_client_config(config_path)?;
     let required_nodes = max_flow_nodes(manifest);
@@ -1761,10 +1961,13 @@ fn validate_host(
             );
         }
     }
-    Ok(worker_findings_warning(
-        &manifest.agent,
-        &config.adapters[&manifest.agent.adapter],
-    ))
+    let mut warnings = argv_hazard_warnings(manifest);
+    if let Some(warning) =
+        worker_findings_warning(&manifest.agent, &config.adapters[&manifest.agent.adapter])
+    {
+        warnings.push(warning);
+    }
+    Ok(warnings)
 }
 
 fn priority(value: &str) -> Priority {
@@ -2135,15 +2338,13 @@ async fn run_campaign_arm(
         },
         projection_wait_ms,
     );
-    if let Some(warning) = validate_host(
+    arm_warnings.extend(validate_host(
         &graph,
         config_path,
         &registration.flow,
         &registration.driver,
         registration.allow_test_local_forge,
-    )? {
-        arm_warnings.push(warning);
-    }
+    )?);
     let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
     for pardon in &pardon_plan {
         let receipt = post_campaign_auto_pardon(&graph, &registration.authenticated_actor, pardon)?;
@@ -6311,6 +6512,59 @@ print(json.dumps({
             .unwrap(),
         );
         assert_eq!(worker_findings_warning(&agent, &adapter), None);
+    }
+
+    #[test]
+    fn hardened_argv_hazards_warn_for_checkpoints_and_gates_but_hermetic_argv_is_silent() {
+        let bare_nix = vec![
+            "nix".to_owned(),
+            "flake".to_owned(),
+            "check".to_owned(),
+            "-L".to_owned(),
+        ];
+        let hermetic_nix = vec![
+            "sh".to_owned(),
+            "-euc".to_owned(),
+            "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix flake check -L".to_owned(),
+        ];
+        let manifest = |argv: Vec<String>| {
+            let mut value = manifest_value_for_test(json!([{
+                "id": "checkpoint",
+                "kind": "checkpoint",
+                "issue": 43,
+                "dependencies": [],
+                "argv": argv,
+                "runtimeMaxSec": 900
+            }]));
+            value["gates"] = json!([{
+                "kind": "command",
+                "id": "flake-check",
+                "preflightArgv": value["tasks"][0]["argv"].clone(),
+                "argv": value["tasks"][0]["argv"].clone(),
+                "runtimeMaxSec": 900
+            }]);
+            serde_json::from_value::<CampaignManifest>(value).unwrap()
+        };
+
+        let warnings = argv_hazard_warnings(&manifest(bare_nix));
+        assert_eq!(warnings.len(), 3, "{warnings:#?}");
+        for context in [
+            "checkpoint task \"checkpoint\" argv",
+            "campaign gate \"flake-check\" preflightArgv",
+            "campaign gate \"flake-check\" argv",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains(context) && warning.contains("nix")),
+                "missing warning for {context}: {warnings:#?}"
+            );
+        }
+
+        assert!(
+            argv_hazard_warnings(&manifest(hermetic_nix)).is_empty(),
+            "the documented private-cache argv must not warn"
+        );
     }
 
     #[test]

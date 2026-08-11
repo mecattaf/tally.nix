@@ -917,6 +917,45 @@ the campaign never interpolates task prose into argv. Command gates also run as
 the accept-time preflight described below; history constraints begin after the
 agent has produced committed task work.
 
+### Direct argv under hardened adapters
+
+Every checkpoint `argv` and command-gate `preflightArgv`/`argv` is a direct
+argv array. The array must be non-empty, every element must be a non-empty
+string, and no element may contain a control character. In particular, a shell
+program passed to `sh -c` must remain one line: a literal newline or tab is
+rejected at admission even though the shell itself could parse it.
+
+Some otherwise valid argvs depend on writable caches below `$HOME`. Under an
+adapter whose resolved tier sets `ProtectHome=read-only`, bare invocations of
+`nix`, `go`, `cargo`, `npm`, `pip`, or `uv` can therefore fail before doing
+useful work. Redirect cache and state in the same argv, using `XDG_CACHE_HOME`
+and `XDG_STATE_HOME` or a tool-specific equivalent such as `GOCACHE`. For
+example, the hardened-safe Nix argv creates its cache inside the job's private
+`/tmp`:
+
+```json
+["sh", "-euc", "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix flake check -L"]
+```
+
+That private location must be created by the argv itself. With `PrivateTmp=yes`,
+a `/tmp/input` staged by the caller before dispatch and `/tmp/input` seen by the
+transient unit are different paths. Put staged inputs in the lane workspace or
+another path writable and visible to the unit; reserve private `/tmp` for data
+the unit creates itself. Likewise, do not direct output through `$HOME` when
+`ProtectHome=read-only` may apply.
+
+Hardening is resolved per adapter, and the adapter option defaults to `null`.
+The shipped campaign adapters do not select a preset today, so the effective
+tier is an estate choice: check the resolved adapter configuration on the host
+instead of assuming `strict`. When a preset is selected, ordinary jobs use the
+property bundle built by `push_hardening_properties`; its strict and production
+tiers allow `AF_UNIX AF_INET AF_INET6`. That is deliberately broader than the
+separate git-ai unit's UNIX-only address-family set.
+
+`tally campaign arm` scans checkpoint and command-gate argvs for these cache,
+private-`/tmp`, and `$HOME`-write shapes. The findings are named, heuristic
+warnings in the arm receipt, never admission errors.
+
 `forbidPaths` is evaluated against the union of committed, non-deleted paths
 changed by every branch commit reachable from the current `HEAD` but not from
 the task's prepared base revision. A later deletion does not erase an earlier

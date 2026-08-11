@@ -6,6 +6,15 @@ authorized.
 
 ## [Unreleased]
 
+### Warn about hardened campaign argvs (#484)
+
+- `campaign arm` now emits non-blocking, surface-named warnings for checkpoint
+  and command-gate argvs that may lose home-backed tool caches, caller-staged
+  `/tmp` paths, or `$HOME` writes under a hardened adapter.
+- Campaign guidance now records the direct-argv control-character rule, the
+  private-cache cure, the `PrivateTmp` staging trap, and how the effective
+  adapter tier and ordinary job property bundle are resolved.
+
 ### Retain campaign worker findings (#481)
 
 - Campaign publication now posts the implementation agent's captured final
