@@ -59,8 +59,8 @@ use tally_core::{
     Config,
 };
 use tally_flow::{
-    check_script, load_catalog, run_script, CheckOptions, FlowError, LifecycleSink, RunOptions,
-    SourceLocation,
+    check_script, load_catalog, render_script, run_script, CheckOptions, FlowError, LifecycleSink,
+    RunOptions, SourceLocation,
 };
 
 use crate::flow_live::{LiveFlowClient, RunnerIdentity};

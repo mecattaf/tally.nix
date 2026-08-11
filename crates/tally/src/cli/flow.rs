@@ -156,6 +156,13 @@ pub(super) async fn run_flow(
             outln!("{}", serde_json::to_string(&checked.meta_json)?);
             Ok(())
         }
+        FlowCommand::Render(args) => {
+            let source = std::fs::read_to_string(&args.script)
+                .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
+            let rendered = render_script(&source, Some(&args.script)).map_err(flow_error)?;
+            outln!("{rendered}");
+            Ok(())
+        }
         FlowCommand::Run(args) => {
             if args.rpc_call_deadline_sec == Some(0) {
                 return Err(invalid("--rpc-call-deadline-sec must be greater than zero"));

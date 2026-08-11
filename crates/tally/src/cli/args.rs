@@ -380,6 +380,7 @@ pub(super) struct HistoryCompactArgs {
 pub(super) enum FlowCommand {
     Run(FlowRunArgs),
     Check(FlowCheckArgs),
+    Render(FlowRenderArgs),
     Cancel(FlowCancelArgs),
     /// Record that a terminal run is replaced by a fresh successor run.
     ///
@@ -484,6 +485,12 @@ pub(super) struct FlowCheckArgs {
     pub(super) args_path: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     pub(super) catalog: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct FlowRenderArgs {
+    #[arg(value_name = "SCRIPT")]
+    pub(super) script: PathBuf,
 }
 
 #[derive(Debug, Args)]

@@ -684,7 +684,7 @@ fn enqueue_submission_mode_defaults_to_full_and_accepts_legacy() {
 }
 
 #[test]
-fn flow_run_and_check_cli_shapes_match_the_declarative_contract() {
+fn flow_run_check_and_render_cli_shapes_match_the_declarative_contract() {
     let check = Opts::try_parse_from([
         "tally",
         "flow",
@@ -708,6 +708,15 @@ fn flow_run_and_check_cli_shapes_match_the_declarative_contract() {
         }) if script == Path::new("/nix/store/example-flow.js")
             && args == json!({"task": "ship"})
             && catalog == Path::new("/nix/store/catalog.json")
+    ));
+
+    let render =
+        Opts::try_parse_from(["tally", "flow", "render", "/nix/store/example-flow.js"]).unwrap();
+    assert!(matches!(
+        render.command,
+        Some(Command::Flow {
+            command: FlowCommand::Render(FlowRenderArgs { script })
+        }) if script == Path::new("/nix/store/example-flow.js")
     ));
 
     let run = Opts::try_parse_from([

@@ -189,6 +189,38 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
 }
 
 #[test]
+fn flow_render_cli_is_static_mermaid_with_check_level_failures() {
+    let rendered = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["flow", "render"])
+        .arg(fixture("valid-drv.js"))
+        .output()
+        .unwrap();
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    assert!(rendered.stderr.is_empty());
+    let mermaid = String::from_utf8(rendered.stdout).unwrap();
+    assert!(mermaid.starts_with("flowchart TD\n"), "{mermaid}");
+    assert!(
+        mermaid.contains("line 9<br/>drv · pools: build"),
+        "{mermaid}"
+    );
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["flow", "render"])
+        .arg(fixture("banned-global.js"))
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(10));
+    assert!(rejected.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("FlowDeterminismError"), "{stderr}");
+    assert!(stderr.contains("determinism-violation"), "{stderr}");
+}
+
+#[test]
 fn flow_check_cli_rejects_configured_windowed_consumption_pools() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.json");

@@ -86,9 +86,13 @@
             ./doc/src/reference/rpc-protocol.md
             ./examples/flows/academic-ocr.js
             ./examples/flows/agency-nightly.js
+            ./examples/flows/domain-failure.js
+            ./examples/flows/fleet-deploy.js
             ./examples/flows/monthly-review.js
+            ./examples/flows/pooled-review.js
             ./drivers/campaign_worktrees.py
             ./examples/flows/spec-build.js
+            ./examples/flows/worklist-fanout.js
             ./drivers/spec_build_driver.py
             ./test/fixtures/flows
             ./test/fixtures/gh-login
@@ -5720,6 +5724,8 @@
                   ${./examples/flows/spec-build.js} \
                   ${./examples/flows/worklist-fanout.js}; do
                   ${tally}/bin/tally flow check "$example" >/dev/null
+                  rendered="$(${tally}/bin/tally flow render "$example")"
+                  test "$(printf '%s\n' "$rendered" | sed -n '1p')" = 'flowchart TD'
                 done
                 ${tally}/bin/tally flow check ${./examples/flows/academic-ocr.js} \
                   --args-path ${exampleArgs.academic-ocr} >/dev/null
