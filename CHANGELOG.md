@@ -6,6 +6,17 @@ authorized.
 
 ## [Unreleased]
 
+### Audit campaign worklist and checkpoint doctrine (#515)
+
+- A 141-claim modality record now checks recurring worklist parsing, conflict-domain ownership,
+  linked-worktree recovery, checkpoint execution, receipt refs, forge binding, and retention
+  against shipped code and focused tests.
+- The audit records seven divergences: capture names omit the campaign half of `taskRef`,
+  forge-native sweep follows reconciliation, worktree identity has a post-add crash window,
+  recurring digests are not arm-fixed, checkpoint and PR invalidation scopes differ, poll uses a
+  structured re-arm reason instead of the documented sentence, and passed native checkpoints do
+  not advance the parent progress projection.
+
 ### Audit recurring campaign gate doctrine (#514)
 
 - A 119-claim modality record now checks recurring campaign configuration, hardened argv,
