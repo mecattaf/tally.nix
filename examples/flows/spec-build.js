@@ -2402,6 +2402,7 @@ function sweepDeferral(sweepNode) {
     const completion = restampFor(reconciliation, task);
     let taskBrief = null;
     let assistedBy = null;
+    let workerFindings = null;
     if (completion !== null) {
       taskBrief = restampBrief(task, prepared.result, completion);
       const restamped = await driverNode(
@@ -2506,6 +2507,18 @@ function sweepDeferral(sweepNode) {
         taskRef
       });
       const agent = await job(agentSpec, { settle: true });
+      if (agent.result !== undefined) {
+        workerFindings = {
+          taskUuid: agent.taskUuid,
+          // The live client decodes JSON-looking final messages for structured
+          // result consumers. Findings are a text channel, so retain that
+          // value in its deterministic JSON spelling when decoding occurred.
+          message:
+            typeof agent.result === "string"
+              ? agent.result
+              : JSON.stringify(agent.result)
+        };
+      }
       if (agent.verdict !== "pass") {
         // #424: the pass still runs the tree-delta gate before it ends. A
         // failing agent is the single most likely context for a rogue write and
@@ -2692,24 +2705,30 @@ function sweepDeferral(sweepNode) {
       }
     }
 
+    const publishBrief = withCapabilities(withSeam({
+      campaign: effective.campaign,
+      repository: codeRepository,
+      repositoryConfig,
+      issue: args.issue,
+      runId: args.runId,
+      workspaceRoot: args.workspaceRoot,
+      task,
+      domainsRequired,
+      gates: effective.gates,
+      // A re-stamp is deterministic machinery all the way through: its PR
+      // uses the validated template rather than spending a narration turn.
+      steward: completion === null ? effective.steward || null : null,
+      workspace: prepared.result,
+      constraints: constraintResults,
+      workerFindings
+    }));
+    const findingsThread = taskThread(task);
+    if (findingsThread !== null) {
+      publishBrief.taskIssue = findingsThread;
+    }
     const publication = await driverNode(
       "publish",
-      withSeam({
-        campaign: effective.campaign,
-        repository: codeRepository,
-        repositoryConfig,
-        issue: args.issue,
-        runId: args.runId,
-        workspaceRoot: args.workspaceRoot,
-        task,
-        domainsRequired,
-        gates: effective.gates,
-        // A re-stamp is deterministic machinery all the way through: its PR
-        // uses the validated template rather than spending a narration turn.
-        steward: completion === null ? effective.steward || null : null,
-        workspace: prepared.result,
-        constraints: constraintResults
-      }),
+      publishBrief,
       `publish-${task.id}`,
       `publish-${task.id}`,
       publicationSchema,

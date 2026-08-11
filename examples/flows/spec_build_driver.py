@@ -63,6 +63,10 @@ RESUME_MARKER = re.compile(
 # back from the forge: past it, the fault is treated as a failed attempt.
 MAX_MACHINE_RETRIES = 2
 MAX_RETRY_CHARS = 2_000
+# A worker's final message is a public finding, not an unbounded transcript.
+# The bound covers the complete rendered comment, including its machine marker.
+MAX_WORKER_FINDINGS_BYTES = 8 * 1024
+WORKER_FINDINGS_TRUNCATION = "\n[... worker findings truncated after redaction ...]"
 # Checkpoint output is retained for diagnosis, not as a second unbounded raw
 # capture. Keep the tail, where command harnesses normally put the actionable
 # failure, under the daemon's existing capture-archive retention envelope.
@@ -1814,6 +1818,19 @@ def diagnosis_heading(task_id: str, attempt: int) -> str:
     return f"### Machine steering for `{task_id}` (attempt {attempt}/2)"
 
 
+def worker_findings_marker(
+    campaign: str,
+    issue_number: str,
+    task_id: str,
+    agent_task_uuid: str,
+) -> str:
+    return (
+        "<!-- tally:spec-build:worker-findings:v1 "
+        f"campaign={campaign} issue={issue_number} task={task_id} "
+        f"agent={agent_task_uuid} -->"
+    )
+
+
 def retry_marker(campaign: str, issue_number: str, task_id: str, attempt: int) -> str:
     return (
         "<!-- tally:spec-build:retry:v1 "
@@ -1942,6 +1959,55 @@ def redact_public_text(value: str) -> tuple[str, bool]:
         if "-----end " in lower and "private key-----" in lower:
             private_key_block = False
     return "".join(output).strip(), redacted
+
+
+def normalized_worker_findings(value: Any) -> dict[str, str] | None:
+    """Validate one projected final message; blank capture means silence."""
+    if value is None:
+        return None
+    findings = object_complete(
+        value,
+        {"taskUuid", "message"},
+        "workerFindings",
+    )
+    task_uuid = required_string(findings.get("taskUuid"), "workerFindings.taskUuid", 64)
+    try:
+        parsed_uuid = uuid.UUID(task_uuid)
+    except ValueError:
+        fail("workerFindings.taskUuid must be a UUID")
+    if str(parsed_uuid) != task_uuid.lower():
+        fail("workerFindings.taskUuid must use canonical UUID spelling")
+    message = findings.get("message")
+    if not isinstance(message, str):
+        fail("workerFindings.message must be text")
+    message = message.replace("\r\n", "\n").replace("\r", "\n")
+    message = "".join(
+        character
+        if character in "\n\t" or not (ord(character) < 32 or 127 <= ord(character) < 160)
+        else "�"
+        for character in message
+    ).strip()
+    if not message:
+        return None
+    return {"taskUuid": task_uuid.lower(), "message": message}
+
+
+def bound_worker_findings_comment(prefix: str, text: str) -> str:
+    """Bound the complete UTF-8 comment without splitting a code point."""
+    prefix_bytes = prefix.encode("utf-8")
+    if len(prefix_bytes) >= MAX_WORKER_FINDINGS_BYTES:
+        fail("worker findings marker exceeds its public comment bound")
+    available = MAX_WORKER_FINDINGS_BYTES - len(prefix_bytes)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= available:
+        return prefix + text
+    truncation = WORKER_FINDINGS_TRUNCATION.encode("utf-8")
+    width = max(0, available - len(truncation))
+    clipped = encoded[:width].decode("utf-8", errors="ignore").rstrip()
+    body = prefix + clipped + WORKER_FINDINGS_TRUNCATION
+    if len(body.encode("utf-8")) > MAX_WORKER_FINDINGS_BYTES:
+        fail("worker findings comment escaped its public byte bound")
+    return body
 
 
 def read_capture_tail(path: Path) -> tuple[str, bool]:
@@ -4675,6 +4741,106 @@ def diagnosis_fallback_note(
     return note
 
 
+def publish_worker_findings(
+    data: dict[str, Any],
+    capabilities: dict[str, bool],
+) -> str | None:
+    """Publish one captured implementation result on its campaign thread."""
+    findings = normalized_worker_findings(data.get("workerFindings"))
+    if findings is None:
+        return None
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    code_repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(code_repository):
+        fail("repository must use owner/name form")
+    target = campaign_coordinates(
+        data,
+        code_repository,
+        repo_config(data.get("repositoryConfig")),
+    )["issue"]
+    repository = target["repository"]
+    config = target["config"]
+    issue = campaign_issue(data.get("issue"))
+    task = data.get("task")
+    if not isinstance(task, dict):
+        fail("task must be an object")
+    task_id = required_string(task.get("id"), "task.id")
+    if not TASK_ID.fullmatch(task_id):
+        fail("task.id is not safe")
+    thread = steering_thread_issue(data, capabilities)
+    marker = worker_findings_marker(
+        campaign,
+        issue["number"],
+        task_id,
+        findings["taskUuid"],
+    )
+    public_text, _ = redact_public_text(findings["message"])
+    prefix = (
+        f"{marker}\n\n### Worker findings\n\n"
+        "_Captured from the implementation worker's final message; "
+        "redacted and bounded by tally._\n\n"
+    )
+    body = bound_worker_findings_comment(prefix, public_text)
+
+    if config["forge"] == "github":
+        matching = [
+            comment
+            for comment in github_machine_comments(repository, thread["number"])
+            if isinstance(comment.get("body"), str)
+            and comment["body"].splitlines()
+            and comment["body"].splitlines()[0] == marker
+        ]
+        if len(matching) > 1:
+            fail(f"worker findings for agent {findings['taskUuid']} were posted more than once")
+        if matching:
+            existing = matching[0]
+            if existing["body"] != body:
+                fail(
+                    f"worker findings for agent {findings['taskUuid']} disagree with the existing comment"
+                )
+            return required_string(
+                existing.get("html_url", existing.get("url")),
+                "worker findings comment URL",
+            )
+        posted = run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                thread["number"],
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+        return required_string(
+            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
+            "worker findings comment URL",
+        )
+
+    ref = (
+        f"{local_state_prefix(campaign, issue['number'])}/findings/"
+        f"{task_id}/{findings['taskUuid']}"
+    )
+    expected = {
+        "schemaVersion": 1,
+        "kind": "worker-findings",
+        "campaign": campaign,
+        "issueNumber": issue["number"],
+        "taskId": task_id,
+        "agentTaskUuid": findings["taskUuid"],
+        "body": body,
+        "redaction": PUBLIC_REDACTION,
+    }
+    _, observed = write_local_blob(config, ref, expected)
+    if observed != expected:
+        fail(f"local forge worker findings {ref!r} disagree with this attempt")
+    return f"local://{repository}/{ref}"
+
+
 def post_diagnosis_comment(
     config: dict[str, Any],
     repository: str,
@@ -7315,7 +7481,16 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
     if action == "rebase":
         allowed.update({"publication", "constraints", "domainsRequired"})
     if action == "publish":
-        allowed.update({"constraints", "domainsRequired", "gates", "steward"})
+        allowed.update(
+            {
+                "constraints",
+                "domainsRequired",
+                "gates",
+                "steward",
+                "taskIssue",
+                "workerFindings",
+            }
+        )
     if action == "merge":
         allowed.update(
             {
@@ -7464,6 +7639,7 @@ def github_pull_request(
 
 
 def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
+    brief, capabilities = take_capabilities(brief)
     data, config, worktree = publication_identity(brief, "publish")
     constraints = normalize_constraint_results(data.get("constraints"), "publish constraints")
     enforce_configured_gates(
@@ -7504,6 +7680,10 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         head,
         constraints,
     )
+    # The implementation has now passed the same identity, ownership, and gate
+    # checks that authorize publication. Retain its report before push/PR
+    # machinery can fail; an exact marker makes a retried publish idempotent.
+    publish_worker_findings(data, capabilities)
     git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
     # The publish node is the crossing point between the two surfaces (§3), so
     # it is where the steward narrates. Everything it is given is already
