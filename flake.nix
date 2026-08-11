@@ -4975,7 +4975,10 @@
                 mkdir -p "$HOME"
                 export SPEC_BUILD_DRIVER_SOURCE=${campaignDrivers}/spec_build_driver.py
                 export SPEC_BUILD_REDACTION_VECTORS=${./test/fixtures/redaction/vectors.json}
+                export SPEC_BUILD_CONTRACT_CORPUS=${./test/fixtures/spec-build/contract-corpus.json}
+                export SPEC_BUILD_CAMPAIGN_CONTRACT_SOURCE=${./crates/tally-core/src/campaign_contract.rs}
                 python3 ${./test/spec_build_driver_test.py}
+                python3 ${./test/spec_build_contract_corpus_test.py}
                 touch "$out"
               '';
           campaign-render =
@@ -5807,6 +5810,7 @@
                   pkgs.python3
                 ];
                 SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
+                SPEC_BUILD_CONTRACT_CORPUS = "${./test/fixtures/spec-build/contract-corpus.json}";
               }
               ''
                 export HOME="$TMPDIR/home"

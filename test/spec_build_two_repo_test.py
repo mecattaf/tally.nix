@@ -34,6 +34,18 @@ assert SPEC is not None and SPEC.loader is not None
 driver = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(driver)
 
+CONTRACT_CORPUS = Path(
+    os.environ.get(
+        "SPEC_BUILD_CONTRACT_CORPUS",
+        Path(__file__).parents[1] / "test/fixtures/spec-build/contract-corpus.json",
+    )
+)
+PULL_REQUEST_WORKSPACE_FIELDS = frozenset(
+    json.loads(CONTRACT_CORPUS.read_text(encoding="utf-8"))["requiredKeySets"][
+        "pullRequestWorkspaceFixture"
+    ]
+)
+
 
 def git(*argv: str, cwd: Path | None = None, check: bool = True) -> str:
     return subprocess.run(
@@ -70,6 +82,21 @@ def implementation_task(identifier: str, domain: str) -> dict[str, Any]:
         "dependencies": [],
         "conflictDomains": [domain],
     }
+
+
+def pull_request_workspace(
+    task_id: str, base_rev: str, publish_branch: str
+) -> dict[str, str]:
+    workspace = {
+        "taskId": task_id,
+        "baseRev": base_rev,
+        "publishBranch": publish_branch,
+    }
+    if set(workspace) != PULL_REQUEST_WORKSPACE_FIELDS:
+        raise AssertionError(
+            "two-repository pull-request fixture keys differ from contract-corpus.json"
+        )
+    return workspace
 
 
 class Repository:
@@ -390,11 +417,11 @@ class TwoRepositoryCampaign(unittest.TestCase):
             "campaign": "fixture",
             "repository": self.code.name,
             "issue": {"number": "7", "url": "https://example.invalid/acme/board/7"},
-            "workspace": {
-                "taskId": "task-1",
-                "baseRev": self.code_rev,
-                "publishBranch": driver.stable_publish_branch("fixture", "7", "task-1"),
-            },
+            "workspace": pull_request_workspace(
+                "task-1",
+                self.code_rev,
+                driver.stable_publish_branch("fixture", "7", "task-1"),
+            ),
             "task": implementation_task("task-1", "one"),
             **seam,
         }
@@ -673,11 +700,11 @@ class SingleRepositoryControl(unittest.TestCase):
             "campaign": "fixture",
             "repository": self.repository.name,
             "issue": {"number": "7", "url": "https://example.invalid/acme/solo/7"},
-            "workspace": {
-                "taskId": "task-1",
-                "baseRev": self.base_rev,
-                "publishBranch": driver.stable_publish_branch("fixture", "7", "task-1"),
-            },
+            "workspace": pull_request_workspace(
+                "task-1",
+                self.base_rev,
+                driver.stable_publish_branch("fixture", "7", "task-1"),
+            ),
             "task": implementation_task("task-1", "one"),
         }
         created = subprocess.CompletedProcess(

@@ -6,6 +6,15 @@ authorized.
 
 ## [Unreleased]
 
+### Single-source campaign contract vectors (#486)
+
+- `tally-core` now generates a checked corpus of canonical manifests, graphs,
+  exact JSON bytes, digests, and named rejection mutations from the Rust
+  campaign contract.
+- The packaged Python decoder check consumes every corpus vector and guards the
+  two-repository fixtures' required workspace keys, so contract and fixture
+  drift fail before merge.
+
 ### Recharter Python campaign drivers (#485)
 
 - Campaign driver Python now lives under `drivers/`, with every packaging, runtime, and test path
