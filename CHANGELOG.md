@@ -6,6 +6,14 @@ authorized.
 
 ## [Unreleased]
 
+### Audit recurring campaign gate doctrine (#514)
+
+- A 119-claim modality record now checks recurring campaign configuration, hardened argv,
+  `forbidPaths`, marker re-stamps, transport, rendered resources, and pristine-base preflight
+  against shipped code and focused tests.
+- The audit records four divergences: whitespace-trimmed mention matching, enforced mention
+  grammar, advanced-base `forbidPaths` history, and restamp-dependent preflight admission.
+
 ### Audit campaign reconciliation and integration doctrine (#498)
 
 - A 72-claim modality record now checks the reconciliation, checkpoint, conflict-domain,
