@@ -636,6 +636,28 @@ class RedactionVectorTests(unittest.TestCase):
 
 
 class GitHubForgeTests(unittest.TestCase):
+    def test_pull_request_markers_have_one_revision_bearing_grammar(self) -> None:
+        revision = "sha256:" + "a" * 64
+        marker = DRIVER.pull_request_marker("fixture", "7", "task-1", revision)
+
+        self.assertEqual(
+            marker,
+            "<!-- tally:spec-build:v2 campaign=fixture issue=7 task=task-1 "
+            f"revision={revision} -->",
+        )
+        self.assertEqual(
+            DRIVER.pull_request_marker_revisions(marker, "fixture", "7", "task-1"),
+            [revision],
+        )
+        self.assertEqual(
+            DRIVER.campaign_marker_prefixes("fixture", "7"),
+            ("<!-- tally:spec-build:v2 campaign=fixture issue=7 task=",),
+        )
+        with self.assertRaisesRegex(
+            DRIVER.DriverError, "revision must be a lowercase SHA-256 identity"
+        ):
+            DRIVER.pull_request_marker("fixture", "7", "task-1", None)
+
     def test_file_worklist_tasks_carry_v2_completion_revisions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1739,7 +1761,11 @@ class GitHubForgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root)
-            marker = DRIVER.pull_request_marker("fixture", "7", "task-1")
+            revision = "sha256:" + "a" * 64
+            branch = DRIVER.stable_publish_branch(
+                "fixture", "7", "task-1", revision
+            )
+            marker = DRIVER.pull_request_marker("fixture", "7", "task-1", revision)
             head = "a" * 40
             state = {
                 "pulls": [
@@ -1747,7 +1773,7 @@ class GitHubForgeTests(unittest.TestCase):
                         "url": "https://github.com/acme/spec/pull/7",
                         "body": marker,
                         "baseRefName": "main",
-                        "headRefName": "tally/fixture-issue-7/task-1",
+                        "headRefName": branch,
                         "headRefOid": head,
                         "state": "CLOSED",
                     }
@@ -1759,8 +1785,8 @@ class GitHubForgeTests(unittest.TestCase):
                 "campaign": "fixture",
                 "repository": "acme/spec",
                 "issue": issue(),
-                "task": task("task-1"),
-                "workspace": {"publishBranch": "tally/fixture-issue-7/task-1"},
+                "task": {**task("task-1"), "revision": revision},
+                "workspace": {"publishBranch": branch},
             }
             with FakeGitHub(root, state) as github:
                 url = DRIVER.github_pull_request(
@@ -1826,14 +1852,17 @@ class GitHubForgeTests(unittest.TestCase):
             root = Path(temporary)
             checkout, _ = initialize_repository(root)
             base = git(checkout, "rev-parse", "HEAD")
+            revision = "sha256:" + "a" * 64
             data = {
                 "campaign": "fixture",
                 "repository": "acme/spec",
                 "issue": issue(),
-                "task": task("task-1"),
+                "task": {**task("task-1"), "revision": revision},
                 "workspace": {
                     "baseRev": base,
-                    "publishBranch": "tally/fixture-issue-7/task-1",
+                    "publishBranch": DRIVER.stable_publish_branch(
+                        "fixture", "7", "task-1", revision
+                    ),
                 },
             }
             config = DRIVER.repo_config(repository_config(checkout, "github"))
@@ -2220,7 +2249,9 @@ class GitHubForgeTests(unittest.TestCase):
                     },
                     {
                         "url": "https://github.com/acme/spec/pull/9",
-                        "body": DRIVER.pull_request_marker("fixture", "7", "task-1"),
+                        "body": DRIVER.pull_request_marker(
+                            "fixture", "7", "task-1", revision
+                        ),
                         "merged": False,
                         "baseRefName": "main",
                         "headRefName": branch,
@@ -3270,6 +3301,7 @@ class LaneLifecycleTests(unittest.TestCase):
                 checkout, _ = initialize_repository(root, remote=True)
                 campaign_task = {
                     **task("task-1"),
+                    "revision": "sha256:" + "a" * 64,
                     "brief": {
                         "issue": {
                             "number": "8",
@@ -4560,7 +4592,7 @@ class NarrationValidatorTests(unittest.TestCase):
                 {
                     "type": "feat",
                     "subject": "do a thing",
-                    "body": "Noted an update.\n\n<!-- tally:spec-build:v1 campaign=fixture -->",
+                    "body": "Noted an update.\n\n<!-- tally:spec-build:v2 campaign=fixture -->",
                 },
                 "managed campaign marker",
             ),

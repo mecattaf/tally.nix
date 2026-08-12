@@ -2964,14 +2964,11 @@ def task_revision(task: dict[str, Any]) -> str | None:
 
 
 def pull_request_marker(
-    campaign: str, issue_number: str, task_id: str, revision: str | None = None
+    campaign: str, issue_number: str, task_id: str, revision: str
 ) -> str:
-    if revision is None:
-        return (
-            "<!-- tally:spec-build:v1 "
-            f"campaign={campaign} issue={issue_number} task={task_id} -->"
-        )
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", revision):
+    if not isinstance(revision, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", revision
+    ):
         fail("pull request marker revision must be a lowercase SHA-256 identity")
     return (
         "<!-- tally:spec-build:v2 "
@@ -2981,7 +2978,7 @@ def pull_request_marker(
 
 def pull_request_marker_revisions(
     body: str, campaign: str, issue_number: str, task_id: str
-) -> list[str | None]:
+) -> list[str]:
     """Every exact marker revision this body carries for one campaign task.
 
     A re-stamp may reason from an older marker only after the candidate has
@@ -2989,17 +2986,12 @@ def pull_request_marker_revisions(
     the ordinary completion validator derive the matching historical branch;
     the marker itself still proves nothing.
     """
-    revisions: list[str | None] = []
-    legacy = pull_request_marker(campaign, issue_number, task_id)
-    if legacy in body:
-        revisions.append(None)
     prefix = (
         "<!-- tally:spec-build:v2 "
         f"campaign={campaign} issue={issue_number} task={task_id} revision="
     )
     pattern = re.compile(re.escape(prefix) + r"(sha256:[0-9a-f]{64}) -->")
-    revisions.extend(match.group(1) for match in pattern.finditer(body))
-    return list(dict.fromkeys(revisions))
+    return list(dict.fromkeys(match.group(1) for match in pattern.finditer(body)))
 
 
 def checkpoint_identity(
@@ -3290,7 +3282,7 @@ def pull_requests_by_head(
 
 
 def campaign_marker_prefixes(campaign: str, issue_number: str) -> tuple[str, ...]:
-    """Every pull-request marker this campaign has ever written, revision-blind.
+    """The pull-request marker this campaign writes, revision-blind.
 
     Matching the prefix identifies a pull request as *this campaign's own work*
     without saying anything about whether it still proves a task. That is a
@@ -3298,7 +3290,6 @@ def campaign_marker_prefixes(campaign: str, issue_number: str) -> tuple[str, ...
     ordinary graph edit look like operator error.
     """
     return (
-        f"<!-- tally:spec-build:v1 campaign={campaign} issue={issue_number} task=",
         f"<!-- tally:spec-build:v2 campaign={campaign} issue={issue_number} task=",
     )
 
@@ -8831,7 +8822,7 @@ def github_checkpoint_progress_comment(
     task = data["task"]
     task_id = task["id"]
     marker = (
-        "<!-- tally:spec-build:v1 "
+        "<!-- tally:spec-build:checkpoint:v1 "
         f"campaign={campaign} issue={issue['number']} checkpoint={task_id} "
         f"source={source_sha256} revision={revision} passed -->"
     )
