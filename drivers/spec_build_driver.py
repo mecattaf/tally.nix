@@ -1160,6 +1160,8 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         # Only a split campaign records this. With one repository the pinned
         # revision is unambiguous and the witness stays byte-identical.
         source["repository"] = spec["repository"]
+    for task in tasks:
+        task["revision"] = file_task_completion_revision(repository, source, task)
     return {
         "schemaVersion": 1,
         "repository": repository,
@@ -1696,6 +1698,30 @@ def task_completion_revision(
             "gates": manifest["gates"],
             "task": reference,
             "content": content,
+        }
+    )
+
+
+def file_task_completion_revision(
+    repository: str,
+    source: dict[str, str],
+    task: dict[str, Any],
+) -> str:
+    """Identity for one file-worklist task proof.
+
+    The worklist digest and Git revision cover the complete file. Completion is
+    narrower: an unrelated task or base-branch edit must not invalidate this
+    task's proof, while its normalized content and source coordinate must.
+    """
+    return canonical_sha256(
+        {
+            "contractVersion": 1,
+            "repository": repository,
+            "source": {
+                "repository": source.get("repository", repository),
+                "path": source["path"],
+            },
+            "task": task,
         }
     )
 

@@ -191,7 +191,8 @@ fn implementation_task(conflict_domains: Option<Value>) -> Value {
         "acceptanceCriteria": [
             {"id": "focused", "description": "The focused check passes.", "argv": ["true"]}
         ],
-        "dependencies": []
+        "dependencies": [],
+        "revision": DIGEST
     });
     if let Some(domains) = conflict_domains {
         task["conflictDomains"] = domains;
