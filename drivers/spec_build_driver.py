@@ -1746,17 +1746,38 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     )
     if not isinstance(master, dict) or master.get("pull_request") is not None:
         fail("campaign master locator did not resolve to an issue")
-    if master.get("state") != "open" or master.get("html_url") != expected_url:
-        fail("campaign master issue must be open and canonical")
+    if master.get("html_url") != expected_url:
+        fail("campaign master issue must be canonical")
+    master_state = master.get("state")
+    if master_state not in {"open", "closed"}:
+        fail("campaign master issue has an unknown state")
+    master_closed = master_state == "closed"
     body = master.get("body")
-    if not isinstance(body, str):
+    if not isinstance(body, str) and not (master_closed and canonical is not None):
         fail("campaign master issue has no body")
-    subissues = github_json(
+    # Current Rust dispatches carry the complete canonical graph. Once that
+    # canonical master is closed, its mutable task projection is irrelevant:
+    # synthesize only the deterministic locators needed by the result shape
+    # and do not let a stale sub-issue read turn completion back into failure.
+    subissues = (
         [
-            "api",
-            f"repos/{repository}/issues/{issue['number']}/sub_issues?per_page=100",
-        ],
-        "campaign sub-issues",
+            {
+                "number": task["number"],
+                "title": task["title"],
+                "body": task["body"],
+                "state": "closed",
+                "html_url": f"https://github.com/{repository}/issues/{task['number']}",
+            }
+            for task in canonical["tasks"]
+        ]
+        if master_closed and canonical is not None
+        else github_json(
+            [
+                "api",
+                f"repos/{repository}/issues/{issue['number']}/sub_issues?per_page=100",
+            ],
+            "campaign sub-issues",
+        )
     )
     if not isinstance(subissues, list):
         fail("campaign sub-issues response must be an array")
@@ -1865,7 +1886,12 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         },
         "tasks": tasks,
         "config": config,
-        "masterBody": body,
+        "masterBody": body if isinstance(body, str) else "",
+        # A poll may have admitted this pass from an open snapshot immediately
+        # before the terminal reconciler closed the issue. Keep that race a
+        # schema-valid completion instead of turning the driver's accurate
+        # closed-state observation into a FlowResultError.
+        "masterClosed": master_closed,
     }
 
 
@@ -4242,6 +4268,31 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         if same_repository(coordinates["spec"], code)
         else observed_base_revision(code["config"])
     )
+    if forge_native and worklist.get("masterClosed") is True:
+        return {
+            "schemaVersion": 1,
+            "campaign": campaign,
+            "repository": repository,
+            "source": worklist["source"],
+            "baseRevision": base_rev,
+            "tasks": worklist["tasks"],
+            "merged": [],
+            "restamps": [],
+            "checkpoints": [],
+            "remaining": [],
+            "frontier": [],
+            "diagnoses": [],
+            "retries": [],
+            "deferrals": [],
+            "blocked": [],
+            "quiescent": False,
+            "escalation": None,
+            "complete": True,
+            "anomalies": [],
+            "warnings": [],
+            "closingSummary": None,
+            "config": worklist["config"],
+        }
     # One bounded walk per pass feeds both halves of the forge read: which
     # pull requests may be considered, and which machine receipts each task
     # thread carries.

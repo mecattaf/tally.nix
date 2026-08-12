@@ -15,6 +15,7 @@ use tally_core::campaign_contract::{
     CampaignAgent, CampaignGate, CampaignManifest, CanonicalCampaignGraphV1,
     CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
 };
+use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
@@ -27,6 +28,8 @@ const WORKLIST_BEGIN: &str = "<!-- tally:campaign-worklist:v1 -->";
 const WORKLIST_END: &str = "<!-- tally:campaign-worklist:v1:end -->";
 const TASK_MARKER_PREFIX: &str = "<!-- tally:campaign-task:v1 id=";
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
+const CAMPAIGN_COMPLETE_COMMENT_PREFIX: &str = "<!-- tally:campaign-complete:";
+const CAMPAIGN_SUMMARY_COMMENT_PREFIX: &str = "<!-- tally:campaign-summary:";
 const APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_APPROVED_GRAPH_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -147,8 +150,12 @@ impl PardonBoundary {
 #[derive(Debug)]
 enum CampaignPollAttempt {
     Dispatched,
-    Pruned,
+    Complete,
     Unchanged,
+    Stabilizing {
+        approved_graph_digest: String,
+        live_graph_digest: String,
+    },
     RearmRequired {
         approved_graph_digest: String,
         live_graph_digest: String,
@@ -401,11 +408,27 @@ fn fetch_issue_comments(locator: &IssueLocator) -> Result<Vec<GithubComment>> {
     Ok(pages.into_iter().flatten().collect())
 }
 
+/// Comments written by the campaign mechanism, never operator steering.
+///
+/// Completion summaries use a campaign-level marker rather than the older
+/// `spec-build` namespace. Treating their timestamp bump as fresh steering is
+/// what let a poll queue one last pass while the same reconcile was closing
+/// the master.
+fn tally_authored_comment(body: &str) -> bool {
+    [
+        SYSTEM_COMMENT_PREFIX,
+        CAMPAIGN_COMPLETE_COMMENT_PREFIX,
+        CAMPAIGN_SUMMARY_COMMENT_PREFIX,
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
 fn fetch_steering(locator: &IssueLocator, allowed: &[String]) -> Result<Vec<Value>> {
     let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut comments = Vec::new();
     for comment in fetch_issue_comments(locator)? {
-        if comment.body.contains(SYSTEM_COMMENT_PREFIX) {
+        if tally_authored_comment(&comment.body) {
             continue;
         }
         let actor = comment.user.login.to_ascii_lowercase();
@@ -814,7 +837,7 @@ fn task_steering(
     for number in subissues {
         let mut comments = Vec::new();
         for comment in threads.get(number).into_iter().flatten() {
-            if comment.body.contains(SYSTEM_COMMENT_PREFIX) {
+            if tally_authored_comment(&comment.body) {
                 continue;
             }
             let Some(author) = comment.author.as_ref() else {
@@ -1280,6 +1303,25 @@ fn forge_state_value(graph: &CampaignGraph) -> Value {
     })
 }
 
+/// Forge facts with scheduling meaning after the steering read has completed.
+///
+/// `updated_at` belongs in the cheap precondition above because it tells the
+/// poll when comments may need rereading. It does not belong in the admitted
+/// observation itself: Tally's own comments and checkbox projection bump that
+/// timestamp, while the filtered steering and executable graph stay exactly
+/// the same.
+fn campaign_state_value(graph: &CampaignGraph) -> Value {
+    json!({
+        "master": {
+            "state": graph.master.state,
+        },
+        "tasks": graph.tasks.iter().map(|issue| json!({
+            "number": issue.number,
+            "state": issue.state,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn campaign_state_ref_prefix(campaign: &str, issue_number: u64) -> String {
     let scope = format!("{campaign}\0{issue_number}");
     let digest = format!("{:x}", Sha256::digest(scope.as_bytes()));
@@ -1380,6 +1422,29 @@ fn forge_observation(
     }))
 }
 
+/// A bounded confirmation identity for an unapproved executable graph.
+///
+/// The first mismatch is retained here but is not yet called
+/// `rearm-required`. A second identical registry scan confirms that the graph
+/// is stable. This absorbs the one-read intermediate views GitHub can expose
+/// while Tally is applying its own sequence of issue mutations, without ever
+/// dispatching unapproved content.
+fn graph_mismatch_observation(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
+    sha256_json(&json!({
+        "kind": "campaign-graph-mismatch-v1",
+        "graph": graph.canonical.executable_digest,
+        "forgeState": forge_state_value(graph),
+        "armSerial": arm_serial,
+    }))
+}
+
+fn graph_poll_snapshot(graph: &CampaignGraph) -> Result<String> {
+    sha256_json(&json!({
+        "graph": graph.canonical.executable_digest,
+        "forgeState": forge_state_value(graph),
+    }))
+}
+
 fn campaign_observation(
     graph: &CampaignGraph,
     steering: &CampaignSteering,
@@ -1388,7 +1453,7 @@ fn campaign_observation(
 ) -> Result<String> {
     sha256_json(&json!({
         "graph": graph.canonical.executable_digest,
-        "forgeState": forge_state_value(graph),
+        "forgeState": campaign_state_value(graph),
         "repositoryProgress": repository_progress,
         "steering": steering.master,
         // A comment on one task's sub-issue thread must nudge the campaign
@@ -2749,30 +2814,42 @@ async fn run_campaign_poll(
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
     let entries = registry.registrations()?;
-    let mut observed = 0usize;
-    let mut dispatched = 0usize;
-    let mut pruned = 0usize;
-    let mut blocked = Vec::new();
-    let mut failures = Vec::new();
+    let mut had_failures = false;
     for (path, mut registration) in entries {
-        observed += 1;
         let attempt = async {
             let locator = parse_issue_url(&registration.issue_url)?;
-            require_authenticated_actor(&registration)?;
             let master = fetch_issue(&locator)?;
-            if master.state != "open" {
-                registry.remove(&registration)?;
-                remove_approved_graph_snapshots(&state_dir, &registration.issue_url)?;
-                return Ok(CampaignPollAttempt::Pruned);
+            match master.state.as_str() {
+                "closed" => {
+                    // Canonical locator validation happened in `fetch_issue`.
+                    // Completion is therefore allowed to clean up before any
+                    // actor, graph, host, or projection checks that only make
+                    // sense for a campaign which can still execute.
+                    registry.remove(&registration)?;
+                    remove_approved_graph_snapshots(&state_dir, &registration.issue_url)?;
+                    return Ok(CampaignPollAttempt::Complete);
+                }
+                "open" => {}
+                state => bail!("campaign master issue returned unknown state {state:?}"),
             }
+            require_authenticated_actor(&registration)?;
             let graph = campaign_graph_from(&locator, master)?;
             require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
             if graph.canonical.executable_digest != registration.approved_graph_digest {
+                let mismatch = graph_mismatch_observation(&graph, registration.arm_serial)?;
+                if registration.last_forge_observation.as_deref() != Some(&mismatch) {
+                    registration.last_forge_observation = Some(mismatch);
+                    registry.write(&mut registration)?;
+                    return Ok(CampaignPollAttempt::Stabilizing {
+                        approved_graph_digest: registration.approved_graph_digest.clone(),
+                        live_graph_digest: graph.canonical.executable_digest.clone(),
+                    });
+                }
                 // Refusing an unapproved graph is the admission mechanism
-                // working, not a poll-process failure. Keep the refusal loud
-                // and structured without putting the periodic systemd unit in
-                // failed state on every tick while the operator inspects and
-                // explicitly re-arms the campaign.
+                // working, not a poll-process failure. The identical graph
+                // was observed on the previous scan too, so this is a stable
+                // refusal rather than an intermediate view of Tally's own
+                // forge mutations.
                 return Ok(CampaignPollAttempt::RearmRequired {
                     approved_graph_digest: registration.approved_graph_digest.clone(),
                     live_graph_digest: graph.canonical.executable_digest.clone(),
@@ -2805,6 +2882,26 @@ async fn run_campaign_poll(
                 return Ok(CampaignPollAttempt::Unchanged);
             }
             registration.last_forge_observation = Some(forge);
+
+            // The scan above crosses several forge and Git reads. Refresh the
+            // public issue graph immediately before enqueue and refuse to act
+            // on a mixed snapshot. Most importantly, a master that closed
+            // while this poll was reading becomes completion here rather than
+            // a queued pass whose driver later says it should have been open.
+            let refreshed_master = fetch_issue(&locator)?;
+            match refreshed_master.state.as_str() {
+                "closed" => {
+                    registry.remove(&registration)?;
+                    remove_approved_graph_snapshots(&state_dir, &registration.issue_url)?;
+                    return Ok(CampaignPollAttempt::Complete);
+                }
+                "open" => {}
+                state => bail!("campaign master issue returned unknown state {state:?}"),
+            }
+            let refreshed_graph = campaign_graph_from(&locator, refreshed_master)?;
+            if graph_poll_snapshot(&refreshed_graph)? != graph_poll_snapshot(&graph)? {
+                return Ok(CampaignPollAttempt::Unchanged);
+            }
             let result = dispatch_campaign(
                 CampaignHost {
                     socket,
@@ -2835,37 +2932,63 @@ async fn run_campaign_poll(
             Ok::<_, anyhow::Error>(CampaignPollAttempt::Dispatched)
         }
         .await;
-        match attempt {
-            Ok(CampaignPollAttempt::Dispatched) => dispatched += 1,
-            Ok(CampaignPollAttempt::Pruned) => pruned += 1,
-            Ok(CampaignPollAttempt::Unchanged) => {}
+        let registration_path = path.display().to_string();
+        let event = match attempt {
+            Ok(CampaignPollAttempt::Dispatched) => CampaignPollEvent::new(
+                &registration.registration_id,
+                &registration.issue_url,
+                &registration_path,
+                CampaignPollStatus::Dispatched,
+            ),
+            Ok(CampaignPollAttempt::Complete) => CampaignPollEvent::complete(
+                &registration.registration_id,
+                &registration.issue_url,
+                &registration_path,
+            ),
+            Ok(CampaignPollAttempt::Unchanged) => CampaignPollEvent::new(
+                &registration.registration_id,
+                &registration.issue_url,
+                &registration_path,
+                CampaignPollStatus::Unchanged,
+            ),
+            Ok(CampaignPollAttempt::Stabilizing {
+                approved_graph_digest,
+                live_graph_digest,
+            }) => CampaignPollEvent::graph_change(
+                &registration.registration_id,
+                &registration.issue_url,
+                &registration_path,
+                CampaignPollStatus::Stabilizing,
+                approved_graph_digest,
+                live_graph_digest,
+            ),
             Ok(CampaignPollAttempt::RearmRequired {
                 approved_graph_digest,
                 live_graph_digest,
-            }) => blocked.push(json!({
-                "registration": path.display().to_string(),
-                "issue": &registration.issue_url,
-                "reason": "rearm-required",
-                "approvedGraphDigest": approved_graph_digest,
-                "liveGraphDigest": live_graph_digest,
-            })),
-            Err(error) => failures.push(format!("{}: {error:#}", path.display())),
-        }
+            }) => CampaignPollEvent::graph_change(
+                &registration.registration_id,
+                &registration.issue_url,
+                &registration_path,
+                CampaignPollStatus::RearmRequired,
+                approved_graph_digest,
+                live_graph_digest,
+            ),
+            Err(error) => {
+                had_failures = true;
+                CampaignPollEvent::failed(
+                    &registration.registration_id,
+                    &registration.issue_url,
+                    &registration_path,
+                    format!("{error:#}"),
+                )
+            }
+        };
+        outln!("{}", serde_json::to_string(&event)?);
     }
-    outln!(
-        "{}",
-        serde_json::to_string(&json!({
-            "observed": observed,
-            "dispatched": dispatched,
-            "pruned": pruned,
-            "blocked": blocked,
-            "failures": failures,
-        }))?
-    );
-    if failures.is_empty() {
-        Ok(())
-    } else {
+    if had_failures {
         bail!("one or more armed campaigns could not be polled")
+    } else {
+        Ok(())
     }
 }
 
@@ -4892,6 +5015,50 @@ esac"#,
             campaign_observation(&graph, &quiet, &repository_progress, 1).unwrap(),
             campaign_observation(&graph, &steered, &repository_progress, 1).unwrap()
         );
+    }
+
+    #[test]
+    fn campaign_completion_and_summary_comments_are_machine_state_not_steering() {
+        for body in [
+            "<!-- tally:spec-build:diagnosis:v1 campaign=x -->\nreceipt",
+            "<!-- tally:campaign-complete:v1 source=sha256:abc -->\nsummary",
+            "<!-- tally:campaign-summary:v1 campaign=x outcome=blocked -->\nsummary",
+        ] {
+            assert!(tally_authored_comment(body), "{body:?}");
+        }
+        assert!(!tally_authored_comment("please rerun the failed task"));
+    }
+
+    #[test]
+    fn timestamp_only_machine_writes_wake_the_poll_without_moving_the_campaign() {
+        let base = graph_for_forge_observation();
+        let mut machine_touched = graph_for_forge_observation();
+        machine_touched.master.updated_at = "2026-08-01T11:00:00Z".to_owned();
+        machine_touched.tasks[0].updated_at = "2026-08-01T11:00:00Z".to_owned();
+        let repository_progress = json!({"base": "a", "campaignRefs": {}});
+        let steering = CampaignSteering::default();
+
+        assert_ne!(
+            forge_observation(&base, &repository_progress, 1).unwrap(),
+            forge_observation(&machine_touched, &repository_progress, 1).unwrap(),
+            "the cheap precondition must still notice that comments may need rereading"
+        );
+        assert_eq!(
+            campaign_observation(&base, &steering, &repository_progress, 1).unwrap(),
+            campaign_observation(&machine_touched, &steering, &repository_progress, 1).unwrap(),
+            "filtered machine writes must not enqueue a new reconcile pass"
+        );
+    }
+
+    #[test]
+    fn a_graph_mismatch_requires_the_same_complete_forge_snapshot_twice() {
+        let graph = graph_for_forge_observation();
+        let first = graph_mismatch_observation(&graph, 1).unwrap();
+        assert_eq!(graph_mismatch_observation(&graph, 1).unwrap(), first);
+
+        let mut moving = graph;
+        moving.tasks[0].updated_at = "2026-08-01T11:00:00Z".to_owned();
+        assert_ne!(graph_mismatch_observation(&moving, 1).unwrap(), first);
     }
 
     /// The poll skips the expensive sub-issue walk while this digest holds
