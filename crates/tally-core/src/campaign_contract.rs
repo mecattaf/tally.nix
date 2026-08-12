@@ -15,6 +15,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::lease::is_campaign_pool_name;
+
 pub const CAMPAIGN_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_MAX_TASKS: usize = 64;
 pub const DEFAULT_DRIVER_RUNTIME_MAX_SEC: u64 = 900;
@@ -307,8 +309,10 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
             "campaign runtime limits must be positive when present",
         ));
     }
-    if !safe_component(&manifest.pool) {
-        return Err(invalid("campaign pool is not a safe component"));
+    if !safe_component(&manifest.pool) && !is_campaign_pool_name(&manifest.pool) {
+        return Err(invalid(
+            "campaign pool must be a safe component or use campaign/OWNER/REPO form",
+        ));
     }
     if !matches!(manifest.merge_method.as_str(), "merge" | "squash") {
         return Err(invalid("campaign mergeMethod must be merge or squash"));
