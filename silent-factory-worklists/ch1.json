@@ -87,7 +87,8 @@
       "conflictDomains": [
         "drivers",
         "crates/tally",
-        "test/fixtures/spec-build"
+        "test/fixtures/spec-build",
+        "test/spec_build_checkpoint_receipts_test.py"
       ]
     },
     {
