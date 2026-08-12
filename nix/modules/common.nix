@@ -2171,13 +2171,52 @@ let
   );
 
   mkCampaignType = types.submodule (
-    { config, name, ... }: {
+    {
+      config,
+      name,
+      options,
+      ...
+    }:
+    let
+      forgeNativeOnlyOptions = {
+        inherit (options)
+          issueRepository
+          label
+          mention
+          allowSelfTriggered
+          allowedActors
+          pollIntervalSec
+          ;
+      };
+      # Option defaults are definitions at mkOptionDefault priority. Anything
+      # stronger came from a campaign declaration, even when it repeats the
+      # default value; local campaigns must not silently ignore that intent.
+      declaredForgeNativeOnlyFields = builtins.attrNames (
+        filterAttrs (
+          _: option: option.highestPrio < (lib.mkOptionDefault null).priority
+        ) forgeNativeOnlyOptions
+      );
+    in
+    {
       options = {
         enable = mkOption {
           type = types.bool;
           default = false;
           example = true;
           description = "Render this spec-driven build campaign.";
+        };
+        forge = mkOption {
+          type = types.enum [
+            "github"
+            "local"
+          ];
+          default = "github";
+          example = "local";
+          description = ''
+            Forge used for campaign repository publication and durable
+            receipts. Local campaigns keep those operations in Git and must
+            not declare fields that configure a forge-native issue trigger.
+          '';
         };
         repositories = mkOption {
           type = types.attrsOf mkCampaignRepositoryType;
@@ -2577,6 +2616,10 @@ let
         {
           assertion = !config.enable || config.repositories != { };
           message = "enabled tally campaign ${name} requires at least one repository";
+        }
+        {
+          assertion = config.forge != "local" || declaredForgeNativeOnlyFields == [ ];
+          message = "tally campaign ${name} forge=local must not declare forge-native-only fields: ${lib.concatStringsSep ", " declaredForgeNativeOnlyFields}";
         }
         # A role that names a repository the campaign never configured has no
         # checkout to read or write, and would only be discovered on the first
@@ -3617,12 +3660,12 @@ let
       filterAttrs (_: flow: flow.onCalendar != null) flows
     );
 
-  renderCampaignRepositories = mapAttrs (
-    _: repository: {
+  renderCampaignRepositories =
+    campaign:
+    mapAttrs (_: repository: {
       inherit (repository) checkout baseBranch remote;
-      forge = "github";
-    }
-  );
+      inherit (campaign) forge;
+    }) campaign.repositories;
 
   renderCampaignGates = map (
     gate:
@@ -3693,7 +3736,7 @@ let
         number = issueNumber;
         url = issueUrl;
       };
-      repositories = renderCampaignRepositories campaign.repositories;
+      repositories = renderCampaignRepositories campaign;
       inherit (campaign) worklist maxTasks maxParallel;
     }
     # The two-repository seam. A role left null is absent from the args, so a
