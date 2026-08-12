@@ -245,8 +245,8 @@ in
         default = { };
         description = ''
           Campaign execution surface for the system service, and the forge
-          identity it acts as. Enabling this renders the generic campaign pools
-          (`campaign`, `campaign-agent`, `campaign-control`, `flow`), the
+          identity it acts as. Enabling this renders the host-wide campaign
+          resource pools (`campaign-agent`, `campaign-control`, `flow`), the
           packaged spec-build driver adapter, and the continuation registry
           entry, then installs `tally-campaign-poll` when
           `services.tally.campaignPoll.enable` is also on, so that a
@@ -340,9 +340,9 @@ in
     }
     # The generic campaign surface, rendered by the same builder the Home
     # Manager module uses. With `campaigns` empty it contributes exactly the
-    # generic half: the campaign pools, the flow pool, the driver adapter, the
-    # fanout floor, and the continuation registry entry -- which is what
-    # `tally campaign arm` validates a host against before it spends agent time.
+    # generic half: the campaign resource pools, the driver adapter, the fanout
+    # floor, and the continuation registry entry -- which is what `tally
+    # campaign arm` validates a host against before it spends agent time.
     (lib.mkIf campaignSurface { services.tally = common.mkCampaignConfig cfg; })
     (lib.mkIf campaignSurface {
       # The driver's forge identity lives in the service account's home, and

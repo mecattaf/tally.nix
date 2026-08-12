@@ -1789,6 +1789,10 @@ let
 
       config._tallyAssertions = flatten [
         {
+          assertion = !lib.hasPrefix "campaign/" name;
+          message = "pool ${name} uses the reserved campaign/ namespace; repository campaign mutexes are minted on demand";
+        }
+        {
           assertion =
             effectivePoolResource config != "mutex"
             || (config.capacity == 1 && config.predicate ? co-residency);
@@ -3840,29 +3844,17 @@ let
       requiredFanout = lib.foldl' (capacity: campaign: lib.max capacity (campaignMaxNodes campaign)) 64 (
         builtins.attrValues enabled
       );
-      mutexPools =
-        lib.foldl'
-          (
-            pools: campaign:
-            pools
-            // {
-              ${campaign.pool.name} = {
-                resource = lib.mkDefault "mutex";
-                capacity = lib.mkDefault 1;
-                predicate.co-residency = { };
-              };
-            }
-          )
-          {
-            # The forge-native ad-hoc lane is installed once. Arming a campaign
-            # only registers an issue locator; it never mutates Nix state.
-            campaign = {
-              resource = lib.mkDefault "mutex";
-              capacity = lib.mkDefault 1;
-              predicate.co-residency = { };
-            };
-          }
-          (builtins.attrValues enabled);
+      mutexPools = lib.foldl' (
+        pools: campaign:
+        pools
+        // {
+          ${campaign.pool.name} = {
+            resource = lib.mkDefault "mutex";
+            capacity = lib.mkDefault 1;
+            predicate.co-residency = { };
+          };
+        }
+      ) { } (builtins.attrValues enabled);
     in
     {
       enqueue.fanoutCap = lib.mkDefault requiredFanout;
@@ -3878,10 +3870,10 @@ let
           )
           {
             # One generic drain for every campaign's machine self-continuation,
-            # installed once and unconditionally like the forge-native `campaign`
-            # pool, so arming a campaign still needs no Nix change. Both campaign
-            # classes write their next-pass payload here; the frozen enqueue
-            # kernel collapses a duplicate against `tally-campaign-poll.timer`.
+            # installed once and unconditionally, so arming a campaign still
+            # needs no Nix change. Both campaign classes write their next-pass
+            # payload here; the frozen enqueue kernel collapses a duplicate
+            # against `tally-campaign-poll.timer`.
             #
             # It renders no unit of its own. `tally-drain.timer` already claimed
             # this directory unconditionally at the same 5 s cadence on every

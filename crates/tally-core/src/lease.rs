@@ -11,12 +11,48 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{
-    PoolConfig, PoolPredicate, Priority, ResourceKind, DEFAULT_AGING_THRESHOLD_SEC,
+    CoResidencyPredicate, PoolConfig, PoolPredicate, Priority, ResourceKind,
+    DEFAULT_AGING_THRESHOLD_SEC,
 };
 use crate::witness::{Verdict, WitnessError, WitnessRecord};
 
 pub const LEASE_EPOCH_FILE: &str = "lease_epoch";
 pub const LEASE_EVENTS_FILE: &str = "lease-events.jsonl";
+pub const CAMPAIGN_POOL_PREFIX: &str = "campaign/";
+
+/// Whether `name` identifies a repository-scoped campaign runner mutex.
+///
+/// The name is the complete durable definition of this reserved pool: exactly
+/// `campaign/<owner>/<repo>`, using the same bounded alphabet accepted for
+/// forge repository locators. No configured pool or extra persistence is
+/// needed to reconstruct its capacity and predicate.
+pub fn is_campaign_pool_name(name: &str) -> bool {
+    let mut parts = name.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("campaign"), Some(owner), Some(repository), None)
+            if safe_campaign_pool_component(owner)
+                && safe_campaign_pool_component(repository)
+    )
+}
+
+fn safe_campaign_pool_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn campaign_mutex_config() -> PoolConfig {
+    PoolConfig {
+        resource: Some(ResourceKind::Mutex),
+        capacity: 1,
+        predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+        ..PoolConfig::default()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -391,7 +427,7 @@ impl LeaseEngine {
         epoch: u64,
         yield_grace: Duration,
         aging_threshold: Duration,
-        pools: BTreeMap<String, PoolConfig>,
+        mut pools: BTreeMap<String, PoolConfig>,
         events: Option<LeaseEventLog>,
     ) -> Result<Self, LeaseError> {
         if epoch == 0 {
@@ -409,7 +445,18 @@ impl LeaseEngine {
                 "agingThresholdSec must be positive".to_owned(),
             ));
         }
-        for (name, config) in &pools {
+        for (name, config) in &mut pools {
+            if name.starts_with(CAMPAIGN_POOL_PREFIX) {
+                if !is_campaign_pool_name(name) {
+                    return Err(LeaseError::InvalidRequest(format!(
+                        "configured pool {name:?} uses the reserved campaign/ namespace"
+                    )));
+                }
+                // Durable replay feeds derived pools through this constructor
+                // too. Normalize any exact namespace name here so neither a
+                // stale nor hand-written config can redefine its shape.
+                *config = campaign_mutex_config();
+            }
             if config.capacity == 0 {
                 return Err(LeaseError::InvalidRequest(format!(
                     "pool {name:?} has zero capacity"
@@ -463,11 +510,24 @@ impl LeaseEngine {
         epoch: u64,
         yield_grace: Duration,
         aging_threshold: Duration,
-        pools: BTreeMap<String, PoolConfig>,
+        mut pools: BTreeMap<String, PoolConfig>,
         events: LeaseEventLog,
         witness: &[WitnessRecord],
         now: DateTime<Utc>,
     ) -> Result<Self, LeaseError> {
+        // Grants are already the durable admission authority. Their pool names
+        // therefore contain everything needed to close restart replay over the
+        // reserved campaign namespace, without a registry or another event.
+        for event in events.read()? {
+            let LeaseEventKind::Granted { grant, .. } = event.event else {
+                continue;
+            };
+            for pool in grant.pools {
+                if is_campaign_pool_name(&pool) {
+                    pools.entry(pool).or_insert_with(campaign_mutex_config);
+                }
+            }
+        }
         let rebuilt = rebuild_window_usage(&pools, &events, witness, now)?;
         let mut engine = Self::new_with_aging_threshold(
             epoch,
@@ -515,11 +575,12 @@ impl LeaseEngine {
         self.pools
             .get(pool)
             .map(|state| state.holders.len())
+            .or_else(|| is_campaign_pool_name(pool).then_some(0))
             .ok_or_else(|| LeaseError::UnknownPool(pool.to_owned()))
     }
 
     pub fn queued_in_pool(&self, pool: &str) -> Result<usize, LeaseError> {
-        if !self.pools.contains_key(pool) {
+        if !self.pools.contains_key(pool) && !is_campaign_pool_name(pool) {
             return Err(LeaseError::UnknownPool(pool.to_owned()));
         }
         Ok(self
@@ -535,10 +596,12 @@ impl LeaseEngine {
     }
 
     pub fn budget_used_at(&mut self, pool: &str, now: DateTime<Utc>) -> Result<u64, LeaseError> {
-        let state = self
-            .pools
-            .get_mut(pool)
-            .ok_or_else(|| LeaseError::UnknownPool(pool.to_owned()))?;
+        let Some(state) = self.pools.get_mut(pool) else {
+            if is_campaign_pool_name(pool) {
+                return Ok(0);
+            }
+            return Err(LeaseError::UnknownPool(pool.to_owned()));
+        };
         prune_debits(state, now)?;
         Ok(state.debits.iter().map(|debit| debit.amount).sum())
     }
@@ -548,10 +611,12 @@ impl LeaseEngine {
         pool: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, LeaseError> {
-        let state = self
-            .pools
-            .get_mut(pool)
-            .ok_or_else(|| LeaseError::UnknownPool(pool.to_owned()))?;
+        let Some(state) = self.pools.get_mut(pool) else {
+            if is_campaign_pool_name(pool) {
+                return Ok(None);
+            }
+            return Err(LeaseError::UnknownPool(pool.to_owned()));
+        };
         prune_debits(state, now)?;
         let PoolPredicate::WindowedConsumption(window) = &state.config.predicate else {
             return Ok(None);
@@ -575,6 +640,13 @@ impl LeaseEngine {
         now: DateTime<Utc>,
     ) -> Result<AdmitOutcome, LeaseError> {
         self.canonicalize_request(&mut request)?;
+        for pool in &request.pools {
+            if is_campaign_pool_name(pool) {
+                self.pools
+                    .entry(pool.clone())
+                    .or_insert_with(|| RuntimePool::new(campaign_mutex_config()));
+            }
+        }
         let sequence = self.next_sequence;
         self.next_sequence =
             self.next_sequence
@@ -763,10 +835,12 @@ impl LeaseEngine {
             ));
         }
         for pool in &request.pools {
-            let state = self
-                .pools
-                .get(pool)
-                .ok_or_else(|| LeaseError::UnknownPool(pool.clone()))?;
+            let Some(state) = self.pools.get(pool) else {
+                if is_campaign_pool_name(pool) {
+                    continue;
+                }
+                return Err(LeaseError::UnknownPool(pool.clone()));
+            };
             if matches!(
                 state.config.predicate,
                 PoolPredicate::WindowedConsumption(_)
@@ -1540,6 +1614,198 @@ mod tests {
         assert!(matches!(
             engine
                 .admit_at(request("agent-3", &["codex-window"], Priority::Low), now(),)
+                .unwrap(),
+            AdmitOutcome::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn campaign_pool_namespace_shape_is_exact() {
+        for valid in ["campaign/acme/widgets", "campaign/Acme-Inc/widget_repo.rs"] {
+            assert!(is_campaign_pool_name(valid), "rejected {valid:?}");
+        }
+        for invalid in [
+            "campaign",
+            "campaign/",
+            "campaign/acme",
+            "campaign//widgets",
+            "campaign/acme/..",
+            "campaign/acme/widgets/extra",
+            "campaign/acme/widget space",
+        ] {
+            assert!(!is_campaign_pool_name(invalid), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn untouched_campaign_namespace_is_known_to_pool_queries() {
+        let campaign_pool = "campaign/acme/widgets";
+        let mut engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("flow".to_owned(), pool(2))]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(engine.held_in_pool(campaign_pool).unwrap(), 0);
+        assert_eq!(engine.queued_in_pool(campaign_pool).unwrap(), 0);
+        assert_eq!(engine.budget_used_at(campaign_pool, now()).unwrap(), 0);
+        assert_eq!(engine.window_reset_at(campaign_pool, now()).unwrap(), None);
+    }
+
+    #[test]
+    fn configured_campaign_namespace_cannot_override_the_derived_mutex() {
+        let campaign_pool = "campaign/acme/widgets";
+        let mut engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([(campaign_pool.to_owned(), pool(2))]),
+            None,
+        )
+        .unwrap();
+
+        grant(
+            engine
+                .admit_at(request("first", &[campaign_pool], Priority::Low), now())
+                .unwrap(),
+        );
+        assert_eq!(
+            engine.declared_resource_kind(campaign_pool),
+            Some(ResourceKind::Mutex)
+        );
+        assert!(matches!(
+            engine
+                .admit_at(request("second", &[campaign_pool], Priority::Low), now())
+                .unwrap(),
+            AdmitOutcome::Queued { .. }
+        ));
+
+        let Err(error) = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("campaign/acme".to_owned(), pool(1))]),
+            None,
+        ) else {
+            panic!("malformed reserved pool config must be rejected");
+        };
+        assert!(error.to_string().contains("reserved campaign/ namespace"));
+    }
+
+    #[test]
+    fn repository_campaign_mutexes_hold_concurrently_across_repositories() {
+        let mut engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("flow".to_owned(), pool(2))]),
+            None,
+        )
+        .unwrap();
+
+        for (job, campaign_pool) in [
+            ("widgets", "campaign/acme/widgets"),
+            ("gadgets", "campaign/acme/gadgets"),
+        ] {
+            assert!(matches!(
+                engine
+                    .admit_at(request(job, &["flow", campaign_pool], Priority::Low), now())
+                    .unwrap(),
+                AdmitOutcome::Granted(_)
+            ));
+            assert_eq!(
+                engine.declared_resource_kind(campaign_pool),
+                Some(ResourceKind::Mutex)
+            );
+        }
+        assert_eq!(engine.held_len(), 2);
+    }
+
+    #[test]
+    fn repository_campaign_mutex_serializes_the_same_repository() {
+        let campaign_pool = "campaign/acme/widgets";
+        let mut engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("flow".to_owned(), pool(2))]),
+            None,
+        )
+        .unwrap();
+        let holder = grant(
+            engine
+                .admit_at(
+                    request("first", &["flow", campaign_pool], Priority::Low),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            engine
+                .admit_at(
+                    request("second", &["flow", campaign_pool], Priority::Low),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { .. }
+        ));
+        assert_eq!(engine.held_in_pool(campaign_pool).unwrap(), 1);
+        assert_eq!(engine.queued_in_pool(campaign_pool).unwrap(), 1);
+
+        let promoted = engine
+            .release_at(&holder.lease_id, holder.epoch, now())
+            .unwrap()
+            .promoted;
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].job_id, "second");
+    }
+
+    #[test]
+    fn durable_rebuild_remints_campaign_mutex_before_held_and_queued_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = LeaseEventLog::in_state_dir(temp.path());
+        let campaign_pool = "campaign/acme/widgets";
+        let pools = BTreeMap::from([("flow".to_owned(), pool(2))]);
+        let mut first =
+            LeaseEngine::new(3, Duration::from_secs(20), pools.clone(), Some(log.clone())).unwrap();
+        grant(
+            first
+                .admit_at(
+                    request("held", &["flow", campaign_pool], Priority::Low),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            first
+                .admit_at(
+                    request("queued", &["flow", campaign_pool], Priority::Low),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { .. }
+        ));
+        assert_eq!(log.read().unwrap().len(), 1, "only grants are durable");
+
+        let mut restarted =
+            LeaseEngine::from_durable(4, Duration::from_secs(20), pools, log, &[], now()).unwrap();
+        assert_eq!(
+            restarted.declared_resource_kind(campaign_pool),
+            Some(ResourceKind::Mutex),
+            "the old grant event alone must reconstruct the namespace pool"
+        );
+        grant(
+            restarted
+                .admit_at(
+                    request("held", &["flow", campaign_pool], Priority::Low),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            restarted
+                .admit_at(
+                    request("queued", &["flow", campaign_pool], Priority::Low),
+                    now(),
+                )
                 .unwrap(),
             AdmitOutcome::Queued { .. }
         ));

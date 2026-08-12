@@ -10,14 +10,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::AdapterConfig;
 use tally_core::campaign_contract::{
-    admit_manifest_json, admit_manifest_value, task_completion_revision, validate_argv,
-    validate_manifest, CampaignAgent, CampaignGate, CampaignManifest, CanonicalCampaignGraphV1,
+    admit_manifest_value, task_completion_revision, validate_argv, validate_manifest,
+    CampaignAgent, CampaignGate, CampaignManifest, CanonicalCampaignGraphV1,
     CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
 };
 use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
-use tally_core::config::ResourceKind;
+use tally_core::config::{PoolConfig, ResourceKind};
+use tally_core::lease::{is_campaign_pool_name, CAMPAIGN_POOL_PREFIX};
 
 const CAMPAIGN_BEGIN: &str = "<!-- tally:campaign:v1 -->";
 const CAMPAIGN_END: &str = "<!-- tally:campaign:v1:end -->";
@@ -1110,14 +1111,37 @@ fn extract_managed_section<'a>(body: &'a str, start: &str, end: &str) -> Result<
     Ok(remainder[..relative_end].trim())
 }
 
-fn parse_manifest(body: &str) -> Result<CampaignManifest> {
+fn parse_manifest(body: &str, repository: &str) -> Result<CampaignManifest> {
     let section = extract_managed_section(body, CAMPAIGN_BEGIN, CAMPAIGN_END)?;
     let json = section
         .strip_prefix("```json")
         .and_then(|value| value.strip_suffix("```"))
         .map(str::trim)
         .ok_or_else(|| invalid("campaign manifest must be one fenced JSON object"))?;
-    Ok(admit_manifest_json(json)?)
+    let mut value: Value = serde_json::from_str(json)
+        .map_err(|error| invalid(format!("campaign manifest is invalid: {error}")))?;
+    if let Some(manifest) = value.as_object_mut() {
+        let repository_pool = format!("{CAMPAIGN_POOL_PREFIX}{repository}");
+        match manifest.get("pool") {
+            None => {
+                manifest.insert("pool".to_owned(), json!(repository_pool));
+            }
+            Some(Value::String(pool)) if pool.starts_with(CAMPAIGN_POOL_PREFIX) => {
+                if !is_campaign_pool_name(pool) {
+                    return Err(invalid(
+                        "campaign namespace pool must use campaign/OWNER/REPO form",
+                    ));
+                }
+                if pool != &repository_pool {
+                    return Err(invalid(format!(
+                        "campaign namespace pool must match issue repository {repository:?}"
+                    )));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(admit_manifest_value(value)?)
 }
 
 fn fetch_campaign_graph(locator: &IssueLocator) -> Result<CampaignGraph> {
@@ -1134,7 +1158,10 @@ fn campaign_graph_from(locator: &IssueLocator, master: GithubIssue) -> Result<Ca
     if master.state != "open" {
         return Err(invalid("campaign master issue must be open"));
     }
-    let manifest = parse_manifest(master.body.as_deref().unwrap_or_default())?;
+    let manifest = parse_manifest(
+        master.body.as_deref().unwrap_or_default(),
+        &locator.repository,
+    )?;
     validate_worklist_projection(master.body.as_deref().unwrap_or_default(), &manifest)?;
     let subissues = fetch_subissues(locator)?;
     let subissue_count = subissues.len();
@@ -1864,25 +1891,14 @@ fn validate_host(
             config.enqueue.fanout_cap
         )));
     }
-    for pool in [
-        "flow",
-        "campaign-agent",
-        "campaign-control",
-        manifest.pool.as_str(),
-    ] {
+    for pool in ["flow", "campaign-agent", "campaign-control"] {
         if !config.pools.contains_key(pool) {
             return Err(invalid(format!(
                 "forge-native campaigns require configured pool {pool:?}"
             )));
         }
     }
-    let runner = &config.pools[&manifest.pool];
-    if runner.resource() != ResourceKind::Mutex || runner.capacity != 1 {
-        return Err(invalid(format!(
-            "campaign runner pool {:?} must be a capacity-1 mutex",
-            manifest.pool
-        )));
-    }
+    validate_campaign_runner_pool(&manifest.pool, &config.pools)?;
     let mut required_adapters = vec![
         "shell",
         "spec-build-driver",
@@ -1968,6 +1984,28 @@ fn validate_host(
         warnings.push(warning);
     }
     Ok(warnings)
+}
+
+fn validate_campaign_runner_pool(pool: &str, pools: &BTreeMap<String, PoolConfig>) -> Result<()> {
+    if pool.starts_with(CAMPAIGN_POOL_PREFIX) {
+        if is_campaign_pool_name(pool) {
+            return Ok(());
+        }
+        return Err(invalid(
+            "campaign namespace pool must use campaign/OWNER/REPO form",
+        ));
+    }
+    let runner = pools.get(pool).ok_or_else(|| {
+        invalid(format!(
+            "forge-native campaigns require configured pool {pool:?}"
+        ))
+    })?;
+    if runner.resource() != ResourceKind::Mutex || runner.capacity != 1 {
+        return Err(invalid(format!(
+            "campaign runner pool {pool:?} must be a capacity-1 mutex"
+        )));
+    }
+    Ok(())
 }
 
 fn priority(value: &str) -> Priority {
@@ -4902,6 +4940,112 @@ esac"#,
     }
 
     #[test]
+    fn arm_manifest_defaults_to_the_repository_campaign_namespace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut value = manifest_value_for_test(json!([{
+            "id": "foundation",
+            "kind": "implementation",
+            "issue": 43,
+            "dependencies": [],
+            "conflictDomains": []
+        }]));
+        value["repository"]["checkout"] = json!(checkout);
+        value["repository"]["forge"] = json!("local");
+        let body = |manifest: &Value| {
+            format!(
+                "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
+                serde_json::to_string(manifest).unwrap()
+            )
+        };
+
+        let admitted = parse_manifest(&body(&value), "acme/widgets").unwrap();
+        assert_eq!(admitted.pool, "campaign/acme/widgets");
+
+        value["pool"] = json!("legacy-runner");
+        let explicit = parse_manifest(&body(&value), "acme/widgets").unwrap();
+        assert_eq!(explicit.pool, "legacy-runner");
+    }
+
+    #[test]
+    fn arm_manifest_validates_campaign_namespace_shape_and_repository() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut value = manifest_value_for_test(json!([{
+            "id": "foundation",
+            "kind": "implementation",
+            "issue": 43,
+            "dependencies": [],
+            "conflictDomains": []
+        }]));
+        value["repository"]["checkout"] = json!(checkout);
+        value["repository"]["forge"] = json!("local");
+        let parse = |value: &Value| {
+            let body = format!(
+                "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
+                serde_json::to_string(value).unwrap()
+            );
+            parse_manifest(&body, "acme/widgets")
+        };
+
+        value["pool"] = json!("campaign/acme/widgets");
+        assert_eq!(parse(&value).unwrap().pool, "campaign/acme/widgets");
+        for invalid in [
+            "campaign/acme",
+            "campaign//widgets",
+            "campaign/acme/widgets/extra",
+        ] {
+            value["pool"] = json!(invalid);
+            let error = parse(&value).unwrap_err().to_string();
+            assert!(error.contains("campaign/OWNER/REPO"), "{error}");
+        }
+        value["pool"] = json!("campaign/acme/other");
+        let error = parse(&value).unwrap_err().to_string();
+        assert!(error.contains("must match issue repository"), "{error}");
+    }
+
+    #[test]
+    fn namespace_runner_bypasses_config_while_explicit_runner_keeps_mutex_validation() {
+        let mut pools = BTreeMap::new();
+        validate_campaign_runner_pool("campaign/acme/widgets", &pools).unwrap();
+        let missing = validate_campaign_runner_pool("legacy-runner", &pools)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("require configured pool"), "{missing}");
+
+        pools.insert(
+            "legacy-runner".to_owned(),
+            PoolConfig {
+                resource: Some(ResourceKind::Mutex),
+                capacity: 1,
+                ..PoolConfig::default()
+            },
+        );
+        validate_campaign_runner_pool("legacy-runner", &pools).unwrap();
+        pools.get_mut("legacy-runner").unwrap().capacity = 2;
+        let invalid = validate_campaign_runner_pool("legacy-runner", &pools)
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("capacity-1 mutex"), "{invalid}");
+    }
+
+    #[test]
     fn managed_sections_preserve_operator_prose() {
         let body = "Operator context.\n\n<!-- tally:campaign:v1 -->\nold\n<!-- tally:campaign:v1:end -->\n\nTail.\n";
         let updated =
@@ -5579,6 +5723,7 @@ esac"#,
                 "schemaVersion": 1,
                 "name": "parity",
                 "repository": {"checkout": spelling, "forge": "local"},
+                "pool": "campaign",
                 "agent": {},
                 "steward": {"adapter": "narrator", "argv": ["narrate"]},
                 "gates": [{"kind": "forbidPaths", "id": "gate-forbid", "forbidPaths": ["*.db"]}],
@@ -5588,7 +5733,8 @@ esac"#,
                 "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
                 serde_json::to_string(&raw_manifest).unwrap()
             );
-            let manifest = parse_manifest(&body).expect("arm admission must succeed");
+            let manifest =
+                parse_manifest(&body, "acme/widgets").expect("arm admission must succeed");
             assert_eq!(manifest.repository.checkout, canonical_checkout);
             let steward = manifest.steward.as_ref().unwrap();
             assert!(steward.env.is_empty());
