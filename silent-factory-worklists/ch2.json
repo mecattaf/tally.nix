@@ -126,7 +126,10 @@
       "conflictDomains": [
         "drivers",
         "crates/tally",
-        "crates/tally/src/cli"
+        "crates/tally/src/cli",
+        "test/spec_build_driver_test.py",
+        "examples/flows/spec-build.js",
+        "crates/tally-flow/tests"
       ]
     },
     {
@@ -168,7 +171,9 @@
       ],
       "conflictDomains": [
         "drivers",
-        "test/spec_build_driver_test.py"
+        "test/spec_build_driver_test.py",
+        "examples/flows/spec-build.js",
+        "crates/tally-flow/tests"
       ]
     },
     {
@@ -199,7 +204,9 @@
       "dependencies": [],
       "conflictDomains": [
         "drivers",
-        "test/spec_build_driver_test.py"
+        "test/spec_build_driver_test.py",
+        "examples/flows/spec-build.js",
+        "crates/tally-flow/tests"
       ]
     },
     {
@@ -418,7 +425,9 @@
       "conflictDomains": [
         "drivers",
         "test",
-        "flake.nix"
+        "flake.nix",
+        "examples/flows/spec-build.js",
+        "crates/tally-flow/tests"
       ]
     },
     {
