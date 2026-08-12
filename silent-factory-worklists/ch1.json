@@ -122,7 +122,9 @@
       "dependencies": [],
       "conflictDomains": [
         "drivers",
-        "test/spec_build_driver_test.py"
+        "test/spec_build_driver_test.py",
+        "examples/flows/spec-build.js",
+        "crates/tally-flow"
       ]
     },
     {
