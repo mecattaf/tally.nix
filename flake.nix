@@ -84,6 +84,7 @@
             ./doc/src/flows/submission-and-replay.md
             ./doc/src/reference/errors.md
             ./doc/src/reference/rpc-protocol.md
+            ./silent-factory-worklists
             ./examples/flows/academic-ocr.js
             ./examples/flows/agency-nightly.js
             ./examples/flows/domain-failure.js
