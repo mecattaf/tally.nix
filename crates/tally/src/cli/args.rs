@@ -186,29 +186,33 @@ pub(super) struct MigrateCaptureLabelsArgs {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum CampaignCommand {
-    /// Register a forge-native campaign issue and admit its current reconcile pass.
+    /// Register a repository/worklist campaign and admit its current reconcile pass.
     Arm(CampaignArmArgs),
     /// Pardon an escalated campaign's counters, record why, and re-arm it.
     Resume(CampaignResumeArgs),
     /// Project a worklist into one master issue and native task sub-issues.
     Project(CampaignProjectArgs),
-    /// Reconcile changed armed issue graphs into fresh bounded flow passes.
+    /// Reconcile changed armed campaigns into fresh bounded flow passes.
     Poll(CampaignPollArgs),
     /// Show the current or latest durable pass for one campaign, plus usage
     /// across every pass in its lineage.
     Status(CampaignStatusArgs),
-    /// Print local campaign locators, admitted digests, and authority bindings.
+    /// Print local campaign identities, admitted digests, and authority bindings.
     List(CampaignListArgs),
     /// Exit successfully only when the local campaign registry is empty.
     Quiescent(CampaignQuiescentArgs),
-    /// Remove a local campaign registration without changing its forge issues.
+    /// Remove a local campaign registration without changing any forge projection.
     Disarm(CampaignDisarmArgs),
 }
 
 #[derive(Debug, Args)]
 pub(super) struct CampaignResumeArgs {
-    /// Canonical GitHub master issue URL of an existing armed campaign.
-    pub(super) issue: String,
+    /// Code repository coordinate of an existing armed campaign.
+    #[arg(value_name = "OWNER/REPO")]
+    pub(super) code_repository: String,
+    /// Committed worklist pattern identifying the campaign.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist_pattern: String,
     /// Audit reason recorded on the campaign before its counters are pardoned.
     #[arg(long, value_name = "TEXT")]
     pub(super) reason: String,
@@ -222,8 +226,12 @@ pub(super) struct CampaignResumeArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct CampaignArmArgs {
-    /// GitHub master issue URL containing the campaign manifest.
-    pub(super) issue: String,
+    /// Code repository coordinate of the campaign.
+    #[arg(value_name = "OWNER/REPO")]
+    pub(super) code_repository: String,
+    /// Relative committed worklist pattern identifying the campaign.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist_pattern: String,
     /// Register and validate without admitting a reconcile runner.
     #[arg(long, conflicts_with = "wait")]
     pub(super) no_enqueue: bool,
@@ -269,6 +277,9 @@ pub(super) struct CampaignProjectArgs {
     /// GitHub repository receiving the issue graph.
     #[arg(long, value_name = "OWNER/REPO")]
     pub(super) repo: String,
+    /// Durable projection root used by a later identity-based arm.
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
     /// Existing master issue URL to maintain instead of creating one.
     #[arg(long, value_name = "URL")]
     pub(super) issue: Option<String>,
@@ -300,8 +311,12 @@ pub(super) struct CampaignPollArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct CampaignStatusArgs {
-    /// Canonical GitHub master issue URL of the campaign.
-    pub(super) issue: String,
+    /// Code repository coordinate of the campaign.
+    #[arg(value_name = "OWNER/REPO")]
+    pub(super) code_repository: String,
+    /// Committed worklist pattern identifying the campaign.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist_pattern: String,
     /// Emit the complete machine-readable status object.
     #[arg(long)]
     pub(super) json: bool,
@@ -326,8 +341,12 @@ pub(super) struct CampaignQuiescentArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct CampaignDisarmArgs {
-    /// Canonical GitHub master issue URL to remove from the local registry.
-    pub(super) issue: String,
+    /// Code repository coordinate of the campaign to remove.
+    #[arg(value_name = "OWNER/REPO")]
+    pub(super) code_repository: String,
+    /// Committed worklist pattern identifying the campaign.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist_pattern: String,
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }

@@ -17,7 +17,7 @@ use tally_core::campaign_contract::{
 };
 use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
-    CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
+    CampaignRegistration, CampaignRegistrationV3, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 use tally_core::config::{PoolConfig, ResourceKind};
 use tally_core::lease::{is_campaign_pool_name, CAMPAIGN_POOL_PREFIX};
@@ -32,6 +32,8 @@ const CAMPAIGN_COMPLETE_COMMENT_PREFIX: &str = "<!-- tally:campaign-complete:";
 const CAMPAIGN_SUMMARY_COMMENT_PREFIX: &str = "<!-- tally:campaign-summary:";
 const APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_APPROVED_GRAPH_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
+const CAMPAIGN_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const MAX_CAMPAIGN_PROJECTION_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct ProjectTask {
@@ -90,6 +92,43 @@ struct IssueLocator {
     url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CampaignProjectionV1 {
+    schema_version: u32,
+    code_repository: String,
+    worklist_pattern: String,
+    source_revision: String,
+    worklist_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issue: Option<ProjectedIssueV1>,
+    #[serde(default)]
+    sub_issue_walk: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProjectedIssueV1 {
+    repository: String,
+    number: u64,
+    url: String,
+}
+
+impl CampaignProjectionV1 {
+    fn locator(&self) -> Result<IssueLocator> {
+        let issue = self.issue.as_ref().ok_or_else(|| {
+            invalid("campaign has no forge issue projection; use the local worklist arm path")
+        })?;
+        let locator = parse_issue_url(&issue.url)?;
+        if locator.repository != issue.repository || locator.number != issue.number {
+            return Err(invalid(
+                "campaign projection has inconsistent issue coordinates",
+            ));
+        }
+        Ok(locator)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CampaignGraph {
     locator: IssueLocator,
@@ -100,9 +139,9 @@ struct CampaignGraph {
 
 /// The prior executable graph needed to interpret a later amendment.
 ///
-/// Authority schema 2 stays frozen. This snapshot is generation-scoped beside
-/// it, so publishing arm N+1 cannot make an arm-N reader decode a new field or
-/// observe a graph that disagrees with its authority digest.
+/// This projection snapshot is generation-scoped beside authority, so
+/// publishing arm N+1 cannot make an arm-N reader observe a graph that
+/// disagrees with its authority digest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ApprovedGraphSnapshotV1 {
@@ -152,10 +191,6 @@ enum CampaignPollAttempt {
     Dispatched,
     Complete,
     Unchanged,
-    Stabilizing {
-        approved_graph_digest: String,
-        live_graph_digest: String,
-    },
     RearmRequired {
         approved_graph_digest: String,
         live_graph_digest: String,
@@ -226,6 +261,30 @@ fn parse_repository(value: &str) -> Result<String> {
         return Err(invalid("--repo must use safe OWNER/REPO form"));
     }
     Ok(value.to_owned())
+}
+
+fn parse_worklist_pattern(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.len() > 1_024
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains('\0')
+        || value
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(invalid(
+            "campaign worklist must be a relative pattern without empty, '.' or '..' components",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn campaign_identity(code_repository: &str, worklist_pattern: &str) -> Result<(String, String)> {
+    Ok((
+        parse_repository(code_repository)?,
+        parse_worklist_pattern(worklist_pattern)?,
+    ))
 }
 
 fn safe_repo_part(value: &str) -> bool {
@@ -348,6 +407,11 @@ fn authenticated_actor() -> Result<String> {
     Ok(actor.login.to_ascii_lowercase())
 }
 
+fn local_actor() -> String {
+    // SAFETY: `geteuid` has no preconditions and does not mutate process state.
+    format!("uid:{}", unsafe { libc::geteuid() })
+}
+
 fn normalize_allowed_actors(values: &[String], authenticated: &str) -> Result<Vec<String>> {
     let mut actors = if values.is_empty() {
         BTreeSet::from([authenticated.to_owned()])
@@ -368,13 +432,14 @@ fn normalize_allowed_actors(values: &[String], authenticated: &str) -> Result<Ve
     Ok(actors.into_iter().collect())
 }
 
-fn require_authenticated_actor(registration: &CampaignRegistration) -> Result<()> {
-    let actor = authenticated_actor()?;
-    if actor != registration.authenticated_actor {
+fn require_local_actor(registration: &CampaignRegistration) -> Result<()> {
+    let actor = local_actor();
+    if actor != registration.local_actor {
         bail!(
-            "armed campaign {} was approved by gh actor {:?}, but the current gh actor is {:?}; re-arm explicitly with the intended identity",
-            registration.issue_url,
-            registration.authenticated_actor,
+            "armed campaign {}/{} was approved by local actor {:?}, but the current local actor is {:?}; run the verb as the arming operator",
+            registration.code_repository,
+            registration.worklist_pattern,
+            registration.local_actor,
             actor
         );
     }
@@ -1409,6 +1474,7 @@ fn repository_progress_value(graph: &CampaignGraph) -> Result<Value> {
 /// `ls-remote` covers driver progress that moves only Git. If both are stable,
 /// the full observation is stable and the poll can skip the walk; if either
 /// moves, the full revision and enqueue identity include the same change.
+#[cfg(test)]
 fn forge_observation(
     graph: &CampaignGraph,
     repository_progress: &Value,
@@ -1429,6 +1495,7 @@ fn forge_observation(
 /// is stable. This absorbs the one-read intermediate views GitHub can expose
 /// while Tally is applying its own sequence of issue mutations, without ever
 /// dispatching unapproved content.
+#[cfg(test)]
 fn graph_mismatch_observation(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
     sha256_json(&json!({
         "kind": "campaign-graph-mismatch-v1",
@@ -1471,15 +1538,189 @@ fn resolve_state_dir(value: Option<PathBuf>) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn approved_graph_directory(state_dir: &Path, issue_url: &str) -> PathBuf {
-    let scope = format!("{:x}", Sha256::digest(issue_url.as_bytes()));
+fn campaign_projection_path(
+    state_dir: &Path,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(code_repository.as_bytes());
+    hasher.update([0]);
+    hasher.update(worklist_pattern.as_bytes());
+    state_dir
+        .join("campaigns/projections")
+        .join(format!("{:x}.projection-v1.json", hasher.finalize()))
+}
+
+fn read_campaign_projection(
+    state_dir: &Path,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> Result<CampaignProjectionV1> {
+    let path = campaign_projection_path(state_dir, code_repository, worklist_pattern);
+    let metadata = fs::metadata(&path).with_context(|| {
+        format!(
+            "campaign {code_repository}/{worklist_pattern} has no local forge projection at {}; run `tally campaign project` first when this campaign still uses a forge projection",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_CAMPAIGN_PROJECTION_BYTES {
+        bail!(
+            "campaign projection {} is not a bounded regular file",
+            path.display()
+        );
+    }
+    let projection: CampaignProjectionV1 = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("campaign projection {} is invalid", path.display()))?;
+    if projection.schema_version != CAMPAIGN_PROJECTION_SCHEMA_VERSION
+        || projection.code_repository != code_repository
+        || projection.worklist_pattern != worklist_pattern
+        || !projection
+            .worklist_sha256
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        || !matches!(projection.source_revision.len(), 40 | 64)
+        || !projection
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!(
+            "campaign projection {} violates projection-v1 invariants",
+            path.display()
+        );
+    }
+    if projection.issue.is_some() {
+        projection.locator()?;
+    }
+    Ok(projection)
+}
+
+fn write_campaign_projection(state_dir: &Path, projection: &CampaignProjectionV1) -> Result<()> {
+    let path = campaign_projection_path(
+        state_dir,
+        &projection.code_repository,
+        &projection.worklist_pattern,
+    );
+    let directory = path
+        .parent()
+        .expect("campaign projection path always has a parent");
+    fs::create_dir_all(directory)?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::now_v7()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    serde_json::to_writer(&mut file, projection)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn committed_worklist_coordinate(
+    worklist: &Path,
+    manifest: &CampaignManifest,
+) -> Result<(String, String, String)> {
+    if worklist == Path::new("-") {
+        return Err(invalid(
+            "campaign project requires a committed worklist file; stdin has no repository identity",
+        ));
+    }
+    let checkout = fs::canonicalize(&manifest.repository.checkout).with_context(|| {
+        format!(
+            "cannot resolve campaign checkout {}",
+            manifest.repository.checkout.display()
+        )
+    })?;
+    let worklist = fs::canonicalize(worklist)
+        .with_context(|| format!("cannot resolve campaign worklist {}", worklist.display()))?;
+    let relative = worklist.strip_prefix(&checkout).map_err(|_| {
+        invalid(format!(
+            "campaign worklist {} is outside code checkout {}",
+            worklist.display(),
+            checkout.display()
+        ))
+    })?;
+    let pattern = relative
+        .to_str()
+        .ok_or_else(|| invalid("campaign worklist path is not valid UTF-8"))?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let pattern = parse_worklist_pattern(&pattern)?;
+
+    let git = |arguments: &[&str], context: &str| -> Result<std::process::Output> {
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(arguments)
+            .output()
+            .with_context(|| format!("cannot execute git while {context}"))
+    };
+    let fetched = git(
+        &["fetch", "--prune", "--no-tags", &manifest.repository.remote],
+        "fetching the worklist authority revision",
+    )?;
+    if !fetched.status.success() {
+        bail!(
+            "cannot fetch campaign worklist authority revision: {}",
+            String::from_utf8_lossy(&fetched.stderr).trim()
+        );
+    }
+    let base_ref = format!(
+        "{}/{}^{{commit}}",
+        manifest.repository.remote, manifest.repository.base_branch
+    );
+    let resolved = git(
+        &["rev-parse", "--verify", &base_ref],
+        "resolving the worklist authority revision",
+    )?;
+    if !resolved.status.success() {
+        bail!(
+            "cannot resolve campaign worklist authority revision {base_ref}: {}",
+            String::from_utf8_lossy(&resolved.stderr).trim()
+        );
+    }
+    let revision = String::from_utf8(resolved.stdout)?
+        .trim()
+        .to_ascii_lowercase();
+    let object = format!("{revision}:{pattern}");
+    let committed = git(
+        &["show", &object],
+        "reading the committed campaign worklist",
+    )?;
+    if !committed.status.success() {
+        bail!(
+            "campaign worklist pattern {pattern:?} is not a regular file at fetched base revision {revision}"
+        );
+    }
+    let local = fs::read(&worklist)?;
+    if committed.stdout != local {
+        bail!(
+            "campaign worklist {} differs from {pattern:?} at fetched base revision {revision}; commit and push it before projecting",
+            worklist.display()
+        );
+    }
+    let digest = format!("sha256:{:x}", Sha256::digest(&committed.stdout));
+    Ok((pattern, revision, digest))
+}
+
+fn approved_graph_directory(state_dir: &Path, registration_id: &str) -> PathBuf {
+    let scope = format!("{:x}", Sha256::digest(registration_id.as_bytes()));
     state_dir
         .join("campaigns/approved-graphs")
         .join(&scope[..32])
 }
 
 fn approved_graph_path(state_dir: &Path, registration: &CampaignRegistration) -> PathBuf {
-    approved_graph_directory(state_dir, &registration.issue_url)
+    approved_graph_directory(state_dir, &registration.registration_id)
         .join(format!("{}.graph-v1.json", registration.arm_serial))
 }
 
@@ -1548,7 +1789,7 @@ fn write_approved_graph_snapshot(
     if graph.executable_digest != registration.approved_graph_digest {
         bail!("cannot snapshot a campaign graph that disagrees with arm authority");
     }
-    let directory = approved_graph_directory(state_dir, &registration.issue_url);
+    let directory = approved_graph_directory(state_dir, &registration.registration_id);
     fs::create_dir_all(&directory).with_context(|| {
         format!(
             "cannot create campaign approved-graph directory {}",
@@ -1601,7 +1842,7 @@ fn prune_approved_graph_snapshots(
     state_dir: &Path,
     registration: &CampaignRegistration,
 ) -> Result<()> {
-    let directory = approved_graph_directory(state_dir, &registration.issue_url);
+    let directory = approved_graph_directory(state_dir, &registration.registration_id);
     let expected = approved_graph_path(state_dir, registration);
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -1622,8 +1863,8 @@ fn prune_approved_graph_snapshots(
     Ok(())
 }
 
-fn remove_approved_graph_snapshots(state_dir: &Path, issue_url: &str) -> Result<()> {
-    let directory = approved_graph_directory(state_dir, issue_url);
+fn remove_approved_graph_snapshots(state_dir: &Path, registration_id: &str) -> Result<()> {
+    let directory = approved_graph_directory(state_dir, registration_id);
     match fs::remove_dir_all(&directory) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2297,6 +2538,7 @@ async fn dispatch_campaign(
     steering: &CampaignSteering,
     repository_progress: &Value,
     registration: &mut CampaignRegistration,
+    sub_issue_walk: bool,
     wait: bool,
 ) -> Result<Value> {
     let CampaignHost {
@@ -2308,10 +2550,11 @@ async fn dispatch_campaign(
     let manifest = &graph.canonical.manifest;
     if graph.canonical.executable_digest != registration.approved_graph_digest {
         bail!(
-            "campaign executable graph changed from admitted {} to {}; inspect the issue graph and run `tally campaign arm {}` to approve it",
+            "campaign executable graph changed from admitted {} to {}; inspect the projection and run `tally campaign arm {} {}` to approve it",
             registration.approved_graph_digest,
             graph.canonical.executable_digest,
-            registration.issue_url
+            registration.code_repository,
+            registration.worklist_pattern,
         );
     }
     let _ = validate_host(
@@ -2319,7 +2562,7 @@ async fn dispatch_campaign(
         config_path,
         &registration.flow,
         &registration.driver,
-        registration.allow_test_local_forge,
+        true,
     )?;
     let revision = campaign_observation(
         graph,
@@ -2356,7 +2599,7 @@ async fn dispatch_campaign(
         // comments would silently exclude an allowed actor who had not yet
         // commented -- precisely the late-arrival case this field serves.
         "allowedActors": &registration.allowed_actors,
-        "capabilities": {"subIssueWalk": registration.sub_issue_walk},
+        "capabilities": {"subIssueWalk": sub_issue_walk},
         "workspaceRoot": &registration.workspace_root,
         // Checkpoint snapshots join the executor's existing archive so the
         // ordinary captureArchiveHorizon sweep owns their lifecycle.
@@ -2411,7 +2654,7 @@ async fn dispatch_campaign(
             "issue": &graph.locator.url,
             "registrationId": &registration.registration_id,
             "revision": &revision,
-            "approvedBy": &registration.authenticated_actor,
+            "approvedBy": &registration.local_actor,
             "allowedActors": &registration.allowed_actors,
             "graphDigest": &registration.approved_graph_digest,
         })),
@@ -2453,25 +2696,33 @@ async fn run_campaign_arm(
     rpc_timeout: Duration,
     args: CampaignArmArgs,
 ) -> Result<()> {
-    let locator = parse_issue_url(&args.issue)?;
+    let (code_repository, worklist_pattern) =
+        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
-    let authenticated_actor = authenticated_actor()?;
-    let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &authenticated_actor)?;
+    let prior = registry.read_campaign(&code_repository, &worklist_pattern)?;
+    if let Some(registration) = &prior {
+        require_local_actor(registration)?;
+    }
+    let mut projection = read_campaign_projection(&state_dir, &code_repository, &worklist_pattern)?;
+    let locator = projection.locator()?;
+    let local_actor = local_actor();
+    let forge_actor = authenticated_actor()?;
+    let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &forge_actor)?;
     let graph = fetch_campaign_graph(&locator)?;
     require_allowed_issue_authors(&graph, &allowed_actors)?;
     // Probe once, at arm, and record the answer. A pass never has to discover
     // mid-flight that half its projection is unavailable.
     let sub_issue_walk = probe_sub_issue_walk(&locator)?;
+    projection.sub_issue_walk = Some(sub_issue_walk);
     let steering = fetch_campaign_steering(&graph, &allowed_actors, sub_issue_walk)?;
-    let prior = registry.read_issue(&locator.url)?;
     let prior_graph = prior
         .as_ref()
         .map(|registration| read_approved_graph_snapshot(&state_dir, registration))
         .transpose()?
         .flatten();
     let escalated = if prior.is_some() && graph.canonical.manifest.repository.forge == "github" {
-        active_escalated_tasks(&graph, &authenticated_actor, sub_issue_walk)?
+        active_escalated_tasks(&graph, &forge_actor, sub_issue_walk)?
     } else {
         BTreeSet::new()
     };
@@ -2493,28 +2744,22 @@ async fn run_campaign_arm(
             .ok_or_else(|| invalid("campaign arm retry counter is exhausted"))
     })?;
     let mut registration = CampaignRegistration::new(
-        CampaignRegistrationV2 {
+        CampaignRegistrationV3 {
             schema_version: REGISTRY_SCHEMA_VERSION,
             registration_id: prior.as_ref().map_or_else(
                 || uuid::Uuid::now_v7().to_string(),
                 |value| value.registration_id.clone(),
             ),
-            issue_url: locator.url.clone(),
-            repository: locator.repository.clone(),
-            issue_number: locator.number,
+            worklist_pattern: worklist_pattern.clone(),
+            code_repository: code_repository.clone(),
             armed_at: Utc::now().to_rfc3339(),
             arm_serial,
             approved_graph_digest: graph.canonical.executable_digest.clone(),
-            authenticated_actor,
+            local_actor,
             allowed_actors,
-            allow_test_local_forge: args.allow_test_local_forge,
-            sub_issue_walk,
             last_observation: prior
                 .as_ref()
                 .and_then(|value| value.last_observation.clone()),
-            // Arming always dispatches, so the cheap precondition starts empty
-            // and the first poll after an arm re-establishes it.
-            last_forge_observation: None,
             flow,
             driver,
             workspace_root,
@@ -2526,17 +2771,18 @@ async fn run_campaign_arm(
         config_path,
         &registration.flow,
         &registration.driver,
-        registration.allow_test_local_forge,
+        args.allow_test_local_forge,
     )?);
     let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
     for pardon in &pardon_plan {
-        let receipt = post_campaign_auto_pardon(&graph, &registration.authenticated_actor, pardon)?;
+        let receipt = post_campaign_auto_pardon(&graph, &forge_actor, pardon)?;
         auto_pardons.push(AutoPardonReceipt {
             task_id: pardon.task_id.clone(),
             added_dependencies: pardon.added_dependencies.clone(),
             resume_receipt: receipt,
         });
     }
+    write_campaign_projection(&state_dir, &projection)?;
     write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
     prune_approved_graph_snapshots(&state_dir, &registration)?;
@@ -2544,6 +2790,8 @@ async fn run_campaign_arm(
         let receipt = json!({
             "status": "armed",
             "issue": locator.url,
+            "codeRepository": code_repository,
+            "worklistPattern": worklist_pattern,
             "tasks": graph.tasks.len(),
             "graphDigest": graph.canonical.executable_digest,
             "allowedActors": registration.allowed_actors,
@@ -2553,7 +2801,7 @@ async fn run_campaign_arm(
             "{}",
             serde_json::to_string(&arm_receipt(
                 &receipt,
-                registration.sub_issue_walk,
+                sub_issue_walk,
                 &auto_pardons,
                 &arm_warnings,
             ))?
@@ -2572,6 +2820,7 @@ async fn run_campaign_arm(
         &steering,
         &repository_progress,
         &mut registration,
+        sub_issue_walk,
         args.wait,
     )
     .await?;
@@ -2580,7 +2829,7 @@ async fn run_campaign_arm(
         "{}",
         serde_json::to_string(&arm_receipt(
             &result,
-            registration.sub_issue_walk,
+            sub_issue_walk,
             &auto_pardons,
             &arm_warnings,
         ))?
@@ -2707,16 +2956,21 @@ async fn run_campaign_resume(
     rpc_timeout: Duration,
     args: CampaignResumeArgs,
 ) -> Result<()> {
-    let locator = parse_issue_url(&args.issue)?;
+    let (code_repository, worklist_pattern) =
+        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
-    let mut registration = registry.read_issue(&locator.url)?.ok_or_else(|| {
+    let mut projection = read_campaign_projection(&state_dir, &code_repository, &worklist_pattern)?;
+    let locator = projection.locator()?;
+    let mut registration = registry
+        .read_campaign(&code_repository, &worklist_pattern)?
+        .ok_or_else(|| {
         invalid(format!(
-            "campaign {} is not armed; arm it before attempting resume",
-            locator.url
+            "campaign {code_repository}/{worklist_pattern} is not armed; arm it before attempting resume"
         ))
     })?;
-    require_authenticated_actor(&registration)?;
+    require_local_actor(&registration)?;
+    let forge_actor = authenticated_actor()?;
     let graph = fetch_campaign_graph(&locator)?;
     require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
     if graph.canonical.manifest.repository.forge != "github" {
@@ -2725,12 +2979,13 @@ async fn run_campaign_resume(
         ));
     }
     let sub_issue_walk = probe_sub_issue_walk(&locator)?;
+    projection.sub_issue_walk = Some(sub_issue_walk);
     let _ = validate_host(
         &graph,
         config_path,
         &registration.flow,
         &registration.driver,
-        registration.allow_test_local_forge,
+        true,
     )?;
 
     let next_arm_serial = registration
@@ -2738,24 +2993,19 @@ async fn run_campaign_resume(
         .checked_add(1)
         .ok_or_else(|| invalid("campaign resume counter is exhausted"))?;
     let prior_digest = registration.approved_graph_digest.clone();
-    let receipt = post_campaign_resume(&graph, &registration.authenticated_actor, &args.reason)?;
+    let receipt = post_campaign_resume(&graph, &forge_actor, &args.reason)?;
     registration.arm_serial = next_arm_serial;
     registration.armed_at = Utc::now().to_rfc3339();
     registration.approved_graph_digest = graph.canonical.executable_digest.clone();
-    registration.sub_issue_walk = sub_issue_walk;
-    registration.last_forge_observation = None;
     // Publish the new authority before dispatch. Once this write succeeds, the
     // timer can recover an interrupted dispatch without comment deletion or
     // another manual state edit.
+    write_campaign_projection(&state_dir, &projection)?;
     write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
     prune_approved_graph_snapshots(&state_dir, &registration)?;
 
-    let steering = fetch_campaign_steering(
-        &graph,
-        &registration.allowed_actors,
-        registration.sub_issue_walk,
-    )?;
+    let steering = fetch_campaign_steering(&graph, &registration.allowed_actors, sub_issue_walk)?;
     let repository_progress = repository_progress_value(&graph)?;
     let result = dispatch_campaign(
         CampaignHost {
@@ -2768,12 +3018,13 @@ async fn run_campaign_resume(
         &steering,
         &repository_progress,
         &mut registration,
+        sub_issue_walk,
         args.wait,
     )
     .await?;
     registry.write(&mut registration)?;
 
-    let mut output = armed_projection(&result, registration.sub_issue_walk);
+    let mut output = armed_projection(&result, sub_issue_walk);
     if let Some(object) = output.as_object_mut() {
         object.insert("status".to_owned(), json!("resumed"));
         object.insert("resumeReceipt".to_owned(), json!(receipt));
@@ -2816,60 +3067,60 @@ async fn run_campaign_poll(
     let entries = registry.registrations()?;
     let mut had_failures = false;
     for (path, mut registration) in entries {
+        let projection = read_campaign_projection(
+            &state_dir,
+            &registration.code_repository,
+            &registration.worklist_pattern,
+        );
+        let event_issue = projection
+            .as_ref()
+            .ok()
+            .and_then(|value| value.locator().ok())
+            .map_or_else(
+                || {
+                    format!(
+                        "local://{}/{}",
+                        registration.code_repository, registration.worklist_pattern
+                    )
+                },
+                |locator| locator.url,
+            );
         let attempt = async {
-            let locator = parse_issue_url(&registration.issue_url)?;
+            require_local_actor(&registration)?;
+            let mut projection = projection?;
+            let locator = projection.locator()?;
+            let sub_issue_walk = match projection.sub_issue_walk {
+                Some(value) => value,
+                None => {
+                    let value = probe_sub_issue_walk(&locator)?;
+                    projection.sub_issue_walk = Some(value);
+                    write_campaign_projection(&state_dir, &projection)?;
+                    value
+                }
+            };
             let master = fetch_issue(&locator)?;
             match master.state.as_str() {
                 "closed" => {
                     // Canonical locator validation happened in `fetch_issue`.
                     // Completion is therefore allowed to clean up before any
-                    // actor, graph, host, or projection checks that only make
-                    // sense for a campaign which can still execute.
                     registry.remove(&registration)?;
-                    remove_approved_graph_snapshots(&state_dir, &registration.issue_url)?;
+                    remove_approved_graph_snapshots(&state_dir, &registration.registration_id)?;
                     return Ok(CampaignPollAttempt::Complete);
                 }
                 "open" => {}
                 state => bail!("campaign master issue returned unknown state {state:?}"),
             }
-            require_authenticated_actor(&registration)?;
             let graph = campaign_graph_from(&locator, master)?;
             require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
             if graph.canonical.executable_digest != registration.approved_graph_digest {
-                let mismatch = graph_mismatch_observation(&graph, registration.arm_serial)?;
-                if registration.last_forge_observation.as_deref() != Some(&mismatch) {
-                    registration.last_forge_observation = Some(mismatch);
-                    registry.write(&mut registration)?;
-                    return Ok(CampaignPollAttempt::Stabilizing {
-                        approved_graph_digest: registration.approved_graph_digest.clone(),
-                        live_graph_digest: graph.canonical.executable_digest.clone(),
-                    });
-                }
-                // Refusing an unapproved graph is the admission mechanism
-                // working, not a poll-process failure. The identical graph
-                // was observed on the previous scan too, so this is a stable
-                // refusal rather than an intermediate view of Tally's own
-                // forge mutations.
                 return Ok(CampaignPollAttempt::RearmRequired {
                     approved_graph_digest: registration.approved_graph_digest.clone(),
                     live_graph_digest: graph.canonical.executable_digest.clone(),
                 });
             }
             let repository_progress = repository_progress_value(&graph)?;
-            // The cheap comparison comes first. Reading the steering surfaces
-            // runs the full bounded GraphQL walk over every sub-issue thread,
-            // and running it before deciding whether anything moved made every
-            // tick of a 60 s timer pay for a traversal that almost always
-            // returned what the previous tick returned.
-            let forge = forge_observation(&graph, &repository_progress, registration.arm_serial)?;
-            if registration.last_forge_observation.as_deref() == Some(&forge) {
-                return Ok(CampaignPollAttempt::Unchanged);
-            }
-            let steering = fetch_campaign_steering(
-                &graph,
-                &registration.allowed_actors,
-                registration.sub_issue_walk,
-            )?;
+            let steering =
+                fetch_campaign_steering(&graph, &registration.allowed_actors, sub_issue_walk)?;
             let observation = campaign_observation(
                 &graph,
                 &steering,
@@ -2877,11 +3128,8 @@ async fn run_campaign_poll(
                 registration.arm_serial,
             )?;
             if registration.last_observation.as_deref() == Some(&observation) {
-                registration.last_forge_observation = Some(forge);
-                registry.write(&mut registration)?;
                 return Ok(CampaignPollAttempt::Unchanged);
             }
-            registration.last_forge_observation = Some(forge);
 
             // The scan above crosses several forge and Git reads. Refresh the
             // public issue graph immediately before enqueue and refuse to act
@@ -2892,7 +3140,7 @@ async fn run_campaign_poll(
             match refreshed_master.state.as_str() {
                 "closed" => {
                     registry.remove(&registration)?;
-                    remove_approved_graph_snapshots(&state_dir, &registration.issue_url)?;
+                    remove_approved_graph_snapshots(&state_dir, &registration.registration_id)?;
                     return Ok(CampaignPollAttempt::Complete);
                 }
                 "open" => {}
@@ -2913,6 +3161,7 @@ async fn run_campaign_poll(
                 &steering,
                 &repository_progress,
                 &mut registration,
+                sub_issue_walk,
                 args.wait,
             )
             .await?;
@@ -2923,8 +3172,8 @@ async fn run_campaign_poll(
                     return Err(anyhow::Error::new(ExitFailure {
                         code,
                         message: format!(
-                            "campaign reconcile pass for {} returned a non-zero verdict",
-                            registration.issue_url
+                            "campaign reconcile pass for {}/{} returned a non-zero verdict",
+                            registration.code_repository, registration.worklist_pattern
                         ),
                     }));
                 }
@@ -2936,38 +3185,27 @@ async fn run_campaign_poll(
         let event = match attempt {
             Ok(CampaignPollAttempt::Dispatched) => CampaignPollEvent::new(
                 &registration.registration_id,
-                &registration.issue_url,
+                &event_issue,
                 &registration_path,
                 CampaignPollStatus::Dispatched,
             ),
             Ok(CampaignPollAttempt::Complete) => CampaignPollEvent::complete(
                 &registration.registration_id,
-                &registration.issue_url,
+                &event_issue,
                 &registration_path,
             ),
             Ok(CampaignPollAttempt::Unchanged) => CampaignPollEvent::new(
                 &registration.registration_id,
-                &registration.issue_url,
+                &event_issue,
                 &registration_path,
                 CampaignPollStatus::Unchanged,
-            ),
-            Ok(CampaignPollAttempt::Stabilizing {
-                approved_graph_digest,
-                live_graph_digest,
-            }) => CampaignPollEvent::graph_change(
-                &registration.registration_id,
-                &registration.issue_url,
-                &registration_path,
-                CampaignPollStatus::Stabilizing,
-                approved_graph_digest,
-                live_graph_digest,
             ),
             Ok(CampaignPollAttempt::RearmRequired {
                 approved_graph_digest,
                 live_graph_digest,
             }) => CampaignPollEvent::graph_change(
                 &registration.registration_id,
-                &registration.issue_url,
+                &event_issue,
                 &registration_path,
                 CampaignPollStatus::RearmRequired,
                 approved_graph_digest,
@@ -2977,7 +3215,7 @@ async fn run_campaign_poll(
                 had_failures = true;
                 CampaignPollEvent::failed(
                     &registration.registration_id,
-                    &registration.issue_url,
+                    &event_issue,
                     &registration_path,
                     format!("{error:#}"),
                 )
@@ -2998,10 +3236,16 @@ async fn run_campaign_status(
     rpc_timeout: Duration,
     args: CampaignStatusArgs,
 ) -> Result<()> {
-    let locator = parse_issue_url(&args.issue)?;
+    let (code_repository, worklist_pattern) =
+        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
-    let registration = registry.read_issue(&locator.url)?;
+    let registration = registry.read_campaign(&code_repository, &worklist_pattern)?;
+    if let Some(registration) = &registration {
+        require_local_actor(registration)?;
+    }
+    let projection = read_campaign_projection(&state_dir, &code_repository, &worklist_pattern)?;
+    let locator = projection.locator()?;
     let params = json!({
         "issueUrl": locator.url,
         "registrationId": registration
@@ -3072,9 +3316,11 @@ fn campaign_list_values(registry: &CampaignRegistry) -> Result<Vec<Value>> {
     registry
         .registrations()?
         .into_iter()
-        .map(|(_, registration)| registration.list_value())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        .map(|(_, registration)| {
+            require_local_actor(&registration)?;
+            Ok(registration.list_value()?)
+        })
+        .collect()
 }
 
 fn run_campaign_quiescent(args: CampaignQuiescentArgs) -> Result<()> {
@@ -3090,16 +3336,26 @@ fn run_campaign_quiescent(args: CampaignQuiescentArgs) -> Result<()> {
 }
 
 fn run_campaign_disarm(args: CampaignDisarmArgs) -> Result<()> {
-    let locator = parse_issue_url(&args.issue)?;
+    let (code_repository, worklist_pattern) =
+        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
-    let removed = registry.remove_issue(&locator.url)?;
-    if removed {
-        remove_approved_graph_snapshots(&state_dir, &locator.url)?;
-    }
+    let registration = registry.read_campaign(&code_repository, &worklist_pattern)?;
+    let removed = if let Some(registration) = registration {
+        require_local_actor(&registration)?;
+        registry.remove(&registration)?;
+        remove_approved_graph_snapshots(&state_dir, &registration.registration_id)?;
+        true
+    } else {
+        false
+    };
     outln!(
         "{}",
-        serde_json::to_string(&json!({"issue": locator.url, "disarmed": removed}))?
+        serde_json::to_string(&json!({
+            "codeRepository": code_repository,
+            "worklistPattern": worklist_pattern,
+            "disarmed": removed,
+        }))?
     );
     Ok(())
 }
@@ -3983,6 +4239,7 @@ fn reconcile_dependencies(repository: &str, tasks: &[ProjectTask]) -> Result<()>
 
 fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
     let repository = parse_repository(&args.repo)?;
+    let state_dir = resolve_state_dir(args.state_dir.clone())?;
     let document = read_json_document(&args.worklist, "campaign worklist")?;
     let separate = args
         .campaign_config
@@ -3997,6 +4254,8 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
         .ok_or_else(|| invalid("campaign configuration name is missing or invalid"))?;
     let mut tasks = project_tasks(&document, name)?;
     let canonical_preview = validate_project_shape(&raw_config, &tasks)?;
+    let (worklist_pattern, source_revision, worklist_sha256) =
+        committed_worklist_coordinate(&args.worklist, &canonical_preview)?;
     let mut config = serde_json::to_value(canonical_preview)?;
     config
         .as_object_mut()
@@ -4235,10 +4494,26 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
         &args.label,
         &master_body,
     )?;
+    let projection = CampaignProjectionV1 {
+        schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
+        code_repository: repository.clone(),
+        worklist_pattern: worklist_pattern.clone(),
+        source_revision,
+        worklist_sha256,
+        issue: Some(ProjectedIssueV1 {
+            repository: locator.repository.clone(),
+            number: locator.number,
+            url: locator.url.clone(),
+        }),
+        sub_issue_walk: None,
+    };
+    write_campaign_projection(&state_dir, &projection)?;
     outln!(
         "{}",
         serde_json::to_string(&json!({
             "issue": locator.url,
+            "codeRepository": repository,
+            "worklistPattern": worklist_pattern,
             "tasks": tasks.iter().map(|task| json!({"id": task.id, "issue": task.issue})).collect::<Vec<_>>(),
             "merged": merged,
         }))?
@@ -4890,25 +5165,45 @@ esac"#,
     }
 
     #[test]
-    fn a_registration_written_before_the_probe_reads_as_degraded() {
-        let registration: CampaignRegistrationV2 = serde_json::from_value(json!({
-            "schemaVersion": REGISTRY_SCHEMA_VERSION,
-            "registrationId": "0198f000-0000-7000-8000-000000000001",
-            "issueUrl": "https://github.com/acme/widgets/issues/42",
-            "repository": "acme/widgets",
-            "issueNumber": 42,
-            "armedAt": "2026-08-01T10:00:00Z",
-            "armSerial": 1,
-            "approvedGraphDigest": format!("sha256:{}", "a".repeat(64)),
-            "authenticatedActor": "operator",
-            "allowedActors": ["operator"],
-            "allowTestLocalForge": false,
-            "flow": "/nix/store/spec-build.js",
-            "driver": "/nix/store/spec_build_driver.py",
-            "workspaceRoot": "/var/lib/tally/campaigns",
+    fn a_projection_written_before_the_probe_has_no_capability_answer() {
+        let projection: CampaignProjectionV1 = serde_json::from_value(json!({
+            "schemaVersion": CAMPAIGN_PROJECTION_SCHEMA_VERSION,
+            "codeRepository": "acme/widgets",
+            "worklistPattern": "specs/night/tasks.json",
+            "sourceRevision": "a".repeat(40),
+            "worklistSha256": format!("sha256:{}", "b".repeat(64)),
+            "issue": {
+                "repository": "acme/widgets",
+                "number": 42,
+                "url": "https://github.com/acme/widgets/issues/42"
+            }
         }))
         .unwrap();
-        assert!(!registration.sub_issue_walk);
+        assert_eq!(projection.sub_issue_walk, None);
+    }
+
+    #[test]
+    fn a_local_projection_need_not_invent_a_forge_issue() {
+        let temporary = tempfile::tempdir().unwrap();
+        let projection = CampaignProjectionV1 {
+            schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
+            code_repository: "acme/widgets".to_owned(),
+            worklist_pattern: "specs/night/tasks.json".to_owned(),
+            source_revision: "a".repeat(40),
+            worklist_sha256: format!("sha256:{}", "b".repeat(64)),
+            issue: None,
+            sub_issue_walk: None,
+        };
+        write_campaign_projection(temporary.path(), &projection).unwrap();
+
+        let loaded = read_campaign_projection(
+            temporary.path(),
+            &projection.code_repository,
+            &projection.worklist_pattern,
+        )
+        .unwrap();
+        assert!(loaded.issue.is_none());
+        assert!(loaded.locator().is_err());
     }
 
     #[test]
@@ -6314,13 +6609,31 @@ esac"#,
         );
         let gh_program = GhProgramGuard::acquire();
         gh_program.use_program(&gh);
+        write_campaign_projection(
+            &state_dir,
+            &CampaignProjectionV1 {
+                schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
+                code_repository: "acme/widgets".to_owned(),
+                worklist_pattern: "specs/night/tasks.json".to_owned(),
+                source_revision: "a".repeat(40),
+                worklist_sha256: format!("sha256:{}", "b".repeat(64)),
+                issue: Some(ProjectedIssueV1 {
+                    repository: "acme/widgets".to_owned(),
+                    number: 42,
+                    url: "https://github.com/acme/widgets/issues/42".to_owned(),
+                }),
+                sub_issue_walk: None,
+            },
+        )
+        .unwrap();
 
         let error = run_campaign_arm(
             &temporary.path().join("missing-tally.sock"),
             None,
             Duration::from_secs(1),
             CampaignArmArgs {
-                issue: "https://github.com/acme/widgets/issues/42".to_owned(),
+                code_repository: "acme/widgets".to_owned(),
+                worklist_pattern: "specs/night/tasks.json".to_owned(),
                 no_enqueue: false,
                 wait: false,
                 allowed_actors: Vec::new(),
@@ -6471,31 +6784,27 @@ print(json.dumps({
     }
 
     #[test]
-    fn registration_v2_round_trips_local_authority() {
+    fn registration_v3_round_trips_local_authority() {
         let root = tempfile::tempdir().unwrap();
         let state_dir = root.path();
-        let authenticated = "operator".to_owned();
+        let forge_actor = "operator".to_owned();
         let flow = root.path().join("flow.js");
         let driver = root.path().join("driver");
         fs::write(&flow, "flow fixture\n").unwrap();
         fs::write(&driver, "driver fixture\n").unwrap();
         let mut registration = CampaignRegistration::new(
-            CampaignRegistrationV2 {
+            CampaignRegistrationV3 {
                 schema_version: REGISTRY_SCHEMA_VERSION,
                 registration_id: uuid::Uuid::now_v7().to_string(),
-                issue_url: "https://github.com/acme/widgets/issues/42".to_owned(),
-                repository: "acme/widgets".to_owned(),
-                issue_number: 42,
+                worklist_pattern: "specs/night/tasks.json".to_owned(),
+                code_repository: "acme/widgets".to_owned(),
                 armed_at: "2026-08-01T00:00:00Z".to_owned(),
                 arm_serial: 1,
                 approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
-                authenticated_actor: authenticated.clone(),
-                allowed_actors: normalize_allowed_actors(&["Reviewer".into()], &authenticated)
+                local_actor: local_actor(),
+                allowed_actors: normalize_allowed_actors(&["Reviewer".into()], &forge_actor)
                     .unwrap(),
-                allow_test_local_forge: false,
-                sub_issue_walk: true,
                 last_observation: None,
-                last_forge_observation: None,
                 flow,
                 driver,
                 workspace_root: PathBuf::from("/srv/tally-campaigns"),
@@ -6505,7 +6814,10 @@ print(json.dumps({
         let registry = CampaignRegistry::open(state_dir).unwrap();
         registry.write(&mut registration).unwrap();
         let loaded = registry
-            .read_issue(&registration.issue_url)
+            .read_campaign(
+                &registration.code_repository,
+                &registration.worklist_pattern,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(loaded.registration_id, registration.registration_id);
@@ -6526,21 +6838,17 @@ print(json.dumps({
         let prior = canonical_graph_for_pardon(&[]);
         let amended = canonical_graph_for_pardon(&["prerequisite"]);
         let mut registration = CampaignRegistration::new(
-            CampaignRegistrationV2 {
+            CampaignRegistrationV3 {
                 schema_version: REGISTRY_SCHEMA_VERSION,
                 registration_id: uuid::Uuid::now_v7().to_string(),
-                issue_url: "https://github.com/acme/widgets/issues/42".to_owned(),
-                repository: "acme/widgets".to_owned(),
-                issue_number: 42,
+                worklist_pattern: "specs/night/tasks.json".to_owned(),
+                code_repository: "acme/widgets".to_owned(),
                 armed_at: "2026-08-01T00:00:00Z".to_owned(),
                 arm_serial: 1,
                 approved_graph_digest: prior.executable_digest.clone(),
-                authenticated_actor: "operator".to_owned(),
+                local_actor: local_actor(),
                 allowed_actors: vec!["operator".to_owned()],
-                allow_test_local_forge: false,
-                sub_issue_walk: true,
                 last_observation: None,
-                last_forge_observation: None,
                 flow: PathBuf::from("/nix/store/flow.js"),
                 driver: PathBuf::from("/nix/store/driver"),
                 workspace_root: PathBuf::from("/srv/tally-campaigns"),
@@ -6689,24 +6997,22 @@ print(json.dumps({
     fn a_registration_without_a_projection_wait_still_loads() {
         let root = tempfile::tempdir().unwrap();
         let state_dir = root.path();
-        let url = "https://github.com/acme/widgets/issues/42";
+        let code_repository = "acme/widgets";
+        let worklist_pattern = "specs/night/tasks.json";
         let registry = CampaignRegistry::open(state_dir).unwrap();
-        let path = registry.registration_path(url);
+        let path = registry.registration_path(code_repository, worklist_pattern);
         fs::write(
             &path,
             serde_json::to_string(&json!({
                 "schemaVersion": REGISTRY_SCHEMA_VERSION,
                 "registrationId": uuid::Uuid::now_v7().to_string(),
-                "issueUrl": url,
-                "repository": "acme/widgets",
-                "issueNumber": 42,
+                "worklistPattern": worklist_pattern,
+                "codeRepository": code_repository,
                 "armedAt": "2026-08-01T00:00:00Z",
                 "armSerial": 1,
                 "approvedGraphDigest": format!("sha256:{}", "a".repeat(64)),
-                "authenticatedActor": "operator",
+                "localActor": local_actor(),
                 "allowedActors": ["operator"],
-                "allowTestLocalForge": false,
-                "subIssueWalk": true,
                 "flow": "/nix/store/flow.js",
                 "driver": "/nix/store/driver",
                 "workspaceRoot": "/srv/tally-campaigns",
