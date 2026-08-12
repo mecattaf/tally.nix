@@ -1759,14 +1759,14 @@ mod tests {
     }
 
     #[test]
-    fn durable_rebuild_remints_campaign_mutex_before_held_and_queued_replay() {
+    fn namespace_mutex_restart_recovery_preserves_held_and_queued_order() {
         let temp = tempfile::tempdir().unwrap();
         let log = LeaseEventLog::in_state_dir(temp.path());
         let campaign_pool = "campaign/acme/widgets";
         let pools = BTreeMap::from([("flow".to_owned(), pool(2))]);
         let mut first =
             LeaseEngine::new(3, Duration::from_secs(20), pools.clone(), Some(log.clone())).unwrap();
-        grant(
+        let old_holder = grant(
             first
                 .admit_at(
                     request("held", &["flow", campaign_pool], Priority::Low),
@@ -1774,25 +1774,39 @@ mod tests {
                 )
                 .unwrap(),
         );
-        assert!(matches!(
+        assert_eq!(
             first
                 .admit_at(
                     request("queued", &["flow", campaign_pool], Priority::Low),
                     now(),
                 )
                 .unwrap(),
-            AdmitOutcome::Queued { .. }
-        ));
+            AdmitOutcome::Queued {
+                ticket_id: "lease-3-2".to_owned(),
+                position: 1,
+            }
+        );
+        assert_eq!(first.held_in_pool(campaign_pool).unwrap(), 1);
+        assert_eq!(first.queued_in_pool(campaign_pool).unwrap(), 1);
         assert_eq!(log.read().unwrap().len(), 1, "only grants are durable");
+        drop(first);
 
-        let mut restarted =
-            LeaseEngine::from_durable(4, Duration::from_secs(20), pools, log, &[], now()).unwrap();
+        let mut restarted = LeaseEngine::from_durable_with_aging_threshold(
+            4,
+            Duration::from_secs(20),
+            Duration::from_secs(60),
+            pools,
+            log,
+            &[],
+            now(),
+        )
+        .unwrap();
         assert_eq!(
             restarted.declared_resource_kind(campaign_pool),
             Some(ResourceKind::Mutex),
             "the old grant event alone must reconstruct the namespace pool"
         );
-        grant(
+        let recovered_holder = grant(
             restarted
                 .admit_at(
                     request("held", &["flow", campaign_pool], Priority::Low),
@@ -1800,15 +1814,51 @@ mod tests {
                 )
                 .unwrap(),
         );
-        assert!(matches!(
+        assert_ne!(recovered_holder.lease_id, old_holder.lease_id);
+        assert!(
+            restarted
+                .status(&recovered_holder.lease_id, 4)
+                .unwrap()
+                .held
+        );
+        assert_eq!(
             restarted
                 .admit_at(
                     request("queued", &["flow", campaign_pool], Priority::Low),
                     now(),
                 )
                 .unwrap(),
-            AdmitOutcome::Queued { .. }
-        ));
+            AdmitOutcome::Queued {
+                ticket_id: "lease-4-2".to_owned(),
+                position: 1,
+            },
+            "the recovered holder must fence duplicate dispatch of the queued runner"
+        );
+        assert_eq!(restarted.held_in_pool(campaign_pool).unwrap(), 1);
+        assert_eq!(restarted.queued_in_pool(campaign_pool).unwrap(), 1);
+        assert_eq!(
+            restarted
+                .pending
+                .iter()
+                .map(|pending| pending.request.job_id.as_str())
+                .collect::<Vec<_>>(),
+            ["queued"],
+            "durable registration replay must retain queue order"
+        );
+
+        let promoted = restarted
+            .release_at(&recovered_holder.lease_id, 4, now())
+            .unwrap()
+            .promoted;
+        assert_eq!(
+            promoted
+                .iter()
+                .map(|grant| grant.job_id.as_str())
+                .collect::<Vec<_>>(),
+            ["queued"]
+        );
+        assert_eq!(restarted.held_in_pool(campaign_pool).unwrap(), 1);
+        assert_eq!(restarted.queued_in_pool(campaign_pool).unwrap(), 0);
     }
 
     #[test]

@@ -1443,6 +1443,51 @@ mod tests {
     }
 
     #[test]
+    fn armed_registration_restart_recovery_preserves_arm_attempt_counter() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let source_dir = temporary.path().join("sources");
+        fs::create_dir_all(&source_dir).unwrap();
+        let (flow, driver) = local_assets(&source_dir, "restart");
+        let expected_arm_attempt = 7;
+        let expected_registration_id;
+        let expected_issue_url;
+
+        {
+            let registry = CampaignRegistry::open(&state_dir).unwrap();
+            let mut registration = registration_with_assets(flow, driver);
+            registration.arm_serial = expected_arm_attempt;
+            expected_registration_id = registration.registration_id.clone();
+            expected_issue_url = registration.issue_url.clone();
+            registry.write(&mut registration).unwrap();
+        }
+
+        let restarted = CampaignRegistry::open(&state_dir).unwrap();
+        let registrations = restarted.registrations().unwrap();
+        assert_eq!(
+            registrations.len(),
+            1,
+            "restart must not duplicate dispatch authority"
+        );
+        let recovered = &registrations[0].1;
+        assert_eq!(recovered.registration_id, expected_registration_id);
+        assert_eq!(recovered.issue_url, expected_issue_url);
+        assert_eq!(
+            recovered.arm_serial, expected_arm_attempt,
+            "the armed registration's attempt counter is durable coordinator state"
+        );
+        assert_eq!(
+            restarted
+                .read_issue(&expected_issue_url)
+                .unwrap()
+                .unwrap()
+                .arm_serial,
+            expected_arm_attempt,
+            "repeated recovery reads must not advance the counter"
+        );
+    }
+
+    #[test]
     fn polluted_v2_is_migrated_once_to_stable_authority_and_sidecar() {
         let temporary = tempfile::tempdir().unwrap();
         let registry = CampaignRegistry::open(temporary.path()).unwrap();
