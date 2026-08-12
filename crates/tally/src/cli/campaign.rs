@@ -3702,7 +3702,7 @@ fn merged_project_tasks(
             "<!-- tally:spec-build:v2 campaign={} issue={} task={} revision={} -->",
             manifest.name, issue_number, task.id, revision
         );
-        let branch = stable_publish_branch(&manifest.name, issue_number, &task.id, Some(&revision));
+        let branch = stable_publish_branch(&manifest.name, issue_number, &task.id, &revision);
         let mut matching = candidates
             .iter()
             .filter(|candidate| {
@@ -3852,14 +3852,12 @@ fn stable_publish_branch(
     campaign: &str,
     issue_number: u64,
     task_id: &str,
-    revision: Option<&str>,
+    revision: &str,
 ) -> String {
     let slug = campaign.trim_matches(['.', '-']);
     let slug = &slug[..slug.len().min(32)];
-    let suffix = revision
-        .and_then(|value| value.strip_prefix("sha256:"))
-        .map(|value| format!("-{}", &value[..value.len().min(16)]))
-        .unwrap_or_default();
+    let revision = revision.strip_prefix("sha256:").unwrap_or(revision);
+    let suffix = format!("-{}", &revision[..revision.len().min(16)]);
     format!("tally/{slug}-issue-{issue_number}/{task_id}{suffix}")
 }
 
