@@ -194,6 +194,9 @@ pub(super) enum CampaignCommand {
     Project(CampaignProjectArgs),
     /// Reconcile changed armed issue graphs into fresh bounded flow passes.
     Poll(CampaignPollArgs),
+    /// Show the current or latest durable pass for one campaign, plus usage
+    /// across every pass in its lineage.
+    Status(CampaignStatusArgs),
     /// Print local campaign locators, admitted digests, and authority bindings.
     List(CampaignListArgs),
     /// Exit successfully only when the local campaign registry is empty.
@@ -291,6 +294,19 @@ pub(super) struct CampaignPollArgs {
     /// Compatibility input for continuation events emitted by older binaries.
     #[arg(long, value_name = "TOKEN", hide = true)]
     pub(super) continuation_token: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignStatusArgs {
+    /// Canonical GitHub master issue URL of the campaign.
+    pub(super) issue: String,
+    /// Emit the complete machine-readable status object.
+    #[arg(long)]
+    pub(super) json: bool,
+    /// Durable registration root; defaults beneath tally state. A completed
+    /// campaign whose registration was pruned resolves from daemon history.
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }

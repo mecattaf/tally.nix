@@ -77,6 +77,31 @@ fn campaign_resume_requires_and_preserves_its_audit_reason() {
 }
 
 #[test]
+fn campaign_status_accepts_the_master_url_and_machine_output() {
+    let options = Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "status",
+        "https://github.com/acme/widgets/issues/42",
+        "--json",
+        "--state-dir",
+        "/var/lib/tally/state",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Campaign {
+            command: CampaignCommand::Status(CampaignStatusArgs {
+                issue,
+                json: true,
+                state_dir: Some(state_dir),
+            })
+        }) if issue == "https://github.com/acme/widgets/issues/42"
+            && state_dir == Path::new("/var/lib/tally/state")
+    ));
+}
+
+#[test]
 fn flow_run_jobs_lookup_conflicts_with_broad_archive_controls() {
     let flow_run = "00000000-0000-4000-8000-000000000415";
     assert!(Opts::try_parse_from(["tally", "query", "jobs", "--flow-run", flow_run]).is_ok());

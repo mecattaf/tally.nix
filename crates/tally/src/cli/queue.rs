@@ -802,7 +802,7 @@ fn component(tokens: &serde_json::Map<String, Value>, key: &str) -> String {
 /// reads as a bill. A daemon that predates the rollup sends no `usage` object
 /// at all; that prints nothing, because absence of the field is not a claim
 /// about the run.
-fn print_run_usage(usage: &Value) -> Result<()> {
+fn print_run_usage(usage: &Value, label: &str) -> Result<()> {
     let (Some(coverage), Some(tokens)) =
         (usage["coverage"].as_object(), usage["tokens"].as_object())
     else {
@@ -825,7 +825,7 @@ fn print_run_usage(usage: &Value) -> Result<()> {
         .unwrap_or(attested);
     let reported = count("attemptsReported");
     if coverage.get("ledgerVerified").and_then(Value::as_bool) != Some(true) {
-        outln!("Usage: not summed -- the advisory attestation ledger did not verify");
+        outln!("{label}: not summed -- the advisory attestation ledger did not verify");
         return Ok(());
     }
     // Whether any attempt reported usage is `coverage.attemptsReported`'s
@@ -835,15 +835,15 @@ fn print_run_usage(usage: &Value) -> Result<()> {
     // zeros underneath contradicting it.
     if reported == 0 {
         outln!(
-            "Usage: no attempt reported usage ({attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)"
+            "{label}: no attempt reported usage ({attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)"
         );
     } else {
         match tokens.get("totalTokens").and_then(Value::as_object) {
             None => outln!(
-                "Usage: no total ({reported} reported; {attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)"
+                "{label}: no total ({reported} reported; {attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)"
             ),
             Some(total) => outln!(
-                "Usage: {} tokens, {} ({reported} reported; {attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)",
+                "{label}: {} tokens, {} ({reported} reported; {attested} attested of {expected} expected attempt(s) over {tasks} member task(s), advisory adapter captures)",
                 total.get("value").and_then(Value::as_u64).unwrap_or(0),
                 compact_text(
                     total
@@ -989,7 +989,17 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
     // Directly under the header, before any task board: a superseded run is
     // terminal, and a reader who misses that fact will wait for progress that
     // can never come.
-    if let Some(record) = run["supersededBy"].as_object() {
+    if let Some(record) = run["campaignSupersededBy"].as_object() {
+        outln!(
+            "!! SUPERSEDED — campaign advanced; latest flow run {}",
+            compact_text(
+                record
+                    .get("latestFlowRunId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            )
+        );
+    } else if let Some(record) = run["supersededBy"].as_object() {
         outln!(
             "!! SUPERSEDED by {} ({}) at {}; this run is terminal and replaying it is refused",
             compact_text(
@@ -1020,6 +1030,14 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         );
     }
 
+    print_run_body(run, status_filter, "Usage")
+}
+
+pub(super) fn print_run_body(
+    run: &Value,
+    status_filter: Option<&str>,
+    usage_label: &str,
+) -> Result<()> {
     let counts = &run["counts"];
     outln!(
         "Tasks: {} done, {} running, {} blocked, {} pending",
@@ -1028,7 +1046,7 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         counts["blocked"].as_u64().unwrap_or(0),
         counts["pending"].as_u64().unwrap_or(0)
     );
-    print_run_usage(&run["usage"])?;
+    print_run_usage(&run["usage"], usage_label)?;
 
     // Above the board, never inside it: a sub-issue closed with no merged
     // proof is a contradiction between what the forge shows a reader and what

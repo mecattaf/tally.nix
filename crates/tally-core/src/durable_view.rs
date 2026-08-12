@@ -45,8 +45,8 @@ use crate::history::{
 };
 use crate::query::RowStatus;
 use crate::query_v2::{
-    apply_reader_state_to_run, apply_run_lineage, query_run, ObservabilityError, RowDetailFact,
-    RunView,
+    apply_campaign_run_supersession, apply_reader_state_to_run, apply_run_lineage, query_run,
+    ObservabilityError, RowDetailFact, RunView,
 };
 use crate::reader_state::{reader_state_path, ReaderState};
 use crate::recovery::collect_durable_recovery_facts;
@@ -179,6 +179,13 @@ pub fn durable_run_view(
     apply_run_lineage(
         &mut view,
         &FlowLineage::read(&paths.flow_lineage_path()).unwrap_or_default(),
+    );
+    apply_campaign_run_supersession(
+        &mut view,
+        &details,
+        &history,
+        durable.witness(),
+        &membership,
     );
     apply_reader_state_to_run(
         &mut view,
