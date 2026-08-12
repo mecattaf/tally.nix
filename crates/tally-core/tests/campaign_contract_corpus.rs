@@ -230,7 +230,7 @@ fn generated_corpus() -> String {
                     "kind": "implementation",
                     "issue": 201,
                     "dependencies": [],
-                    "conflictDomains": ["src/build"]
+                    "conflictDomains": ["src/build", "SRC/build"]
                 },
                 {
                     "id": "verify",
@@ -304,9 +304,29 @@ fn generated_corpus() -> String {
     }
     for (name, pointer, value) in [
         (
+            "conflict-domains-empty",
+            "/tasks/0/conflictDomains",
+            json!([]),
+        ),
+        (
+            "conflict-domains-duplicate",
+            "/tasks/0/conflictDomains",
+            json!(["src/build", "src/build"]),
+        ),
+        (
+            "conflict-domains-parent",
+            "/tasks/0/conflictDomains/0",
+            json!("src/../build"),
+        ),
+        (
             "forbid-trailing-slash",
             "/gates/1/forbidPaths/0",
             json!("tmp/"),
+        ),
+        (
+            "forbid-duplicate",
+            "/gates/1/forbidPaths",
+            json!(["*.db", "*.db"]),
         ),
         ("model-129", "/agent/model", json!("m".repeat(129))),
         (
