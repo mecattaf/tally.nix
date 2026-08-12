@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::{Command as ProcessCommand, Stdio};
 
+use chrono::{DateTime, SecondsFormat};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::{AdapterConfig, AdapterHardening};
@@ -28,12 +30,16 @@ const WORKLIST_BEGIN: &str = "<!-- tally:campaign-worklist:v1 -->";
 const WORKLIST_END: &str = "<!-- tally:campaign-worklist:v1:end -->";
 const TASK_MARKER_PREFIX: &str = "<!-- tally:campaign-task:v1 id=";
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
-const CAMPAIGN_COMPLETE_COMMENT_PREFIX: &str = "<!-- tally:campaign-complete:";
-const CAMPAIGN_SUMMARY_COMMENT_PREFIX: &str = "<!-- tally:campaign-summary:";
 const APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_APPROVED_GRAPH_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 const CAMPAIGN_PROJECTION_SCHEMA_VERSION: u32 = 1;
 const MAX_CAMPAIGN_PROJECTION_BYTES: u64 = 1024 * 1024;
+const CAMPAIGN_STEERING_SCHEMA_VERSION: u32 = 1;
+const CAMPAIGN_STEERING_CURSOR_SCHEMA_VERSION: u32 = 1;
+const CAMPAIGN_STEERING_EMBARGO_MILLISECONDS: i64 = 1_000;
+const MAX_CAMPAIGN_STEERING_LOG_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CAMPAIGN_STEERING_BODY_CHARS: usize = 64_000;
+const MAX_CAMPAIGN_STEERING_PER_TARGET: usize = 1_000;
 
 #[derive(Debug, Clone)]
 struct ProjectTask {
@@ -79,9 +85,6 @@ struct GithubIssue {
 struct GithubComment {
     id: u64,
     body: String,
-    html_url: String,
-    created_at: String,
-    updated_at: String,
     user: GithubActor,
 }
 
@@ -135,6 +138,86 @@ struct CampaignGraph {
     canonical: CanonicalCampaignGraphV1,
     master: GithubIssue,
     tasks: Vec<GithubIssue>,
+}
+
+/// The six-field object an implementation brief has always consumed.
+///
+/// Keep this object closed and nested inside the append-only envelope. The
+/// transport is local now; the worker-facing steering record is deliberately
+/// byte-for-byte the prior `authorizedComments` shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LocalSteeringCommentV1 {
+    id: u64,
+    url: String,
+    author: String,
+    body: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LocalSteeringRecordV1 {
+    schema_version: u32,
+    sequence: u64,
+    registration_id: String,
+    task_id: Option<String>,
+    do_not_dispatch_before: String,
+    comment: LocalSteeringCommentV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LocalSteeringCursorV1 {
+    schema_version: u32,
+    registration_id: String,
+    high_water: u64,
+    dispatched_at: String,
+    observation: String,
+}
+
+/// The trusted source descriptor handed to the separately packaged driver.
+/// Absolute paths make the same verb usable through SSH: the remote shell
+/// writes coordinator-local state and the worker later reads that exact state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSteeringSourceV1 {
+    schema_version: u32,
+    kind: &'static str,
+    registration_id: String,
+    local_actor: String,
+    log_path: PathBuf,
+    lock_path: PathBuf,
+    prepared_cursor: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LocalSteeringSnapshot {
+    steering: CampaignSteering,
+    source: LocalSteeringSourceV1,
+    do_not_dispatch_before: Option<DateTime<chrono::FixedOffset>>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalSteeringPaths {
+    directory: PathBuf,
+    log: PathBuf,
+    lock: PathBuf,
+    cursor: PathBuf,
+}
+
+struct LocalSteeringDispatch {
+    lock: fs::File,
+    cursor_path: PathBuf,
+    directory: PathBuf,
+    registration_id: String,
+    snapshot: Box<LocalSteeringSnapshot>,
+}
+
+enum LocalSteeringDispatchState {
+    Embargoed(DateTime<chrono::FixedOffset>),
+    Ready(LocalSteeringDispatch),
 }
 
 /// The prior executable graph needed to interpret a later amendment.
@@ -207,6 +290,7 @@ pub(super) async fn run_campaign(
         CampaignCommand::Arm(args) => {
             run_campaign_arm(socket, config_path, rpc_timeout, args).await
         }
+        CampaignCommand::Steer(args) => run_campaign_steer(args),
         CampaignCommand::Resume(args) => {
             run_campaign_resume(socket, config_path, rpc_timeout, args).await
         }
@@ -473,56 +557,6 @@ fn fetch_issue_comments(locator: &IssueLocator) -> Result<Vec<GithubComment>> {
     Ok(pages.into_iter().flatten().collect())
 }
 
-/// Comments written by the campaign mechanism, never operator steering.
-///
-/// Completion summaries use a campaign-level marker rather than the older
-/// `spec-build` namespace. Treating their timestamp bump as fresh steering is
-/// what let a poll queue one last pass while the same reconcile was closing
-/// the master.
-fn tally_authored_comment(body: &str) -> bool {
-    [
-        SYSTEM_COMMENT_PREFIX,
-        CAMPAIGN_COMPLETE_COMMENT_PREFIX,
-        CAMPAIGN_SUMMARY_COMMENT_PREFIX,
-    ]
-    .iter()
-    .any(|marker| body.contains(marker))
-}
-
-fn fetch_steering(locator: &IssueLocator, allowed: &[String]) -> Result<Vec<Value>> {
-    let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    let mut comments = Vec::new();
-    for comment in fetch_issue_comments(locator)? {
-        if tally_authored_comment(&comment.body) {
-            continue;
-        }
-        let actor = comment.user.login.to_ascii_lowercase();
-        if !allowed.contains(actor.as_str()) {
-            continue;
-        }
-        if comment.body.contains('\0') || comment.body.chars().count() > 64_000 {
-            bail!(
-                "approved steering comment {} exceeds the campaign comment contract",
-                comment.html_url
-            );
-        }
-        comments.push(json!({
-            "id": comment.id,
-            "url": comment.html_url,
-            "author": actor,
-            "body": comment.body,
-            "createdAt": comment.created_at,
-            "updatedAt": comment.updated_at,
-        }));
-    }
-    if comments.len() > 1_000 {
-        return Err(invalid(
-            "campaign has more than 1000 approved steering comments",
-        ));
-    }
-    Ok(comments)
-}
-
 fn fetch_issue(locator: &IssueLocator) -> Result<GithubIssue> {
     let endpoint = format!("repos/{}/issues/{}", locator.repository, locator.number);
     let issue: GithubIssue = gh_json(&os_arguments(&["api", &endpoint]))?;
@@ -545,7 +579,7 @@ fn fetch_subissues(locator: &IssueLocator) -> Result<Vec<GithubIssue>> {
     gh_json(&os_arguments(&["api", &endpoint]))
 }
 
-/// The sub-issue surface the reconciler's read path and steering threads need.
+/// The sub-issue surface the reconciler's remaining forge read path needs.
 ///
 /// One bounded GraphQL query walks the parent's sub-issues, the pull requests
 /// that close each of them, and each thread's comments. `arm` runs it once as
@@ -562,8 +596,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             nodes { url merged }
           }
           comments(last: 100) {
-            pageInfo { hasPreviousPage }
-            nodes { databaseId url body createdAt updatedAt author { login } }
+            nodes { databaseId body author { login } }
           }
         }
       }
@@ -574,23 +607,12 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 /// The parent's sub-issue ceiling is 100 and a manifest caps at that number,
 /// so two pages of 50 always cover an admitted graph.
 const MAX_SUB_ISSUE_PAGES: usize = 2;
-/// This is the window `SUB_ISSUE_THREAD_QUERY` asks for, and it is the steering
-/// read: what survives it is what an agent is allowed to be steered by. `last:`
-/// returns the newest, so an exhausted window drops the *oldest* comments —
-/// `hasPreviousPage`, not `hasNextPage`. A thread long enough to exhaust it is
-/// ordinary human discussion, which must not halt a campaign, so the truncation
-/// is reported rather than refused.
-const MAX_SUB_ISSUE_COMMENTS: usize = 100;
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphqlComment {
     #[serde(default)]
     database_id: Option<u64>,
-    url: String,
     body: String,
-    created_at: String,
-    updated_at: String,
     #[serde(default)]
     author: Option<GithubActor>,
 }
@@ -616,15 +638,10 @@ fn sub_issue_walk_arguments(
     arguments
 }
 
-/// One bounded walk of the parent's sub-issue threads, plus the numbers whose
-/// comment window the forge truncated.
+/// One bounded walk of the parent's sub-issue threads.
 #[derive(Debug, Clone, Default)]
 struct SubIssueThreads {
     threads: BTreeMap<u64, Vec<GraphqlComment>>,
-    /// Sub-issues carrying more than `MAX_SUB_ISSUE_COMMENTS` comments. The
-    /// oldest fell out of the window this walk read, so an approved steering
-    /// comment on one of them can no longer reach its task.
-    truncated: BTreeSet<u64>,
 }
 
 fn sub_issue_threads(locator: &IssueLocator) -> Result<SubIssueThreads> {
@@ -651,9 +668,6 @@ fn sub_issue_threads(locator: &IssueLocator) -> Result<SubIssueThreads> {
                 .and_then(Value::as_u64)
                 .filter(|number| *number > 0)
                 .ok_or_else(|| invalid("campaign sub-issue walk returned an invalid number"))?;
-            if node.pointer("/comments/pageInfo/hasPreviousPage") == Some(&Value::Bool(true)) {
-                walked.truncated.insert(number);
-            }
             let comments = node
                 .pointer("/comments/nodes")
                 .cloned()
@@ -849,97 +863,627 @@ fn arm_receipt(
     value
 }
 
-/// Every steering surface a pass reads: the campaign-wide master thread, plus
-/// each task's own sub-issue thread where the forge serves one.
+/// Every steering surface a pass reads: campaign-wide records plus records
+/// addressed to one task. Task keys are task IDs, never forge issue numbers.
 #[derive(Debug, Clone, Default)]
 struct CampaignSteering {
     master: Vec<Value>,
     tasks: BTreeMap<String, Vec<Value>>,
 }
 
-fn fetch_campaign_steering(
-    graph: &CampaignGraph,
-    allowed: &[String],
-    native: bool,
-) -> Result<CampaignSteering> {
-    let master = fetch_steering(&graph.locator, allowed)?;
-    let tasks = if native {
-        let numbers = graph
-            .tasks
-            .iter()
-            .map(|issue| issue.number)
-            .collect::<Vec<_>>();
-        task_steering(&graph.locator, allowed, &numbers)?
-    } else {
-        BTreeMap::new()
-    };
-    Ok(CampaignSteering { master, tasks })
+fn local_steering_paths(state_dir: &Path, registration_id: &str) -> LocalSteeringPaths {
+    let directory = state_dir.join("campaigns/steering").join(registration_id);
+    LocalSteeringPaths {
+        log: directory.join("steering-v1.jsonl"),
+        lock: directory.join("steering.lock"),
+        cursor: directory.join("dispatch-cursor-v1.json"),
+        directory,
+    }
 }
 
-fn task_steering(
-    locator: &IssueLocator,
-    allowed: &[String],
-    subissues: &[u64],
-) -> Result<BTreeMap<String, Vec<Value>>> {
-    let walked = sub_issue_threads(locator)?;
-    // Reported, never refused. The window is exhausted by ordinary human
-    // discussion, and halting a campaign over that would be worse than the
-    // truncation; but a steering comment that scrolled out of it silently
-    // stops reaching its agent, and nothing else on this path would say so.
-    for number in subissues {
-        if walked.truncated.contains(number) {
-            errln!(
-                "tally: campaign sub-issue #{number} carries more than \
-                 {MAX_SUB_ISSUE_COMMENTS} comments; the steering read sees only the newest \
-                 {MAX_SUB_ISSUE_COMMENTS} and an approved comment older than that can no \
-                 longer reach this task"
+fn open_local_steering_lock(paths: &LocalSteeringPaths, exclusive: bool) -> Result<fs::File> {
+    fs::create_dir_all(&paths.directory).with_context(|| {
+        format!(
+            "cannot create campaign steering directory {}",
+            paths.directory.display()
+        )
+    })?;
+    fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "cannot secure campaign steering directory {}",
+                paths.directory.display()
+            )
+        },
+    )?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&paths.lock)
+        .with_context(|| {
+            format!(
+                "cannot open campaign steering lock {}",
+                paths.lock.display()
+            )
+        })?;
+    if !lock.metadata()?.is_file() {
+        bail!(
+            "campaign steering lock {} is not a regular file",
+            paths.lock.display()
+        );
+    }
+    if exclusive {
+        FileExt::lock_exclusive(&lock)
+    } else {
+        FileExt::lock_shared(&lock)
+    }
+    .with_context(|| {
+        format!(
+            "cannot lock campaign steering source {}",
+            paths.lock.display()
+        )
+    })?;
+    Ok(lock)
+}
+
+fn open_bounded_local_steering_log(path: &Path) -> Result<Option<fs::File>> {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open campaign steering log {}", path.display()))
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_CAMPAIGN_STEERING_LOG_BYTES {
+        bail!(
+            "campaign steering log {} is not a bounded regular file",
+            path.display()
+        );
+    }
+    Ok(Some(file))
+}
+
+fn parse_steering_time(value: &str, context: &str) -> Result<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("{context} is not an RFC 3339 timestamp"))
+}
+
+fn valid_steering_observation(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn validate_local_steering_record(
+    record: &LocalSteeringRecordV1,
+    expected_sequence: u64,
+    registration: &CampaignRegistration,
+) -> Result<DateTime<chrono::FixedOffset>> {
+    if record.schema_version != CAMPAIGN_STEERING_SCHEMA_VERSION
+        || record.sequence != expected_sequence
+        || record.registration_id != registration.registration_id
+        || record.comment.id != record.sequence
+        || record.comment.author != registration.local_actor
+        || record
+            .task_id
+            .as_deref()
+            .is_some_and(|task_id| !safe_task_id(task_id))
+        || record.comment.body.contains('\0')
+        || record.comment.body.chars().count() > MAX_CAMPAIGN_STEERING_BODY_CHARS
+        || record.comment.body.contains(SYSTEM_COMMENT_PREFIX)
+    {
+        bail!(
+            "campaign steering record {} violates steering-v1 invariants",
+            expected_sequence
+        );
+    }
+    let expected_url = format!(
+        "local://campaign/{}/steering/{}",
+        registration.registration_id, record.sequence
+    );
+    if record.comment.url != expected_url {
+        bail!(
+            "campaign steering record {} has an invalid local URL",
+            record.sequence
+        );
+    }
+    let created = parse_steering_time(
+        &record.comment.created_at,
+        &format!("campaign steering record {} createdAt", record.sequence),
+    )?;
+    let updated = parse_steering_time(
+        &record.comment.updated_at,
+        &format!("campaign steering record {} updatedAt", record.sequence),
+    )?;
+    let embargo = parse_steering_time(
+        &record.do_not_dispatch_before,
+        &format!(
+            "campaign steering record {} doNotDispatchBefore",
+            record.sequence
+        ),
+    )?;
+    if updated != created
+        || embargo
+            != created + chrono::Duration::milliseconds(CAMPAIGN_STEERING_EMBARGO_MILLISECONDS)
+    {
+        bail!(
+            "campaign steering record {} has inconsistent append-only timestamps",
+            record.sequence
+        );
+    }
+    Ok(embargo)
+}
+
+fn read_local_steering_records_locked(
+    paths: &LocalSteeringPaths,
+    registration: &CampaignRegistration,
+) -> Result<Vec<LocalSteeringRecordV1>> {
+    let Some(mut file) = open_bounded_local_steering_log(&paths.log)? else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bail!(
+            "campaign steering log {} has an incomplete final record",
+            paths.log.display()
+        );
+    }
+    let mut records = Vec::new();
+    let mut per_target = BTreeMap::<Option<String>, usize>::new();
+    let mut prior_embargo = None;
+    if bytes.is_empty() {
+        return Ok(records);
+    }
+    for (index, line) in bytes[..bytes.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        if line.is_empty() {
+            bail!(
+                "campaign steering log {} has an empty record at line {}",
+                paths.log.display(),
+                index + 1
+            );
+        }
+        let value: Value = serde_json::from_slice(line).with_context(|| {
+            format!(
+                "campaign steering log {} has an invalid record at line {}",
+                paths.log.display(),
+                index + 1
+            )
+        })?;
+        if !value
+            .as_object()
+            .is_some_and(|record| record.contains_key("taskId"))
+        {
+            bail!(
+                "campaign steering log {} record at line {} omits taskId",
+                paths.log.display(),
+                index + 1
+            );
+        }
+        let record: LocalSteeringRecordV1 = serde_json::from_value(value).with_context(|| {
+            format!(
+                "campaign steering log {} has an invalid record at line {}",
+                paths.log.display(),
+                index + 1
+            )
+        })?;
+        let sequence = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| invalid("campaign steering sequence is exhausted"))?;
+        let embargo = validate_local_steering_record(&record, sequence, registration)?;
+        if prior_embargo.is_some_and(|prior| embargo <= prior) {
+            bail!(
+                "campaign steering record {} does not advance doNotDispatchBefore",
+                sequence
+            );
+        }
+        prior_embargo = Some(embargo);
+        let count = per_target.entry(record.task_id.clone()).or_default();
+        *count += 1;
+        if *count > MAX_CAMPAIGN_STEERING_PER_TARGET {
+            bail!(
+                "campaign steering target {:?} has more than {} records",
+                record.task_id,
+                MAX_CAMPAIGN_STEERING_PER_TARGET
+            );
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn read_local_steering_cursor_locked(
+    paths: &LocalSteeringPaths,
+    registration: &CampaignRegistration,
+    records: &[LocalSteeringRecordV1],
+) -> Result<Option<LocalSteeringCursorV1>> {
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&paths.cursor)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot open campaign steering cursor {}",
+                    paths.cursor.display()
+                )
+            })
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        bail!(
+            "campaign steering cursor {} is not a bounded regular file",
+            paths.cursor.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let cursor: LocalSteeringCursorV1 = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "campaign steering cursor {} is invalid",
+            paths.cursor.display()
+        )
+    })?;
+    let log_high_water = records.last().map_or(0, |record| record.sequence);
+    if cursor.schema_version != CAMPAIGN_STEERING_CURSOR_SCHEMA_VERSION
+        || cursor.registration_id != registration.registration_id
+        || cursor.high_water > log_high_water
+        || !valid_steering_observation(&cursor.observation)
+    {
+        bail!(
+            "campaign steering cursor {} violates cursor-v1 invariants",
+            paths.cursor.display()
+        );
+    }
+    let dispatched_at = parse_steering_time(
+        &cursor.dispatched_at,
+        "campaign steering cursor dispatchedAt",
+    )?;
+    if cursor.high_water > 0 {
+        let index = usize::try_from(cursor.high_water - 1)
+            .map_err(|_| invalid("campaign steering cursor high-water is exhausted"))?;
+        let embargo = parse_steering_time(
+            &records[index].do_not_dispatch_before,
+            "campaign steering cursor high-water embargo",
+        )?;
+        if dispatched_at < embargo {
+            bail!(
+                "campaign steering cursor {} advanced before its embargo",
+                paths.cursor.display()
             );
         }
     }
-    let threads = walked.threads;
-    let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    let mut steering = BTreeMap::new();
-    for number in subissues {
-        let mut comments = Vec::new();
-        for comment in threads.get(number).into_iter().flatten() {
-            if tally_authored_comment(&comment.body) {
-                continue;
-            }
-            let Some(author) = comment.author.as_ref() else {
-                continue;
-            };
-            let actor = author.login.to_ascii_lowercase();
-            if !allowed.contains(actor.as_str()) {
-                continue;
-            }
-            if comment.body.contains('\0') || comment.body.chars().count() > 64_000 {
-                bail!(
-                    "approved steering comment {} exceeds the campaign comment contract",
-                    comment.url
-                );
-            }
-            let Some(id) = comment.database_id else {
-                continue;
-            };
-            comments.push(json!({
-                "id": id,
-                "url": comment.url,
-                "author": actor,
-                "body": comment.body,
-                "createdAt": comment.created_at,
-                "updatedAt": comment.updated_at,
-            }));
-        }
-        if comments.len() > 1_000 {
-            return Err(invalid(format!(
-                "campaign sub-issue #{number} has more than 1000 approved steering comments"
-            )));
-        }
-        if !comments.is_empty() {
-            steering.insert(number.to_string(), comments);
+    Ok(Some(cursor))
+}
+
+fn local_steering_snapshot_from_records(
+    paths: &LocalSteeringPaths,
+    registration: &CampaignRegistration,
+    records: &[LocalSteeringRecordV1],
+) -> Result<LocalSteeringSnapshot> {
+    let high_water = records.last().map_or(0, |record| record.sequence);
+    let _cursor = read_local_steering_cursor_locked(paths, registration, records)?;
+    let mut steering = CampaignSteering::default();
+    for record in records {
+        let comment = serde_json::to_value(&record.comment)?;
+        match &record.task_id {
+            Some(task_id) => steering
+                .tasks
+                .entry(task_id.clone())
+                .or_default()
+                .push(comment),
+            None => steering.master.push(comment),
         }
     }
-    Ok(steering)
+    Ok(LocalSteeringSnapshot {
+        steering,
+        source: LocalSteeringSourceV1 {
+            schema_version: CAMPAIGN_STEERING_SCHEMA_VERSION,
+            kind: "local-jsonl",
+            registration_id: registration.registration_id.clone(),
+            local_actor: registration.local_actor.clone(),
+            log_path: paths.log.clone(),
+            lock_path: paths.lock.clone(),
+            prepared_cursor: high_water,
+        },
+        do_not_dispatch_before: records.last().map(|record| {
+            parse_steering_time(
+                &record.do_not_dispatch_before,
+                "campaign steering doNotDispatchBefore",
+            )
+            .expect("validated steering timestamp must parse")
+        }),
+    })
+}
+
+fn read_local_steering_snapshot(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> Result<LocalSteeringSnapshot> {
+    let paths = local_steering_paths(state_dir, &registration.registration_id);
+    let lock = open_local_steering_lock(&paths, false)?;
+    let records = read_local_steering_records_locked(&paths, registration)?;
+    let snapshot = local_steering_snapshot_from_records(&paths, registration, &records);
+    let unlock = FileExt::unlock(&lock).with_context(|| {
+        format!(
+            "cannot unlock campaign steering source {}",
+            paths.lock.display()
+        )
+    });
+    match (snapshot, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(snapshot), Ok(())) => Ok(snapshot),
+    }
+}
+
+fn ensure_local_steering_log_locked(paths: &LocalSteeringPaths) -> Result<()> {
+    let existed = paths.log.exists();
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&paths.log)
+        .with_context(|| {
+            format!(
+                "cannot create campaign steering log {}",
+                paths.log.display()
+            )
+        })?;
+    if !file.metadata()?.is_file() {
+        bail!(
+            "campaign steering log {} is not a regular file",
+            paths.log.display()
+        );
+    }
+    if !existed {
+        file.sync_all()?;
+        fs::File::open(&paths.directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn append_local_steering_at(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+    task_id: Option<String>,
+    body: String,
+    now: DateTime<Utc>,
+) -> Result<LocalSteeringRecordV1> {
+    if body.contains('\0') || body.chars().count() > MAX_CAMPAIGN_STEERING_BODY_CHARS {
+        return Err(invalid(format!(
+            "campaign steering text must contain no NUL byte and at most {MAX_CAMPAIGN_STEERING_BODY_CHARS} characters"
+        )));
+    }
+    if body.trim().is_empty() {
+        return Err(invalid("campaign steering text must not be empty"));
+    }
+    if body.contains(SYSTEM_COMMENT_PREFIX) {
+        return Err(invalid(
+            "campaign steering text contains a reserved tally receipt marker",
+        ));
+    }
+    if task_id
+        .as_deref()
+        .is_some_and(|task_id| !safe_task_id(task_id))
+    {
+        return Err(invalid("campaign steering --task is not a safe task ID"));
+    }
+    let paths = local_steering_paths(state_dir, &registration.registration_id);
+    let lock = open_local_steering_lock(&paths, true)?;
+    ensure_local_steering_log_locked(&paths)?;
+    let records = read_local_steering_records_locked(&paths, registration)?;
+    let high_water = records.last().map_or(0, |record| record.sequence);
+    let _cursor = read_local_steering_cursor_locked(&paths, registration, &records)?;
+    let target_count = records
+        .iter()
+        .filter(|record| record.task_id == task_id)
+        .count();
+    if target_count >= MAX_CAMPAIGN_STEERING_PER_TARGET {
+        bail!(
+            "campaign steering target {:?} already has the maximum {} records",
+            task_id,
+            MAX_CAMPAIGN_STEERING_PER_TARGET
+        );
+    }
+    let sequence = high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid("campaign steering sequence is exhausted"))?;
+    let mut created =
+        DateTime::parse_from_rfc3339(&now.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .expect("UTC timestamp formatted by chrono must parse")
+            .with_timezone(&Utc);
+    if let Some(last) = records.last() {
+        let prior = parse_steering_time(
+            &last.comment.created_at,
+            "prior campaign steering createdAt",
+        )?
+        .with_timezone(&Utc);
+        if created <= prior {
+            created = prior + chrono::Duration::milliseconds(1);
+        }
+    }
+    let created_at = created.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let do_not_dispatch_before = (created
+        + chrono::Duration::milliseconds(CAMPAIGN_STEERING_EMBARGO_MILLISECONDS))
+    .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let record = LocalSteeringRecordV1 {
+        schema_version: CAMPAIGN_STEERING_SCHEMA_VERSION,
+        sequence,
+        registration_id: registration.registration_id.clone(),
+        task_id,
+        do_not_dispatch_before,
+        comment: LocalSteeringCommentV1 {
+            id: sequence,
+            url: format!(
+                "local://campaign/{}/steering/{sequence}",
+                registration.registration_id
+            ),
+            author: registration.local_actor.clone(),
+            body,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+        },
+    };
+    validate_local_steering_record(&record, sequence, registration)?;
+    let mut encoded = serde_json::to_vec(&record)?;
+    encoded.push(b'\n');
+    let append_result = (|| -> Result<()> {
+        let mut log = fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&paths.log)
+            .with_context(|| {
+                format!(
+                    "cannot append campaign steering log {}",
+                    paths.log.display()
+                )
+            })?;
+        let final_size = log
+            .metadata()?
+            .len()
+            .checked_add(u64::try_from(encoded.len())?)
+            .ok_or_else(|| invalid("campaign steering log size is exhausted"))?;
+        if final_size > MAX_CAMPAIGN_STEERING_LOG_BYTES {
+            bail!("campaign steering log exceeds 128 MiB");
+        }
+        log.write_all(&encoded)?;
+        log.sync_all()?;
+        Ok(())
+    })();
+    let unlock = FileExt::unlock(&lock).with_context(|| {
+        format!(
+            "cannot unlock campaign steering source {}",
+            paths.lock.display()
+        )
+    });
+    match (append_result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(record),
+    }
+}
+
+fn open_local_steering_dispatch_at(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+    now: DateTime<Utc>,
+) -> Result<LocalSteeringDispatchState> {
+    let paths = local_steering_paths(state_dir, &registration.registration_id);
+    let lock = open_local_steering_lock(&paths, true)?;
+    ensure_local_steering_log_locked(&paths)?;
+    let records = read_local_steering_records_locked(&paths, registration)?;
+    let snapshot = local_steering_snapshot_from_records(&paths, registration, &records)?;
+    if let Some(embargo) = snapshot.do_not_dispatch_before {
+        if embargo > now.fixed_offset() {
+            FileExt::unlock(&lock).with_context(|| {
+                format!(
+                    "cannot unlock embargoed campaign steering source {}",
+                    paths.lock.display()
+                )
+            })?;
+            return Ok(LocalSteeringDispatchState::Embargoed(embargo));
+        }
+    }
+    Ok(LocalSteeringDispatchState::Ready(LocalSteeringDispatch {
+        lock,
+        cursor_path: paths.cursor,
+        directory: paths.directory,
+        registration_id: registration.registration_id.clone(),
+        snapshot: Box::new(snapshot),
+    }))
+}
+
+fn write_local_steering_cursor(
+    path: &Path,
+    directory: &Path,
+    cursor: &LocalSteeringCursorV1,
+) -> Result<()> {
+    let temporary = directory.join(format!(".dispatch-cursor.{}.tmp", uuid::Uuid::now_v7()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temporary)
+        .with_context(|| {
+            format!(
+                "cannot create campaign steering cursor {}",
+                temporary.display()
+            )
+        })?;
+    serde_json::to_writer(&mut file, cursor)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("cannot publish campaign steering cursor {}", path.display()))?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+impl LocalSteeringDispatch {
+    fn commit(self, observation: &str, now: DateTime<Utc>) -> Result<()> {
+        if !valid_steering_observation(observation) {
+            return Err(invalid(
+                "campaign steering dispatch observation is not a sha256 digest",
+            ));
+        }
+        if self
+            .snapshot
+            .do_not_dispatch_before
+            .is_some_and(|embargo| now.fixed_offset() < embargo)
+        {
+            return Err(invalid(
+                "campaign steering cursor cannot advance before the steering embargo",
+            ));
+        }
+        let cursor = LocalSteeringCursorV1 {
+            schema_version: CAMPAIGN_STEERING_CURSOR_SCHEMA_VERSION,
+            registration_id: self.registration_id.clone(),
+            high_water: self.snapshot.source.prepared_cursor,
+            dispatched_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            observation: observation.to_owned(),
+        };
+        let write = write_local_steering_cursor(&self.cursor_path, &self.directory, &cursor);
+        let unlock = FileExt::unlock(&self.lock).with_context(|| {
+            format!(
+                "cannot unlock dispatched campaign steering source {}",
+                self.lock_path().display()
+            )
+        });
+        match (write, unlock) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.snapshot.source.lock_path.clone()
+    }
 }
 
 fn machine_marker_fields<'a>(body: &'a str, kind: &str) -> Option<BTreeMap<&'a str, &'a str>> {
@@ -1523,8 +2067,8 @@ fn campaign_observation(
         "forgeState": campaign_state_value(graph),
         "repositoryProgress": repository_progress,
         "steering": steering.master,
-        // A comment on one task's sub-issue thread must nudge the campaign
-        // exactly like a comment on the master does.
+        // A task-addressed local record must nudge the campaign exactly like a
+        // campaign-wide record does.
         "taskSteering": steering.tasks,
         "armSerial": arm_serial,
     }))
@@ -2535,7 +3079,6 @@ impl CampaignHost<'_> {
 async fn dispatch_campaign(
     host: CampaignHost<'_>,
     graph: &CampaignGraph,
-    steering: &CampaignSteering,
     repository_progress: &Value,
     registration: &mut CampaignRegistration,
     sub_issue_walk: bool,
@@ -2564,6 +3107,23 @@ async fn dispatch_campaign(
         &registration.driver,
         true,
     )?;
+    // A steer racing this boundary has exactly two outcomes. If its append
+    // wins the lock, its embargo must expire and this dispatch includes it. If
+    // enqueue wins, the append follows the committed cursor and necessarily
+    // changes the next observation. Holding the lock through enqueue is the
+    // transaction boundary; a failed enqueue never advances the cursor.
+    let steering_dispatch = loop {
+        match open_local_steering_dispatch_at(host.state_dir, registration, Utc::now())? {
+            LocalSteeringDispatchState::Ready(dispatch) => break dispatch,
+            LocalSteeringDispatchState::Embargoed(until) => {
+                let delay = (until - Utc::now().fixed_offset())
+                    .to_std()
+                    .unwrap_or_default();
+                tokio::time::sleep(delay).await;
+            }
+        }
+    };
+    let steering = &steering_dispatch.snapshot.steering;
     let revision = campaign_observation(
         graph,
         steering,
@@ -2594,10 +3154,13 @@ async fn dispatch_campaign(
         "campaignGraph": &graph.canonical,
         "steering": steering.master,
         "taskSteering": steering.tasks,
-        // The pre-dispatch task-thread re-check must use the exact authority
-        // that produced both snapshots above. Inferring it from existing
-        // comments would silently exclude an allowed actor who had not yet
-        // commented -- precisely the late-arrival case this field serves.
+        // The pre-agent re-check reads the same append-only source. The local
+        // actor comes from the closed arm authority; it is not inferred from
+        // a record that happens to be present in the log.
+        "localActor": &registration.local_actor,
+        "steeringSource": &steering_dispatch.snapshot.source,
+        // Kept while the surrounding forge transport is removed by later
+        // Chapter 2 tasks; local steering authorization does not consult it.
         "allowedActors": &registration.allowed_actors,
         "capabilities": {"subIssueWalk": sub_issue_walk},
         "workspaceRoot": &registration.workspace_root,
@@ -2677,6 +3240,7 @@ async fn dispatch_campaign(
     let admitted = client
         .call("queue.enqueue", Some(serde_json::to_value(payload)?))
         .await?;
+    steering_dispatch.commit(&revision, Utc::now())?;
     report_degraded_membership(&admitted)?;
     registration.last_observation = Some(revision);
     if !wait || admitted.get("verdict").and_then(Value::as_str).is_some() {
@@ -2688,6 +3252,93 @@ async fn dispatch_campaign(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid("queue.enqueue returned no task_uuid for campaign --wait"))?;
     Ok(await_job_with_rearm(client, socket, task_uuid, rpc_timeout).await?)
+}
+
+fn read_campaign_steering_message(args: &CampaignSteerArgs) -> Result<String> {
+    if let Some(message) = &args.message {
+        return Ok(message.clone());
+    }
+    let path = args
+        .message_file
+        .as_deref()
+        .expect("clap requires --message or --message-file");
+    let mut bytes = Vec::new();
+    let byte_limit = u64::try_from(MAX_CAMPAIGN_STEERING_BODY_CHARS)
+        .expect("steering body bound fits u64")
+        .saturating_mul(4)
+        .saturating_add(1);
+    if path == Path::new("-") {
+        std::io::stdin()
+            .take(byte_limit)
+            .read_to_end(&mut bytes)
+            .context("cannot read campaign steering from stdin")?;
+    } else {
+        fs::File::open(path)
+            .with_context(|| format!("cannot open campaign steering text {}", path.display()))?
+            .take(byte_limit)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("cannot read campaign steering text {}", path.display()))?;
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) >= byte_limit {
+        return Err(invalid(format!(
+            "campaign steering text exceeds {MAX_CAMPAIGN_STEERING_BODY_CHARS} characters"
+        )));
+    }
+    String::from_utf8(bytes).context("campaign steering text is not valid UTF-8")
+}
+
+fn run_campaign_steer(args: CampaignSteerArgs) -> Result<()> {
+    let (code_repository, worklist_pattern) =
+        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
+    let state_dir = resolve_state_dir(args.state_dir.clone())?;
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let registration = registry
+        .read_campaign(&code_repository, &worklist_pattern)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "campaign {code_repository}/{worklist_pattern} is not armed; arm it before steering"
+            ))
+        })?;
+    require_local_actor(&registration)?;
+    let task_id = args.task.clone();
+    if let Some(task_id) = task_id.as_deref() {
+        if !safe_task_id(task_id) {
+            return Err(invalid("campaign steering --task is not a safe task ID"));
+        }
+        let graph = read_approved_graph_snapshot(&state_dir, &registration)?.ok_or_else(|| {
+            invalid(
+                "campaign has no approved graph snapshot; re-arm it before task-scoped steering",
+            )
+        })?;
+        if !graph.manifest.tasks.iter().any(|task| task.id == task_id) {
+            return Err(invalid(format!(
+                "campaign has no admitted task {task_id:?}; inspect the worklist and re-arm before steering"
+            )));
+        }
+    }
+    let body = read_campaign_steering_message(&args)?;
+    let record = append_local_steering_at(&state_dir, &registration, task_id, body, Utc::now())?;
+    let paths = local_steering_paths(&state_dir, &registration.registration_id);
+    outln!(
+        "{}",
+        serde_json::to_string(&json!({
+            "status": "recorded",
+            "codeRepository": code_repository,
+            "worklistPattern": worklist_pattern,
+            "taskId": record.task_id,
+            "sequence": record.sequence,
+            "comment": record.comment,
+            "doNotDispatchBefore": record.do_not_dispatch_before,
+            "source": {
+                "kind": "local-jsonl",
+                "path": paths.log,
+            },
+            // The stdout receipt is what an SSH caller reads back. No forge
+            // acknowledgement or coordinator-side shell parsing is involved.
+            "offHostReceipt": "stdout-json-v1",
+        }))?
+    );
+    Ok(())
 }
 
 async fn run_campaign_arm(
@@ -2715,7 +3366,6 @@ async fn run_campaign_arm(
     // mid-flight that half its projection is unavailable.
     let sub_issue_walk = probe_sub_issue_walk(&locator)?;
     projection.sub_issue_walk = Some(sub_issue_walk);
-    let steering = fetch_campaign_steering(&graph, &allowed_actors, sub_issue_walk)?;
     let prior_graph = prior
         .as_ref()
         .map(|registration| read_approved_graph_snapshot(&state_dir, registration))
@@ -2817,7 +3467,6 @@ async fn run_campaign_arm(
             rpc_timeout,
         },
         &graph,
-        &steering,
         &repository_progress,
         &mut registration,
         sub_issue_walk,
@@ -3005,7 +3654,6 @@ async fn run_campaign_resume(
     registry.write(&mut registration)?;
     prune_approved_graph_snapshots(&state_dir, &registration)?;
 
-    let steering = fetch_campaign_steering(&graph, &registration.allowed_actors, sub_issue_walk)?;
     let repository_progress = repository_progress_value(&graph)?;
     let result = dispatch_campaign(
         CampaignHost {
@@ -3015,7 +3663,6 @@ async fn run_campaign_resume(
             rpc_timeout,
         },
         &graph,
-        &steering,
         &repository_progress,
         &mut registration,
         sub_issue_walk,
@@ -3119,11 +3766,10 @@ async fn run_campaign_poll(
                 });
             }
             let repository_progress = repository_progress_value(&graph)?;
-            let steering =
-                fetch_campaign_steering(&graph, &registration.allowed_actors, sub_issue_walk)?;
+            let steering = read_local_steering_snapshot(&state_dir, &registration)?;
             let observation = campaign_observation(
                 &graph,
-                &steering,
+                &steering.steering,
                 &repository_progress,
                 registration.arm_serial,
             )?;
@@ -3158,7 +3804,6 @@ async fn run_campaign_poll(
                     rpc_timeout,
                 },
                 &graph,
-                &steering,
                 &repository_progress,
                 &mut registration,
                 sub_issue_walk,
@@ -4848,14 +5493,7 @@ mod tests {
         assert!(probe_sub_issue_walk(&locator).unwrap());
         let walked = sub_issue_threads(&locator).unwrap();
         assert_eq!(walked.threads.keys().copied().collect::<Vec<_>>(), vec![8]);
-        assert!(walked.truncated.is_empty());
-        // The task thread carries human steering under the same contract the
-        // master thread has always used: allowed actors only, machine
-        // receipts excluded.
-        let steering = task_steering(&locator, &["operator".to_owned()], &[8]).unwrap();
-        assert_eq!(steering["8"].len(), 1);
-        assert_eq!(steering["8"][0]["id"], json!(11));
-        assert_eq!(steering["8"][0]["author"], json!("operator"));
+        assert_eq!(walked.threads[&8].len(), 3);
     }
 
     /// A capability gate must not be answerable by an input a stranger writes.
@@ -4907,41 +5545,6 @@ mod tests {
         gh_program.use_program(&quoting_failure);
         let failure = probe_sub_issue_walk(&locator).unwrap_err().to_string();
         assert!(failure.contains("capability probe failed"), "{failure}");
-    }
-
-    /// The steering read's own comment window, on the surface that produces the
-    /// steering an agent is briefed with. `last:` returns the newest, so an
-    /// exhausted window drops the oldest approved comment silently.
-    #[test]
-    fn a_truncated_steering_window_is_reported_by_the_walk_that_reads_it() {
-        let temporary = tempfile::tempdir().unwrap();
-        let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
-        let gh_program = GhProgramGuard::acquire();
-
-        let truncated = fake_gh(
-            temporary.path(),
-            "gh-truncated",
-            &format!("cat <<'TALLY_WALK'\n{HOSTILE_WALK_PAYLOAD}\nTALLY_WALK"),
-        );
-        gh_program.use_program(&truncated);
-        let walked = sub_issue_threads(&locator).unwrap();
-        assert_eq!(
-            walked.truncated.iter().copied().collect::<Vec<_>>(),
-            vec![8]
-        );
-        // Reported, never refused: the walk still returns its threads and the
-        // steering it did read.
-        assert_eq!(walked.threads.keys().copied().collect::<Vec<_>>(), vec![8]);
-        let steering = task_steering(&locator, &["operator".to_owned()], &[8]).unwrap();
-        assert_eq!(steering["8"].len(), 1);
-
-        let untruncated = fake_gh(
-            temporary.path(),
-            "gh-untruncated",
-            &format!("cat <<'TALLY_WALK'\n{WALK_PAYLOAD}\nTALLY_WALK"),
-        );
-        gh_program.use_program(&untruncated);
-        assert!(sub_issue_threads(&locator).unwrap().truncated.is_empty());
     }
 
     #[test]
@@ -5246,18 +5849,6 @@ esac"#,
             campaign_observation(&graph, &quiet, &repository_progress, 1).unwrap(),
             campaign_observation(&graph, &steered, &repository_progress, 1).unwrap()
         );
-    }
-
-    #[test]
-    fn campaign_completion_and_summary_comments_are_machine_state_not_steering() {
-        for body in [
-            "<!-- tally:spec-build:diagnosis:v1 campaign=x -->\nreceipt",
-            "<!-- tally:campaign-complete:v1 source=sha256:abc -->\nsummary",
-            "<!-- tally:campaign-summary:v1 campaign=x outcome=blocked -->\nsummary",
-        ] {
-            assert!(tally_authored_comment(body), "{body:?}");
-        }
-        assert!(!tally_authored_comment("please rerun the failed task"));
     }
 
     #[test]
@@ -6830,6 +7421,134 @@ print(json.dumps({
         // what makes `campaign poll` dispatch later passes with the same
         // widened window the operator armed with.
         assert_eq!(loaded.projection_wait_ms, Some(240_000));
+    }
+
+    #[test]
+    fn local_steering_embargo_and_cursor_bound_dispatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let registration = CampaignRegistration::new(
+            CampaignRegistrationV3 {
+                schema_version: REGISTRY_SCHEMA_VERSION,
+                registration_id: "0198a62b-41ee-7000-8000-000000000571".to_owned(),
+                worklist_pattern: "specs/night/tasks.json".to_owned(),
+                code_repository: "acme/widgets".to_owned(),
+                armed_at: "2026-08-01T00:00:00Z".to_owned(),
+                arm_serial: 1,
+                approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
+                local_actor: local_actor(),
+                allowed_actors: vec!["operator".to_owned()],
+                last_observation: None,
+                flow: PathBuf::from("/nix/store/spec-build.js"),
+                driver: PathBuf::from("/nix/store/spec-build-driver"),
+                workspace_root: PathBuf::from("/srv/tally-campaigns"),
+            },
+            None,
+        );
+        let now = DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first = append_local_steering_at(
+            temporary.path(),
+            &registration,
+            None,
+            "Keep the bounded path.".to_owned(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&first.comment).unwrap(),
+            json!({
+                "id": 1,
+                "url": "local://campaign/0198a62b-41ee-7000-8000-000000000571/steering/1",
+                "author": local_actor(),
+                "body": "Keep the bounded path.",
+                "createdAt": "2026-08-13T10:00:00.000Z",
+                "updatedAt": "2026-08-13T10:00:00.000Z",
+            })
+        );
+
+        let paths = local_steering_paths(temporary.path(), &registration.registration_id);
+        assert!(!paths.cursor.exists());
+        match open_local_steering_dispatch_at(temporary.path(), &registration, now).unwrap() {
+            LocalSteeringDispatchState::Embargoed(until) => assert_eq!(
+                until,
+                DateTime::parse_from_rfc3339("2026-08-13T10:00:01Z").unwrap()
+            ),
+            LocalSteeringDispatchState::Ready(_) => panic!("steering dispatched inside embargo"),
+        }
+
+        // Dropping a prepared dispatch models an enqueue failure: its lock is
+        // released, but the durable high-water cursor must not move.
+        let uncommitted = match open_local_steering_dispatch_at(
+            temporary.path(),
+            &registration,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap()
+        {
+            LocalSteeringDispatchState::Ready(dispatch) => dispatch,
+            LocalSteeringDispatchState::Embargoed(_) => panic!("embargo did not expire"),
+        };
+        assert_eq!(uncommitted.snapshot.source.prepared_cursor, 1);
+        assert_eq!(uncommitted.snapshot.steering.master.len(), 1);
+        drop(uncommitted);
+        assert!(!paths.cursor.exists());
+
+        let committed = match open_local_steering_dispatch_at(
+            temporary.path(),
+            &registration,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap()
+        {
+            LocalSteeringDispatchState::Ready(dispatch) => dispatch,
+            LocalSteeringDispatchState::Embargoed(_) => panic!("embargo did not expire"),
+        };
+        committed
+            .commit(
+                &format!("sha256:{}", "b".repeat(64)),
+                now + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        let first_cursor: LocalSteeringCursorV1 =
+            serde_json::from_slice(&fs::read(&paths.cursor).unwrap()).unwrap();
+        assert_eq!(first_cursor.high_water, 1);
+
+        let second = append_local_steering_at(
+            temporary.path(),
+            &registration,
+            Some("task-1".to_owned()),
+            "Use the local receipt.".to_owned(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.comment.created_at, "2026-08-13T10:00:00.001Z");
+        let unchanged_cursor: LocalSteeringCursorV1 =
+            serde_json::from_slice(&fs::read(&paths.cursor).unwrap()).unwrap();
+        assert_eq!(unchanged_cursor.high_water, 1);
+
+        let committed = match open_local_steering_dispatch_at(
+            temporary.path(),
+            &registration,
+            now + chrono::Duration::seconds(3),
+        )
+        .unwrap()
+        {
+            LocalSteeringDispatchState::Ready(dispatch) => dispatch,
+            LocalSteeringDispatchState::Embargoed(_) => panic!("second embargo did not expire"),
+        };
+        assert_eq!(committed.snapshot.source.prepared_cursor, 2);
+        assert_eq!(committed.snapshot.steering.tasks["task-1"].len(), 1);
+        committed
+            .commit(
+                &format!("sha256:{}", "c".repeat(64)),
+                now + chrono::Duration::seconds(3),
+            )
+            .unwrap();
+        let second_cursor: LocalSteeringCursorV1 =
+            serde_json::from_slice(&fs::read(&paths.cursor).unwrap()).unwrap();
+        assert_eq!(second_cursor.high_water, 2);
     }
 
     #[test]

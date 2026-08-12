@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta
 import fcntl
 import fnmatch
 import hashlib
@@ -4580,30 +4581,19 @@ def steering_thread_issue(
     return campaign_issue(task_issue)
 
 
-STEERING_RECHECK_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    issue(number: $number) {
-      comments(last: 100) {
-        pageInfo { hasPreviousPage }
-        nodes { databaseId url body createdAt updatedAt author { login } }
-      }
-    }
-  }
-}
-"""
-
-
-def github_login(value: Any, context: str) -> str:
-    login = required_string(value, context, 39)
+def local_actor(value: Any, context: str) -> str:
+    """Validate the actor frozen into authority schema v3 at arm time."""
     if (
-        not login.isascii()
-        or login.startswith("-")
-        or login.endswith("-")
-        or any(not (char.isalnum() or char == "-") for char in login)
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or "\0" in value
+        or "/" in value
+        or "\\" in value
+        or any(char.isspace() for char in value)
     ):
-        fail(f"{context} is not a valid GitHub login")
-    return login.casefold()
+        fail(f"{context} is not a valid local actor")
+    return value
 
 
 def steering_comment(value: Any, context: str) -> dict[str, Any]:
@@ -4623,7 +4613,7 @@ def steering_comment(value: Any, context: str) -> dict[str, Any]:
     return {
         "id": identifier,
         "url": required_string(comment.get("url"), f"{context}.url"),
-        "author": github_login(comment.get("author"), f"{context}.author"),
+        "author": local_actor(comment.get("author"), f"{context}.author"),
         "body": body,
         "createdAt": required_string(
             comment.get("createdAt"), f"{context}.createdAt"
@@ -4634,168 +4624,284 @@ def steering_comment(value: Any, context: str) -> dict[str, Any]:
     }
 
 
+RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def steering_timestamp(value: Any, context: str) -> datetime:
+    text = required_string(value, context)
+    if not RFC3339_TIMESTAMP.fullmatch(text):
+        fail(f"{context} is not an RFC 3339 timestamp")
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        fail(f"{context} is not an RFC 3339 timestamp")
+
+
 def authorized_steering_comments(
-    comments: Any, allowed_actors: set[str], context: str
+    comments: Any, allowed_actor: str, context: str
 ) -> list[dict[str, Any]]:
-    """Apply the arm-time steering authorization contract to one fresh read."""
+    """Apply the arm-time local actor authorization to one fresh read."""
     if not isinstance(comments, list):
         fail(f"{context} must be an array")
     authorized: list[dict[str, Any]] = []
     seen: set[int] = set()
     for index, candidate in enumerate(comments):
-        if not isinstance(candidate, dict):
-            fail(f"{context}[{index}] must be an object")
-        body = candidate.get("body")
-        if not isinstance(body, str):
-            fail(f"{context}[{index}].body must be text")
-        # This is the same contains-marker rule as campaign.rs's prep-time
-        # `fetch_steering` and `task_steering` paths. A second read must not
-        # admit tally's own receipts as if they were human instructions.
-        if SYSTEM_COMMENT_PREFIX in body:
+        comment = steering_comment(candidate, f"{context}[{index}]")
+        # Preserve the historical contains-marker exclusion as a second check
+        # behind the writer. A hand-edited receipt record still cannot become
+        # an instruction merely because the transport moved off the forge.
+        if SYSTEM_COMMENT_PREFIX in comment["body"]:
             continue
-        author = candidate.get("user")
-        if not isinstance(author, dict):
-            author = candidate.get("author")
-        login = author.get("login") if isinstance(author, dict) else None
-        if not isinstance(login, str):
+        if comment["author"] != allowed_actor:
             continue
-        actor = github_login(login, f"{context}[{index}].user.login")
-        if actor not in allowed_actors:
-            continue
-        if "\0" in body or len(body) > 64_000:
-            url = candidate.get("html_url")
-            if not isinstance(url, str):
-                url = candidate.get("url")
-            fail(
-                f"approved steering comment {url!r} exceeds the campaign comment contract"
-            )
-        identifier = candidate.get("id", candidate.get("databaseId"))
-        if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier < 1:
-            # GraphQL can redact an id or author. Prep-time task steering skips
-            # those comments, so the re-check does too.
-            continue
-        url = candidate.get("html_url", candidate.get("url"))
-        created_at = candidate.get("created_at", candidate.get("createdAt"))
-        updated_at = candidate.get("updated_at", candidate.get("updatedAt"))
-        normalized = steering_comment(
-            {
-                "id": identifier,
-                "url": url,
-                "author": actor,
-                "body": body,
-                "createdAt": created_at,
-                "updatedAt": updated_at,
-            },
-            f"{context}[{index}]",
-        )
-        if identifier in seen:
-            fail(f"{context} repeated comment id {identifier}")
-        seen.add(identifier)
-        authorized.append(normalized)
-    if len(authorized) > 1_000:
-        fail(f"{context} has more than 1000 approved steering comments")
+        if comment["id"] in seen:
+            fail(f"{context} repeated comment id {comment['id']}")
+        seen.add(comment["id"])
+        authorized.append(comment)
+    if len(authorized) > 2_000:
+        fail(f"{context} has more than 2000 approved steering comments")
     return authorized
 
 
-def github_steering_thread_comments(
-    repository: str, issue_number: str, native: bool
-) -> tuple[list[dict[str, Any]], bool]:
-    """Read the task thread once, in the same window shape used at prep."""
-    if not native:
-        return github_issue_comments(repository, issue_number), False
-    owner, name = repository.split("/", 1)
-    payload = github_json(
-        [
-            "api",
-            "graphql",
-            "-f",
-            f"query={STEERING_RECHECK_QUERY}",
-            "-F",
-            f"owner={owner}",
-            "-F",
-            f"name={name}",
-            "-F",
-            f"number={issue_number}",
-        ],
-        "task steering re-check",
+def steering_source(value: Any, local_actor_value: str) -> dict[str, Any]:
+    source = object_complete(
+        value,
+        {
+            "schemaVersion",
+            "kind",
+            "registrationId",
+            "localActor",
+            "logPath",
+            "lockPath",
+            "preparedCursor",
+        },
+        "steeringSource",
     )
-    connection: Any = payload
-    for key in ("data", "repository", "issue", "comments"):
-        connection = connection.get(key) if isinstance(connection, dict) else None
-    if not isinstance(connection, dict):
-        fail("task steering re-check returned no comment connection")
-    comments = connection.get("nodes")
-    if not isinstance(comments, list):
-        fail("task steering re-check returned malformed comments")
-    page_info = connection.get("pageInfo")
-    if not isinstance(page_info, dict):
-        fail("task steering re-check returned no page information")
-    return comments, page_info.get("hasPreviousPage") is True
+    if source.get("schemaVersion") != 1 or source.get("kind") != "local-jsonl":
+        fail("steeringSource must use local-jsonl schema version 1")
+    registration_id = required_string(
+        source.get("registrationId"), "steeringSource.registrationId", 128
+    )
+    try:
+        if str(uuid.UUID(registration_id)) != registration_id:
+            raise ValueError
+    except ValueError:
+        fail("steeringSource.registrationId must be a canonical UUID")
+    source_actor = local_actor(source.get("localActor"), "steeringSource.localActor")
+    if source_actor != local_actor_value:
+        fail("steeringSource.localActor does not match localActor")
+    log_path = Path(required_string(source.get("logPath"), "steeringSource.logPath"))
+    lock_path = Path(required_string(source.get("lockPath"), "steeringSource.lockPath"))
+    if not log_path.is_absolute() or not lock_path.is_absolute():
+        fail("steeringSource paths must be absolute")
+    if (
+        log_path.name != "steering-v1.jsonl"
+        or lock_path.name != "steering.lock"
+        or log_path.parent != lock_path.parent
+        or log_path.parent.name != registration_id
+        or log_path.parent.parent.name != "steering"
+        or log_path.parent.parent.parent.name != "campaigns"
+    ):
+        fail("steeringSource paths do not identify one campaign steering source")
+    prepared_cursor = source.get("preparedCursor")
+    if (
+        not isinstance(prepared_cursor, int)
+        or isinstance(prepared_cursor, bool)
+        or prepared_cursor < 0
+    ):
+        fail("steeringSource.preparedCursor must be a non-negative integer")
+    return {
+        "registrationId": registration_id,
+        "localActor": source_actor,
+        "logPath": log_path,
+        "lockPath": lock_path,
+        "preparedCursor": prepared_cursor,
+    }
+
+
+def _open_regular_nofollow(path: Path, flags: int, context: str) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags | nofollow | cloexec)
+    except OSError as error:
+        fail(f"cannot open {context} {path}: {error}")
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"{context} {path} is not a regular file")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def local_steering_comments(
+    source: dict[str, Any], task_id: str
+) -> tuple[list[dict[str, Any]], int]:
+    """Read one complete append-only snapshot under the writer's flock."""
+    lock_descriptor = _open_regular_nofollow(
+        source["lockPath"], os.O_RDWR, "campaign steering lock"
+    )
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_SH)
+        log_descriptor = _open_regular_nofollow(
+            source["logPath"], os.O_RDONLY, "campaign steering log"
+        )
+        try:
+            metadata = os.fstat(log_descriptor)
+            if metadata.st_size > 128 * 1024 * 1024:
+                fail("campaign steering log exceeds 128 MiB")
+            with os.fdopen(log_descriptor, "rb", closefd=False) as handle:
+                raw = handle.read(128 * 1024 * 1024 + 1)
+        finally:
+            os.close(log_descriptor)
+    finally:
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+    if len(raw) > 128 * 1024 * 1024:
+        fail("campaign steering log exceeds 128 MiB")
+    if raw and not raw.endswith(b"\n"):
+        fail("campaign steering log has an incomplete final record")
+    comments: list[dict[str, Any]] = []
+    target_counts: dict[str | None, int] = {}
+    prior_embargo: datetime | None = None
+    lines = raw.splitlines()
+    for index, line in enumerate(lines):
+        if not line:
+            fail(f"campaign steering log has an empty record at line {index + 1}")
+        try:
+            value = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            fail(f"campaign steering log record {index + 1} is invalid: {error}")
+        record = object_complete(
+            value,
+            {
+                "schemaVersion",
+                "sequence",
+                "registrationId",
+                "taskId",
+                "doNotDispatchBefore",
+                "comment",
+            },
+            f"campaign steering record {index + 1}",
+        )
+        sequence = index + 1
+        target = record.get("taskId")
+        if target is not None and (
+            not isinstance(target, str)
+            or len(target) > 80
+            or not TASK_ID.fullmatch(target)
+        ):
+            fail(f"campaign steering record {sequence}.taskId is invalid")
+        comment = steering_comment(
+            record.get("comment"), f"campaign steering record {sequence}.comment"
+        )
+        expected_url = (
+            f"local://campaign/{source['registrationId']}/steering/{sequence}"
+        )
+        if (
+            record.get("schemaVersion") != 1
+            or record.get("sequence") != sequence
+            or record.get("registrationId") != source["registrationId"]
+            or comment["id"] != sequence
+            or comment["url"] != expected_url
+            or comment["author"] != source["localActor"]
+        ):
+            fail(f"campaign steering record {sequence} violates steering-v1 invariants")
+        created = steering_timestamp(
+            comment["createdAt"],
+            f"campaign steering record {sequence}.comment.createdAt",
+        )
+        updated = steering_timestamp(
+            comment["updatedAt"],
+            f"campaign steering record {sequence}.comment.updatedAt",
+        )
+        embargo = steering_timestamp(
+            record.get("doNotDispatchBefore"),
+            f"campaign steering record {sequence}.doNotDispatchBefore",
+        )
+        if updated != created or embargo != created + timedelta(milliseconds=1_000):
+            fail(
+                f"campaign steering record {sequence} has inconsistent "
+                "append-only timestamps"
+            )
+        if prior_embargo is not None and embargo <= prior_embargo:
+            fail(
+                f"campaign steering record {sequence} does not advance "
+                "doNotDispatchBefore"
+            )
+        prior_embargo = embargo
+        target_counts[target] = target_counts.get(target, 0) + 1
+        if target_counts[target] > 1_000:
+            fail(f"campaign steering target {target!r} has more than 1000 records")
+        if target is None or target == task_id:
+            comments.append(comment)
+    return comments, len(lines)
 
 
 def action_steering_recheck(brief: dict[str, Any]) -> dict[str, Any]:
     """Fold steering that arrived after prep into this attempt's own brief."""
-    brief, capabilities = take_capabilities(brief)
-    fields = {
-        "campaign",
-        "repository",
-        "repositoryConfig",
-        "issue",
-        "taskId",
-        "allowedActors",
-        "preparedComments",
-    }
-    if "taskIssue" in brief:
-        fields.add("taskIssue")
-    data = object_exact(
+    data = object_complete(
         brief,
-        seam_fields(brief, fields),
+        {
+            "campaign",
+            "campaignIdentity",
+            "taskId",
+            "localActor",
+            "steeringSource",
+            "preparedComments",
+        },
         "steering re-check brief",
     )
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
-    repository = required_string(data.get("repository"), "repository")
-    if not REPOSITORY.fullmatch(repository):
-        fail("repository must use owner/name form")
+    campaign_identity = required_string(
+        data.get("campaignIdentity"), "campaignIdentity", 128
+    )
     task_id = required_string(data.get("taskId"), "taskId")
-    if not TASK_ID.fullmatch(task_id):
+    if len(task_id) > 80 or not TASK_ID.fullmatch(task_id):
         fail("taskId is not safe")
-    config = repo_config(data.get("repositoryConfig"))
-    target = campaign_coordinates(data, repository, config)["issue"]
-    thread = steering_thread_issue(data, capabilities)
-
-    actors = string_list(data.get("allowedActors"), "allowedActors", nonempty=True)
-    allowed_actors = {
-        github_login(actor, f"allowedActors[{index}]")
-        for index, actor in enumerate(actors)
-    }
-    if len(allowed_actors) != len(actors):
-        fail("allowedActors must not repeat a GitHub login")
+    actor = local_actor(data.get("localActor"), "localActor")
+    source = steering_source(data.get("steeringSource"), actor)
+    if source["registrationId"] != campaign_identity:
+        fail("steeringSource.registrationId does not match campaignIdentity")
 
     prepared_value = data.get("preparedComments")
     if not isinstance(prepared_value, list):
         fail("preparedComments must be an array")
+    if len(prepared_value) > 2_000:
+        fail("preparedComments has more than 2000 local steering records")
     prepared: list[dict[str, Any]] = []
     prepared_ids: set[int] = set()
     for index, value in enumerate(prepared_value):
         comment = steering_comment(value, f"preparedComments[{index}]")
-        if comment["author"] not in allowed_actors:
-            fail("preparedComments contains an actor outside allowedActors")
+        if comment["author"] != actor:
+            fail("preparedComments contains an actor outside local authority")
         if SYSTEM_COMMENT_PREFIX in comment["body"]:
             fail("preparedComments contains a system receipt")
+        if comment["id"] > source["preparedCursor"]:
+            fail("preparedComments contains an ID beyond the prepared cursor")
+        expected_url = (
+            f"local://campaign/{source['registrationId']}/steering/{comment['id']}"
+        )
+        if comment["url"] != expected_url:
+            fail("preparedComments contains a record outside the local source")
         if comment["id"] in prepared_ids:
             fail(f"preparedComments repeated comment id {comment['id']}")
         prepared_ids.add(comment["id"])
         prepared.append(comment)
 
-    raw_comments, truncated = github_steering_thread_comments(
-        target["repository"],
-        thread["number"],
-        capabilities["subIssueWalk"] and data.get("taskIssue") is not None,
-    )
+    raw_comments, rechecked_cursor = local_steering_comments(source, task_id)
+    if rechecked_cursor < source["preparedCursor"]:
+        fail("campaign steering log is behind the prepared cursor")
     rechecked = authorized_steering_comments(
-        raw_comments, allowed_actors, "task steering re-check comments"
+        raw_comments, actor, "task steering re-check comments"
     )
 
     merged = list(prepared)
@@ -4816,9 +4922,15 @@ def action_steering_recheck(brief: dict[str, Any]) -> dict[str, Any]:
         "taskId": task_id,
         "authorizedComments": merged,
         "receipt": {
-            "thread": thread,
+            "source": {
+                "kind": "local-jsonl",
+                "registrationId": source["registrationId"],
+                "path": str(source["logPath"]),
+                "preparedCursor": source["preparedCursor"],
+                "recheckedCursor": rechecked_cursor,
+            },
             "rechecked": True,
-            "recheckTruncated": truncated,
+            "recheckTruncated": False,
             "preparedCommentIds": [comment["id"] for comment in prepared],
             "lateRecheckCommentIds": late_ids,
         },

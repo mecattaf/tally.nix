@@ -188,6 +188,8 @@ pub(super) struct MigrateCaptureLabelsArgs {
 pub(super) enum CampaignCommand {
     /// Register a repository/worklist campaign and admit its current reconcile pass.
     Arm(CampaignArmArgs),
+    /// Append human steering to an armed campaign's local ordered log.
+    Steer(CampaignSteerArgs),
     /// Pardon an escalated campaign's counters, record why, and re-arm it.
     Resume(CampaignResumeArgs),
     /// Project a worklist into one master issue and native task sub-issues.
@@ -203,6 +205,41 @@ pub(super) enum CampaignCommand {
     Quiescent(CampaignQuiescentArgs),
     /// Remove a local campaign registration without changing any forge projection.
     Disarm(CampaignDisarmArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignSteerArgs {
+    /// Code repository coordinate of an existing armed campaign.
+    #[arg(value_name = "OWNER/REPO")]
+    pub(super) code_repository: String,
+    /// Committed worklist pattern identifying the campaign.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist_pattern: String,
+    /// Address only this task. Omit to steer every task in the campaign.
+    #[arg(long, value_name = "TASK_ID")]
+    pub(super) task: Option<String>,
+    /// Steering text. Use --message-file - when invoking the verb over SSH.
+    #[arg(
+        long,
+        alias = "body",
+        value_name = "TEXT",
+        conflicts_with = "message_file",
+        required_unless_present = "message_file"
+    )]
+    pub(super) message: Option<String>,
+    /// Read steering text from PATH, or from stdin with `-`. The stdin form is
+    /// the stable off-host contract: `ssh HOST tally campaign steer ...
+    /// --message-file -` does not expose or re-quote the text in remote argv.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "message",
+        required_unless_present = "message"
+    )]
+    pub(super) message_file: Option<PathBuf>,
+    /// Durable registration root; defaults beneath tally state.
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
