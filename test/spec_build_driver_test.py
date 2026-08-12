@@ -86,6 +86,37 @@ def issue() -> dict[str, str]:
     return {"number": "7", "url": "https://github.com/acme/spec/issues/7"}
 
 
+LOCAL_STEERING_REGISTRATION = "0198a62b-41ee-7000-8000-000000000571"
+LOCAL_STEERING_ACTOR = "uid:1000"
+
+
+def local_steering_comment(identifier: int, body: str) -> dict[str, object]:
+    timestamp = f"2026-08-13T00:00:0{identifier}Z"
+    return {
+        "id": identifier,
+        "url": (
+            f"local://campaign/{LOCAL_STEERING_REGISTRATION}/steering/{identifier}"
+        ),
+        "author": LOCAL_STEERING_ACTOR,
+        "body": body,
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+    }
+
+
+def local_steering_record(
+    identifier: int, body: str, task_id: str | None
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "sequence": identifier,
+        "registrationId": LOCAL_STEERING_REGISTRATION,
+        "taskId": task_id,
+        "doNotDispatchBefore": f"2026-08-13T00:00:0{identifier + 1}Z",
+        "comment": local_steering_comment(identifier, body),
+    }
+
+
 def canonical_graph(
     manifest: dict[str, object], issues: list[dict[str, object]]
 ) -> dict[str, object]:
@@ -5017,6 +5048,144 @@ class OutcomeFirstGrammarTests(unittest.TestCase):
         # The heading is structural, not prose; the first prose line is what
         # the grammar contract governs, and it must be the outcome sentence.
         self.assertTrue(lines[1].startswith("Settled "))
+
+
+class LocalSteeringRecheckTests(unittest.TestCase):
+    def source(self, root: Path, prepared_cursor: int) -> dict[str, object]:
+        directory = root / "campaigns" / "steering" / LOCAL_STEERING_REGISTRATION
+        directory.mkdir(parents=True)
+        log = directory / "steering-v1.jsonl"
+        lock = directory / "steering.lock"
+        log.touch()
+        lock.touch()
+        return {
+            "schemaVersion": 1,
+            "kind": "local-jsonl",
+            "registrationId": LOCAL_STEERING_REGISTRATION,
+            "localActor": LOCAL_STEERING_ACTOR,
+            "logPath": str(log),
+            "lockPath": str(lock),
+            "preparedCursor": prepared_cursor,
+        }
+
+    def brief(
+        self,
+        source: dict[str, object],
+        prepared: list[dict[str, object]],
+    ) -> dict[str, object]:
+        return {
+            "campaign": "fixture",
+            "campaignIdentity": LOCAL_STEERING_REGISTRATION,
+            "taskId": "task-1",
+            "localActor": LOCAL_STEERING_ACTOR,
+            "steeringSource": source,
+            "preparedComments": prepared,
+        }
+
+    def write_records(
+        self, source: dict[str, object], records: list[dict[str, object]]
+    ) -> None:
+        Path(str(source["logPath"])).write_text(
+            "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in records
+            ),
+            encoding="utf-8",
+        )
+
+    def test_local_high_water_fold_preserves_comments_and_witnesses_late_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self.source(Path(temporary), 1)
+            prepared = local_steering_comment(1, "Keep the bounded path.")
+            late = local_steering_record(2, "Use the local receipt.", "task-1")
+            unrelated = local_steering_record(3, "Only task two sees this.", "task-2")
+            self.write_records(
+                source,
+                [
+                    local_steering_record(1, "Keep the bounded path.", None),
+                    late,
+                    unrelated,
+                ],
+            )
+
+            with mock.patch.object(
+                DRIVER,
+                "github_json",
+                side_effect=AssertionError("local recheck must not call gh"),
+            ):
+                result = DRIVER.action_steering_recheck(
+                    self.brief(source, [prepared])
+                )
+
+            self.assertEqual(
+                result["authorizedComments"],
+                [prepared, late["comment"]],
+            )
+            self.assertEqual(
+                result["receipt"],
+                {
+                    "source": {
+                        "kind": "local-jsonl",
+                        "registrationId": LOCAL_STEERING_REGISTRATION,
+                        "path": source["logPath"],
+                        "preparedCursor": 1,
+                        "recheckedCursor": 3,
+                    },
+                    "rechecked": True,
+                    "recheckTruncated": False,
+                    "preparedCommentIds": [1],
+                    "lateRecheckCommentIds": [2],
+                },
+            )
+
+    def test_append_only_edit_detection_fold_is_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self.source(Path(temporary), 1)
+            before = local_steering_comment(1, "Use the first direction.")
+            after = local_steering_record(1, "Use the corrected direction.", None)
+            self.write_records(source, [after])
+
+            result = DRIVER.action_steering_recheck(self.brief(source, [before]))
+
+            self.assertEqual(result["authorizedComments"], [after["comment"]])
+            self.assertEqual(result["receipt"]["lateRecheckCommentIds"], [1])
+
+    def test_partial_local_record_is_refused_instead_of_silently_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self.source(Path(temporary), 0)
+            Path(str(source["logPath"])).write_text("{", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "incomplete final record"
+            ):
+                DRIVER.action_steering_recheck(self.brief(source, []))
+
+    def test_local_record_embargo_must_be_one_second_after_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self.source(Path(temporary), 0)
+            record = local_steering_record(1, "Keep the embargo.", None)
+            record["doNotDispatchBefore"] = "2026-08-13T00:00:09Z"
+            self.write_records(source, [record])
+
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "inconsistent append-only timestamps"
+            ):
+                DRIVER.action_steering_recheck(self.brief(source, []))
+
+    def test_each_append_must_push_the_dispatch_embargo(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self.source(Path(temporary), 0)
+            first = local_steering_record(1, "First.", None)
+            second = local_steering_record(2, "Second.", "task-1")
+            second["comment"]["createdAt"] = first["comment"]["createdAt"]
+            second["comment"]["updatedAt"] = first["comment"]["updatedAt"]
+            second["doNotDispatchBefore"] = first["doNotDispatchBefore"]
+            self.write_records(source, [first, second])
+
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "does not advance doNotDispatchBefore"
+            ):
+                DRIVER.action_steering_recheck(self.brief(source, []))
 
 
 class SteeringGrammarTests(unittest.TestCase):

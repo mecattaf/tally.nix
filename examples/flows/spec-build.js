@@ -346,7 +346,7 @@ export const meta = {
           properties: {
             id: { type: "integer", minimum: 1 },
             url: { type: "string", minLength: 1 },
-            author: { type: "string", minLength: 1, maxLength: 39 },
+            author: { type: "string", minLength: 1, maxLength: 128 },
             body: { type: "string", maxLength: 64000 },
             createdAt: { type: "string", minLength: 1 },
             updatedAt: { type: "string", minLength: 1 }
@@ -354,10 +354,44 @@ export const meta = {
           additionalProperties: false
         }
       },
-      // The exact arm-time authorization boundary used to build `steering`
-      // and `taskSteering`. The pre-dispatch re-check receives this list
-      // rather than inferring authority from whichever actors happened to
-      // comment before prep.
+      // Closed arm authority for the local steering source. Unlike the old
+      // comment transport, authorization is not inferred from a forge actor
+      // carried by whichever record happened to arrive first.
+      localActor: {
+        type: "string",
+        minLength: 1,
+        maxLength: 128,
+        pattern: "^[^\\s/\\\\\\u0000]+$"
+      },
+      steeringSource: {
+        type: "object",
+        required: [
+          "schemaVersion",
+          "kind",
+          "registrationId",
+          "localActor",
+          "logPath",
+          "lockPath",
+          "preparedCursor"
+        ],
+        properties: {
+          schemaVersion: { const: 1 },
+          kind: { const: "local-jsonl" },
+          registrationId: { type: "string", minLength: 1, maxLength: 128 },
+          localActor: {
+            type: "string",
+            minLength: 1,
+            maxLength: 128,
+            pattern: "^[^\\s/\\\\\\u0000]+$"
+          },
+          logPath: { type: "string", pattern: "^/" },
+          lockPath: { type: "string", pattern: "^/" },
+          preparedCursor: { type: "integer", minimum: 0 }
+        },
+        additionalProperties: false
+      },
+      // Legacy forge authority retained for the surrounding campaign paths;
+      // local steering authorization uses `localActor` exclusively.
       allowedActors: {
         type: "array",
         minItems: 1,
@@ -370,9 +404,9 @@ export const meta = {
           pattern: "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
         }
       },
-      // Human steering collected from each task's own sub-issue thread, keyed
-      // by sub-issue number. The master stays the campaign-wide channel and
-      // still reaches every task; a task thread reaches exactly one.
+      // Task-addressed steering, keyed by stable task ID for local sources.
+      // The pre-local file-worklist branch keeps accepting issue-number keys
+      // until its forge projection is removed later in the shift.
       taskSteering: {
         type: "object",
         maxProperties: 100,
@@ -385,7 +419,7 @@ export const meta = {
             properties: {
               id: { type: "integer", minimum: 1 },
               url: { type: "string", minLength: 1 },
-              author: { type: "string", minLength: 1, maxLength: 39 },
+              author: { type: "string", minLength: 1, maxLength: 128 },
               body: { type: "string", maxLength: 64000 },
               createdAt: { type: "string", minLength: 1 },
               updatedAt: { type: "string", minLength: 1 }
@@ -445,6 +479,23 @@ export const meta = {
           "steering",
           "allowedActors",
           "tally"
+        ],
+        // The compatibility corpus predates task-addressed local steering. A
+        // canonical dispatch that supplies that map must supply both halves of
+        // the new closed source authority; either half alone is always invalid.
+        allOf: [
+          {
+            if: { required: ["taskSteering"] },
+            then: { required: ["localActor", "steeringSource"] }
+          },
+          {
+            if: { required: ["localActor"] },
+            then: { required: ["steeringSource"] }
+          },
+          {
+            if: { required: ["steeringSource"] },
+            then: { required: ["localActor"] }
+          }
         ],
         properties: {
           worklist: {
@@ -1264,7 +1315,7 @@ const authorizedSteeringCommentSchema = {
   properties: {
     id: { type: "integer", minimum: 1 },
     url: { type: "string", minLength: 1 },
-    author: { type: "string", minLength: 1, maxLength: 39 },
+    author: { type: "string", minLength: 1, maxLength: 128 },
     body: { type: "string", maxLength: 64000 },
     createdAt: { type: "string", minLength: 1 },
     updatedAt: { type: "string", minLength: 1 }
@@ -1285,19 +1336,28 @@ const steeringRecheckSchema = {
     receipt: {
       type: "object",
       required: [
-        "thread",
+        "source",
         "rechecked",
         "recheckTruncated",
         "preparedCommentIds",
         "lateRecheckCommentIds"
       ],
       properties: {
-        thread: {
+        source: {
           type: "object",
-          required: ["number", "url"],
+          required: [
+            "kind",
+            "registrationId",
+            "path",
+            "preparedCursor",
+            "recheckedCursor"
+          ],
           properties: {
-            number: { type: "string", pattern: "^[1-9][0-9]*$" },
-            url: { type: "string", minLength: 1 }
+            kind: { const: "local-jsonl" },
+            registrationId: { type: "string", minLength: 1, maxLength: 128 },
+            path: { type: "string", pattern: "^/" },
+            preparedCursor: { type: "integer", minimum: 0 },
+            recheckedCursor: { type: "integer", minimum: 0 }
           },
           additionalProperties: false
         },
@@ -1654,11 +1714,22 @@ function failureClass(reconciliation, failure) {
 
 function preparedSteering(task) {
   const comments = authorizedComments(task);
+  const origin = args.steeringSource === undefined
+    ? { thread: taskThread(task) || args.issue }
+    : {
+        source: {
+          kind: "local-jsonl",
+          registrationId: args.steeringSource.registrationId,
+          path: args.steeringSource.logPath,
+          preparedCursor: args.steeringSource.preparedCursor,
+          recheckedCursor: args.steeringSource.preparedCursor
+        }
+      };
   return {
     taskId: task.id,
     authorizedComments: comments,
     receipt: {
-      thread: taskThread(task) || args.issue,
+      ...origin,
       rechecked: false,
       recheckTruncated: false,
       preparedCommentIds: comments.map(comment => comment.id),
@@ -1815,15 +1886,18 @@ function taskThread(task) {
   return task.brief.issue;
 }
 
-// The master reaches every task; a task's own sub-issue thread reaches only
-// that task.
+// Campaign-wide local records reach every task; a task-addressed record
+// reaches only that task. The task ID survives every forge projection change.
 function authorizedComments(task) {
   const master = args.steering || [];
-  const thread = taskThread(task);
-  if (thread === null || args.taskSteering === undefined) {
+  if (args.taskSteering === undefined) {
     return master;
   }
-  return master.concat(args.taskSteering[thread.number] || []);
+  const thread = taskThread(task);
+  const key = args.steeringSource === undefined && thread !== null
+    ? thread.number
+    : task.id;
+  return master.concat(args.taskSteering[key] || []);
 }
 
 function reconciledProjection(reconciliation) {
@@ -2443,24 +2517,19 @@ function sweepDeferral(sweepNode) {
     } else {
       const prepSteering = preparedSteering(task);
       let attemptSteering = prepSteering;
-      if (task.brief) {
-        const recheckBrief = withCapabilities({
+      if (task.brief && args.steeringSource !== undefined) {
+        const recheckBrief = {
           campaign: effective.campaign,
-          repository: codeRepository,
-          repositoryConfig,
-          issue: args.issue,
+          campaignIdentity: args.campaignIdentity,
           taskId: task.id,
-          allowedActors: args.allowedActors,
+          localActor: args.localActor,
+          steeringSource: args.steeringSource,
           preparedComments: prepSteering.authorizedComments
-        });
-        const recheckThread = taskThread(task);
-        if (recheckThread !== null) {
-          recheckBrief.taskIssue = recheckThread;
-        }
-        // The task thread is read once after lane preparation and immediately
-        // before adapter admission. This is the only mutable-forge window in an
-        // otherwise immutable attempt brief. Module-declared tasks keep their
-        // historical agent-owned GitHub channel and carry no local allowlist.
+        };
+        // The append-only source is read once after lane preparation and
+        // immediately before adapter admission. The prepared cursor plus this
+        // fresh high-water read preserve the existing union/late-ID receipt;
+        // neither read touches a forge or invokes gh.
         const recheckedSteering = await driverNode(
           "steeringRecheck",
           recheckBrief,

@@ -75,6 +75,49 @@ fn campaign_arm_takes_repository_and_committed_worklist_identity() {
 }
 
 #[test]
+fn campaign_steer_supports_task_scope_and_the_ssh_stdin_contract() {
+    let options = Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "steer",
+        "acme/widgets",
+        "specs/night/tasks.json",
+        "--task",
+        "local-steering-source",
+        "--message-file",
+        "-",
+        "--state-dir",
+        "/var/lib/tally/state",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Campaign {
+            command: CampaignCommand::Steer(CampaignSteerArgs {
+                code_repository,
+                worklist_pattern,
+                task: Some(task),
+                message: None,
+                message_file: Some(message_file),
+                state_dir: Some(state_dir),
+            })
+        }) if code_repository == "acme/widgets"
+            && worklist_pattern == "specs/night/tasks.json"
+            && task == "local-steering-source"
+            && message_file == Path::new("-")
+            && state_dir == Path::new("/var/lib/tally/state")
+    ));
+    assert!(Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "steer",
+        "acme/widgets",
+        "specs/night/tasks.json",
+    ])
+    .is_err());
+}
+
+#[test]
 fn campaign_resume_requires_and_preserves_its_audit_reason() {
     let options = Opts::try_parse_from([
         "tally",

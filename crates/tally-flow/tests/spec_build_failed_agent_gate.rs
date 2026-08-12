@@ -230,6 +230,7 @@ fn issue_task(conflict_domains: Option<Value>) -> Value {
 fn args() -> Value {
     json!({
         "campaign": "fixture",
+        "campaignIdentity": "0198a62b-41ee-7000-8000-000000000571",
         "repository": "acme/spec",
         "repositories": {
             "acme/spec": {
@@ -244,6 +245,19 @@ fn args() -> Value {
         "worklist": "/srv/spec/checkout/worklist.json",
         "maxTasks": 8,
         "maxParallel": 1,
+        "steering": [],
+        "taskSteering": {},
+        "allowedActors": ["operator"],
+        "localActor": "uid:1000",
+        "steeringSource": {
+            "schemaVersion": 1,
+            "kind": "local-jsonl",
+            "registrationId": "0198a62b-41ee-7000-8000-000000000571",
+            "localActor": "uid:1000",
+            "logPath": "/srv/spec/state/campaigns/steering/0198a62b-41ee-7000-8000-000000000571/steering-v1.jsonl",
+            "lockPath": "/srv/spec/state/campaigns/steering/0198a62b-41ee-7000-8000-000000000571/steering.lock",
+            "preparedCursor": 0
+        },
         "agent": {
             "adapter": "codex",
             "argv": ["read the brief"],
@@ -331,9 +345,12 @@ fn replies(task: Value, tree_delta: Reply) -> BTreeMap<String, Reply> {
             "taskId": TASK_ID,
             "authorizedComments": [],
             "receipt": {
-                "thread": {
-                    "number": "7",
-                    "url": "local://acme/spec/issues/7"
+                "source": {
+                    "kind": "local-jsonl",
+                    "registrationId": "0198a62b-41ee-7000-8000-000000000571",
+                    "path": "/srv/spec/state/campaigns/steering/0198a62b-41ee-7000-8000-000000000571/steering-v1.jsonl",
+                    "preparedCursor": 0,
+                    "recheckedCursor": 0
                 },
                 "rechecked": true,
                 "recheckTruncated": false,
