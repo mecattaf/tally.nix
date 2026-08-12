@@ -1,6 +1,7 @@
 //! Core types and validation shared by the tally daemon and CLI.
 
 pub mod adapters;
+pub mod assisted_by;
 pub mod authorship;
 pub mod brief;
 pub mod campaign_contract;
