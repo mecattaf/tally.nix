@@ -4657,10 +4657,11 @@
           assert !(systemTimers ? tally-campaign-poll);
           assert stockNixos.config.users.users.tally.home == "/var/empty";
           # With the switch on, the host renders exactly what `tally campaign
-          # arm` validates a host against: the four pools, the driver adapter,
-          # and a fanout cap that admits a worst-case pass.
-          assert campaignSystemConfig.pools.campaign.resource == "mutex";
-          assert campaignSystemConfig.pools.campaign.capacity == 1;
+          # arm` validates a host against: the three resource pools, the driver
+          # adapter, and a fanout cap that admits a worst-case pass. Repository
+          # campaign/<owner>/<repo> mutexes are minted on demand from the name
+          # alone, so no generic host-wide campaign pool is configured.
+          assert !(campaignSystemConfig.pools ? campaign);
           assert campaignSystemConfig.pools.campaign-agent.resource == "slot";
           assert campaignSystemConfig.pools.campaign-control.resource == "cpu-slot";
           assert campaignSystemConfig.pools.flow.resource == "cpu-slot";
