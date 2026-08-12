@@ -176,7 +176,8 @@
       "title": "Chapter gate: full gate ladder",
       "argv": [
         "bash",
-        "test/fleet-gate.sh"
+        "-lc",
+        "exec test/fleet-gate.sh \"$(git rev-parse HEAD)\""
       ],
       "runtimeMaxSec": 7200,
       "dependencies": [

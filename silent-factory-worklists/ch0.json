@@ -348,7 +348,8 @@
       "title": "Chapter 0 gate: full workspace check",
       "argv": [
         "bash",
-        "test/fleet-gate.sh"
+        "-lc",
+        "exec test/fleet-gate.sh \"$(git rev-parse HEAD)\""
       ],
       "runtimeMaxSec": 7200,
       "dependencies": [
