@@ -1118,7 +1118,7 @@ fn selected_pools(
         return Ok(config.pools.keys().cloned().collect());
     }
     let pool = pool.expect("checked above");
-    if !config.pools.contains_key(&pool) {
+    if !is_admitted_pool_name(config, &pool) {
         return Err(WireError::invalid(format!("unknown pool {pool:?}")));
     }
     Ok(vec![pool])

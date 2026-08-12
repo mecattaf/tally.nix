@@ -626,7 +626,7 @@ impl DaemonHandler {
         crate::poolset::canonicalize(&mut requested_pools)
             .map_err(|error| WireError::invalid(error.to_string()))?;
         for requested_pool in &requested_pools {
-            if !context.config.pools.contains_key(requested_pool) {
+            if !is_admitted_pool_name(&context.config, requested_pool) {
                 return Err(WireError::invalid(format!(
                     "unknown pool {requested_pool:?}"
                 )));
@@ -656,13 +656,14 @@ impl DaemonHandler {
         resolved.brief_hash = prepared_brief.as_ref().map(|brief| brief.hash().to_owned());
         let mut child_charged = caller_job_id.is_some() && !full_mode;
         for pool in &resolved.pools {
+            // Reserved campaign mutexes cannot be configured, so unlike
+            // ordinary pools they have no pool-scoped credential sources.
             let pool_credentials = context
                 .config
                 .pools
                 .get(pool)
-                .expect("the requested pools were validated above")
-                .credentials
-                .clone();
+                .map(|pool| pool.credentials.clone())
+                .unwrap_or_default();
             for (name, source) in pool_credentials {
                 if resolved
                     .credentials

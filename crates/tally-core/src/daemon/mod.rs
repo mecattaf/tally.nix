@@ -122,8 +122,8 @@ use crate::git_ai::GitAiExecution;
 use crate::history::{HistoryError, LifecycleStore};
 use crate::journal::{EmitEvent, JournalEmitter, JournalEntry, TallyEvent};
 use crate::lease::{
-    bump_epoch, AdmitOutcome, LeaseBackend, LeaseEngine, LeaseError, LeaseEventLog, LeaseGrant,
-    LeaseRequest, LeaseSchedulingGroup, LocalLease, SystemdUnitLiveness,
+    bump_epoch, is_campaign_pool_name, AdmitOutcome, LeaseBackend, LeaseEngine, LeaseError,
+    LeaseEventLog, LeaseGrant, LeaseRequest, LeaseSchedulingGroup, LocalLease, SystemdUnitLiveness,
 };
 use crate::nix_store::{DerivationAvailability, NixStore};
 use crate::occupancy;
@@ -285,6 +285,15 @@ const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_METER_EVENT_BYTES: u64 = 64 * 1024;
 const UNCLAIMED_DRAIN_BARRIER_LIMIT: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// Whether a daemon boundary may pass a pool name to the lease engine.
+///
+/// Campaign mutexes are fully defined by their reserved namespace name and
+/// deliberately absent from the configured pool map. The lease layer validates
+/// and mints those pools on admission.
+fn is_admitted_pool_name(config: &Config, pool: &str) -> bool {
+    config.pools.contains_key(pool) || is_campaign_pool_name(pool)
+}
 
 #[derive(Debug, Clone)]
 pub struct DaemonPaths {

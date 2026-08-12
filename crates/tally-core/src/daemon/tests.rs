@@ -10447,6 +10447,120 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn campaign_pool_namespace_crosses_enqueue_and_control_front_doors() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                const CAMPAIGN_POOL: &str = "campaign/mecattaf/tally.nix";
+
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths,
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+
+                assert!(!daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .config
+                    .pools
+                    .contains_key(CAMPAIGN_POOL));
+                let paused = daemon
+                    .handler
+                    .pause(Some(json!({"pool": CAMPAIGN_POOL})))
+                    .await
+                    .unwrap();
+                assert_eq!(paused["paused"], json!([CAMPAIGN_POOL]));
+
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": CAMPAIGN_POOL,
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(admitted["state"], "paused");
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+
+                for rejected_pool in ["campaign/mecattaf", "unconfigured"] {
+                    let control_error = daemon
+                        .handler
+                        .pause(Some(json!({"pool": rejected_pool})))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(control_error.code, WireErrorCode::InvalidParams);
+                    assert_eq!(
+                        control_error.message,
+                        format!("unknown pool {rejected_pool:?}")
+                    );
+
+                    let enqueue_error = daemon
+                        .handler
+                        .enqueue_as_client(Some(json!({
+                            "argv": ["true"],
+                            "pool": rejected_pool,
+                            "adapter": "shell",
+                            "source": "manual",
+                            "evidence": ["exit:0"]
+                        })))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(enqueue_error.code, WireErrorCode::InvalidParams);
+                    assert_eq!(
+                        enqueue_error.message,
+                        format!("unknown pool {rejected_pool:?}")
+                    );
+                }
+
+                let resumed = daemon
+                    .handler
+                    .resume(Some(json!({"pool": CAMPAIGN_POOL})))
+                    .await
+                    .unwrap();
+                assert_eq!(resumed["resumed"], json!([CAMPAIGN_POOL]));
+                let finished = await_positive_progress(
+                    "campaign namespace job completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["verdict"], "pass");
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .lease
+                        .engine()
+                        .declared_resource_kind(CAMPAIGN_POOL),
+                    Some(ResourceKind::Mutex)
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pause_withdraws_pending_lease_and_queued_cancel_is_durable() {
         let local = LocalSet::new();
         local
