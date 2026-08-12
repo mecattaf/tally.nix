@@ -27,6 +27,113 @@ fn spec_build_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/flows/spec-build.js")
 }
 
+fn campaign_args(runner_pool: &str) -> Value {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    json!({
+        "campaignIdentity": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+        "campaignGraph": {
+            "manifest": {
+                "schemaVersion": 1,
+                "name": "fixture",
+                "repository": {
+                    "checkout": "/tmp/tally-fixture",
+                    "baseBranch": "main",
+                    "remote": "origin",
+                    "forge": "github"
+                },
+                "maxTasks": 1,
+                "maxParallel": 1,
+                "driverRuntimeMaxSec": 60,
+                "runtimeMaxSec": null,
+                "pool": runner_pool,
+                "mergeMethod": "squash",
+                "gitAiBinding": "off",
+                "gitAiAwaitSec": 30,
+                "agent": {
+                    "adapter": "codex",
+                    "argv": ["implement"],
+                    "priority": "medium",
+                    "runtimeMaxSec": null,
+                    "approvalPolicy": null,
+                    "sandboxPolicy": null,
+                    "diagnosisSandboxPolicy": null,
+                    "model": null
+                },
+                "steward": null,
+                "gates": [{
+                    "kind": "forbidPaths",
+                    "id": "scope",
+                    "forbidPaths": ["flake.nix"],
+                    "runtimeMaxSec": 60
+                }],
+                "tasks": [{
+                    "id": "task-1",
+                    "kind": "implementation",
+                    "issue": 537,
+                    "dependencies": [],
+                    "conflictDomains": [],
+                    "argv": null,
+                    "runtimeMaxSec": null
+                }]
+            },
+            "tasks": [{
+                "number": 537,
+                "title": "Fixture task",
+                "body": "Implement the fixture."
+            }],
+            "executableDigest": digest.clone()
+        },
+        "repository": "mecattaf/tally.nix",
+        "issue": {
+            "number": "536",
+            "url": "https://github.com/mecattaf/tally.nix/issues/536"
+        },
+        "runId": "fixture-run",
+        "worklist": {
+            "kind": "github-issue",
+            "graphDigest": digest
+        },
+        "continuation": {
+            "argv": ["tally", "campaign", "resume"],
+            "pool": ["campaign-control"],
+            "priority": "low",
+            "runtimeMaxSec": 60,
+            "eventsDir": "/tmp/tally-state/events"
+        },
+        "workspaceRoot": "/tmp/tally-workspaces",
+        "captureRoot": "/tmp/tally-state/capture/archive",
+        "tally": "/bin/tally",
+        "driver": "/bin/spec-build-driver",
+        "driverRuntimeMaxSec": 60,
+        "steering": [],
+        "allowedActors": ["mecattaf"]
+    })
+}
+
+fn check_campaign_args(args: &Value) -> Result<(), crate::FlowError> {
+    let args = args.clone();
+    thread::Builder::new()
+        .name("campaign-flow-schema".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let path = spec_build_path();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            check_script(
+                &source,
+                Some(&path),
+                CheckOptions {
+                    args: Some(&args),
+                    ..CheckOptions::default()
+                },
+            )
+            .map(|_| ())
+        })
+        .expect("campaign flow schema worker must start")
+        .join()
+        .expect("campaign flow schema worker must stop cleanly")
+}
+
 enum CampaignFlowRequest {
     Call {
         name: String,
@@ -172,6 +279,43 @@ fn checkpoint_failure(stage: &str) -> Value {
         "stage": stage,
         "node": {"verdict": "fail"},
     })
+}
+
+#[test]
+fn campaign_namespace_runner_passes_the_flow_schema_and_evaluates() {
+    let args = campaign_args("campaign/mecattaf/tally.nix");
+    check_campaign_args(&args).unwrap();
+
+    let mut realm = CampaignFlowRealm::new(&args);
+    assert_eq!(
+        realm.call(
+            "authorizedComments",
+            &[json!({"id": "task-1", "kind": "implementation"})]
+        ),
+        json!([])
+    );
+
+    check_campaign_args(&campaign_args("campaign/Acme-Inc/widget_repo.rs")).unwrap();
+    check_campaign_args(&campaign_args("legacy-runner")).unwrap();
+}
+
+#[test]
+fn malformed_campaign_namespace_runners_stay_out_of_the_flow_schema() {
+    for runner_pool in [
+        "campaign/mecattaf",
+        "campaign//tally.nix",
+        "campaign/./tally.nix",
+        "campaign/mecattaf/..",
+        "campaign/mecattaf/tally.nix/extra",
+        "campaign/mecattaf/tally nix",
+    ] {
+        let error = check_campaign_args(&campaign_args(runner_pool)).unwrap_err();
+        assert_eq!(error.code, "args-schema-mismatch");
+        assert!(
+            error.message.contains("/campaignGraph/manifest/pool"),
+            "wrong schema failure for {runner_pool:?}: {error}"
+        );
+    }
 }
 
 /// A validated historical completion fact selects the deterministic branch

@@ -190,7 +190,10 @@ export const meta = {
               pool: {
                 type: "string",
                 maxLength: 80,
-                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+                // Configured runner names keep the ordinary pool alphabet.
+                // Repository campaign mutexes are instead defined entirely by
+                // their exact campaign/OWNER/REPO namespace name.
+                pattern: "^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|campaign/(?!\\.{1,2}/)[A-Za-z0-9_.-]+/(?!\\.{1,2}$)[A-Za-z0-9_.-]+)$"
               },
               mergeMethod: { enum: ["merge", "squash"] },
               gitAiBinding: { enum: ["off", "advisory", "required"] },
