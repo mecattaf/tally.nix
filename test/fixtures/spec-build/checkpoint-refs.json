@@ -9,9 +9,7 @@
       "source": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "baseRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "ref": "refs/tally/spec-build/v1/b936cd45e4ca0a237a2540a3/checkpoint/gate-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "refPrefix": "refs/tally/spec-build/v1/b936cd45e4ca0a237a2540a3/checkpoint/gate-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "legacyTag": "refs/tags/tally/spec-build/v1/night-build-758234d9f70c-issue-42/gate-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "legacyTagPrefix": "refs/tags/tally/spec-build/v1/night-build-758234d9f70c-issue-42/gate-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "refPrefix": "refs/tally/spec-build/v1/b936cd45e4ca0a237a2540a3/checkpoint/gate-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     {
       "campaign": "Agency Spec Wave 2!!",
@@ -20,9 +18,7 @@
       "source": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "baseRevision": "cccccccccccccccccccccccccccccccccccccccc",
       "ref": "refs/tally/spec-build/v1/6f45f801c1fca100049f4b9d/checkpoint/checkpoint-1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/cccccccccccccccccccccccccccccccccccccccc",
-      "refPrefix": "refs/tally/spec-build/v1/6f45f801c1fca100049f4b9d/checkpoint/checkpoint-1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "legacyTag": "refs/tags/tally/spec-build/v1/agency-spec-wave-2-652043115ae3-issue-7/checkpoint-1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/cccccccccccccccccccccccccccccccccccccccc",
-      "legacyTagPrefix": "refs/tags/tally/spec-build/v1/agency-spec-wave-2-652043115ae3-issue-7/checkpoint-1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      "refPrefix": "refs/tally/spec-build/v1/6f45f801c1fca100049f4b9d/checkpoint/checkpoint-1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     },
     {
       "campaign": "-",
@@ -31,9 +27,7 @@
       "source": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "baseRevision": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "ref": "refs/tally/spec-build/v1/e15908c8dc5b984094043d81/checkpoint/t-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "refPrefix": "refs/tally/spec-build/v1/e15908c8dc5b984094043d81/checkpoint/t-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-      "legacyTag": "refs/tags/tally/spec-build/v1/campaign-3973e022e932-issue-1/t-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "legacyTagPrefix": "refs/tags/tally/spec-build/v1/campaign-3973e022e932-issue-1/t-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      "refPrefix": "refs/tally/spec-build/v1/e15908c8dc5b984094043d81/checkpoint/t-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
     },
     {
       "campaign": "a-very-long-campaign-name-that-exceeds-the-slug-window",
@@ -42,9 +36,7 @@
       "source": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "baseRevision": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "ref": "refs/tally/spec-build/v1/e3854e82c85cfb623e48498a/checkpoint/final_gate.v2-1111111111111111111111111111111111111111111111111111111111111111/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-      "refPrefix": "refs/tally/spec-build/v1/e3854e82c85cfb623e48498a/checkpoint/final_gate.v2-1111111111111111111111111111111111111111111111111111111111111111",
-      "legacyTag": "refs/tags/tally/spec-build/v1/a-very-long-campaign-nam-25cfd4fde4e5-issue-1234/final_gate.v2-1111111111111111111111111111111111111111111111111111111111111111/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-      "legacyTagPrefix": "refs/tags/tally/spec-build/v1/a-very-long-campaign-nam-25cfd4fde4e5-issue-1234/final_gate.v2-1111111111111111111111111111111111111111111111111111111111111111"
+      "refPrefix": "refs/tally/spec-build/v1/e3854e82c85cfb623e48498a/checkpoint/final_gate.v2-1111111111111111111111111111111111111111111111111111111111111111"
     }
   ]
 }

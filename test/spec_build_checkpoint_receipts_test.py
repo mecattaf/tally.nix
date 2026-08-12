@@ -673,16 +673,6 @@ class CheckpointReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(driver.DriverError, "immutable checkpoint ref"):
             driver.action_checkpoint(self.checkpoint_brief())
 
-    def legacy_reference(self) -> str:
-        source = self.worklist["source"]
-        return driver.legacy_checkpoint_tag(
-            "fixture",
-            "7",
-            "phase-checkpoint",
-            source["sha256"],
-            source["revision"],
-        )
-
     def test_new_receipts_are_hidden_refs_and_never_tags(self) -> None:
         """A public target repository must not auto-fetch a campaign's ledger.
 
@@ -704,37 +694,14 @@ class CheckpointReceiptTests(unittest.TestCase):
             [fact["ref"] for fact in self.completed()], [recorded["ref"]]
         )
 
-    def test_a_published_tag_receipt_is_still_honored(self) -> None:
-        """The namespace move must never re-execute a checkpoint that passed."""
-        legacy = self.legacy_reference()
-        self.push_receipt(self.base_rev, legacy)
-        self.assertEqual(
-            self.completed(),
-            [
-                {
-                    "taskId": "phase-checkpoint",
-                    "ref": legacy,
-                    "revision": self.base_rev,
-                }
-            ],
-        )
-        # Nothing new is published for a checkpoint whose receipt already
-        # exists, so the honored ref stays the one already on the forge.
-        recorded = driver.action_checkpoint(self.checkpoint_brief())
-        self.assertEqual(recorded["ref"], legacy)
-        self.assertEqual(
-            git("ls-remote", "origin", self.reference(), cwd=self.checkout).strip(), ""
-        )
-
-
 class CheckpointRefVectorTests(unittest.TestCase):
     """The driver half of the shared cross-language checkpoint-ref vectors.
 
     `crates/tally/src/cli/campaign.rs` computes the same ref layout to project
     checkpoint completion onto the master issue, and for two waves it computed
-    a name the driver has never written in either namespace, because nothing
-    pinned the two implementations to one another. Both sides now assert
-    against this file; neither owns it.
+    a name the driver has never written because nothing pinned the two
+    implementations to one another. Both sides now assert against this file;
+    neither owns it.
     """
 
     def vectors(self) -> list[dict[str, Any]]:
@@ -754,9 +721,6 @@ class CheckpointRefVectorTests(unittest.TestCase):
                     vector["baseRevision"],
                 )
                 self.assertEqual(driver.checkpoint_ref(*arguments), vector["ref"])
-                self.assertEqual(
-                    driver.legacy_checkpoint_tag(*arguments), vector["legacyTag"]
-                )
 
     def test_every_vector_ref_is_its_prefix_plus_the_tested_revision(self) -> None:
         # The Rust projection knows the family but not the revision, so it
@@ -767,10 +731,6 @@ class CheckpointRefVectorTests(unittest.TestCase):
                 self.assertEqual(
                     vector["ref"],
                     f"{vector['refPrefix']}/{vector['baseRevision']}",
-                )
-                self.assertEqual(
-                    vector["legacyTag"],
-                    f"{vector['legacyTagPrefix']}/{vector['baseRevision']}",
                 )
 
 

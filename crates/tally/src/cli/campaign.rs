@@ -3679,15 +3679,7 @@ fn merged_project_tasks(
         if task.kind == "checkpoint" {
             let reference =
                 checkpoint_reference_prefix(&manifest.name, issue_number, &task.id, &graph_digest)?;
-            let legacy = legacy_checkpoint_tag_prefix(
-                &manifest.name,
-                issue_number,
-                &task.id,
-                &graph_digest,
-            )?;
-            if projected_checkpoint_complete(manifest, &reference)?
-                || projected_checkpoint_complete(manifest, &legacy)?
-            {
+            if projected_checkpoint_complete(manifest, &reference)? {
                 merged.insert(task.id.clone());
             }
             continue;
@@ -3783,11 +3775,10 @@ fn merged_project_tasks(
 /// `prefix` names the task's receipt family, not one ref: the driver appends
 /// the tested base revision as a final path component, and this projection —
 /// which runs from a manifest, not from a reconcile pass — does not know which
-/// revision that was. Reading the exact prefix as if it were the ref name is
-/// how both namespaces silently matched nothing at all. Every receipt under
-/// the family is considered and one that the base branch contains is enough;
-/// the driver's own exact-revision check remains the completion oracle, and
-/// this is the checkbox the reader sees.
+/// revision that was. Every receipt under the family is considered and one
+/// that the base branch contains is enough; the driver's own exact-revision
+/// check remains the completion oracle, and this is the checkbox the reader
+/// sees.
 fn projected_checkpoint_complete(manifest: &CampaignManifest, prefix: &str) -> Result<bool> {
     let git = |arguments: &[&str]| -> Result<std::process::Output> {
         ProcessCommand::new("git")
@@ -3878,11 +3869,6 @@ fn stable_publish_branch(
 /// actually tested (`checkpoint_ref` in `spec_build_driver.py`); the shared
 /// vectors in `test/fixtures/spec-build/checkpoint-refs.json` pin the two
 /// layouts together from both languages.
-///
-/// The pre-#307 namespace was `refs/tags/`, which every clone of a public
-/// target repository auto-fetches; a campaign's checkpoint ledger became part
-/// of that repository's public surface. Receipts now share the hidden
-/// namespace the campaign's other durable state already uses.
 fn checkpoint_reference_prefix(
     campaign: &str,
     issue_number: u64,
@@ -3896,47 +3882,6 @@ fn checkpoint_reference_prefix(
     Ok(format!(
         "{}/checkpoint/{task_id}-{digest}",
         campaign_state_ref_prefix(campaign, issue_number),
-    ))
-}
-
-/// The visible tag family published before the namespace moved. Read for
-/// compatibility so an existing campaign is never re-executed; never written.
-/// Like the hidden namespace above this is a prefix: the tested base revision
-/// is the last path component.
-fn legacy_checkpoint_tag_prefix(
-    campaign: &str,
-    issue_number: u64,
-    task_id: &str,
-    source: &str,
-) -> Result<String> {
-    let digest = source
-        .strip_prefix("sha256:")
-        .filter(|value| value.len() == 64)
-        .ok_or_else(|| invalid("checkpoint source is not a SHA-256 identity"))?;
-    let mut readable = campaign
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_lowercase() || character.is_ascii_digit() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    while readable.contains("--") {
-        readable = readable.replace("--", "-");
-    }
-    readable = readable.trim_matches('-').chars().take(24).collect();
-    readable = readable.trim_end_matches('-').to_owned();
-    if readable.is_empty() {
-        readable = "campaign".to_owned();
-    }
-    let campaign_identity = format!("{:x}", Sha256::digest(campaign.as_bytes()));
-    Ok(format!(
-        "refs/tags/tally/spec-build/v1/{}-{}-issue-{issue_number}/{task_id}-{digest}",
-        readable,
-        &campaign_identity[..12],
     ))
 }
 
@@ -4339,9 +4284,6 @@ mod tests {
             let prefix =
                 checkpoint_reference_prefix(campaign, issue_number, task_id, source).unwrap();
             assert_eq!(prefix, vector["refPrefix"].as_str().unwrap());
-            let legacy =
-                legacy_checkpoint_tag_prefix(campaign, issue_number, task_id, source).unwrap();
-            assert_eq!(legacy, vector["legacyTagPrefix"].as_str().unwrap());
 
             // The prefix has to be exactly the driver's ref minus the tested
             // revision, or the `<prefix>/*` query the projection runs matches
@@ -4349,10 +4291,6 @@ mod tests {
             assert_eq!(
                 vector["ref"].as_str().unwrap(),
                 format!("{prefix}/{base_revision}")
-            );
-            assert_eq!(
-                vector["legacyTag"].as_str().unwrap(),
-                format!("{legacy}/{base_revision}")
             );
         }
     }
