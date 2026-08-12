@@ -167,7 +167,8 @@
         "authority-schema-v3"
       ],
       "conflictDomains": [
-        "drivers"
+        "drivers",
+        "test/spec_build_driver_test.py"
       ]
     },
     {
@@ -197,7 +198,8 @@
       ],
       "dependencies": [],
       "conflictDomains": [
-        "drivers"
+        "drivers",
+        "test/spec_build_driver_test.py"
       ]
     },
     {
@@ -539,7 +541,8 @@
       "conflictDomains": [
         "drivers",
         "crates/tally",
-        "test/fixtures"
+        "test/fixtures",
+        "test/spec_build_driver_test.py"
       ]
     },
     {
