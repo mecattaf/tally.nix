@@ -3242,9 +3242,27 @@
               campaign_cli + " campaign poll --once --wait --state-dir " + campaign_state
             )
 
+            def poll_event():
+              events = [
+                json.loads(line)
+                for line in machine.succeed(plain_poll).splitlines()
+              ]
+              assert len(events) == 1, events
+              event = events[0]
+              assert event["schemaVersion"] == 1, event
+              assert event["issueUrl"] == issue, event
+              assert re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                event["registrationId"],
+              ), event
+              assert event["registration"].startswith(
+                campaign_state + "/campaigns/armed/"
+              ), event
+              return event
+
             # An operator edit changes the executable digest. Poll must still
-            # refuse to dispatch it, but that correct admission stop is a
-            # structured blocked state rather than a failed periodic service.
+            # refuse to dispatch it. The first observation stabilizes the
+            # changed graph; the second reports the durable admission stop.
             machine.succeed(
               "grep -F '\"name\":\"sentinel-config\"' "
               + campaign_root + "/master-body"
@@ -3254,16 +3272,24 @@
               "\"name\":\"sentinel-config-edited\"/' "
               + campaign_root + "/master-body"
             )
-            blocked_poll = json.loads(machine.succeed(plain_poll))
-            assert blocked_poll["observed"] == 1, blocked_poll
-            assert blocked_poll["dispatched"] == 0, blocked_poll
-            assert blocked_poll["pruned"] == 0, blocked_poll
-            assert blocked_poll["failures"] == [], blocked_poll
-            assert len(blocked_poll["blocked"]) == 1, blocked_poll
-            blocked = blocked_poll["blocked"][0]
-            assert blocked["issue"] == issue, blocked
-            assert blocked["reason"] == "rearm-required", blocked
-            assert blocked["approvedGraphDigest"] != blocked["liveGraphDigest"], blocked
+            stabilizing_poll = poll_event()
+            assert stabilizing_poll["status"] == "stabilizing", stabilizing_poll
+            assert (
+              stabilizing_poll["approvedGraphDigest"]
+              != stabilizing_poll["liveGraphDigest"]
+            ), stabilizing_poll
+            blocked_poll = poll_event()
+            assert blocked_poll["status"] == "rearm-required", blocked_poll
+            assert blocked_poll["registrationId"] == stabilizing_poll["registrationId"], (
+              stabilizing_poll,
+              blocked_poll,
+            )
+            assert blocked_poll["approvedGraphDigest"] == (
+              stabilizing_poll["approvedGraphDigest"]
+            ), (stabilizing_poll, blocked_poll)
+            assert blocked_poll["liveGraphDigest"] == (
+              stabilizing_poll["liveGraphDigest"]
+            ), (stabilizing_poll, blocked_poll)
             assert machine.succeed(
               "wc -l < " + campaign_root + "/frame-probes"
             ).strip() == "1"
@@ -3276,12 +3302,12 @@
             )
             poll_results = []
             for _ in range(8):
-              poll_results.append(json.loads(machine.succeed(plain_poll)))
+              poll_results.append(poll_event())
               if machine.execute("test -e " + campaign_root + "/master-closed")[0] == 0:
                 break
             else:
               raise AssertionError(("plain campaign polls did not reach closeout", poll_results))
-            assert any(result["dispatched"] == 1 for result in poll_results), poll_results
+            assert any(result["status"] == "dispatched" for result in poll_results), poll_results
             assert machine.succeed(
               "wc -l < " + campaign_root + "/frame-probes"
             ).strip() == "2"
