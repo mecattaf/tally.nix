@@ -2396,9 +2396,9 @@ fn a_banned_global_says_what_to_do_instead() {
 }
 
 #[test]
-fn a_float_in_an_integer_field_says_so_instead_of_naming_a_rust_type() {
+fn a_fractional_number_in_an_integer_field_says_so_instead_of_naming_a_rust_type() {
     let source = format!(
-        "{}\n(async () => sh(['x'], {{pools: ['cpu'], runtimeMaxSec: Math.floor(600.5)}}))()",
+        "{}\n(async () => sh(['x'], {{pools: ['cpu'], runtimeMaxSec: 600.5}}))()",
         meta(&["cpu"], &[])
     );
     let error = run(&source, MockClient::new(Vec::new())).unwrap_err();
@@ -2406,15 +2406,14 @@ fn a_float_in_an_integer_field_says_so_instead_of_naming_a_rust_type() {
     assert_eq!(error.code, "invalid-spec");
     assert_eq!(
         error.message,
-        "sh() options runtimeMaxSec must be a whole number, but arrived as the floating-point \
-         value 600.0; JavaScript arithmetic such as Math.floor() stays floating point even when \
-         its result is integral — coerce it with (x | 0)"
+        "sh() options runtimeMaxSec must be a whole number within JavaScript's exact integer \
+         range, but arrived as the floating-point value 600.5"
     );
     assert_eq!(error.details["field"], "runtimeMaxSec");
 
-    // The coercion the message recommends actually works.
+    // An integer-valued arithmetic result now crosses the JSON boundary as an integer.
     let fixed = format!(
-        "{}\n(async () => sh(['x'], {{pools: ['cpu'], runtimeMaxSec: Math.floor(600.5) | 0}}))()",
+        "{}\n(async () => sh(['x'], {{pools: ['cpu'], runtimeMaxSec: Math.floor(600.5)}}))()",
         meta(&["cpu"], &[])
     );
     let client = MockClient::new(vec![Reply::pass(Disposition::Created, 1)]);

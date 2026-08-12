@@ -1,15 +1,46 @@
 use super::*;
 
+const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0;
+
 pub(super) fn value_to_json(
     value: &JsValue,
     label: &str,
     context: &mut Context,
 ) -> JsResult<Value> {
-    value.to_json(context)?.ok_or_else(|| {
-        JsNativeError::typ()
-            .with_message(format!("{label} must be JSON-serializable"))
-            .into()
-    })
+    let mut json = value.to_json(context)?.ok_or_else(|| {
+        JsError::from(
+            JsNativeError::typ().with_message(format!("{label} must be JSON-serializable")),
+        )
+    })?;
+    preserve_integer_valued_numbers(&mut json);
+    Ok(json)
+}
+
+/// Recover JSON integer encoding where Boa's `Rational(f64)` still represents
+/// an exact integer. Host values are structured, so the conversion must cover
+/// numbers nested anywhere in an array or object payload.
+fn preserve_integer_valued_numbers(value: &mut Value) {
+    match value {
+        Value::Number(number) if number.is_f64() => {
+            let Some(float) = number.as_f64() else {
+                return;
+            };
+            if float.fract() == 0.0 && float.abs() <= MAX_EXACT_F64_INTEGER {
+                *number = (float as i64).into();
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                preserve_integer_valued_numbers(value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                preserve_integer_valued_numbers(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 pub(super) fn host(context: &Context) -> JsResult<Rc<HostShared>> {
@@ -251,4 +282,73 @@ pub(super) fn js_error_to_flow(error: JsError, context: &mut Context) -> FlowErr
     FlowError::new("FlowScriptError", "script-exception", rendered.clone())
         .at(location)
         .with_stack(rendered)
+}
+
+#[cfg(test)]
+mod tests {
+    use boa_engine::{Context, Source};
+    use serde_json::{json, Value};
+
+    use super::value_to_json;
+
+    fn json_at_boundary(source: &str) -> Value {
+        let mut context = Context::default();
+        let value = context
+            .eval(Source::from_bytes(source))
+            .expect("test JavaScript must evaluate");
+        value_to_json(&value, "test value", &mut context)
+            .expect("test value must cross the JSON boundary")
+    }
+
+    #[test]
+    fn integer_valued_floats_cross_the_json_boundary_as_integers() {
+        let value = json_at_boundary(
+            "({ preparedComments: [{ id: 5266404097 }], exactLimits: [9007199254740992, -9007199254740992] })",
+        );
+
+        assert_eq!(
+            value,
+            json!({
+                "preparedComments": [{"id": 5_266_404_097_i64}],
+                "exactLimits": [9_007_199_254_740_992_i64, -9_007_199_254_740_992_i64],
+            })
+        );
+        for pointer in ["/preparedComments/0/id", "/exactLimits/0", "/exactLimits/1"] {
+            let number = value
+                .pointer(pointer)
+                .expect("boundary value must exist")
+                .as_number()
+                .expect("boundary value must be numeric");
+            assert!(!number.is_f64(), "{pointer} remained a JSON float");
+        }
+    }
+
+    #[test]
+    fn fractional_numbers_remain_json_floats() {
+        let value = json_at_boundary("({ id: 5266404097.5 })");
+        let number = value["id"].as_number().expect("id must be numeric");
+
+        assert!(number.is_f64());
+        assert_eq!(number.as_f64(), Some(5_266_404_097.5));
+    }
+
+    #[test]
+    fn integer_valued_numbers_beyond_the_exact_range_remain_json_floats() {
+        let value = json_at_boundary("[9007199254740994, -9007199254740994]");
+
+        assert_eq!(
+            value,
+            json!([9_007_199_254_740_994.0_f64, -9_007_199_254_740_994.0_f64])
+        );
+        assert!(value[0].as_number().is_some_and(|number| number.is_f64()));
+        assert!(value[1].as_number().is_some_and(|number| number.is_f64()));
+    }
+
+    #[test]
+    fn non_finite_numbers_keep_boas_null_conversion() {
+        assert_eq!(
+            json_at_boundary("[NaN, Infinity, -Infinity]"),
+            json!([null, null, null])
+        );
+    }
 }

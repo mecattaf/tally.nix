@@ -756,9 +756,11 @@ impl SpecSurface<'_> {
     }
 }
 
-/// Reject a float in a field that must be a whole number.
+/// Reject a number that remains a float after interop normalization in a field
+/// that must be a whole number. Such a value is fractional or outside the
+/// exactly representable integer range of an `f64`.
 ///
-/// Without this, serde reports `invalid type: floating point 600.0, expected u64`
+/// Without this, serde reports `invalid type: floating point 600.5, expected u64`
 /// — which names neither the field nor anything the author can act on.
 pub(super) fn reject_nonintegral_numbers(
     value: &Value,
@@ -780,9 +782,8 @@ pub(super) fn reject_nonintegral_numbers(
             "FlowSpecError",
             "invalid-spec",
             format!(
-                "{} {field} must be a whole number, but arrived as the floating-point value \
-                 {seen:?}; JavaScript arithmetic such as Math.floor() stays floating point even \
-                 when its result is integral — coerce it with (x | 0)",
+                "{} {field} must be a whole number within JavaScript's exact integer range, but \
+                 arrived as the floating-point value {seen:?}",
                 surface.subject()
             ),
         )
