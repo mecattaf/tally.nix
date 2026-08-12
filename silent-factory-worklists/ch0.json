@@ -1,0 +1,366 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "campaign-pool-namespace",
+      "kind": "implementation",
+      "title": "Repo-scoped campaign mutexes: reserve and mint the campaign/ pool namespace",
+      "goal": "Retire the host-wide campaign mutex default. Reserve the campaign/ pool namespace in the lease engine: a lease request naming campaign/<owner>/<repo> mints a capacity-1 co-residency mutex deterministically from the name alone, both in live admission (the paths that return UnknownPool today, crates/tally-core/src/lease.rs 518-541 with admit_at at 572) and in durable rebuild (from_durable_with_aging_threshold, lease.rs 462), so restart replay is closed over minted pools with zero new persistence. At arm (crates/tally/src/cli/campaign.rs 1867-1885), default manifest.pool to campaign/<repository> when the manifest declares none, and accept namespace pools without a config lookup; an explicitly configured pool keeps the existing capacity-1 mutex validation unchanged. Add a module assertion that no configured pool name begins with campaign/ (nix/modules/common.nix pools section, beside the mutex assertion at 1794-1795). Resource pools (campaign-agent, campaign-control, the gpu pools) remain host-wide and untouched: mutexes scope to the thing they serialize (one pass per repository); resource pools scope to the host.",
+      "deliveredBehaviors": [
+        "Campaigns on different repositories hold their runner mutexes concurrently",
+        "Two campaigns on the same repository still serialize on one minted mutex",
+        "A daemon restart re-mints namespace pools from replayed events alone, with no config entry and no new store",
+        "Arming a campaign no longer requires a pre-declared runner pool in daemon config"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D62",
+          "SILENT-FACTORY-PLAN.md Part 6 findings table (mutex)"
+        ],
+        "styleReferences": [
+          "crates/tally-core/src/lease.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "core-tests-green",
+          "description": "tally-core suite passes, including new lease tests: cross-repo concurrent hold, same-repo serialization, and durable-rebuild re-minting of a held and a queued namespace lease.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        },
+        {
+          "id": "cli-tests-green",
+          "description": "tally CLI suite passes, including the arm-path default (manifest without pool arms onto campaign/<repository>) and the namespace-shape validation.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally",
+        "nix/modules"
+      ]
+    },
+    {
+      "id": "mutex-restart-recovery",
+      "kind": "implementation",
+      "title": "Prove lease and attempt-counter recovery across a daemon restart (D59)",
+      "goal": "The D59 demand, made executable: with one namespace mutex held and a second runner queued behind it, plus a non-zero attempt counter on an armed registration, rebuild the engine from durable events (from_durable_with_aging_threshold, crates/tally-core/src/lease.rs 462) and the registry from its store, and assert nothing regresses: the held lease is held, the queued runner is queued in order, the attempt counter is unchanged, and no duplicate dispatch is possible. This is a test-and-fix task: if recovery is broken, fix the replay path in the same change; the test is the deliverable either way.",
+      "deliveredBehaviors": [
+        "A daemon restart under live campaigns is a proven-safe operation, not a prohibited one",
+        "Attempt counters survive coordinator restart (D59 discharged)"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 5 D59",
+          "SILENT-FACTORY-PLAN.md Part 6 D62"
+        ],
+        "styleReferences": [
+          "crates/tally-core/src/lease.rs",
+          "crates/tally-core/src/campaign_registry.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "recovery-tests-green",
+          "description": "tally-core suite passes including the named restart-recovery tests over held+queued namespace leases and armed-registration attempt counters.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        }
+      ],
+      "dependencies": [
+        "campaign-pool-namespace"
+      ],
+      "conflictDomains": [
+        "crates/tally-core"
+      ]
+    },
+    {
+      "id": "campaign-quiescent-verb",
+      "kind": "implementation",
+      "title": "Substrate freeze as mechanism: tally campaign quiescent",
+      "goal": "Add tally campaign quiescent: exit 0 when no campaign registration is armed, exit 1 (with a one-line listing on stderr) when any is. It reads the registry store directly so it works whether or not the daemon is up. Purpose: deploy units declare ExecCondition=tally campaign quiescent, so a fleet deploy defers itself while any campaign is armed - the pin can never move under a live campaign again. This replaces the hand-authored epoch-arithmetic ExecCondition drop-in from the Aug-12 night (finding F5) with mechanism; per D58 the roll-in deletes an operator rule rather than adding one.",
+      "deliveredBehaviors": [
+        "Deploy units can gate on campaign quiescence with one ExecCondition line",
+        "The hand-tended skip-tonight drop-in ceremony is obsolete"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D63",
+          "SILENT-FACTORY-PLAN.md Part 5 D58"
+        ],
+        "styleReferences": [
+          "crates/tally/src/cli/campaign.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "cli-tests-green",
+          "description": "tally CLI suite passes including quiescent's two exit paths against a fixture registry.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally",
+        "crates/tally-core"
+      ]
+    },
+    {
+      "id": "tier-aware-arm-lint",
+      "kind": "implementation",
+      "title": "Make the arm-time gate-argv hazard lint consult the resolved hardening tier",
+      "goal": "argv_hazard_warnings (crates/tally/src/cli/campaign.rs 1797-1810, called at 1964, tested at 6283) is an unconditional static lint: it warns about missing in-argv cache redirects on every nix/cargo gate argv regardless of whether the host declares any hardening preset, producing ten lines of noise at every arm on this estate (finding F9). Make it consult the resolved adapter hardening tier: emit nothing when the host declares no hardening preset; keep the warnings verbatim when a real tier is resolved. Warnings that fire on every input train operators to ignore warnings. Additionally fix the two #484-family false-positive classes measured in the field (sodimo finding F-03, 11 benign warnings per arm): suppress the /tmp-under-PrivateTmp warning when the argv itself creates the path before use (mkdir -p inside the unit), and only flag a nix invocation when it is followed by an evaluating subcommand (develop, build, shell, run) - 'command -v nix' preflights never evaluate.",
+      "deliveredBehaviors": [
+        "Arming on a no-hardening host is silent",
+        "The cache-redirect warnings still fire under a resolved hardening tier",
+        "The two field-measured false-positive classes (self-created /tmp paths, non-evaluating nix probes) no longer warn"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D65"
+        ],
+        "styleReferences": [
+          "crates/tally/src/cli/campaign.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "cli-tests-green",
+          "description": "tally CLI suite passes; the 6283 test is split into the no-tier (silent) and tiered (warning) cases.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "checkpoint-brief-render",
+      "kind": "implementation",
+      "title": "project synthesizes checkpoint briefs: the committed worklist is its input verbatim",
+      "goal": "render_project_task_body (crates/tally/src/cli/campaign.rs 2827-2838) demands body or the goal-trio for every task, but checkpoint tasks in the worklist schema carry neither by design - so every projection of a committed worklist fails until an operator hand-adds a body to a side copy (findings F8/F11, hit on both Aug-12 armings). Sound fix on the render side, not the schema side: for kind=checkpoint tasks, project synthesizes the standard checkpoint brief from what the task already carries (argv, runtimeMaxSec, dependency list) plus the campaign name. A committed worklist file becomes project's input verbatim, with zero operator-side additions and zero side copies.",
+      "deliveredBehaviors": [
+        "tally campaign project accepts every committed silent-factory worklist unmodified",
+        "Checkpoint sub-issues carry a rendered brief stating the gate argv and its dependency set"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D64"
+        ],
+        "styleReferences": [
+          "crates/tally/src/cli/campaign.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "cli-tests-green",
+          "description": "tally CLI suite passes including a projection test whose input is a fixture worklist containing a bare checkpoint task.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        },
+        {
+          "id": "worklists-project-clean",
+          "description": "Every committed silent-factory worklist renders a project body set without error via the render path's own test harness (no live forge contact).",
+          "argv": [
+            "bash",
+            "-lc",
+            "cargo test -p tally checkpoint_brief -- --nocapture"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "campaign-status-verb",
+      "kind": "implementation",
+      "title": "tally campaign status: one live view per campaign, with a usage rollup",
+      "goal": "tally query run on the arm-time uuid silently goes stale after the arm-to-poller handover: campaign arm admits only the first flow run, each poll cycle with work spawns a new run with a fresh task_uuid, and querying the arm uuid forever replays its final snapshot with no hint it is superseded - a supervisor watched a stale '1 done, 7 blocked' for three hours while the campaign merged a task every ~25 minutes and closed its own master (sodimo finding F-01). Two deliverables: (1) tally campaign status <master-issue-url>, resolving registration -> latest observation -> per-task durable state -> the live or latest flow run uuid, and carrying a campaign-level usage rollup aggregated across the arm run and every poller run (finding F-08: spend is currently fragmented per flow run, with attempts-without-usage partials) so cost is visible where decisions are made; (2) tally query run on a finished flow run that has campaign descendants prints a superseded pointer naming the latest run (barrier/parent linkage exists to derive it).",
+      "deliveredBehaviors": [
+        "One verb answers 'how is this campaign doing' from the master issue URL, live, at any point in the campaign lifecycle",
+        "A finished arm-time run identifies itself as superseded and points at the latest flow run",
+        "A campaign's total token spend is one number in status output, not a scatter across N flow runs"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D69",
+          "sodimo-aug11-learnings.md F-01 and F-08"
+        ],
+        "styleReferences": [
+          "crates/tally/src/cli/campaign.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "cli-tests-green",
+          "description": "tally CLI suite passes including status resolution against fixture registration plus flow-run lineage, and the superseded pointer on a finished ancestor run.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        },
+        {
+          "id": "core-tests-green",
+          "description": "tally-core suite passes including the usage rollup aggregation across an arm run and poller runs.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally",
+        "crates/tally-core"
+      ]
+    },
+    {
+      "id": "preflight-error-argv",
+      "kind": "implementation",
+      "title": "A failing gate preflight names its argv",
+      "goal": "Gate preflights run as a pristine arm-time admission sweep; when one fails, the campaign dies in seconds with an EMPTY stderrExcerpt and a 0-byte .err capture (sodimo finding F-02: sh -euc 'test -d node_modules' can never pass in a pristine worktree and says nothing when it dies). Tally already fails fast with exact gateId and taskRef; the fix is to include the failing preflightArgv verbatim in the preflight-failure error and in the witnessed failure record - tally has the argv in hand at the failure site. The operator doctrine half (preflights assert environment only; every check echoes a diagnostic to stderr; the pre-arm freeze rehearsal runs preflight argvs in a pristine worktree) lands in the Chapter-2 skills-rewrite, not here.",
+      "deliveredBehaviors": [
+        "A preflight failure states the exact argv that failed, alongside gateId and taskRef",
+        "An empty-stderr preflight death is no longer possible: the error text itself carries the evidence"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D70",
+          "sodimo-aug11-learnings.md F-02"
+        ],
+        "styleReferences": [
+          "crates/tally/src/cli/campaign.rs",
+          "drivers/spec_build_driver.py"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "cli-tests-green",
+          "description": "tally CLI suite passes including a preflight-failure test asserting the argv appears verbatim in the error.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "Driver suite passes with the argv-bearing preflight failure shape.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally",
+        "drivers"
+      ]
+    },
+    {
+      "id": "poll-event-quality",
+      "kind": "implementation",
+      "title": "The poll journal tells the truth: per-campaign attribution, clean completion",
+      "goal": "Three field-measured defects in the poll cycle's event surface, all misleading a supervisor at exactly the moments that matter. (1) Poll JSON counters are fleet-wide (sodimo finding F-04): mid-campaign, pruned:1 referred to an unrelated campaign completing; with repo-scoped mutexes making concurrent campaigns the norm, emit per-registration events (or one JSON line per registration) carrying the registration id and issueUrl. (2) A completed campaign's final poll cycles emit FlowResultError result-schema-mismatch plus a 10s finalMessage projection timeout wrapping the true message (finding F-07) - it reads as a failure at the exact moment of success; a closed-canonical master short-circuits to a clean complete-then-pruning event. (3) Tally's own forge writes transiently trip the rearm digest check (one-cycle rearm-required flap while tally was mutating its own issues); self-inflicted writes must not perturb the digest even for one cycle.",
+      "deliveredBehaviors": [
+        "Every poll event names the registration it belongs to; fleet-wide ambiguity is gone",
+        "Campaign completion reads as completion: no schema-mismatch error, no projection-timeout wrapper, no rearm flap",
+        "Two concurrent campaigns produce two unambiguous event streams"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D69",
+          "sodimo-aug11-learnings.md F-04 and F-07"
+        ],
+        "styleReferences": [
+          "crates/tally-core/src/producers"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "core-tests-green",
+          "description": "tally-core suite passes including per-registration event attribution and the closed-canonical completion short-circuit.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        },
+        {
+          "id": "cli-tests-green",
+          "description": "tally CLI suite passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally",
+        "drivers"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Chapter 0 gate: full workspace check",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "campaign-pool-namespace",
+        "mutex-restart-recovery",
+        "campaign-quiescent-verb",
+        "tier-aware-arm-lint",
+        "checkpoint-brief-render",
+        "campaign-status-verb",
+        "preflight-error-argv",
+        "poll-event-quality"
+      ]
+    }
+  ]
+}

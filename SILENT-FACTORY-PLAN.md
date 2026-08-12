@@ -593,3 +593,136 @@ The canonical worklists for arming are **compiler A's six files** (`ch1`–`ch5`
 ## 5.4 The producers ruling — RESOLVED 2026-08-11 evening
 
 **D56/R45 is ruled: the GitHub-inbound trigger surface is DEAD.** Operator, verbatim: *"github-inbound trigger is DEAD. i no longer want this. 6k lines of code less."* The producers GH stack goes in full: `producers/gh_intake.rs` (2,145), `gh_decision.rs` (739), `orphan.rs` (339), the gh arms of `engine.rs`/`validate.rs` (~600), ~1,500 test LOC, the `ghProducerType` nix tree + projection options, `nix/lib/gh-login.nix` + fixtures + flake check, `CliSource::Gh`, the GhOrigin/GhContextSnapshot write paths, `producer orphaned` and the gh arms of `producer test`. The contingent worklist `chR.json` is hereby **activated as Chapter P**, ordered after Chapter 2, with two standing preconditions: (1) the `Assisted-by:` builder relocation out of `gh_intake.rs:101-154`/`engine.rs:986,1049` (already a CH2 dependency); (2) the one-time deployment-flake grep for `build-effect`/`pool-reachability` producer kinds (D57), whose result folds `~1,100` further LOC into Chapter P if clean.
+
+---
+
+# PART 6 — AUG-12 AMENDMENT (field findings F1–F11 rolled in as sound fixes)
+
+The first two nights of execution (campaign #527/#467, the ch1 arming as #529, and
+sodimo/os running as the estate's first second tenant) produced eleven recorded
+findings plus one morning discovery. This amendment rules each into the pass with
+its **sound** fix — never a workaround — adds **Chapter 0**, amends **Chapter 2**,
+and re-sequences the ladder. Authored 2026-08-12; supersedes Part 3's ordering.
+
+## 6.1 New rulings
+
+- **D62 — Repo-scoped campaign mutexes, minted on demand.** The host-wide
+  `campaign` pool was a relic of the single-tenant era; the capacity-1 invariant
+  protects a *repository's* integration branch, and two campaigns on different
+  repositories share nothing but compute — which `campaign-agent` (slots) and the
+  gpu pools already govern host-wide. The doctrine line: **mutexes scope to the
+  thing they serialize; resource pools scope to the host.** Mechanism: the
+  `campaign/` pool namespace is reserved; a lease request naming
+  `campaign/<owner>/<repo>` mints a capacity-1 co-residency mutex deterministically
+  from the name alone, in live admission and in durable rebuild — no config entry,
+  no daemon restart, no new persistence (the pool *is* its name). Arm defaults
+  `manifest.pool` to the repo's namespace pool. Cross-repo campaigns run
+  concurrently; same-repo campaigns serialize exactly as before.
+- **D63 — Substrate freeze is mechanism.** `tally campaign quiescent` (exit 0 iff
+  no registration is armed) becomes the `ExecCondition` of every deploy unit. The
+  hand-authored epoch drop-in from the Aug-12 night (F5) is retired; per D58 the
+  roll-in deletes an operator rule.
+- **D64 — `project` synthesizes checkpoint briefs.** The committed worklist file is
+  `project`'s input **verbatim**; for `kind=checkpoint` tasks the brief is rendered
+  from the task's own argv/runtime/dependencies (F8/F11). Side copies of worklists
+  with hand-added bodies are abolished.
+- **D65 — The arm-time gate-argv hazard lint is tier-aware** (F9). Silent on a
+  host with no hardening preset; verbatim warnings under a real tier. A warning
+  that fires on every input trains operators to ignore warnings.
+- **D66 — The gitAi config surface deletes with the gates** (F6). With the key
+  gone from the schema, a stale host config fails loud at boot — residue cannot be
+  carried silently. Host-side key removal is a documented step of the deploy that
+  ships Chapter 2.
+- **D67 — The module renders `forge` as a declared option** (F10).
+  `renderCampaignRepositories` stops hardcoding `github`; a module-declared
+  campaign can state `forge = "local"` once authority v3 lands.
+- **D69 — One live view per campaign** (sodimo F-01/F-08/F-04/F-07). `tally
+  campaign status <master-url>` resolves registration → latest observation →
+  per-task state → live flow run, with a campaign-level usage rollup; a finished
+  arm-time run prints a superseded pointer; poll events carry per-registration
+  attribution; completion short-circuits clean (no schema-mismatch noise, no
+  rearm flap from tally's own forge writes). The arm-time run is not the
+  campaign — the machinery must say so itself.
+- **D70 — The preflight contract** (sodimo F-02). Preflights assert environment
+  only, never gate-produced state; a failing preflight's error carries its argv
+  verbatim (empty-stderr deaths are abolished); the pre-arm freeze rehearsal runs
+  preflight argvs in a pristine worktree. Code half in ch0
+  (`preflight-error-argv`); doctrine half in the ch2 `skills-rewrite` (which also
+  picks up F-06: all supervision `gh` calls pass `-R <owner>/<repo>` — bare `gh`
+  resolves to `upstream` in fork checkouts).
+- **D71 — The adversarial lane is a standing campaign pattern** (sodimo positive
+  finding 4). Two dedicated adversarial-suite lanes found and fixed five real
+  security holes that implementation lanes' own tests missed, inside the same
+  witnessed-gate discipline. Every future campaign of consequence ships one
+  end-of-chapter adversarial task with a fix-in-place mandate and structural
+  (not hand-listed) surface enumeration. For this pass: candidate for ch3 (the
+  release surface is the outward-facing one); not retrofitted into ch0-ch2's
+  deletion work.
+- **D68 — The worker-context law.** Every `readFirst` pointer must name a file
+  that exists on the authority revision. (This amendment repaired 48 phantom
+  `final-plan-A.md` pointers across all six worklists to `SILENT-FACTORY-PLAN.md`
+  — every worker's primary spec pointer named a file absent from the repo.)
+  Corollary, per the operator's ruling on ceremony friction: the arming ceremony
+  is fixed by **provisioning context** — the skills carry the exact projection
+  contract and this document carries the worker context — not by relaxing
+  mechanism. And F4's fix is never "fake a URL": arm's authority input becomes
+  the campaign identity (repository + committed worklist), per the sharpened
+  `authority-schema-v3` task.
+
+## 6.2 Findings ledger — disposition of all eleven plus the morning discovery
+
+| Finding | Disposition |
+|---|---|
+| F1 stale untracked file blocked ff | Resolved in the night; no mechanism. |
+| F2 dotfiles lock carried 5-input update | **Operator's**: land the pending nixpkgs+friends update deliberately. |
+| F3 docs-only commits never move the pin (src filter) | Knowledge; recorded here. Worklist changes need no redeploy. |
+| F4 arm demands GitHub URL even local | Sound fix in **ch2 `authority-schema-v3`** (sharpened) + `port-local-semantics` + `delete-forge-io-rust`. |
+| F5 fleet-deploy vs live campaign | **ch0 `campaign-quiescent-verb`** (D63). |
+| F6 gitAi config residue | **ch2 `gitai-config-purge`** (D66). |
+| F7 readFirst resolves from checkout | Knowledge; superseded in practice by D68 (pointers verified against authority). |
+| F8 project rejects reference manifest | **ch0 `checkpoint-brief-render`** (D64) + skills carry the projection contract. |
+| F9 static arm-lint noise | **ch0 `tier-aware-arm-lint`** (D65). |
+| F10 module hardcodes forge github | **ch2 `module-forge-option`** (D67). |
+| F11 checkpoint tasks need bodies | Same fix as F8 (D64) — render-side synthesis, not schema relaxation. |
+| Morning: host-wide campaign mutex | **ch0 `campaign-pool-namespace` + `mutex-restart-recovery`** (D62, discharging D59). |
+
+Sodimo program findings (`sodimo-aug11-learnings.md`, 33/33 tasks, zero
+interventions), folded 2026-08-12 afternoon:
+
+| Sodimo finding | Disposition |
+|---|---|
+| F-01 stale arm-uuid query, no live status verb | **ch0 `campaign-status-verb`** (D69). |
+| F-02 preflight fails with empty stderr; pristine-sweep landmine | **ch0 `preflight-error-argv`** (D70); doctrine in ch2 `skills-rewrite`. |
+| F-03 #484 linter false-positives (self-created /tmp, non-evaluating nix) | Folded into **ch0 `tier-aware-arm-lint`** (D65). |
+| F-04 poll counters fleet-wide, not per-campaign | **ch0 `poll-event-quality`** (D69) — urgent once D62 makes concurrency the norm. |
+| F-05 fleet-deploy exec-condition guard exists | Confirms D63's direction; `campaign-quiescent-verb` supersedes both drop-ins. |
+| F-06 bare `gh` resolves to upstream in forks | One line in ch2 `skills-rewrite` (D70). |
+| F-07 post-completion reconcile noise, rearm flap | **ch0 `poll-event-quality`** (D69). |
+| F-08 usage fragmented across poller flow runs | Rollup rides **ch0 `campaign-status-verb`** (D69). |
+| Positive 4: adversarial lanes found 5 real holes | **D71** — standing pattern; ch3 candidate task. |
+
+## 6.3 Revised ladder
+
+**ch0 → pin deploy → ch1 → ch2 (18 tasks, amended) → chP → ch3 → ch4 → ch5**, with
+chR/read-model riding anywhere post-deploy. Rationale:
+
+1. **Chapter 0 first** (9 tasks: D62–D65 and D69–D70, plus the D59 recovery
+   proof). It is the bleeding wound (scheduling), every ceremony fix the later
+   chapters themselves will trip over, and the supervision surface (status
+   verb, truthful poll events, argv-bearing preflight errors) that makes the
+   rest of the ladder cheap to watch. It runs forge-native on the current pin,
+   exactly like #527 did.
+2. **One pin deploy after ch0 merges**, at campaign quiescence, before anything
+   else arms — the only substrate move in the ladder until the operator chooses
+   another. From that pin onward: repo-scoped mutexes are live (**sodimo may
+   resume alongside tally with zero contention**), deploys self-defer under armed
+   campaigns, `project` takes committed worklists verbatim, and arming is silent
+   on this host.
+3. Chapters 1–5 as previously specified. The #529–#535 projection is superseded
+   (worklist bytes changed → new authority hash): disarm #529's registration,
+   close the sub-issues as superseded, and re-project ch1 fresh from the amended
+   file when its turn comes.
+
+57 tasks total across ch0–ch5 + chR, all validated on the working tree against
+`normalize_task(require_conflict_domains=True)` at the time of this amendment
+(re-run after the sodimo fold).

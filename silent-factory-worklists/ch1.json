@@ -13,8 +13,8 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D38",
-          "final-plan-A.md Part 3 Chapter 1"
+          "SILENT-FACTORY-PLAN.md Part 1 D38",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 1"
         ],
         "styleReferences": [
           "crates/tally-core/tests/campaign_contract_corpus.rs"
@@ -57,8 +57,8 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D39-D40",
-          "final-plan-A.md Part 3 Chapter 1"
+          "SILENT-FACTORY-PLAN.md Part 1 D39-D40",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 1"
         ],
         "styleReferences": [
           "doc/audit/campaigns-worklist-checkpoints.md"
@@ -101,8 +101,8 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D40",
-          "final-plan-A.md Part 4 impedance 3"
+          "SILENT-FACTORY-PLAN.md Part 1 D40",
+          "SILENT-FACTORY-PLAN.md Part 4 impedance 3"
         ],
         "styleReferences": [
           "test/spec_build_driver_test.py"
@@ -134,8 +134,8 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D40",
-          "final-plan-A.md Part 3 Chapter 1"
+          "SILENT-FACTORY-PLAN.md Part 1 D40",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 1"
         ],
         "styleReferences": [
           "test/spec_build_driver_test.py"
@@ -179,8 +179,8 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D39-D41",
-          "final-plan-A.md Part 3 Chapter 1"
+          "SILENT-FACTORY-PLAN.md Part 1 D39-D41",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 1"
         ],
         "styleReferences": [
           "crates/tally-core/src/campaign_registry.rs"

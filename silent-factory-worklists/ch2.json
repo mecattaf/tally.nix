@@ -12,7 +12,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D31-D33"
+          "SILENT-FACTORY-PLAN.md Part 1 D31-D33"
         ],
         "styleReferences": []
       },
@@ -46,15 +46,15 @@
       "id": "authority-schema-v3",
       "kind": "implementation",
       "title": "Campaign authority schema v3: local-first registration",
-      "goal": "Bump CampaignRegistrationV2 (crates/tally-core/src/campaign_registry.rs 30-56) to v3: drop issue_url, issue_number, sub_issue_walk, last_forge_observation, allow_test_local_forge; add the worklist pattern, the code repository coordinate, and the local operator actor recorded at arm time and re-checked on every verb. Move the N/N-1 compatibility tests with the schema; the pre-v3 refusal message names the remedy: disarm and re-arm. Depends on Chapter 1's drop-polluted-v2-migration having landed.",
+      "goal": "Bump CampaignRegistrationV2 (crates/tally-core/src/campaign_registry.rs 30-56) to v3: drop issue_url, issue_number, sub_issue_walk, last_forge_observation, allow_test_local_forge; add the worklist pattern, the code repository coordinate, and the local operator actor recorded at arm time and re-checked on every verb. Move the N/N-1 compatibility tests with the schema; the pre-v3 refusal message names the remedy: disarm and re-arm. Depends on Chapter 1's drop-polluted-v2-migration having landed. Finding F4 made the defect concrete: on the current pin, tally campaign arm takes a GitHub issue URL as a required positional even under --allow-test-local-forge. The sound fix is that arm's authority input becomes the campaign identity (repository plus committed worklist path at the fetched base revision); the forge issue, where one exists, is derived from projection state. A synthetic or faked URL is never an accepted input in any mode.",
       "deliveredBehaviors": [
         "A campaign arms with no issue coordinates",
         "Arm-time local actor identity replaces gh-resolved identity"
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D41",
-          "final-plan-A.md Part 3 Chapter 2"
+          "SILENT-FACTORY-PLAN.md Part 1 D41",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 2"
         ],
         "styleReferences": []
       },
@@ -97,7 +97,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D11-D12"
+          "SILENT-FACTORY-PLAN.md Part 1 D11-D12"
         ],
         "styleReferences": []
       },
@@ -140,7 +140,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D13"
+          "SILENT-FACTORY-PLAN.md Part 1 D13"
         ],
         "styleReferences": []
       },
@@ -181,7 +181,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D14-D15"
+          "SILENT-FACTORY-PLAN.md Part 1 D14-D15"
         ],
         "styleReferences": []
       },
@@ -211,7 +211,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 3 Chapter 2 task 2.5"
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 2 task 2.5"
         ],
         "styleReferences": []
       },
@@ -246,7 +246,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D31"
+          "SILENT-FACTORY-PLAN.md Part 1 D31"
         ],
         "styleReferences": []
       },
@@ -292,8 +292,8 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D31",
-          "final-plan-A.md Part 3 Chapter 2 task 2.G3"
+          "SILENT-FACTORY-PLAN.md Part 1 D31",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 2 task 2.G3"
         ],
         "styleReferences": []
       },
@@ -338,7 +338,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D31, D33"
+          "SILENT-FACTORY-PLAN.md Part 1 D31, D33"
         ],
         "styleReferences": []
       },
@@ -383,8 +383,8 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D3-D5",
-          "final-plan-A.md Part 3 Chapter 2 task 2.6"
+          "SILENT-FACTORY-PLAN.md Part 1 D3-D5",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 2 task 2.6"
         ],
         "styleReferences": []
       },
@@ -430,7 +430,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 3 Chapter 2 task 2.7"
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 2 task 2.7"
         ],
         "styleReferences": []
       },
@@ -475,7 +475,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D51"
+          "SILENT-FACTORY-PLAN.md Part 1 D51"
         ],
         "styleReferences": []
       },
@@ -509,7 +509,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D21"
+          "SILENT-FACTORY-PLAN.md Part 1 D21"
         ],
         "styleReferences": []
       },
@@ -553,7 +553,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D49"
+          "SILENT-FACTORY-PLAN.md Part 1 D49"
         ],
         "styleReferences": []
       },
@@ -597,7 +597,7 @@
       ],
       "readFirst": {
         "specSections": [
-          "final-plan-A.md Part 1 D31, D53"
+          "SILENT-FACTORY-PLAN.md Part 1 D31, D53"
         ],
         "styleReferences": []
       },
@@ -632,6 +632,102 @@
       ]
     },
     {
+      "id": "module-forge-option",
+      "kind": "implementation",
+      "title": "The module renders forge as a declared option, not a hardcode",
+      "goal": "renderCampaignRepositories hardcodes forge = \"github\" (nix/modules/common.nix 3619, finding F10), so a module-declared campaign cannot be forge:\"local\" no matter what the CLI supports. Add a per-campaign forge option (\"github\" | \"local\", default \"github\") rendered into the registration verbatim, with a module assertion that a local-forge campaign declares no forge-native-only fields. This is the declaration-side half of authority v3: after it, the Chapter-1-style module declaration expresses the silent factory without a hand-edited registration.",
+      "deliveredBehaviors": [
+        "A module-declared campaign can state forge = \"local\" and have it rendered into the registration",
+        "renderCampaignRepositories carries no hardcoded forge value"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D67",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 2"
+        ],
+        "styleReferences": [
+          "nix/modules/common.nix"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-hardcoded-forge",
+          "description": "The renderCampaignRepositories body no longer contains a hardcoded forge literal; the value flows from the campaign option.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! sed -n '/renderCampaignRepositories/,/^  [a-zA-Z]/p' nix/modules/common.nix | grep -q 'forge = \"github\"'"
+          ]
+        },
+        {
+          "id": "module-eval-tests-green",
+          "description": "The flake's module assertion tests pass with the new option exercised in both values.",
+          "argv": [
+            "nix",
+            "flake",
+            "check",
+            "--no-build"
+          ]
+        }
+      ],
+      "dependencies": [
+        "authority-schema-v3"
+      ],
+      "conflictDomains": [
+        "nix/modules",
+        "flake.nix"
+      ]
+    },
+    {
+      "id": "gitai-config-purge",
+      "kind": "implementation",
+      "title": "Delete the gitAi config surface; stale host keys fail loud",
+      "goal": "The gate removals leave a dead config surface behind (finding F6: the deployed host still carries gitAi { enable = true } feeding a checkpoint pipeline that mints empty notes). Delete GitAiConfig and its wiring from crates/tally-core/src/config.rs (default fn at 44, serde default at 63, field at 542, Default impl at 568, validation at 625 and 695, tests at 959-961) and any nix module option that renders a gitAi key. With the key gone, config decode rejects it as unknown, so a stale host config fails loud at the deploy that ships this change - the residue is impossible to carry silently. The host-side cleanup (dropping the key from ~/.config/tally/config.json) is a documented step of that deploy, not code.",
+      "deliveredBehaviors": [
+        "No gitAi symbol survives in config code or module options",
+        "A config carrying the old gitAi key is refused at boot with a clear unknown-key error"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D66",
+          "SILENT-FACTORY-PLAN.md Part 3 Chapter 2"
+        ],
+        "styleReferences": [
+          "crates/tally-core/src/config.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-gitai-config-symbol",
+          "description": "No gitAi/git_ai reference survives in the config module or the nix module tree.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rni 'git_ai\\|gitai' crates/tally-core/src/config.rs nix/modules"
+          ]
+        },
+        {
+          "id": "core-tests-green",
+          "description": "tally-core suite passes including the unknown-key refusal for a legacy gitAi config.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core"
+          ]
+        }
+      ],
+      "dependencies": [
+        "remove-gate-a",
+        "remove-gate-b-and-contract",
+        "remove-verify-authorship"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "nix/modules"
+      ]
+    },
+    {
       "id": "chapter-gate",
       "kind": "checkpoint",
       "title": "Chapter gate: full gate ladder",
@@ -643,7 +739,9 @@
       "dependencies": [
         "skills-rewrite",
         "drop-local-forge-escape-hatches",
-        "git-ai-test-doc-sweep"
+        "git-ai-test-doc-sweep",
+        "module-forge-option",
+        "gitai-config-purge"
       ]
     }
   ]
