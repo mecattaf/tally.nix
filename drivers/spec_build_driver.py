@@ -931,7 +931,7 @@ def normalize_conflict_domains(
             fail(f"{context} must be a non-empty array")
         return None
     domains = string_list(value, context, nonempty=required)
-    if len(domains) != len({domain.casefold() for domain in domains}):
+    if len(domains) != len(set(domains)):
         fail(f"{context} contains duplicates")
     normalized: list[str] = []
     for index, domain in enumerate(domains):
@@ -1372,6 +1372,42 @@ def narrate(
     return template_narration(task, body=fallback_body), transcript
 
 
+def canonical_forbid_paths_gate(value: Any, context: str) -> dict[str, Any]:
+    """Decode the forbidPaths variant shared by contract and gate actions."""
+    gate = object_complete(
+        value,
+        {"kind", "id", "forbidPaths", "runtimeMaxSec"},
+        context,
+    )
+    if gate["kind"] != "forbidPaths":
+        fail(f"{context}.kind must equal forbidPaths")
+    gate_id = required_string(gate["id"], f"{context}.id", 80)
+    if not COMPONENT.fullmatch(gate_id):
+        fail(f"{context}.id is not a safe component")
+    patterns = string_list(gate["forbidPaths"], f"{context}.forbidPaths", nonempty=True)
+    if len(patterns) > 128:
+        fail(f"{context}.forbidPaths exceeds 128 entries")
+    seen: set[str] = set()
+    for pattern_index, pattern in enumerate(patterns):
+        if len(pattern) > 1024:
+            fail(f"{context}.forbidPaths[{pattern_index}] exceeds 1024 characters")
+        components = pattern.split("/")
+        if (
+            pattern.startswith("/")
+            or pattern.endswith("/")
+            or ".." in components
+            or any("**" in component and component != "**" for component in components)
+            or pattern in seen
+        ):
+            fail(
+                f"internal campaign contract violation: "
+                f"{context}.forbidPaths[{pattern_index}] is not canonical"
+            )
+        seen.add(pattern)
+    positive_integer(gate["runtimeMaxSec"], f"{context}.runtimeMaxSec")
+    return {"kind": "forbidPaths", "id": gate_id, "forbidPaths": patterns}
+
+
 def canonical_gate_list(value: Any, context: str) -> list[dict[str, Any]]:
     """Decode the closed, already-normalized canonical gate variants."""
     if not isinstance(value, list) or not 1 <= len(value) <= 16:
@@ -1392,35 +1428,7 @@ def canonical_gate_list(value: Any, context: str) -> list[dict[str, Any]]:
             argv(gate["argv"], f"{gate_context}.argv")
             positive_integer(gate["runtimeMaxSec"], f"{gate_context}.runtimeMaxSec")
         elif kind == "forbidPaths":
-            gate = object_complete(
-                candidate,
-                {"kind", "id", "forbidPaths", "runtimeMaxSec"},
-                gate_context,
-            )
-            required_string(gate["id"], f"{gate_context}.id", 80)
-            patterns = string_list(
-                gate["forbidPaths"], f"{gate_context}.forbidPaths", nonempty=True
-            )
-            if len(patterns) > 128:
-                fail(f"{gate_context}.forbidPaths exceeds 128 entries")
-            seen: set[str] = set()
-            for pattern_index, pattern in enumerate(patterns):
-                if len(pattern) > 1024:
-                    fail(f"{gate_context}.forbidPaths[{pattern_index}] exceeds 1024 characters")
-                components = pattern.split("/")
-                if (
-                    pattern.startswith("/")
-                    or pattern.endswith("/")
-                    or ".." in components
-                    or any("**" in component and component != "**" for component in components)
-                    or pattern in seen
-                ):
-                    fail(
-                        f"internal campaign contract violation: "
-                        f"{gate_context}.forbidPaths[{pattern_index}] is not canonical"
-                    )
-                seen.add(pattern)
-            positive_integer(gate["runtimeMaxSec"], f"{gate_context}.runtimeMaxSec")
+            canonical_forbid_paths_gate(candidate, gate_context)
         else:
             fail(f"{gate_context}.kind must be command or forbidPaths")
     return value
@@ -6957,35 +6965,6 @@ def path_glob_matches(path: str, pattern: str) -> bool:
     return match(0, 0)
 
 
-def normalize_forbid_paths_gate(value: Any, context: str) -> dict[str, Any]:
-    gate = object_exact(value, {"kind", "id", "forbidPaths", "runtimeMaxSec"}, context)
-    if gate.get("kind") != "forbidPaths":
-        fail(f"{context}.kind must equal forbidPaths")
-    gate_id = required_string(gate.get("id"), f"{context}.id", 80)
-    if not COMPONENT.fullmatch(gate_id):
-        fail(f"{context}.id is not a safe component")
-    patterns = string_list(gate.get("forbidPaths"), f"{context}.forbidPaths", nonempty=True)
-    if len(patterns) > 128:
-        fail(f"{context}.forbidPaths exceeds 128 patterns")
-    if len(patterns) != len(set(patterns)):
-        fail(f"{context}.forbidPaths contains duplicates")
-    for index, pattern in enumerate(patterns):
-        components = pattern.split("/")
-        if len(pattern) > 1024:
-            fail(f"{context}.forbidPaths[{index}] exceeds 1024 characters")
-        if (
-            pattern.startswith("/")
-            or ".." in components
-            or any("**" in component and component != "**" for component in components)
-        ):
-            fail(
-                f"{context}.forbidPaths[{index}] must be a repository-relative glob "
-                "without '..' and may use '**' only as a complete path component"
-            )
-    positive_integer(gate.get("runtimeMaxSec"), f"{context}.runtimeMaxSec")
-    return {"kind": "forbidPaths", "id": gate_id, "forbidPaths": patterns}
-
-
 def reject_merge_commits(worktree: Path, union_base: str, head: str) -> None:
     """A merge commit a lane authored makes the whole mainline look authored.
 
@@ -7435,7 +7414,7 @@ def action_constraint(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief, {"gate", "repositoryConfig", "workspace"}, "constraint brief"
     )
-    gate = normalize_forbid_paths_gate(data.get("gate"), "constraint gate")
+    gate = canonical_forbid_paths_gate(data.get("gate"), "constraint gate")
     gate_id = gate["id"]
     patterns = gate["forbidPaths"]
     config = repo_config(data.get("repositoryConfig"))
@@ -7493,7 +7472,7 @@ def normalize_constraint_results(value: Any, context: str) -> list[dict[str, Any
             {"gateId", "kind", "patterns", "checkedPaths", "baseRev", "head"},
             receipt_context,
         )
-        gate = normalize_forbid_paths_gate(
+        gate = canonical_forbid_paths_gate(
             {
                 "kind": receipt.get("kind"),
                 "id": receipt.get("gateId"),
@@ -7551,7 +7530,7 @@ def normalize_campaign_gates(value: Any, context: str) -> list[dict[str, Any]]:
             fail(f"{context} repeats gate id {gate_id!r}")
         seen.add(gate_id)
         if candidate.get("kind") == "forbidPaths":
-            gates.append(normalize_forbid_paths_gate(candidate, f"{context}[{index}]"))
+            gates.append(canonical_forbid_paths_gate(candidate, f"{context}[{index}]"))
     return gates
 
 
