@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
@@ -64,6 +65,7 @@ pub(crate) struct LiveFlowClient {
     connection: Mutex<ConnectionState>,
     final_message_adapters: BTreeSet<String>,
     result_expected: Mutex<BTreeMap<(String, u32), ResultProjectionExpectation>>,
+    submitted_argv: RefCell<BTreeMap<String, Vec<String>>>,
     result_projection_timeout: Duration,
     call_timeout: Duration,
     retry_limit: u32,
@@ -84,6 +86,7 @@ impl LiveFlowClient {
             connection: Mutex::new(ConnectionState::default()),
             final_message_adapters: BTreeSet::new(),
             result_expected: Mutex::new(BTreeMap::new()),
+            submitted_argv: RefCell::new(BTreeMap::new()),
             result_projection_timeout: RESULT_PROJECTION_TIMEOUT,
             call_timeout: LIVE_CALL_TIMEOUT,
             retry_limit: LIVE_RETRY_LIMIT,
@@ -122,6 +125,37 @@ impl LiveFlowClient {
     pub(crate) fn with_lifecycle_sink(mut self, lifecycle: Rc<dyn LifecycleSink>) -> Self {
         self.lifecycle = Some(lifecycle);
         self
+    }
+
+    /// Add the exact submitted argv to a campaign preflight refusal before the
+    /// runner emits it. The flow's terminal result deliberately stays compact,
+    /// so retain this admission-time evidence separately and join it back to
+    /// the one error shape that promises to identify a failed preflight.
+    pub(crate) fn witness_preflight_failure_argv(&self, error: &mut tally_flow::FlowError) {
+        if error.code != "preflight-failed" {
+            return;
+        }
+        let Some(task_uuid) = error
+            .details
+            .get("node")
+            .and_then(Value::as_object)
+            .and_then(|node| node.get("taskUuid"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let Some(preflight_argv) = self.submitted_argv.borrow().get(task_uuid).cloned() else {
+            return;
+        };
+        let rendered =
+            serde_json::to_string(&preflight_argv).expect("a normalized flow argv is serializable");
+        error
+            .details
+            .insert("preflightArgv".to_owned(), json!(preflight_argv));
+        if !error.message.contains(&rendered) {
+            error.message.push_str("; preflightArgv=");
+            error.message.push_str(&rendered);
+        }
     }
 
     async fn resolve_runner_related_trigger(&self) -> Result<(), ClientError> {
@@ -535,6 +569,14 @@ impl FlowClient for LiveFlowClient {
                     // would be a worse trade than losing the line.
                     let _ = crate::cli::enqueue::report_degraded_membership(&response);
                     let mut admission = parse_admission(&response)?;
+                    self.submitted_argv.borrow_mut().insert(
+                        admission.task_uuid.clone(),
+                        submission
+                            .spec
+                            .argv
+                            .clone()
+                            .expect("enqueue_payload validated the normalized flow argv"),
+                    );
                     if let Some(expectation) = result_expected {
                         self.result_expected.lock().await.insert(
                             (admission.task_uuid.clone(), admission.attempt),
@@ -2454,6 +2496,46 @@ export const meta = {
             RunnerIdentity::default(),
         );
         assert_eq!(client.socket, Path::new("/tmp/tally flow.sock"));
+    }
+
+    #[test]
+    fn empty_stderr_preflight_failure_witnesses_exact_argv() {
+        let task_uuid = "00000000-0000-4000-8000-000000000054";
+        let preflight_argv = vec![
+            "/bin/sh".to_owned(),
+            "-euc".to_owned(),
+            "test -d 'node modules'".to_owned(),
+        ];
+        let client = LiveFlowClient::new(
+            Path::new("/tmp/tally-flow.sock"),
+            16 * 1024 * 1024,
+            RunnerIdentity::default(),
+        );
+        client
+            .submitted_argv
+            .borrow_mut()
+            .insert(task_uuid.to_owned(), preflight_argv.clone());
+        let mut error = tally_flow::FlowError::new(
+            "SpecBuildPreflightError",
+            "preflight-failed",
+            "campaign preflight gate lint failed with empty stderr",
+        )
+        .detail("gateId", "lint")
+        .detail(
+            "node",
+            json!({
+                "taskUuid": task_uuid,
+                "taskRef": "fixture/task-1",
+                "stderrExcerpt": "",
+            }),
+        );
+
+        client.witness_preflight_failure_argv(&mut error);
+
+        assert_eq!(error.details["preflightArgv"], json!(preflight_argv));
+        assert!(error
+            .message
+            .contains(&serde_json::to_string(&preflight_argv).unwrap()));
     }
 
     fn projection_node_result(verdict: Verdict, exit_code: Option<i32>) -> NodeResult {

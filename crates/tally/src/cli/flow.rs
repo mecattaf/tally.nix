@@ -287,9 +287,18 @@ pub(super) async fn run_flow(
                 if let Some(timeout) = projection_wait {
                     client = client.with_result_projection_timeout(timeout);
                 }
-                let client = client.with_lifecycle_sink(Rc::clone(&lifecycle));
-                run_script(&source, Some(&script), Rc::new(client), lifecycle, options)
-                    .map_err(Box::new)
+                let client = Rc::new(client.with_lifecycle_sink(Rc::clone(&lifecycle)));
+                run_script(
+                    &source,
+                    Some(&script),
+                    Rc::clone(&client) as Rc<dyn tally_flow::FlowClient>,
+                    lifecycle,
+                    options,
+                )
+                .map_err(|mut error| {
+                    client.witness_preflight_failure_argv(&mut error);
+                    Box::new(error)
+                })
             })
             .await
             .context("flow runner worker failed")?;
