@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "fixture-checkpoint-render",
+    "repository": {
+      "checkout": "/replaced/by/test",
+      "baseBranch": "main",
+      "remote": "origin",
+      "forge": "local"
+    },
+    "maxTasks": 4,
+    "maxParallel": 1,
+    "agent": {},
+    "gates": [
+      {
+        "kind": "command",
+        "id": "fixture",
+        "preflightArgv": [
+          "true"
+        ],
+        "argv": [
+          "true"
+        ]
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "prepare",
+      "kind": "implementation",
+      "title": "Prepare the fixture",
+      "body": "Prepare the fixture for its checkpoint.",
+      "dependencies": [],
+      "conflictDomains": [
+        "src"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Fixture checkpoint",
+      "argv": [
+        "bash",
+        "test/fleet-gate.sh"
+      ],
+      "runtimeMaxSec": 7200,
+      "dependencies": [
+        "prepare"
+      ]
+    }
+  ]
+}

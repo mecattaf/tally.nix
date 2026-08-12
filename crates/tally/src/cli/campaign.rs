@@ -42,6 +42,13 @@ struct ProjectTask {
     runtime_max_sec: Option<u64>,
 }
 
+struct ProjectCheckpointBrief<'a> {
+    campaign_name: &'a str,
+    argv: &'a [String],
+    runtime_max_sec: u64,
+    dependencies: &'a [String],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GithubActor {
     login: String,
@@ -2950,6 +2957,7 @@ fn project_string_list(value: Option<&Value>, context: &str) -> Result<Vec<Strin
 fn render_project_task_body(
     object: &serde_json::Map<String, Value>,
     context: &str,
+    checkpoint: Option<ProjectCheckpointBrief<'_>>,
 ) -> Result<String> {
     if let Some(body) = object.get("body") {
         return body
@@ -2957,6 +2965,14 @@ fn render_project_task_body(
             .filter(|body| !body.trim().is_empty() && !body.contains('\0'))
             .map(ToOwned::to_owned)
             .ok_or_else(|| invalid(format!("{context}.body must be a non-empty string")));
+    }
+    if let Some(checkpoint) = checkpoint {
+        let argv = serde_json::to_string(checkpoint.argv)?;
+        let dependencies = serde_json::to_string(checkpoint.dependencies)?;
+        return Ok(format!(
+            "## Checkpoint\n\nCampaign: `{}`\n\n## Gate argv\n\n    {argv}\n\n## Runtime limit\n\n{} seconds\n\n## Dependencies\n\n    {dependencies}\n",
+            checkpoint.campaign_name, checkpoint.runtime_max_sec
+        ));
     }
     let goal = required_project_string(object, "goal", context)?;
     let delivered = project_string_list(
@@ -3019,7 +3035,7 @@ fn render_project_task_body(
     Ok(body)
 }
 
-fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
+fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTask>> {
     let object = document
         .as_object()
         .ok_or_else(|| invalid("campaign worklist must be an object"))?;
@@ -3140,7 +3156,15 @@ fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
         } else {
             None
         };
-        let body = render_project_task_body(item, &context)?;
+        let checkpoint = (kind == "checkpoint").then(|| ProjectCheckpointBrief {
+            campaign_name,
+            argv: argv
+                .as_deref()
+                .expect("checkpoint argv was validated above"),
+            runtime_max_sec: runtime_max_sec.expect("checkpoint runtime was validated above"),
+            dependencies: &dependencies,
+        });
+        let body = render_project_task_body(item, &context, checkpoint)?;
         if body.chars().count() > 64_000 {
             return Err(invalid(format!(
                 "{context} task brief must contain at most 64000 characters"
@@ -3827,18 +3851,18 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
         .map(|path| read_json_document(path, "campaign configuration"))
         .transpose()?;
     let raw_config = project_config(&document, separate.as_ref())?;
-    let mut tasks = project_tasks(&document)?;
+    let name = raw_config
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| safe_component(value))
+        .ok_or_else(|| invalid("campaign configuration name is missing or invalid"))?;
+    let mut tasks = project_tasks(&document, name)?;
     let canonical_preview = validate_project_shape(&raw_config, &tasks)?;
     let mut config = serde_json::to_value(canonical_preview)?;
     config
         .as_object_mut()
         .expect("CampaignManifest serializes as an object")
         .remove("tasks");
-    let name = config
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|value| safe_component(value))
-        .ok_or_else(|| invalid("campaign configuration name is missing or invalid"))?;
     let initial_title = args
         .title
         .clone()
@@ -5156,9 +5180,128 @@ esac"#,
                 {"id": "finish", "kind": "implementation", "title": "Finish", "body": "Do the next thing.", "dependencies": ["foundation"], "conflictDomains": ["tests"]}
             ]
         });
-        let tasks = project_tasks(&document).unwrap();
+        let tasks = project_tasks(&document, "night-build").unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].dependencies, ["foundation"]);
+    }
+
+    #[test]
+    fn project_synthesizes_checkpoint_brief_from_fixture_worklist() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/checkpoint-bare-worklist.json");
+        let document: Value = serde_json::from_str(
+            &fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
+        )
+        .expect("checkpoint worklist fixture must be JSON");
+        let mut config = project_config(&document, None).unwrap();
+        let campaign_name = config["name"].as_str().unwrap();
+        let tasks = project_tasks(&document, campaign_name).unwrap();
+        let checkpoint = tasks
+            .iter()
+            .find(|task| task.kind == "checkpoint")
+            .expect("fixture must contain a checkpoint");
+        assert_eq!(
+            checkpoint.body,
+            "## Checkpoint\n\nCampaign: `fixture-checkpoint-render`\n\n## Gate argv\n\n    [\"bash\",\"test/fleet-gate.sh\"]\n\n## Runtime limit\n\n7200 seconds\n\n## Dependencies\n\n    [\"prepare\"]\n"
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        config["repository"]["checkout"] = json!(fs::canonicalize(checkout).unwrap());
+        let manifest = validate_project_shape(&config, &tasks).unwrap();
+        assert_eq!(manifest.tasks.len(), 2);
+        assert_eq!(manifest.tasks[1].kind, "checkpoint");
+    }
+
+    #[test]
+    fn committed_silent_factory_worklists_render_checkpoint_briefs() {
+        let directory =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silent-factory-worklists");
+        let mut paths = fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert!(!paths.is_empty(), "silent-factory worklists must exist");
+
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let checkout = fs::canonicalize(checkout).unwrap();
+
+        for path in paths {
+            let document: Value = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
+            )
+            .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display()));
+            let stem = path.file_stem().and_then(|value| value.to_str()).unwrap();
+            let campaign_name = format!("silent-factory-{stem}");
+            let tasks = project_tasks(&document, &campaign_name)
+                .unwrap_or_else(|error| panic!("cannot render {}: {error}", path.display()));
+            let checkpoints = tasks
+                .iter()
+                .filter(|task| task.kind == "checkpoint")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                checkpoints.len(),
+                1,
+                "{} must contain its chapter checkpoint",
+                path.display()
+            );
+            for checkpoint in checkpoints {
+                let argv = serde_json::to_string(checkpoint.argv.as_ref().unwrap()).unwrap();
+                let dependencies = serde_json::to_string(&checkpoint.dependencies).unwrap();
+                assert!(
+                    checkpoint
+                        .body
+                        .contains(&format!("Campaign: `{campaign_name}`")),
+                    "{} omits its campaign name",
+                    path.display()
+                );
+                assert!(
+                    checkpoint.body.contains(&format!("    {argv}")),
+                    "{} omits its checkpoint argv",
+                    path.display()
+                );
+                assert!(
+                    checkpoint
+                        .body
+                        .contains(&format!("{} seconds", checkpoint.runtime_max_sec.unwrap())),
+                    "{} omits its checkpoint runtime",
+                    path.display()
+                );
+                assert!(
+                    checkpoint.body.contains(&format!("    {dependencies}")),
+                    "{} omits its checkpoint dependencies",
+                    path.display()
+                );
+            }
+
+            let mut config = manifest_value_for_test(json!([]));
+            config["name"] = json!(campaign_name);
+            config["repository"]["checkout"] = json!(checkout);
+            config["repository"]["forge"] = json!("local");
+            config["maxTasks"] = json!(100);
+            config.as_object_mut().unwrap().remove("tasks");
+            validate_project_shape(&config, &tasks)
+                .unwrap_or_else(|error| panic!("cannot project {}: {error}", path.display()));
+        }
     }
 
     #[test]
@@ -5184,7 +5327,7 @@ esac"#,
                 "dependencies": []
             }]
         });
-        let tasks = project_tasks(&document).unwrap();
+        let tasks = project_tasks(&document, "night-build").unwrap();
         assert_eq!(tasks[0].conflict_domains, None);
         let references = task_references(&tasks).unwrap();
         assert!(!references[0]
@@ -5214,7 +5357,7 @@ esac"#,
                 "conflictDomains": []
             }]
         });
-        let explicit_tasks = project_tasks(&explicit).unwrap();
+        let explicit_tasks = project_tasks(&explicit, "night-build").unwrap();
         assert_eq!(explicit_tasks[0].conflict_domains, Some(Vec::new()));
         assert_eq!(
             task_references(&explicit_tasks).unwrap()[0]["conflictDomains"],
@@ -5244,7 +5387,7 @@ esac"#,
                 "conflictDomains": []
             }]
         });
-        assert!(project_tasks(&document).is_err());
+        assert!(project_tasks(&document, "night-build").is_err());
     }
 
     #[test]
@@ -5291,9 +5434,10 @@ esac"#,
             .as_object_mut()
             .unwrap()
             .insert("maxTasks".into(), json!(1));
-        let error = validate_project_shape(&config, &project_tasks(&document).unwrap())
-            .unwrap_err()
-            .to_string();
+        let error =
+            validate_project_shape(&config, &project_tasks(&document, "night-build").unwrap())
+                .unwrap_err()
+                .to_string();
         assert_eq!(
             error,
             "campaign configuration cannot form a valid manifest: campaign contains 2 tasks but manifest maxTasks is 1 — raise \"maxTasks\" in the campaign manifest"
