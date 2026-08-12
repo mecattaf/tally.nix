@@ -196,6 +196,8 @@ pub(super) enum CampaignCommand {
     Poll(CampaignPollArgs),
     /// Print local campaign locators, admitted digests, and authority bindings.
     List(CampaignListArgs),
+    /// Exit successfully only when the local campaign registry is empty.
+    Quiescent(CampaignQuiescentArgs),
     /// Remove a local campaign registration without changing its forge issues.
     Disarm(CampaignDisarmArgs),
 }
@@ -295,6 +297,13 @@ pub(super) struct CampaignPollArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct CampaignListArgs {
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignQuiescentArgs {
+    /// Durable registration root; defaults beneath tally state.
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }

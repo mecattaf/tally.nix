@@ -165,6 +165,7 @@ pub(super) async fn run_campaign(
             run_campaign_poll(socket, config_path, rpc_timeout, args).await
         }
         CampaignCommand::List(args) => run_campaign_list(args),
+        CampaignCommand::Quiescent(args) => run_campaign_quiescent(args),
         CampaignCommand::Disarm(args) => run_campaign_disarm(args),
     }
 }
@@ -2859,13 +2860,30 @@ async fn run_campaign_poll(
 fn run_campaign_list(args: CampaignListArgs) -> Result<()> {
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
-    let values = registry
+    let values = campaign_list_values(&registry)?;
+    outln!("{}", serde_json::to_string(&values)?);
+    Ok(())
+}
+
+fn campaign_list_values(registry: &CampaignRegistry) -> Result<Vec<Value>> {
+    registry
         .registrations()?
         .into_iter()
         .map(|(_, registration)| registration.list_value())
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    outln!("{}", serde_json::to_string(&values)?);
-    Ok(())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn run_campaign_quiescent(args: CampaignQuiescentArgs) -> Result<()> {
+    let state_dir = resolve_state_dir(args.state_dir)?;
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let values = campaign_list_values(&registry)?;
+    if values.is_empty() {
+        return Ok(());
+    }
+
+    errln!("{}", serde_json::to_string(&values)?);
+    Err(exit_failure(1, String::new()))
 }
 
 fn run_campaign_disarm(args: CampaignDisarmArgs) -> Result<()> {

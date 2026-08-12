@@ -1,0 +1,78 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use serde_json::Value;
+use tally_core::campaign_registry::{
+    CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
+};
+
+const ISSUE_URL: &str = "https://github.com/acme/widgets/issues/42";
+
+fn quiescent(state_dir: &Path, absent_socket: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["campaign", "quiescent", "--state-dir"])
+        .arg(state_dir)
+        .env("TALLY_SOCKET", absent_socket)
+        .env_remove("TALLY_JOB_ID")
+        .env_remove("TALLY_JOB_TOKEN")
+        .output()
+        .unwrap()
+}
+
+fn arm_fixture(state_dir: &Path, fixture_dir: &Path) {
+    fs::create_dir_all(fixture_dir).unwrap();
+    let flow = fixture_dir.join("spec-build.js");
+    let driver = fixture_dir.join("spec-build-driver");
+    fs::write(&flow, "fixture flow\n").unwrap();
+    fs::write(&driver, "fixture driver\n").unwrap();
+
+    let authority = CampaignRegistrationV2 {
+        schema_version: REGISTRY_SCHEMA_VERSION,
+        registration_id: "0198a62b-41ee-7000-8000-000000000539".to_owned(),
+        issue_url: ISSUE_URL.to_owned(),
+        repository: "acme/widgets".to_owned(),
+        issue_number: 42,
+        armed_at: "2026-08-12T20:00:00Z".to_owned(),
+        arm_serial: 1,
+        approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
+        authenticated_actor: "operator".to_owned(),
+        allowed_actors: vec!["operator".to_owned()],
+        allow_test_local_forge: false,
+        sub_issue_walk: true,
+        last_observation: None,
+        last_forge_observation: None,
+        flow,
+        driver,
+        workspace_root: PathBuf::from("/var/lib/tally/campaigns"),
+    };
+    let mut registration = CampaignRegistration::new(authority, None);
+    CampaignRegistry::open(state_dir)
+        .unwrap()
+        .write(&mut registration)
+        .unwrap();
+}
+
+#[test]
+fn quiescent_reads_both_exit_paths_from_the_registry_without_a_daemon() {
+    let temporary = tempfile::tempdir().unwrap();
+    let state_dir = temporary.path().join("state");
+    let absent_socket = temporary.path().join("daemon-is-not-running.sock");
+
+    let empty = quiescent(&state_dir, &absent_socket);
+    assert_eq!(empty.status.code(), Some(0), "{empty:?}");
+    assert!(empty.stdout.is_empty(), "{empty:?}");
+    assert!(empty.stderr.is_empty(), "{empty:?}");
+
+    arm_fixture(&state_dir, &temporary.path().join("fixture-assets"));
+    let armed = quiescent(&state_dir, &absent_socket);
+    assert_eq!(armed.status.code(), Some(1), "{armed:?}");
+    assert!(armed.stdout.is_empty(), "{armed:?}");
+
+    let stderr = String::from_utf8(armed.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    let listing: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    let registrations = listing.as_array().expect("listing must be a JSON array");
+    assert_eq!(registrations.len(), 1, "{listing}");
+    assert_eq!(registrations[0]["issueUrl"], ISSUE_URL);
+}
