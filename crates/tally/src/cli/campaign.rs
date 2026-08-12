@@ -8,7 +8,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tally_core::adapters::AdapterConfig;
+use tally_core::adapters::{AdapterConfig, AdapterHardening};
 use tally_core::campaign_contract::{
     admit_manifest_value, task_completion_revision, validate_argv, validate_manifest,
     CampaignAgent, CampaignGate, CampaignManifest, CanonicalCampaignGraphV1,
@@ -1700,6 +1700,27 @@ fn argv_mentions_command(argv: &[String], command: &str) -> bool {
     })
 }
 
+fn argv_invokes_cache_using_tool(argv: &[String], tool: &str) -> bool {
+    if tool != "nix" {
+        return argv_mentions_command(argv, tool);
+    }
+
+    const EVALUATING_NIX_SUBCOMMANDS: [&str; 4] = ["develop", "build", "shell", "run"];
+    let joined = argv.join(" ");
+    joined.split([';', '&', '|']).any(|command| {
+        let tokens = command
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/'))
+            })
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        tokens.windows(2).any(|pair| {
+            pair[0].rsplit('/').next() == Some("nix")
+                && EVALUATING_NIX_SUBCOMMANDS.contains(&pair[1])
+        })
+    })
+}
+
 fn has_nonempty_assignment(argument: &str, name: &str) -> bool {
     let assignment = format!("{name}=");
     argument.match_indices(&assignment).any(|(index, _)| {
@@ -1760,20 +1781,62 @@ fn tmp_reference_is_cache_assignment(argument: &str, tmp_index: usize) -> bool {
     })
 }
 
-fn argument_has_staged_tmp_reference(argument: &str) -> bool {
-    argument.match_indices("/tmp").any(|(index, _)| {
-        let before = argument[..index].chars().next_back();
-        let after = argument[index + "/tmp".len()..].chars().next();
-        let starts_path = before.is_none_or(|character| {
-            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/'))
-        });
-        let ends_root = after.is_none_or(|character| {
-            character == '/'
-                || character.is_ascii_whitespace()
-                || matches!(character, '\'' | '"' | ';' | ':' | ',' | ')')
-        });
-        starts_path && ends_root && !tmp_reference_is_cache_assignment(argument, index)
+fn argument_tmp_references(argument: &str) -> Vec<(usize, String)> {
+    argument
+        .match_indices("/tmp")
+        .filter_map(|(index, _)| {
+            let before = argument[..index].chars().next_back();
+            let after = argument[index + "/tmp".len()..].chars().next();
+            let starts_path = before.is_none_or(|character| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/'))
+            });
+            let ends_root = after.is_none_or(|character| {
+                character == '/'
+                    || character.is_ascii_whitespace()
+                    || matches!(character, '\'' | '"' | ';' | ':' | ',' | ')')
+            });
+            if !starts_path || !ends_root || tmp_reference_is_cache_assignment(argument, index) {
+                return None;
+            }
+            let end = argument[index..]
+                .find(|character: char| {
+                    character.is_ascii_whitespace()
+                        || matches!(character, '\'' | '"' | ';' | ':' | ',' | ')' | '&' | '|')
+                })
+                .map_or(argument.len(), |offset| index + offset);
+            Some((index, argument[index..end].to_owned()))
+        })
+        .collect()
+}
+
+fn tmp_path_was_created(created: &[String], path: &str) -> bool {
+    created.iter().any(|directory| {
+        path == directory
+            || (directory != "/tmp"
+                && path
+                    .strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/')))
     })
+}
+
+fn argv_has_staged_tmp_reference(argv: &[String]) -> bool {
+    let joined = argv.join(" ");
+    let mut created = Vec::new();
+    for command in joined.split([';', '&', '|']) {
+        let references = argument_tmp_references(command);
+        let creates_directories = argv_mentions_command(&[command.to_owned()], "mkdir")
+            && command
+                .split_ascii_whitespace()
+                .any(|token| matches!(token.trim_matches(['\'', '"']), "-p" | "--parents"));
+        for (_, path) in references {
+            if creates_directories {
+                created.push(path);
+            } else if !tmp_path_was_created(&created, &path) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn argument_has_home_reference(argument: &str) -> bool {
@@ -1821,13 +1884,19 @@ fn argv_appears_to_write_home(argv: &[String]) -> bool {
         })
 }
 
-fn argv_hazard_warnings(manifest: &CampaignManifest) -> Vec<String> {
+fn argv_hazard_warnings(manifest: &CampaignManifest, hardening: AdapterHardening) -> Vec<String> {
+    if hardening.is_none() {
+        return Vec::new();
+    }
+
     let mut warnings = Vec::new();
     let mut scan = |context: String, argv: &[String]| {
         let unredirected_tools = CACHE_USING_TOOLS
             .iter()
             .copied()
-            .filter(|tool| argv_mentions_command(argv, tool) && !has_cache_redirect(argv, tool))
+            .filter(|tool| {
+                argv_invokes_cache_using_tool(argv, tool) && !has_cache_redirect(argv, tool)
+            })
             .collect::<Vec<_>>();
         if !unredirected_tools.is_empty() {
             warnings.push(format!(
@@ -1835,10 +1904,7 @@ fn argv_hazard_warnings(manifest: &CampaignManifest) -> Vec<String> {
                 unredirected_tools.join(", ")
             ));
         }
-        if argv
-            .iter()
-            .any(|argument| argument_has_staged_tmp_reference(argument))
-        {
+        if argv_has_staged_tmp_reference(argv) {
             warnings.push(format!(
                 "{context} references a /tmp path; PrivateTmp hides paths staged outside the transient unit"
             ));
@@ -1917,7 +1983,8 @@ fn validate_host(
             )));
         }
     }
-    validate_agent_policies(&manifest.agent, &config.adapters[&manifest.agent.adapter])?;
+    let agent_adapter = &config.adapters[&manifest.agent.adapter];
+    validate_agent_policies(&manifest.agent, agent_adapter)?;
     if !flow.is_file() || !driver.is_file() {
         return Err(invalid(
             "campaign flow and driver assets must be regular files",
@@ -1977,10 +2044,10 @@ fn validate_host(
             );
         }
     }
-    let mut warnings = argv_hazard_warnings(manifest);
-    if let Some(warning) =
-        worker_findings_warning(&manifest.agent, &config.adapters[&manifest.agent.adapter])
-    {
+    // Checkpoint and command-gate argvs run through the flow `sh` native, so
+    // their hazards depend on the resolved shell adapter rather than the agent.
+    let mut warnings = argv_hazard_warnings(manifest, config.adapters["shell"].hardening);
+    if let Some(warning) = worker_findings_warning(&manifest.agent, agent_adapter) {
         warnings.push(warning);
     }
     Ok(warnings)
@@ -6394,39 +6461,55 @@ print(json.dumps({
         assert_eq!(worker_findings_warning(&agent, &adapter), None);
     }
 
+    fn manifest_with_checkpoint_and_gate_argv(argv: Vec<String>) -> CampaignManifest {
+        let mut value = manifest_value_for_test(json!([{
+            "id": "checkpoint",
+            "kind": "checkpoint",
+            "issue": 43,
+            "dependencies": [],
+            "argv": argv,
+            "runtimeMaxSec": 900
+        }]));
+        value["gates"] = json!([{
+            "kind": "command",
+            "id": "flake-check",
+            "preflightArgv": value["tasks"][0]["argv"].clone(),
+            "argv": value["tasks"][0]["argv"].clone(),
+            "runtimeMaxSec": 900
+        }]);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn argv_hazards_are_silent_without_a_hardening_tier() {
+        let hazardous = vec![
+            "sh".to_owned(),
+            "-euc".to_owned(),
+            "nix build /tmp/staged; mkdir -p \"$HOME/output\"".to_owned(),
+        ];
+        assert!(
+            argv_hazard_warnings(
+                &manifest_with_checkpoint_and_gate_argv(hazardous),
+                AdapterHardening::None,
+            )
+            .is_empty(),
+            "a host without a hardening preset must not receive hardened-tier argv warnings"
+        );
+    }
+
     #[test]
     fn hardened_argv_hazards_warn_for_checkpoints_and_gates_but_hermetic_argv_is_silent() {
-        let bare_nix = vec![
-            "nix".to_owned(),
-            "flake".to_owned(),
-            "check".to_owned(),
-            "-L".to_owned(),
-        ];
+        let bare_nix = vec!["nix".to_owned(), "build".to_owned(), ".#checks".to_owned()];
         let hermetic_nix = vec![
             "sh".to_owned(),
             "-euc".to_owned(),
-            "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix flake check -L".to_owned(),
+            "export XDG_CACHE_HOME=/tmp/nix-cache XDG_STATE_HOME=/tmp/nix-state; mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\"; exec nix build .#checks".to_owned(),
         ];
-        let manifest = |argv: Vec<String>| {
-            let mut value = manifest_value_for_test(json!([{
-                "id": "checkpoint",
-                "kind": "checkpoint",
-                "issue": 43,
-                "dependencies": [],
-                "argv": argv,
-                "runtimeMaxSec": 900
-            }]));
-            value["gates"] = json!([{
-                "kind": "command",
-                "id": "flake-check",
-                "preflightArgv": value["tasks"][0]["argv"].clone(),
-                "argv": value["tasks"][0]["argv"].clone(),
-                "runtimeMaxSec": 900
-            }]);
-            serde_json::from_value::<CampaignManifest>(value).unwrap()
-        };
 
-        let warnings = argv_hazard_warnings(&manifest(bare_nix));
+        let warnings = argv_hazard_warnings(
+            &manifest_with_checkpoint_and_gate_argv(bare_nix),
+            AdapterHardening::Strict,
+        );
         assert_eq!(warnings.len(), 3, "{warnings:#?}");
         for context in [
             "checkpoint task \"checkpoint\" argv",
@@ -6442,9 +6525,56 @@ print(json.dumps({
         }
 
         assert!(
-            argv_hazard_warnings(&manifest(hermetic_nix)).is_empty(),
+            argv_hazard_warnings(
+                &manifest_with_checkpoint_and_gate_argv(hermetic_nix),
+                AdapterHardening::Strict,
+            )
+            .is_empty(),
             "the documented private-cache argv must not warn"
         );
+    }
+
+    #[test]
+    fn argv_hazards_ignore_self_created_tmp_paths_and_non_evaluating_nix_probes() {
+        let benign = vec![
+            "sh".to_owned(),
+            "-euc".to_owned(),
+            "command -v nix >/dev/null; mkdir -p /tmp/tally-gate; test -d /tmp/tally-gate/output"
+                .to_owned(),
+        ];
+        assert!(
+            argv_hazard_warnings(
+                &manifest_with_checkpoint_and_gate_argv(benign),
+                AdapterHardening::Production,
+            )
+            .is_empty(),
+            "in-unit /tmp creation and a nix availability probe are safe under PrivateTmp"
+        );
+
+        for subcommand in ["develop", "build", "shell", "run"] {
+            let warnings = argv_hazard_warnings(
+                &manifest_with_checkpoint_and_gate_argv(vec![
+                    "nix".to_owned(),
+                    subcommand.to_owned(),
+                ]),
+                AdapterHardening::Workspace,
+            );
+            assert_eq!(warnings.len(), 3, "nix {subcommand}: {warnings:#?}");
+        }
+
+        for staged in [
+            "mkdir -p /tmp/owned; cat /tmp/staged",
+            "cat /tmp/late; mkdir -p /tmp/late",
+        ] {
+            assert!(
+                argv_has_staged_tmp_reference(&[
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    staged.to_owned()
+                ]),
+                "an unrelated or later mkdir must not suppress {staged:?}"
+            );
+        }
     }
 
     #[test]
