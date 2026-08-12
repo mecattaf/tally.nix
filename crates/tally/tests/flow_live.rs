@@ -2970,6 +2970,25 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(red_failure["error"]["code"], "preflight-failed");
             assert_eq!(red_failure["error"]["details"]["gateId"], "fixture-first");
             assert_eq!(
+                red_failure["error"]["details"]["preflightArgv"],
+                json!(first_preflight_argv),
+                "the witnessed failure record must preserve the failed argv verbatim"
+            );
+            assert_eq!(
+                red_failure["error"]["details"]["node"]["taskRef"],
+                "fixture/task-1"
+            );
+            let rendered_preflight_argv =
+                serde_json::to_string(&first_preflight_argv).unwrap();
+            assert!(
+                red_failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&rendered_preflight_argv),
+                "preflight failure message omitted argv {rendered_preflight_argv}: {}",
+                red_failure["error"]["message"]
+            );
+            assert_eq!(
                 red_failure["error"]["details"]["node"]["verdict"],
                 "failed",
                 "a plain non-zero preflight exit is not a runtime-exceeded verdict"
