@@ -343,6 +343,51 @@
       ]
     },
     {
+      "id": "module-contract-pool-retirement",
+      "kind": "implementation",
+      "title": "Realign the module-layer flake contract with the retired host-wide campaign mutex",
+      "goal": "The module-layer flake check still asserts the existence of the generic host-wide campaign pool that campaign-pool-namespace (D62) retired, so nix flake check now fails at eval with \"attribute 'campaign' missing\" at flake.nix:4661 (assert campaignSystemConfig.pools.campaign.resource == \"mutex\"; and the capacity assertion on the following line). Update the module contract in flake.nix so it states D62's invariant instead of the pre-D62 one: the generic campaign mutex is gone, campaign/<owner>/<repo> mutexes are minted on demand from the name alone, and the surviving host-wide pools are the resource pools (campaign-agent as a slot, campaign-control and flow as cpu-slot), which keep their existing assertions unchanged. Correct any adjacent prose or pool-count comment that the removal falsified. Do not reintroduce the generic pool, and do not weaken the assertions that still hold: the contract must still fail loudly if a resource pool changes resource kind. This is the integration residue of an already-merged task, not new behaviour: no Rust, no driver, and no worklist changes belong in this lane.",
+      "deliveredBehaviors": [
+        "nix flake check evaluates the module-layer contract without error",
+        "The contract asserts the generic host-wide campaign mutex is absent rather than present",
+        "The resource-pool assertions (campaign-agent, campaign-control, flow) are unchanged and still enforced"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 6 D62",
+          "SILENT-FACTORY-PLAN.md Part 6 findings table (mutex)"
+        ],
+        "styleReferences": [
+          "nix/modules/common.nix"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "module-layer-evaluates",
+          "description": "The module-layer flake check builds, proving the campaign pool contract evaluates against the post-D62 module defaults.",
+          "argv": [
+            "nix",
+            "build",
+            "--no-link",
+            ".#checks.x86_64-linux.module-layer"
+          ]
+        },
+        {
+          "id": "no-generic-campaign-pool-assertion",
+          "description": "No assertion in flake.nix requires the generic host-wide campaign pool to exist.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n 'campaignSystemConfig\\.pools\\.campaign\\.' flake.nix"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "flake.nix"
+      ]
+    },
+    {
       "id": "chapter-gate",
       "kind": "checkpoint",
       "title": "Chapter 0 gate: full workspace check",
@@ -360,7 +405,8 @@
         "checkpoint-brief-render",
         "campaign-status-verb",
         "preflight-error-argv",
-        "poll-event-quality"
+        "poll-event-quality",
+        "module-contract-pool-retirement"
       ]
     }
   ]
