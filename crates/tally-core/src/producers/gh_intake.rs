@@ -1,3 +1,5 @@
+use crate::assisted_by::AssistedBy;
+
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,48 +86,6 @@ pub enum ProducerObservation {
     PoolReachability {
         reachable: bool,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AssistedBy {
-    pub adapter: String,
-    pub model: String,
-    pub task_uuid: String,
-    pub witness_seq: u64,
-}
-
-impl AssistedBy {
-    fn trailer(&self) -> String {
-        format!(
-            "Assisted-by: {}:{} (tally:{} witness:{})",
-            self.adapter, self.model, self.task_uuid, self.witness_seq
-        )
-    }
-}
-
-pub(super) fn assisted_by_from_evidence(evidence: &Value) -> Option<AssistedBy> {
-    let adapter = evidence.get("adapter")?.as_str()?;
-    let model = evidence.get("model")?.as_str()?;
-    let task_uuid = evidence.get("taskUuid")?.as_str()?;
-    let witness_seq = evidence
-        .get("witnessSeq")?
-        .as_u64()
-        .filter(|seq| *seq > 0)?;
-    if adapter.is_empty()
-        || model.is_empty()
-        || adapter.chars().any(char::is_control)
-        || model.chars().any(char::is_control)
-        || Uuid::parse_str(task_uuid).is_err()
-    {
-        return None;
-    }
-    Some(AssistedBy {
-        adapter: adapter.to_owned(),
-        model: model.to_owned(),
-        task_uuid: task_uuid.to_owned(),
-        witness_seq,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
