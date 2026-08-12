@@ -159,6 +159,51 @@ impl DaemonHandler {
                 })
                 .await
             }
+            "__campaign.status" => {
+                let selector: CampaignStatusSelector = decode_params(params)?;
+                if selector.issue_url.trim().is_empty() {
+                    return Err(WireError::invalid(
+                        "query campaign issueUrl must not be empty",
+                    ));
+                }
+                if selector
+                    .registration_id
+                    .as_deref()
+                    .is_some_and(|value| uuid::Uuid::parse_str(value).is_err())
+                {
+                    return Err(WireError::invalid(
+                        "query campaign registrationId must be a UUID",
+                    ));
+                }
+                if selector
+                    .latest_observation
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(WireError::invalid(
+                        "query campaign latestObservation must not be empty",
+                    ));
+                }
+                off_thread(move || {
+                    let (ledger_verified, attestations) =
+                        read_attestations_advisory(&attestations_path);
+                    serde_json::to_value(
+                        query_campaign_status(
+                            &selector,
+                            &details,
+                            &live,
+                            &history,
+                            &witness,
+                            Utc::now(),
+                            &membership,
+                            &AttestationEvidence::new(ledger_verified, &attestations),
+                        )
+                        .map_err(observability_wire)?,
+                    )
+                    .map_err(internal_wire)
+                })
+                .await
+            }
             "query.run" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -205,6 +250,13 @@ impl DaemonHandler {
                     )
                     .map_err(observability_wire)?;
                     apply_run_lineage(&mut result, &lineage);
+                    apply_campaign_run_supersession(
+                        &mut result,
+                        &details,
+                        &history,
+                        &witness,
+                        &membership,
+                    );
                     apply_reader_state_to_run(&mut result, &reader_state);
                     for failure in &mut result.failures {
                         let (Some(attempt), Some(lease_epoch), Ok(uuid)) = (
@@ -985,9 +1037,10 @@ fn observability_wire(error: ObservabilityError) -> WireError {
         ObservabilityError::InvalidTimestamp(_) | ObservabilityError::InvalidPosition(_) => {
             WireError::invalid(error.to_string())
         }
-        ObservabilityError::UnknownJob(_) | ObservabilityError::UnknownAttempt { .. } => {
-            WireError::not_found(error.to_string())
-        }
+        ObservabilityError::UnknownJob(_)
+        | ObservabilityError::UnknownCampaign(_)
+        | ObservabilityError::UnknownCampaignObservation { .. }
+        | ObservabilityError::UnknownAttempt { .. } => WireError::not_found(error.to_string()),
         ObservabilityError::InvalidRunProjection(_) => internal_wire(error),
     }
 }

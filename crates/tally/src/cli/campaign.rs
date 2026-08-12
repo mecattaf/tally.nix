@@ -1,3 +1,4 @@
+use super::text::compact_text;
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -170,6 +171,9 @@ pub(super) async fn run_campaign(
         CampaignCommand::Project(args) => run_campaign_project(args),
         CampaignCommand::Poll(args) => {
             run_campaign_poll(socket, config_path, rpc_timeout, args).await
+        }
+        CampaignCommand::Status(args) => {
+            run_campaign_status(socket, config_path, rpc_timeout, args).await
         }
         CampaignCommand::List(args) => run_campaign_list(args),
         CampaignCommand::Quiescent(args) => run_campaign_quiescent(args),
@@ -2340,6 +2344,7 @@ async fn dispatch_campaign(
         evidence_class: Some(json!({
             "kind": "forge-native-campaign",
             "issue": &graph.locator.url,
+            "registrationId": &registration.registration_id,
             "revision": &revision,
             "approvedBy": &registration.authenticated_actor,
             "allowedActors": &registration.allowed_actors,
@@ -2862,6 +2867,74 @@ async fn run_campaign_poll(
     } else {
         bail!("one or more armed campaigns could not be polled")
     }
+}
+
+async fn run_campaign_status(
+    socket: &Path,
+    config_path: Option<&Path>,
+    rpc_timeout: Duration,
+    args: CampaignStatusArgs,
+) -> Result<()> {
+    let locator = parse_issue_url(&args.issue)?;
+    let state_dir = resolve_state_dir(args.state_dir)?;
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let registration = registry.read_issue(&locator.url)?;
+    let params = json!({
+        "issueUrl": locator.url,
+        "registrationId": registration
+            .as_ref()
+            .map(|registration| registration.registration_id.as_str()),
+        "latestObservation": registration
+            .as_ref()
+            .and_then(|registration| registration.last_observation.as_deref()),
+    });
+    let client = connect_rpc(socket, config_path).await?;
+    let status = client
+        .call_with_deadline("__campaign.status", Some(params), rpc_timeout)
+        .await?;
+    if args.json {
+        outln!("{}", serde_json::to_string(&status)?);
+        return Ok(());
+    }
+    print_campaign_status_human(&status)
+}
+
+fn print_campaign_status_human(status: &Value) -> Result<()> {
+    let issue = status["issueUrl"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid campaign status response"))?;
+    let state = status["state"].as_str().unwrap_or("unknown");
+    let name = status["campaign"]
+        .as_str()
+        .or_else(|| status["repository"].as_str())
+        .unwrap_or("campaign");
+    outln!("Campaign {}  {}", compact_text(name), compact_text(state));
+    outln!("  {}", compact_text(issue));
+    if status["registered"].as_bool() == Some(true) {
+        outln!(
+            "Registration: {} (armed)",
+            compact_text(status["registrationId"].as_str().unwrap_or("-"))
+        );
+    } else {
+        outln!("Registration: inactive; resolved from durable campaign lineage");
+    }
+    outln!(
+        "Observation: {}",
+        compact_text(status["latestObservation"].as_str().unwrap_or("none"))
+    );
+    let Some(flow_run) = status["flowRunId"].as_str() else {
+        outln!("Latest flow run: none (no reconcile pass admitted)");
+        outln!("Campaign usage: no flow run admitted");
+        return Ok(());
+    };
+    let run_count = status["flowRuns"].as_array().map_or(0, Vec::len);
+    outln!(
+        "Latest flow run: {} ({} pass{})",
+        compact_text(flow_run),
+        run_count,
+        if run_count == 1 { "" } else { "es" }
+    );
+    print_run_body(status, None, "Campaign usage")
 }
 
 fn run_campaign_list(args: CampaignListArgs) -> Result<()> {

@@ -141,11 +141,12 @@ use crate::query::{
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
 };
 use crate::query_v2::{
-    apply_run_lineage, apply_standup_usage, collapse_lifecycle_echoes, flow_run_exists,
-    log_position_floor, log_position_head, query_flow_proofs, query_job as query_job_v2,
+    apply_campaign_run_supersession, apply_run_lineage, apply_standup_usage,
+    collapse_lifecycle_echoes, flow_run_exists, log_position_floor, log_position_head,
+    query_campaign_status, query_flow_proofs, query_job as query_job_v2,
     query_jobs as query_jobs_v2, query_lifecycle_log, query_proof, query_run, snapshot_metadata,
-    standup_touched_runs, JobsFilter, LifecycleLogFilter, LiveJobFact, LogPosition,
-    ObservabilityError, PositionGap, RowDetailFact,
+    standup_touched_runs, CampaignStatusSelector, JobsFilter, LifecycleLogFilter, LiveJobFact,
+    LogPosition, ObservabilityError, PositionGap, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
@@ -762,6 +763,7 @@ const DISPATCHER_METHODS: &[(&str, DispatchMethod)] = &[
     ("query.jobs", DispatchMethod::Query),
     ("query.job", DispatchMethod::Query),
     ("query.run", DispatchMethod::Query),
+    ("__campaign.status", DispatchMethod::Query),
     ("query.lineage", DispatchMethod::Query),
     ("query.status", DispatchMethod::Query),
     ("query.storage", DispatchMethod::Query),

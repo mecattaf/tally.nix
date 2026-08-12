@@ -586,6 +586,10 @@ pub enum ObservabilityError {
     InvalidTimestamp(String),
     #[error("unknown job {0:?}")]
     UnknownJob(String),
+    #[error("no durable campaign run is known for {0:?}")]
+    UnknownCampaign(String),
+    #[error("campaign {issue:?} has no durable run for observation {observation:?}")]
+    UnknownCampaignObservation { issue: String, observation: String },
     #[error("job {task:?} has no attempt {attempt}")]
     UnknownAttempt { task: String, attempt: u32 },
     #[error("flow run {0:?} has an invalid reconciliation projection")]
@@ -1174,6 +1178,11 @@ pub struct RunView {
     /// The rollover that created this run, when it is itself a successor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<FlowSupersedeRecord>,
+    /// A later forge-native campaign pass descended from this terminal run.
+    /// This is derived from campaign evidence plus durable parent/membership
+    /// linkage, not from the explicit generation-rollover ledger above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_superseded_by: Option<CampaignRunSupersession>,
     pub counts: RunTaskCounts,
     /// What the run cost, summed per attempt over its durable membership.
     /// Advisory by construction and partial by default; see
@@ -1202,6 +1211,95 @@ pub struct RunView {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triage_tag: Option<String>,
+}
+
+/// The campaign-specific successor pointer attached to an ancestor run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CampaignRunSupersession {
+    pub issue_url: String,
+    pub latest_flow_run_id: String,
+    pub latest_observation: String,
+}
+
+/// Registration-side coordinates supplied by `tally campaign status`.
+///
+/// The daemon deliberately does not read the campaign registry: the CLI owns
+/// that state directory and passes only the stable identity needed to join it
+/// to daemon-owned durable rows. With no active registration, the issue URL
+/// alone selects the latest retained lineage so a completed/pruned campaign
+/// remains inspectable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CampaignStatusSelector {
+    pub issue_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_observation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CampaignStatusState {
+    Armed,
+    Running,
+    Complete,
+    Advanced,
+    NeedsAttention,
+    Idle,
+    Superseded,
+}
+
+impl From<RunState> for CampaignStatusState {
+    fn from(value: RunState) -> Self {
+        match value {
+            RunState::Running => Self::Running,
+            RunState::Complete => Self::Complete,
+            RunState::Advanced => Self::Advanced,
+            RunState::NeedsAttention => Self::NeedsAttention,
+            RunState::Idle => Self::Idle,
+            RunState::Superseded => Self::Superseded,
+        }
+    }
+}
+
+/// One live campaign view. The latest pass's board is flattened into this
+/// object, while `usage` is intentionally the campaign-wide rollup. There is
+/// no nested per-run usage figure that could be mistaken for the total.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CampaignStatusView {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub issue_url: String,
+    pub registered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_observation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_run_id: Option<String>,
+    pub flow_runs: Vec<String>,
+    pub state: CampaignStatusState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub counts: RunTaskCounts,
+    /// Usage over the union of every member task in `flowRuns`.
+    pub usage: UsageRollup,
+    #[serde(default)]
+    pub items: Vec<RunMemberProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<RunTaskProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anomalies: Vec<RunAnomalyProjection>,
+    pub current_nodes: Vec<RunNodeProjection>,
+    pub failures: Vec<RunFailureProjection>,
+    pub snapshot: QuerySnapshotMetadata,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1694,6 +1792,7 @@ pub fn query_run(
         state,
         superseded_by: None,
         supersedes: None,
+        campaign_superseded_by: None,
         counts,
         // Over `flow_tasks`, which is durable membership unioned with the rows
         // and witnesses that name the run — so a node this run was handed but
@@ -1725,6 +1824,451 @@ pub fn apply_run_lineage(view: &mut RunView, lineage: &FlowLineage) {
     if view.superseded_by.is_some() {
         view.state = RunState::Superseded;
     }
+}
+
+const FORGE_CAMPAIGN_EVIDENCE_KIND: &str = "forge-native-campaign";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CampaignFlowRunFact {
+    flow_run_id: String,
+    issue_url: String,
+    observation: String,
+    registration_id: Option<String>,
+    parent_task_uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CampaignEvidence {
+    issue_url: String,
+    observation: String,
+    registration_id: Option<String>,
+}
+
+fn campaign_evidence(value: Option<&Value>) -> Option<CampaignEvidence> {
+    let value = value?.as_object()?;
+    if value.get("kind").and_then(Value::as_str) != Some(FORGE_CAMPAIGN_EVIDENCE_KIND) {
+        return None;
+    }
+    let issue_url = value.get("issue")?.as_str()?.trim();
+    let observation = value.get("revision")?.as_str()?.trim();
+    if issue_url.is_empty() || observation.is_empty() {
+        return None;
+    }
+    let registration_id = value
+        .get("registrationId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Some(CampaignEvidence {
+        issue_url: issue_url.to_owned(),
+        observation: observation.to_owned(),
+        registration_id,
+    })
+}
+
+/// Parent facts survive in both durable rows and lifecycle records. The row is
+/// the primary source; lifecycle is the compatibility fallback for a retained
+/// witness whose enqueue row is no longer in the query table.
+///
+/// Forge-native self-continuation deliberately crosses the events-directory
+/// producer, which cannot inherit the writer node's caller capability. Its
+/// durable bridge is therefore identity-based: the old run's
+/// `spec-build-continue` result names the event `dedupKey`, the drained poll row
+/// carries that exact key, and the next campaign root is parented to the poll
+/// row. Treating that poll row as a child of the continuation node restores the
+/// one lineage the producer boundary intentionally split without trusting a
+/// timestamp or a description.
+fn durable_parent_index(
+    details: &[RowDetailFact],
+    history: &LifecycleSnapshot,
+) -> BTreeMap<String, String> {
+    let mut parents = BTreeMap::new();
+    for detail in details {
+        if let Some(parent) = &detail.parent_task_uuid {
+            parents.insert(detail.task_uuid.clone(), parent.clone());
+        }
+    }
+    for record in &history.records {
+        if let Some(parent) = &record.fields.parent {
+            parents
+                .entry(record.fields.task_uuid.clone())
+                .or_insert_with(|| parent.clone());
+        }
+    }
+    let continuation_by_dedup = details
+        .iter()
+        .filter(|detail| {
+            orchestration_string(detail.orchestration.as_ref(), "nodeLabel").as_deref()
+                == Some("spec-build-continue")
+        })
+        .filter_map(|detail| {
+            let result = serde_json::from_str::<Value>(detail.final_message.as_deref()?).ok()?;
+            let dedup_key = result.get("dedupKey")?.as_str()?;
+            dedup_key
+                .starts_with("campaign-continuation:")
+                .then(|| (dedup_key.to_owned(), detail.task_uuid.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for detail in details {
+        let Some(continuation) = detail
+            .dedup_key
+            .as_deref()
+            .and_then(|dedup_key| continuation_by_dedup.get(dedup_key))
+        else {
+            continue;
+        };
+        parents
+            .entry(detail.task_uuid.clone())
+            .or_insert_with(|| continuation.clone());
+    }
+    parents
+}
+
+fn campaign_flow_run_facts(
+    details: &[RowDetailFact],
+    history: &LifecycleSnapshot,
+    witness: &[WitnessRecord],
+) -> Vec<CampaignFlowRunFact> {
+    let parents = durable_parent_index(details, history);
+    let mut runs = BTreeMap::<String, CampaignFlowRunFact>::new();
+    for detail in details {
+        let Some(evidence) = campaign_evidence(detail.evidence_class.as_ref()) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(&detail.task_uuid).is_err() {
+            continue;
+        }
+        runs.insert(
+            detail.task_uuid.clone(),
+            CampaignFlowRunFact {
+                flow_run_id: detail.task_uuid.clone(),
+                issue_url: evidence.issue_url,
+                observation: evidence.observation,
+                registration_id: evidence.registration_id,
+                parent_task_uuid: detail
+                    .parent_task_uuid
+                    .clone()
+                    .or_else(|| parents.get(&detail.task_uuid).cloned()),
+            },
+        );
+    }
+    // A canonical terminal witness retains the campaign evidence even if the
+    // row projection has aged out. It cannot restore an absent parent by
+    // itself, but the lifecycle fallback above usually can.
+    for record in witness {
+        let (Some(task_uuid), Some(evidence)) = (
+            record.task_uuid.as_ref(),
+            campaign_evidence(record.evidence_class.as_ref()),
+        ) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(task_uuid).is_err() {
+            continue;
+        }
+        runs.entry(task_uuid.clone())
+            .or_insert_with(|| CampaignFlowRunFact {
+                flow_run_id: task_uuid.clone(),
+                issue_url: evidence.issue_url,
+                observation: evidence.observation,
+                registration_id: evidence.registration_id,
+                parent_task_uuid: parents.get(task_uuid).cloned(),
+            });
+    }
+    runs.into_values().collect()
+}
+
+fn registration_compatible(run: &CampaignFlowRunFact, registration_id: Option<&str>) -> bool {
+    registration_id.is_none_or(|wanted| {
+        run.registration_id
+            .as_deref()
+            .is_none_or(|recorded| recorded == wanted)
+    })
+}
+
+fn campaign_membership_index(
+    runs: &[CampaignFlowRunFact],
+    details: &[RowDetailFact],
+    witness: &[WitnessRecord],
+    membership: &FlowMembership,
+) -> BTreeMap<String, BTreeSet<String>> {
+    runs.iter()
+        .map(|run| {
+            (
+                run.flow_run_id.clone(),
+                flow_run_tasks(&run.flow_run_id, details, witness, membership),
+            )
+        })
+        .collect()
+}
+
+/// Whether `successor` is a later campaign pass descended from `ancestor`.
+///
+/// The poll node that launched the successor is a durable member of the
+/// ancestor run, and the successor root names that node as its parent. Walking
+/// through intermediate parent rows covers an extra barrier/control layer
+/// without assigning ordering meaning to observation hashes or wall clocks.
+fn campaign_run_precedes(
+    ancestor: &CampaignFlowRunFact,
+    successor: &CampaignFlowRunFact,
+    parent_by_task: &BTreeMap<String, String>,
+    members_by_run: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    if ancestor.flow_run_id == successor.flow_run_id {
+        return false;
+    }
+    let Some(members) = members_by_run.get(&ancestor.flow_run_id) else {
+        return false;
+    };
+    let mut cursor = successor.parent_task_uuid.as_deref();
+    let mut visited = BTreeSet::new();
+    while let Some(task_uuid) = cursor {
+        if task_uuid == ancestor.flow_run_id || members.contains(task_uuid) {
+            return true;
+        }
+        if !visited.insert(task_uuid.to_owned()) {
+            break;
+        }
+        cursor = parent_by_task.get(task_uuid).map(String::as_str);
+    }
+    false
+}
+
+fn campaign_run_depth(
+    run: &CampaignFlowRunFact,
+    candidates: &[CampaignFlowRunFact],
+    parent_by_task: &BTreeMap<String, String>,
+    members_by_run: &BTreeMap<String, BTreeSet<String>>,
+) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| campaign_run_precedes(candidate, run, parent_by_task, members_by_run))
+        .count()
+}
+
+fn latest_campaign_run<'a>(
+    candidates: &'a [&'a CampaignFlowRunFact],
+    all_candidates: &[CampaignFlowRunFact],
+    parent_by_task: &BTreeMap<String, String>,
+    members_by_run: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<&'a CampaignFlowRunFact> {
+    candidates.iter().copied().max_by(|left, right| {
+        campaign_run_depth(left, all_candidates, parent_by_task, members_by_run)
+            .cmp(&campaign_run_depth(
+                right,
+                all_candidates,
+                parent_by_task,
+                members_by_run,
+            ))
+            // Campaign pass roots are UUIDv7 in production. The identity tie-break
+            // is deterministic for malformed/branched fixture lineage too.
+            .then_with(|| left.flow_run_id.cmp(&right.flow_run_id))
+    })
+}
+
+/// Mark a finished campaign ancestor as superseded by the newest descendant.
+///
+/// This complements explicit `flow supersede` lineage. Campaign pollers do not
+/// invoke that mutation: their transition is already durably expressed by the
+/// successor root's parent link into the preceding run.
+pub fn apply_campaign_run_supersession(
+    view: &mut RunView,
+    details: &[RowDetailFact],
+    history: &LifecycleSnapshot,
+    witness: &[WitnessRecord],
+    membership: &FlowMembership,
+) {
+    if view.state == RunState::Running {
+        return;
+    }
+    let is_campaign_root = details.iter().any(|detail| {
+        detail.task_uuid == view.flow_run_id
+            && campaign_evidence(detail.evidence_class.as_ref()).is_some()
+    }) || witness.iter().any(|record| {
+        record.task_uuid.as_deref() == Some(view.flow_run_id.as_str())
+            && campaign_evidence(record.evidence_class.as_ref()).is_some()
+    });
+    if !is_campaign_root {
+        return;
+    }
+    let all = campaign_flow_run_facts(details, history, witness);
+    let Some(current) = all
+        .iter()
+        .find(|candidate| candidate.flow_run_id == view.flow_run_id)
+    else {
+        return;
+    };
+    let parent_by_task = durable_parent_index(details, history);
+    let members_by_run = campaign_membership_index(&all, details, witness, membership);
+    let candidates = all
+        .iter()
+        .filter(|candidate| {
+            candidate.issue_url == current.issue_url
+                && registration_compatible(candidate, current.registration_id.as_deref())
+                && campaign_run_precedes(current, candidate, &parent_by_task, &members_by_run)
+        })
+        .collect::<Vec<_>>();
+    let Some(latest) = latest_campaign_run(&candidates, &all, &parent_by_task, &members_by_run)
+    else {
+        return;
+    };
+    view.campaign_superseded_by = Some(CampaignRunSupersession {
+        issue_url: latest.issue_url.clone(),
+        latest_flow_run_id: latest.flow_run_id.clone(),
+        latest_observation: latest.observation.clone(),
+    });
+    view.state = RunState::Superseded;
+}
+
+/// Resolve one campaign's current pass and aggregate usage across its complete
+/// durable pass lineage.
+#[allow(clippy::too_many_arguments)]
+pub fn query_campaign_status(
+    selector: &CampaignStatusSelector,
+    details: &[RowDetailFact],
+    live: &[LiveJobFact],
+    history: &LifecycleSnapshot,
+    witness: &[WitnessRecord],
+    now: DateTime<Utc>,
+    membership: &FlowMembership,
+    attestations: &AttestationEvidence<'_>,
+) -> Result<CampaignStatusView, ObservabilityError> {
+    let registered = selector.registration_id.is_some();
+    // A newly armed `--no-enqueue` registration has no observation by
+    // definition. Do not let retained history for an older registration on
+    // the same issue masquerade as this arm's current pass.
+    if registered && selector.latest_observation.is_none() {
+        return Ok(CampaignStatusView {
+            schema_version: QUERY_SCHEMA_VERSION,
+            protocol_version: QUERY_PROTOCOL_VERSION,
+            issue_url: selector.issue_url.clone(),
+            registered,
+            registration_id: selector.registration_id.clone(),
+            latest_observation: None,
+            flow_run_id: None,
+            flow_runs: Vec::new(),
+            state: CampaignStatusState::Armed,
+            flow_name: None,
+            campaign: None,
+            repository: None,
+            counts: RunTaskCounts::default(),
+            usage: roll_up(&ExpectedUsageRoster::default(), attestations),
+            items: Vec::new(),
+            tasks: Vec::new(),
+            anomalies: Vec::new(),
+            current_nodes: Vec::new(),
+            failures: Vec::new(),
+            snapshot: snapshot_metadata(history, witness),
+        });
+    }
+
+    let all = campaign_flow_run_facts(details, history, witness);
+    let candidates = all
+        .iter()
+        .filter(|candidate| {
+            candidate.issue_url == selector.issue_url
+                && registration_compatible(candidate, selector.registration_id.as_deref())
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(ObservabilityError::UnknownCampaign(
+            selector.issue_url.clone(),
+        ));
+    }
+    let parent_by_task = durable_parent_index(details, history);
+    let members_by_run = campaign_membership_index(&all, details, witness, membership);
+    let eligible = selector.latest_observation.as_deref().map_or_else(
+        || candidates.clone(),
+        |observation| {
+            candidates
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.observation == observation)
+                .collect()
+        },
+    );
+    if eligible.is_empty() {
+        return Err(ObservabilityError::UnknownCampaignObservation {
+            issue: selector.issue_url.clone(),
+            observation: selector.latest_observation.clone().unwrap_or_default(),
+        });
+    }
+    let latest = latest_campaign_run(&eligible, &all, &parent_by_task, &members_by_run)
+        .expect("a non-empty eligible campaign set has a latest run");
+
+    let mut chain = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.flow_run_id == latest.flow_run_id
+                || campaign_run_precedes(candidate, latest, &parent_by_task, &members_by_run)
+        })
+        .collect::<Vec<_>>();
+    chain.sort_by(|left, right| {
+        campaign_run_depth(left, &all, &parent_by_task, &members_by_run)
+            .cmp(&campaign_run_depth(
+                right,
+                &all,
+                &parent_by_task,
+                &members_by_run,
+            ))
+            .then_with(|| left.flow_run_id.cmp(&right.flow_run_id))
+    });
+    let flow_runs = chain
+        .iter()
+        .map(|run| run.flow_run_id.clone())
+        .collect::<Vec<_>>();
+    let campaign_tasks = chain.iter().fold(BTreeSet::new(), |mut tasks, run| {
+        tasks.extend(
+            members_by_run
+                .get(&run.flow_run_id)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        tasks
+    });
+    let usage = roll_up(
+        &expected_usage_roster(&campaign_tasks, details, witness),
+        attestations,
+    );
+    let latest_view = query_run(
+        &latest.flow_run_id,
+        details,
+        live,
+        history,
+        witness,
+        now,
+        membership,
+        attestations,
+    )?;
+    Ok(CampaignStatusView {
+        schema_version: QUERY_SCHEMA_VERSION,
+        protocol_version: QUERY_PROTOCOL_VERSION,
+        issue_url: selector.issue_url.clone(),
+        registered,
+        registration_id: selector
+            .registration_id
+            .clone()
+            .or_else(|| latest.registration_id.clone()),
+        latest_observation: selector
+            .latest_observation
+            .clone()
+            .or_else(|| Some(latest.observation.clone())),
+        flow_run_id: Some(latest.flow_run_id.clone()),
+        flow_runs,
+        state: latest_view.state.into(),
+        flow_name: latest_view.flow_name,
+        campaign: latest_view.campaign,
+        repository: latest_view.repository,
+        counts: latest_view.counts,
+        usage,
+        items: latest_view.items,
+        tasks: latest_view.tasks,
+        anomalies: latest_view.anomalies,
+        current_nodes: latest_view.current_nodes,
+        failures: latest_view.failures,
+        snapshot: latest_view.snapshot,
+    })
 }
 
 /// Attach one usage rollup per flow run the stand-up window touched.
@@ -3402,6 +3946,10 @@ mod tests {
     use crate::history::{lifecycle_cursor, LIFECYCLE_SCHEMA_VERSION};
     use crate::journal::EmitEvent;
     use crate::taskdb::EnqueueSource;
+    use crate::usage::{
+        UsageAccountingBasis, UsageAccountingState, UsageBreakdown, UsageEvidence, UsageShape,
+    };
+    use crate::usage_rollup::UsageRollupCaveat;
     use crate::witness::{build_record, Authorship, ChainHead, WitnessBody};
 
     const FORGE_REGISTRATION_ID: &str = "0198f000-0000-7000-8000-000000000042";
@@ -3606,6 +4154,114 @@ mod tests {
             "2026-08-01T10:00:12.000Z",
             orchestration,
         )
+    }
+
+    fn campaign_root(
+        flow_run: &str,
+        observation: &str,
+        parent_task_uuid: Option<&str>,
+    ) -> RowDetailFact {
+        let mut root = detail(RowStatus::Completed);
+        root.task_uuid = flow_run.to_owned();
+        root.description = "tally flow run spec-build.js".to_owned();
+        root.parent_task_uuid = parent_task_uuid.map(ToOwned::to_owned);
+        root.evidence_class = Some(serde_json::json!({
+            "kind": "forge-native-campaign",
+            "issue": "https://github.com/acme/widgets/issues/42",
+            "registrationId": FORGE_REGISTRATION_ID,
+            "revision": observation,
+        }));
+        root
+    }
+
+    fn usage_attestation(
+        sequence: u64,
+        task_uuid: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> AttestationRecord {
+        let observation = UsageObservation::Reported(UsageBreakdown {
+            shape: UsageShape::Components,
+            input_tokens: Some(input_tokens),
+            input_tokens_as_reported: Some(input_tokens),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: Some(output_tokens),
+            reasoning_tokens: None,
+            total_tokens: None,
+            cost: None,
+            unreadable_fields: Vec::new(),
+        });
+        let evidence = UsageEvidence {
+            schema_version: crate::usage::USAGE_EVIDENCE_SCHEMA_VERSION,
+            declared_fields: vec![
+                crate::usage::FIELD_INPUT_TOKENS.to_owned(),
+                crate::usage::FIELD_OUTPUT_TOKENS.to_owned(),
+            ],
+            counter_scope: crate::adapters::UsageCounterScope::Attempt,
+            observed: observation.clone(),
+            accounting: UsageAccounting {
+                state: UsageAccountingState::Exact,
+                basis: UsageAccountingBasis::Fresh,
+                predecessor: None,
+                usage: observation.clone(),
+                unavailable_fields: Vec::new(),
+                reason: None,
+            },
+        };
+        AttestationRecord {
+            observed_at: "2026-08-12T00:00:00.000Z".to_owned(),
+            payload: serde_json::json!({
+                "kind": "adapter-scrape",
+                "taskUuid": task_uuid,
+                "jobId": task_uuid,
+                "adapter": "fixture-agent",
+                "attempt": 1,
+                "leaseEpoch": 7,
+                "captures": {},
+                "usage": observation,
+                "usageEvidence": evidence,
+                "usageAuthority": "advisory-only",
+            }),
+            seq: sequence,
+            prev_hash: "sha256:prev".to_owned(),
+            hash: format!("sha256:{sequence:064x}"),
+        }
+    }
+
+    fn no_usage_attestation(sequence: u64, task_uuid: &str) -> AttestationRecord {
+        let evidence = UsageEvidence {
+            schema_version: crate::usage::USAGE_EVIDENCE_SCHEMA_VERSION,
+            declared_fields: Vec::new(),
+            counter_scope: crate::adapters::UsageCounterScope::Attempt,
+            observed: UsageObservation::NotDeclared,
+            accounting: UsageAccounting {
+                state: UsageAccountingState::Exact,
+                basis: UsageAccountingBasis::Fresh,
+                predecessor: None,
+                usage: UsageObservation::NotDeclared,
+                unavailable_fields: Vec::new(),
+                reason: None,
+            },
+        };
+        AttestationRecord {
+            observed_at: "2026-08-12T00:00:00.000Z".to_owned(),
+            payload: serde_json::json!({
+                "kind": "adapter-scrape",
+                "taskUuid": task_uuid,
+                "jobId": task_uuid,
+                "adapter": "shell",
+                "attempt": 1,
+                "leaseEpoch": 7,
+                "captures": {},
+                "usage": UsageObservation::NotDeclared,
+                "usageEvidence": evidence,
+                "usageAuthority": "advisory-only",
+            }),
+            seq: sequence,
+            prev_hash: "sha256:prev".to_owned(),
+            hash: format!("sha256:{sequence:064x}"),
+        }
     }
 
     /// A terminal witness that continues an existing chain, so a fixture can
@@ -4188,6 +4844,201 @@ mod tests {
         assert_eq!(unrelated.state, RunState::Complete);
         assert!(unrelated.superseded_by.is_none());
         assert!(unrelated.supersedes.is_none());
+    }
+
+    #[test]
+    fn campaign_status_resolves_latest_parent_lineage_and_rolls_usage_across_passes() {
+        const ISSUE: &str = "https://github.com/acme/widgets/issues/42";
+        const OLD_RUN: &str = "00000000-0000-7000-8000-000000000410";
+        const NEW_RUN: &str = "00000000-0000-7000-8000-000000000420";
+        const OLD_TASK: &str = "00000000-0000-7000-8000-000000000411";
+        const CONTINUE_TASK: &str = "00000000-0000-7000-8000-000000000412";
+        const POLL_TASK: &str = "00000000-0000-7000-8000-000000000413";
+        const RECONCILE_TASK: &str = "00000000-0000-7000-8000-000000000421";
+        const CONTINUATION_DEDUP: &str =
+            "campaign-continuation:acme/widgets:42:continuation-fixture";
+
+        let old_root = campaign_root(OLD_RUN, "sha256:observation-a", None);
+        let mut old_task = detail(RowStatus::Completed);
+        old_task.task_uuid = OLD_TASK.to_owned();
+        old_task.orchestration = Some(flow_orchestration(
+            OLD_RUN,
+            1,
+            "agent-t01",
+            Some(FORGE_TASK_T01),
+        ));
+        let mut continue_task = detail(RowStatus::Completed);
+        continue_task.task_uuid = CONTINUE_TASK.to_owned();
+        continue_task.orchestration =
+            Some(flow_orchestration(OLD_RUN, 2, "spec-build-continue", None));
+        continue_task.final_message = Some(
+            serde_json::json!({
+                "event": "/var/lib/tally/events/continuation.json",
+                "dedupKey": CONTINUATION_DEDUP,
+                "runId": "continuation-fixture",
+                "created": true,
+                "receipt": null
+            })
+            .to_string(),
+        );
+        // Draining the events-directory payload creates a controller row with
+        // no inherited parent. Its dedup key is the durable bridge back to the
+        // continuation node that wrote the event.
+        let mut poll_task = detail(RowStatus::Completed);
+        poll_task.task_uuid = POLL_TASK.to_owned();
+        poll_task.description = "tally campaign poll --once".to_owned();
+        poll_task.dedup_key = Some(CONTINUATION_DEDUP.to_owned());
+        poll_task.orchestration = None;
+
+        let new_root = campaign_root(NEW_RUN, "sha256:observation-b", Some(POLL_TASK));
+        let mut reconciliation = reconciliation_detail(NEW_RUN);
+        reconciliation.task_uuid = RECONCILE_TASK.to_owned();
+        let mut new_task = flow_node_detail(NEW_RUN, RowStatus::Pending);
+        new_task.task_uuid = "00000000-0000-7000-8000-000000000422".to_owned();
+
+        let details = vec![
+            old_root,
+            old_task.clone(),
+            continue_task.clone(),
+            poll_task,
+            new_root,
+            reconciliation,
+            new_task.clone(),
+        ];
+        let witnesses = vec![
+            terminal_witness(
+                OLD_TASK,
+                Verdict::Pass,
+                old_task.orchestration.clone().unwrap(),
+            ),
+            terminal_witness(
+                CONTINUE_TASK,
+                Verdict::Pass,
+                continue_task.orchestration.clone().unwrap(),
+            ),
+        ];
+        let live = vec![LiveJobFact {
+            anchor: new_task.task_uuid.clone(),
+            job_id: new_task.task_uuid.clone(),
+            live_state: "running".to_owned(),
+            attempt: 1,
+            lease_epoch: 7,
+            unit: "tally-job-campaign-latest.service".to_owned(),
+            labor_class: LaborClass::Fresh,
+        }];
+        let attestations = vec![
+            usage_attestation(1, OLD_TASK, 100, 10),
+            usage_attestation(2, &new_task.task_uuid, 200, 20),
+            no_usage_attestation(3, CONTINUE_TASK),
+            no_usage_attestation(4, RECONCILE_TASK),
+        ];
+        let mut membership = FlowMembership::default();
+        // The new pass was handed an already-created task from the old pass.
+        // Campaign aggregation must union identities, not add two run totals
+        // and charge this attempt twice.
+        assert!(
+            membership.insert(crate::flow_membership::FlowMembershipRecord::new(
+                NEW_RUN.to_owned(),
+                OLD_TASK.to_owned(),
+                crate::flow_membership::MembershipDisposition::Attached,
+                Some(3),
+                Some("reused-t01".to_owned()),
+            ))
+        );
+
+        let status = query_campaign_status(
+            &CampaignStatusSelector {
+                issue_url: ISSUE.to_owned(),
+                registration_id: Some(FORGE_REGISTRATION_ID.to_owned()),
+                latest_observation: Some("sha256:observation-b".to_owned()),
+            },
+            &details,
+            &live,
+            &history(),
+            &witnesses,
+            parse_timestamp("2026-08-12T00:01:00Z").unwrap(),
+            &membership,
+            &AttestationEvidence::new(true, &attestations),
+        )
+        .unwrap();
+
+        assert_eq!(status.flow_run_id.as_deref(), Some(NEW_RUN));
+        assert_eq!(status.flow_runs, [OLD_RUN, NEW_RUN]);
+        assert_eq!(status.state, CampaignStatusState::Running);
+        assert_eq!(status.campaign.as_deref(), Some("crm"));
+        assert_eq!(
+            status
+                .tasks
+                .iter()
+                .find(|task| task.task_ref.task_id() == "t02")
+                .unwrap()
+                .status,
+            RunTaskStatus::Running,
+            "the board comes from the latest pass, not the stale arm pass"
+        );
+        let total = status.usage.tokens.total_tokens.unwrap();
+        assert_eq!(total.value, 330, "both passes contribute exactly once");
+        assert_eq!(total.attempts, 2);
+        assert_eq!(status.usage.coverage.attempts_reported, 2);
+        assert!(status
+            .usage
+            .caveats
+            .contains(&UsageRollupCaveat::AttemptsWithoutUsage));
+
+        let mut old_view = query_run(
+            OLD_RUN,
+            &details,
+            &[],
+            &history(),
+            &witnesses,
+            parse_timestamp("2026-08-12T00:01:00Z").unwrap(),
+            &membership,
+            &AttestationEvidence::new(true, &attestations),
+        )
+        .unwrap();
+        assert_eq!(old_view.state, RunState::Complete);
+        apply_campaign_run_supersession(
+            &mut old_view,
+            &details,
+            &history(),
+            &witnesses,
+            &membership,
+        );
+        assert_eq!(old_view.state, RunState::Superseded);
+        assert_eq!(
+            old_view
+                .campaign_superseded_by
+                .as_ref()
+                .unwrap()
+                .latest_flow_run_id,
+            NEW_RUN
+        );
+    }
+
+    #[test]
+    fn newly_armed_campaign_without_an_observation_does_not_reuse_old_issue_history() {
+        let status = query_campaign_status(
+            &CampaignStatusSelector {
+                issue_url: "https://github.com/acme/widgets/issues/42".to_owned(),
+                registration_id: Some("00000000-0000-7000-8000-000000000499".to_owned()),
+                latest_observation: None,
+            },
+            &[campaign_root(
+                "00000000-0000-7000-8000-000000000410",
+                "sha256:old-observation",
+                None,
+            )],
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-12T00:01:00Z").unwrap(),
+            &FlowMembership::default(),
+            &AttestationEvidence::new(true, &[]),
+        )
+        .unwrap();
+        assert_eq!(status.state, CampaignStatusState::Armed);
+        assert!(status.flow_run_id.is_none());
+        assert!(status.flow_runs.is_empty());
     }
 
     #[test]
