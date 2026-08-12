@@ -13,7 +13,6 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -193,10 +192,7 @@ impl DerefMut for CampaignRegistration {
     }
 }
 
-/// An exclusively locked campaign registry.
-///
-/// Reads are exclusive too because encountering the one historical polluted-v2
-/// shape performs a one-time migration before returning it.
+/// A campaign registry protected by a shared lock.
 pub struct CampaignRegistry {
     state_dir: PathBuf,
     lock: File,
@@ -224,8 +220,7 @@ impl CampaignRegistry {
             .mode(0o600)
             .open(&lock_path)
             .map_err(|source| io_error(&lock_path, source))?;
-        lock.lock_exclusive()
-            .map_err(|source| io_error(&lock_path, source))?;
+        fs2::FileExt::lock_shared(&lock).map_err(|source| io_error(&lock_path, source))?;
         Ok(Self {
             state_dir,
             lock,
@@ -250,14 +245,11 @@ impl CampaignRegistry {
 
     pub fn read(&self, path: &Path) -> Result<CampaignRegistration, CampaignRegistryError> {
         let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
-        match serde_json::from_slice::<CampaignRegistrationV2>(&bytes) {
-            Ok(authority) => {
-                validate_authority(path, &authority)?;
-                let projection_wait_ms = self.read_host_tuning(&authority.registration_id)?;
-                Ok(CampaignRegistration::new(authority, projection_wait_ms))
-            }
-            Err(strict_error) => self.migrate_polluted_v2(path, &bytes, strict_error),
-        }
+        let authority: CampaignRegistrationV2 = serde_json::from_slice(&bytes)
+            .map_err(|source| invalid_registration(path, source.to_string()))?;
+        validate_authority(path, &authority)?;
+        let projection_wait_ms = self.read_host_tuning(&authority.registration_id)?;
+        Ok(CampaignRegistration::new(authority, projection_wait_ms))
     }
 
     pub fn registrations(
@@ -700,45 +692,6 @@ impl CampaignRegistry {
             // override. The reader supplies the effective default.
             None => remove_file_if_present(&path),
         }
-    }
-
-    fn migrate_polluted_v2(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        strict_error: serde_json::Error,
-    ) -> Result<CampaignRegistration, CampaignRegistryError> {
-        // This decoder is intentionally narrow. It removes exactly the one
-        // member shipped accidentally in schema 2, then sends the remainder
-        // through the same deny-unknown-fields decoder. A future unknown field
-        // therefore remains unknown and is rejected rather than silently
-        // acquiring migration privileges.
-        let mut value: Value = serde_json::from_slice(bytes)
-            .map_err(|_| invalid_registration(path, strict_error.to_string()))?;
-        let Some(object) = value.as_object_mut() else {
-            return Err(invalid_registration(path, strict_error.to_string()));
-        };
-        let Some(polluted_value) = object.remove("projectionWaitMs") else {
-            return Err(invalid_registration(path, strict_error.to_string()));
-        };
-        let projection_wait_ms = serde_json::from_value::<Option<u64>>(polluted_value)
-            .map_err(|error| invalid_registration(path, error.to_string()))?;
-        let authority: CampaignRegistrationV2 = serde_json::from_value(value)
-            .map_err(|error| invalid_registration(path, error.to_string()))?;
-        validate_authority(path, &authority)?;
-
-        let sidecar_path = host_tuning_path(&self.state_dir, &authority.registration_id);
-        let projection_wait_ms = if sidecar_path.exists() {
-            // A sidecar may already exist when the previous migration reached
-            // its safe first publication step but crashed before authority was
-            // rewritten. Retain that published tuning.
-            self.read_host_tuning(&authority.registration_id)?
-        } else {
-            self.write_host_tuning(&authority.registration_id, projection_wait_ms)?;
-            Some(projection_wait_ms.unwrap_or(DEFAULT_CAMPAIGN_PROJECTION_WAIT_MS))
-        };
-        atomic_write_json(path, &authority)?;
-        Ok(CampaignRegistration::new(authority, projection_wait_ms))
     }
 }
 
@@ -1488,34 +1441,6 @@ mod tests {
     }
 
     #[test]
-    fn polluted_v2_is_migrated_once_to_stable_authority_and_sidecar() {
-        let temporary = tempfile::tempdir().unwrap();
-        let registry = CampaignRegistry::open(temporary.path()).unwrap();
-        let expected = authority();
-        let path = registry.registration_path(&expected.issue_url);
-        let mut polluted = serde_json::to_value(&expected).unwrap();
-        polluted
-            .as_object_mut()
-            .unwrap()
-            .insert("projectionWaitMs".to_owned(), Value::from(240_000));
-        fs::write(&path, serde_json::to_vec_pretty(&polluted).unwrap()).unwrap();
-
-        let loaded = registry.read(&path).unwrap();
-        assert_eq!(loaded.authority(), &expected);
-        assert_eq!(loaded.projection_wait_ms, Some(240_000));
-        let stable_bytes = fs::read(&path).unwrap();
-        let stable: NMinusOneCampaignRegistration = serde_json::from_slice(&stable_bytes).unwrap();
-        assert_eq!(stable.issue_url, expected.issue_url);
-        assert!(!String::from_utf8(stable_bytes)
-            .unwrap()
-            .contains("projectionWaitMs"));
-        assert!(host_tuning_path(temporary.path(), &expected.registration_id).is_file());
-
-        let loaded_again = registry.read(&path).unwrap();
-        assert_eq!(loaded_again.projection_wait_ms, Some(240_000));
-    }
-
-    #[test]
     fn downgrade_rewrite_keeps_sidecar_override_for_reupgrade() {
         let temporary = tempfile::tempdir().unwrap();
         let registry = CampaignRegistry::open(temporary.path()).unwrap();
@@ -1541,28 +1466,6 @@ mod tests {
         );
         assert_eq!(reupgraded.flow, registration.flow);
         assert_eq!(reupgraded.driver, registration.driver);
-    }
-
-    #[test]
-    fn compatibility_decoder_rejects_every_unknown_member_beyond_the_one_pollution() {
-        for include_historical_pollution in [false, true] {
-            let temporary = tempfile::tempdir().unwrap();
-            let registry = CampaignRegistry::open(temporary.path()).unwrap();
-            let expected = authority();
-            let path = registry.registration_path(&expected.issue_url);
-            let mut value = serde_json::to_value(&expected).unwrap();
-            let object = value.as_object_mut().unwrap();
-            if include_historical_pollution {
-                object.insert("projectionWaitMs".to_owned(), Value::Null);
-            }
-            object.insert("futureAuthority".to_owned(), Value::Bool(true));
-            fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-
-            assert!(matches!(
-                registry.read(&path),
-                Err(CampaignRegistryError::InvalidRegistration { .. })
-            ));
-        }
     }
 
     #[test]
