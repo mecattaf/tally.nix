@@ -517,7 +517,8 @@ const implementationTaskSchema = {
     "deliveredBehaviors",
     "readFirst",
     "acceptanceCriteria",
-    "dependencies"
+    "dependencies",
+    "revision"
   ],
   properties: {
     id: taskIdSchema,
@@ -564,14 +565,15 @@ const implementationTaskSchema = {
       type: "array",
       items: taskIdSchema
     },
-    conflictDomains: stringList
+    conflictDomains: stringList,
+    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
   },
   additionalProperties: false
 };
 
 const checkpointTaskSchema = {
   type: "object",
-  required: ["id", "kind", "title", "argv", "runtimeMaxSec", "dependencies"],
+  required: ["id", "kind", "title", "argv", "runtimeMaxSec", "dependencies", "revision"],
   properties: {
     id: taskIdSchema,
     kind: { const: "checkpoint" },
@@ -585,7 +587,8 @@ const checkpointTaskSchema = {
     dependencies: {
       type: "array",
       items: taskIdSchema
-    }
+    },
+    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
   },
   additionalProperties: false
 };

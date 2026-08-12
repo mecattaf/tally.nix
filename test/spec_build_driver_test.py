@@ -144,6 +144,20 @@ def task(identifier: str, dependencies: list[str] | None = None) -> dict[str, ob
     }
 
 
+def admit_file_worklist(
+    checkout: Path, *, max_tasks: int, max_parallel: int
+) -> dict[str, Any]:
+    return DRIVER.action_worklist(
+        {
+            "repository": "acme/spec",
+            "repositoryConfig": repository_config(checkout, "github"),
+            "worklist": "specs/*/tasks.json",
+            "maxTasks": max_tasks,
+            "maxParallel": max_parallel,
+        }
+    )
+
+
 def prep_brief(
     checkout: Path,
     workspace_root: Path,
@@ -622,6 +636,49 @@ class RedactionVectorTests(unittest.TestCase):
 
 
 class GitHubForgeTests(unittest.TestCase):
+    def test_file_worklist_tasks_carry_v2_completion_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/tasks.json"
+            worklist.parent.mkdir(parents=True)
+            worklist.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "tasks": [
+                            task("task-1"),
+                            {
+                                "id": "verify",
+                                "kind": "checkpoint",
+                                "title": "Verify the task",
+                                "argv": ["true"],
+                                "runtimeMaxSec": 60,
+                                "dependencies": ["task-1"],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            git(checkout, "add", str(worklist.relative_to(checkout)))
+            git(checkout, "commit", "--quiet", "-m", "add worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
+
+            admitted = admit_file_worklist(checkout, max_tasks=2, max_parallel=1)
+
+            for admitted_task in admitted["tasks"]:
+                self.assertRegex(admitted_task["revision"], r"^sha256:[0-9a-f]{64}$")
+            implementation = admitted["tasks"][0]
+            marker = DRIVER.pull_request_marker(
+                "fixture", "7", implementation["id"], implementation["revision"]
+            )
+            self.assertEqual(
+                marker,
+                "<!-- tally:spec-build:v2 campaign=fixture issue=7 task=task-1 "
+                f"revision={implementation['revision']} -->",
+            )
+
     def test_resume_receipt_resets_machine_counters_without_deleting_history(self) -> None:
         def diagnosis(attempt: int, text: str) -> str:
             return (
@@ -786,15 +843,36 @@ class GitHubForgeTests(unittest.TestCase):
             git(checkout, "commit", "--quiet", "-m", "add worklist")
             git(checkout, "push", "--quiet", "origin", "main")
             base_rev = git(checkout, "rev-parse", "HEAD")
-            task_1_marker = DRIVER.pull_request_marker("fixture", "7", "task-1")
-            task_2_marker = DRIVER.pull_request_marker("fixture", "7", "task-2")
+            reconcile_brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 3,
+                "maxParallel": 2,
+            }
+            admitted = admit_file_worklist(checkout, max_tasks=3, max_parallel=2)
+            revisions = {item["id"]: item["revision"] for item in admitted["tasks"]}
+            task_1_marker = DRIVER.pull_request_marker(
+                "fixture", "7", "task-1", revisions["task-1"]
+            )
+            task_2_marker = DRIVER.pull_request_marker(
+                "fixture", "7", "task-2", revisions["task-2"]
+            )
+            task_1_branch = DRIVER.stable_publish_branch(
+                "fixture", "7", "task-1", revisions["task-1"]
+            )
+            task_2_branch = DRIVER.stable_publish_branch(
+                "fixture", "7", "task-2", revisions["task-2"]
+            )
             state = {
                 "merged": [
                     {
                         "url": "https://github.com/acme/spec/pull/1",
                         "body": task_1_marker,
                         "baseRefName": "main",
-                        "headRefName": "tally/fixture-issue-7/task-1",
+                        "headRefName": task_1_branch,
                         "mergeCommit": {"oid": base_rev},
                     },
                     {
@@ -804,21 +882,23 @@ class GitHubForgeTests(unittest.TestCase):
                             "Task `task-2`: quoted text without an identity marker"
                         ),
                         "baseRefName": "main",
-                        "headRefName": "tally/fixture-issue-7/task-2",
+                        "headRefName": task_2_branch,
                         "mergeCommit": {"oid": "b" * 40},
                     },
                     {
                         "url": "https://github.com/acme/spec/pull/3",
                         "body": task_2_marker,
                         "baseRefName": "release",
-                        "headRefName": "tally/fixture-issue-7/task-2",
+                        "headRefName": task_2_branch,
                         "mergeCommit": {"oid": "c" * 40},
                     },
                     {
                         "url": "https://github.com/acme/spec/pull/4",
-                        "body": DRIVER.pull_request_marker("fixture", "7", "unknown-task"),
+                        "body": DRIVER.pull_request_marker(
+                            "fixture", "7", "unknown-task", "sha256:" + "f" * 64
+                        ),
                         "baseRefName": "main",
-                        "headRefName": "tally/fixture-issue-7/task-2",
+                        "headRefName": task_2_branch,
                         "mergeCommit": {"oid": "d" * 40},
                     },
                 ],
@@ -827,17 +907,7 @@ class GitHubForgeTests(unittest.TestCase):
                 "calls": [],
             }
             with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(
-                    {
-                        "campaign": "fixture",
-                        "repository": "acme/spec",
-                        "repositoryConfig": repository_config(checkout, "github"),
-                        "issue": issue(),
-                        "worklist": "specs/*/tasks.json",
-                        "maxTasks": 3,
-                        "maxParallel": 2,
-                    }
-                )
+                result = DRIVER.action_reconcile(reconcile_brief)
                 self.assertEqual([fact["taskId"] for fact in result["merged"]], ["task-1"])
                 self.assertEqual(result["remaining"], ["task-2", "task-3"])
                 self.assertEqual([item["id"] for item in result["frontier"]], ["task-2"])
@@ -857,23 +927,13 @@ class GitHubForgeTests(unittest.TestCase):
                         "url": "https://github.com/acme/spec/pull/5",
                         "body": task_1_marker,
                         "baseRefName": "main",
-                        "headRefName": "tally/fixture-issue-7/task-1",
+                        "headRefName": task_1_branch,
                         "mergeCommit": {"oid": base_rev},
                     }
                 )
                 github.state_path.write_text(json.dumps(ambiguous), encoding="utf-8")
                 with self.assertRaisesRegex(DRIVER.DriverError, "multiple merged pull requests"):
-                    DRIVER.action_reconcile(
-                        {
-                            "campaign": "fixture",
-                            "repository": "acme/spec",
-                            "repositoryConfig": repository_config(checkout, "github"),
-                            "issue": issue(),
-                            "worklist": "specs/*/tasks.json",
-                            "maxTasks": 3,
-                            "maxParallel": 2,
-                        }
-                    )
+                    DRIVER.action_reconcile(reconcile_brief)
 
     def test_machine_receipts_trust_the_current_actor_and_escalate_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1014,14 +1074,32 @@ class GitHubForgeTests(unittest.TestCase):
             git(checkout, "commit", "--quiet", "-m", "add worklist")
             git(checkout, "push", "--quiet", "origin", "main")
             base_rev = git(checkout, "rev-parse", "HEAD")
+            reconcile_brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 1,
+                "maxParallel": 1,
+            }
+            admitted_task = admit_file_worklist(
+                checkout, max_tasks=1, max_parallel=1
+            )["tasks"][0]
+            revision = admitted_task["revision"]
+            marker = DRIVER.pull_request_marker(
+                "fixture", "7", admitted_task["id"], revision
+            )
             state = {
                 "actor": "tally-bot",
                 "merged": [
                     {
                         "url": "https://github.com/acme/spec/pull/1",
-                        "body": DRIVER.pull_request_marker("fixture", "7", "task-1"),
+                        "body": marker,
                         "baseRefName": "main",
-                        "headRefName": "tally/fixture-issue-7/task-1",
+                        "headRefName": DRIVER.stable_publish_branch(
+                            "fixture", "7", admitted_task["id"], revision
+                        ),
                         "mergeCommit": {"oid": base_rev},
                     }
                 ],
@@ -1031,17 +1109,7 @@ class GitHubForgeTests(unittest.TestCase):
                 "calls": [],
             }
             with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(
-                    {
-                        "campaign": "fixture",
-                        "repository": "acme/spec",
-                        "repositoryConfig": repository_config(checkout, "github"),
-                        "issue": issue(),
-                        "worklist": "specs/*/tasks.json",
-                        "maxTasks": 1,
-                        "maxParallel": 1,
-                    }
-                )
+                result = DRIVER.action_reconcile(reconcile_brief)
             self.assertTrue(result["complete"])
             self.assertIsNotNone(result["closingSummary"])
             published = github.state()
