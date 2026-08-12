@@ -1855,6 +1855,7 @@
                 };
                 campaigns.fixture = {
                   enable = true;
+                  forge = "github";
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
                   label = "spec-campaign";
                   # A mention token is posted as a real comment and at-mentions
@@ -1939,6 +1940,7 @@
                 # entry of the campaign's own repositories map.
                 campaigns.split = {
                   enable = true;
+                  forge = "local";
                   # The spec corpus is the fixture repository that actually
                   # holds the worklist; the code repository is a separate
                   # operational checkout, which is what makes this a split.
@@ -2587,6 +2589,30 @@
             }
           ];
         };
+        localForgeNativeFieldsSchema = pkgs.lib.evalModules {
+          modules = [
+            {
+              options.services.tally = moduleCommon.mkOptions {
+                defaultPackage = tally;
+                defaultDataDir = "/tmp/tally-data";
+                defaultStateDir = "/tmp/tally-state";
+              };
+              # Repeat the shipped values deliberately: the assertion guards
+              # declarations, not merely non-default values that would happen
+              # to alter a GitHub issue trigger.
+              config.services.tally.campaigns.local = {
+                forge = "local";
+                repositories."acme/spec".checkout = "/tmp/spec";
+                issueRepository = "acme/spec";
+                label = "campaign";
+                mention = "@tally build";
+                allowSelfTriggered = false;
+                allowedActors = [ ];
+                pollIntervalSec = 60;
+              };
+            }
+          ];
+        };
         mkCampaignGateSchema =
           gates:
           pkgs.lib.evalModules {
@@ -2702,6 +2728,11 @@
           moduleCommon.mkAssertions invalidCampaignSchema.config.services.tally
         );
         invalidCampaignMessages = map (entry: entry.message) invalidCampaignAssertions;
+        localForgeNativeFieldsMessages = map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) (
+            moduleCommon.mkAssertions localForgeNativeFieldsSchema.config.services.tally
+          )
+        );
         invalidCampaignAttempt = builtins.tryEval (
           builtins.deepSeq invalidCampaignHome.activationPackage true
         );
@@ -5207,6 +5238,10 @@
                     != $splitArgs.repositories["acme/spec"].checkout) and
                   $splitArgs.worklist == "specs/001-toy/tasks.json" and
                   $splitArgs.maxTasks == 7 and
+                  $fixtureArgs.repositories["acme/spec"].forge == "github" and
+                  $splitArgs.repositories["acme/code"].forge == "local" and
+                  $splitArgs.repositories["acme/spec"].forge == "local" and
+                  $defaultedArgs.repositories["acme/spec"].forge == "github" and
                   ($defaultedArgs | has("codeRepository") | not) and
                   ($defaultedArgs | has("specRepository") | not) and
                   ($defaultedArgs | has("issueRepository") | not) and
@@ -6171,6 +6206,13 @@
               message: !nixpkgs.lib.hasInfix "is reserved" message
             ) campaignAssertionMessages;
             pkgs.runCommand "tally-campaign-reserved-name-rejected" { } ''
+              touch "$out"
+            '';
+          campaign-local-forge-fields-rejected =
+            assert builtins.elem
+              "tally campaign local forge=local must not declare forge-native-only fields: allowSelfTriggered, allowedActors, issueRepository, label, mention, pollIntervalSec"
+              localForgeNativeFieldsMessages;
+            pkgs.runCommand "tally-campaign-local-forge-fields-rejected" { } ''
               touch "$out"
             '';
           campaign-noncommitting-sandbox-rejected =
