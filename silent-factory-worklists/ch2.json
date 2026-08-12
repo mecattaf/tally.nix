@@ -287,7 +287,8 @@
         "crates/tally-core/src/executor",
         "nix/modules",
         "flake.nix",
-        "test/fixtures"
+        "test/fixtures",
+        "crates/tally/tests/migrate_cli.rs"
       ]
     },
     {
