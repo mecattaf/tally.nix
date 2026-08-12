@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tally_core::campaign_registry::{
-    CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
+    CampaignRegistration, CampaignRegistrationV3, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 
 #[path = "support/shell_program.rs"]
@@ -24,22 +25,20 @@ fn arm_fixture(
     fs::write(&flow, "fixture flow\n").unwrap();
     fs::write(&driver, "fixture driver\n").unwrap();
     let issue_url = format!("https://github.com/{repository}/issues/{issue_number}");
+    let worklist_pattern = format!("specs/{issue_number}/tasks.json");
     let mut registration = CampaignRegistration::new(
-        CampaignRegistrationV2 {
+        CampaignRegistrationV3 {
             schema_version: REGISTRY_SCHEMA_VERSION,
             registration_id: registration_id.to_owned(),
-            issue_url,
-            repository: repository.to_owned(),
-            issue_number,
+            worklist_pattern: worklist_pattern.clone(),
+            code_repository: repository.to_owned(),
             armed_at: "2026-08-12T20:00:00Z".to_owned(),
             arm_serial: 1,
             approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
-            authenticated_actor: "operator".to_owned(),
+            // SAFETY: `geteuid` has no preconditions and does not mutate process state.
+            local_actor: format!("uid:{}", unsafe { libc::geteuid() }),
             allowed_actors: vec!["operator".to_owned()],
-            allow_test_local_forge: false,
-            sub_issue_walk: true,
             last_observation: None,
-            last_forge_observation: None,
             flow,
             driver,
             workspace_root: PathBuf::from("/var/lib/tally/campaigns"),
@@ -50,6 +49,31 @@ fn arm_fixture(
         .unwrap()
         .write(&mut registration)
         .unwrap();
+
+    let mut identity = Sha256::new();
+    identity.update(repository.as_bytes());
+    identity.update([0]);
+    identity.update(worklist_pattern.as_bytes());
+    let directory = state_dir.join("campaigns/projections");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join(format!("{:x}.projection-v1.json", identity.finalize())),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "codeRepository": repository,
+            "worklistPattern": worklist_pattern,
+            "sourceRevision": "a".repeat(40),
+            "worklistSha256": format!("sha256:{}", "b".repeat(64)),
+            "issue": {
+                "repository": repository,
+                "number": issue_number,
+                "url": issue_url,
+            },
+            "subIssueWalk": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]

@@ -3,15 +3,18 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tally_client::{RequestFrame, WireError};
 use tally_core::campaign_registry::{
-    CampaignRegistration, CampaignRegistrationV2, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
+    CampaignRegistration, CampaignRegistrationV3, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 use tally_core::wire::{serve_connection, RpcHandler};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
 const ISSUE_URL: &str = "https://github.com/acme/widgets/issues/42";
+const CODE_REPOSITORY: &str = "acme/widgets";
+const WORKLIST: &str = "specs/night/tasks.json";
 const REGISTRATION_ID: &str = "0198a62b-41ee-7000-8000-000000000542";
 const OBSERVATION: &str = "sha256:fixture-observation-b";
 const OLD_RUN: &str = "00000000-0000-7000-8000-000000000510";
@@ -23,21 +26,18 @@ fn write_registration(state_dir: &Path, fixture_dir: &Path) {
     let driver = fixture_dir.join("spec-build-driver");
     std::fs::write(&flow, "fixture flow\n").unwrap();
     std::fs::write(&driver, "fixture driver\n").unwrap();
-    let authority = CampaignRegistrationV2 {
+    let authority = CampaignRegistrationV3 {
         schema_version: REGISTRY_SCHEMA_VERSION,
         registration_id: REGISTRATION_ID.to_owned(),
-        issue_url: ISSUE_URL.to_owned(),
-        repository: "acme/widgets".to_owned(),
-        issue_number: 42,
+        worklist_pattern: WORKLIST.to_owned(),
+        code_repository: CODE_REPOSITORY.to_owned(),
         armed_at: "2026-08-12T20:00:00Z".to_owned(),
         arm_serial: 1,
         approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
-        authenticated_actor: "operator".to_owned(),
+        // SAFETY: `geteuid` has no preconditions and does not mutate process state.
+        local_actor: format!("uid:{}", unsafe { libc::geteuid() }),
         allowed_actors: vec!["operator".to_owned()],
-        allow_test_local_forge: false,
-        sub_issue_walk: true,
         last_observation: Some(OBSERVATION.to_owned()),
-        last_forge_observation: Some("sha256:fixture-forge-observation".to_owned()),
         flow,
         driver,
         workspace_root: PathBuf::from("/var/lib/tally/campaigns"),
@@ -46,6 +46,31 @@ fn write_registration(state_dir: &Path, fixture_dir: &Path) {
         .unwrap()
         .write(&mut CampaignRegistration::new(authority, None))
         .unwrap();
+
+    let mut identity = Sha256::new();
+    identity.update(CODE_REPOSITORY.as_bytes());
+    identity.update([0]);
+    identity.update(WORKLIST.as_bytes());
+    let directory = state_dir.join("campaigns/projections");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join(format!("{:x}.projection-v1.json", identity.finalize())),
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "codeRepository": CODE_REPOSITORY,
+            "worklistPattern": WORKLIST,
+            "sourceRevision": "a".repeat(40),
+            "worklistSha256": format!("sha256:{}", "b".repeat(64)),
+            "issue": {
+                "repository": CODE_REPOSITORY,
+                "number": 42,
+                "url": ISSUE_URL,
+            },
+            "subIssueWalk": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 fn usage() -> Value {
@@ -204,7 +229,8 @@ async fn campaign_status_joins_fixture_registration_to_latest_lineage_and_one_us
                 &[
                     "campaign",
                     "status",
-                    ISSUE_URL,
+                    CODE_REPOSITORY,
+                    WORKLIST,
                     "--state-dir",
                     state_dir.to_str().unwrap(),
                 ],

@@ -1,9 +1,9 @@
-//! Durable, rollback-compatible campaign registrations.
+//! Durable campaign registrations.
 //!
-//! The authority object is deliberately frozen at schema version 2: it is the
-//! exact closed shape understood by the immediately preceding tally release.
-//! Host-local settings live beside it so an older binary can keep scanning the
-//! `armed` directory without encountering fields it cannot decode.
+//! Authority schema 3 is a deliberate local-first cut. Pre-v3 registrations
+//! are refused with an operator remedy instead of being guessed into the new
+//! repository/worklist identity. Host-local settings remain separate from the
+//! closed authority shape.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -20,37 +20,31 @@ use thiserror::Error;
 
 use crate::nix_store::{GcRootBackend, NixStore};
 
-pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 3;
 pub const HOST_TUNING_SCHEMA_VERSION: u32 = 1;
-/// Effective host tuning when a stable-v2 authority has no tuning sidecar.
+/// Effective host tuning when a stable-v3 authority has no tuning sidecar.
 pub const DEFAULT_CAMPAIGN_PROJECTION_WAIT_MS: u64 = 10_000;
 const ASSET_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// The schema-2 authority record, frozen to the literal N-1 field set.
+/// The schema-3 authority record.
 ///
 /// Do not add fields to this type. Extensions belong in a separately
 /// versioned sidecar and the N/N-1 compatibility tests below must move with
 /// any future authority schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct CampaignRegistrationV2 {
+pub struct CampaignRegistrationV3 {
     pub schema_version: u32,
     pub registration_id: String,
-    pub issue_url: String,
-    pub repository: String,
-    pub issue_number: u64,
+    pub worklist_pattern: String,
+    pub code_repository: String,
     pub armed_at: String,
     pub arm_serial: u64,
     pub approved_graph_digest: String,
-    pub authenticated_actor: String,
+    pub local_actor: String,
     pub allowed_actors: Vec<String>,
-    pub allow_test_local_forge: bool,
-    #[serde(default)]
-    pub sub_issue_walk: bool,
     #[serde(default)]
     pub last_observation: Option<String>,
-    #[serde(default)]
-    pub last_forge_observation: Option<String>,
     pub flow: PathBuf,
     pub driver: PathBuf,
     pub workspace_root: PathBuf,
@@ -74,9 +68,9 @@ impl CampaignHostTuningV1 {
 }
 
 /// Private ownership metadata for one `(registrationId, armSerial)` asset
-/// generation. It is intentionally not an authority extension: an N-1 reader
-/// can continue to consume the exact flow and driver paths without learning
-/// how the current process keeps them alive.
+/// generation. It is intentionally not an authority extension: asset
+/// retention remains independently versioned and cannot silently grow the
+/// closed registration shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CampaignAssetManifestV1 {
@@ -135,26 +129,26 @@ impl AssetGeneration {
 ///
 /// This type intentionally does not implement `Serialize`. Durable writers
 /// must choose the authority or sidecar explicitly, preventing a convenient
-/// whole-value serialization from putting tuning back into closed schema 2.
+/// whole-value serialization from putting tuning back into closed schema 3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CampaignRegistration {
-    authority: CampaignRegistrationV2,
+    authority: CampaignRegistrationV3,
     pub projection_wait_ms: Option<u64>,
 }
 
 impl CampaignRegistration {
-    pub const fn new(authority: CampaignRegistrationV2, projection_wait_ms: Option<u64>) -> Self {
+    pub const fn new(authority: CampaignRegistrationV3, projection_wait_ms: Option<u64>) -> Self {
         Self {
             authority,
             projection_wait_ms,
         }
     }
 
-    pub const fn authority(&self) -> &CampaignRegistrationV2 {
+    pub const fn authority(&self) -> &CampaignRegistrationV3 {
         &self.authority
     }
 
-    pub fn into_authority(self) -> CampaignRegistrationV2 {
+    pub fn into_authority(self) -> CampaignRegistrationV3 {
         self.authority
     }
 
@@ -179,7 +173,7 @@ impl CampaignRegistration {
 }
 
 impl Deref for CampaignRegistration {
-    type Target = CampaignRegistrationV2;
+    type Target = CampaignRegistrationV3;
 
     fn deref(&self) -> &Self::Target {
         &self.authority
@@ -228,15 +222,16 @@ impl CampaignRegistry {
         })
     }
 
-    pub fn registration_path(&self, issue_url: &str) -> PathBuf {
-        registration_path(&self.state_dir, issue_url)
+    pub fn registration_path(&self, code_repository: &str, worklist_pattern: &str) -> PathBuf {
+        registration_path(&self.state_dir, code_repository, worklist_pattern)
     }
 
-    pub fn read_issue(
+    pub fn read_campaign(
         &self,
-        issue_url: &str,
+        code_repository: &str,
+        worklist_pattern: &str,
     ) -> Result<Option<CampaignRegistration>, CampaignRegistryError> {
-        let path = self.registration_path(issue_url);
+        let path = self.registration_path(code_repository, worklist_pattern);
         Ok(self
             .registrations()?
             .into_iter()
@@ -245,7 +240,22 @@ impl CampaignRegistry {
 
     pub fn read(&self, path: &Path) -> Result<CampaignRegistration, CampaignRegistryError> {
         let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
-        let authority: CampaignRegistrationV2 = serde_json::from_slice(&bytes)
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|source| invalid_registration(path, source.to_string()))?;
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or_else(|| invalid_registration(path, "record has no valid schemaVersion"))?;
+        if schema_version < REGISTRY_SCHEMA_VERSION {
+            return Err(invalid_registration(
+                path,
+                format!(
+                    "authority schema {schema_version} predates schema {REGISTRY_SCHEMA_VERSION}; disarm and re-arm"
+                ),
+            ));
+        }
+        let authority: CampaignRegistrationV3 = serde_json::from_value(value)
             .map_err(|source| invalid_registration(path, source.to_string()))?;
         validate_authority(path, &authority)?;
         let projection_wait_ms = self.read_host_tuning(&authority.registration_id)?;
@@ -276,7 +286,10 @@ impl CampaignRegistry {
         &self,
         registration: &mut CampaignRegistration,
     ) -> Result<(), CampaignRegistryError> {
-        let path = self.registration_path(&registration.issue_url);
+        let path = self.registration_path(
+            &registration.code_repository,
+            &registration.worklist_pattern,
+        );
         validate_authority(&path, registration.authority())?;
         self.ensure_asset_generation(registration)?;
         validate_authority(&path, registration.authority())?;
@@ -292,8 +305,12 @@ impl CampaignRegistry {
         self.cleanup_orphan_generations(&live)
     }
 
-    pub fn remove_issue(&self, issue_url: &str) -> Result<bool, CampaignRegistryError> {
-        let path = self.registration_path(issue_url);
+    pub fn remove_campaign(
+        &self,
+        code_repository: &str,
+        worklist_pattern: &str,
+    ) -> Result<bool, CampaignRegistryError> {
+        let path = self.registration_path(code_repository, worklist_pattern);
         if !path.exists() {
             // Disarm is still a reconciliation entry for every registration
             // that remains live, even when its requested target is absent.
@@ -310,7 +327,10 @@ impl CampaignRegistry {
     }
 
     pub fn remove(&self, registration: &CampaignRegistration) -> Result<(), CampaignRegistryError> {
-        let path = self.registration_path(&registration.issue_url);
+        let path = self.registration_path(
+            &registration.code_repository,
+            &registration.worklist_pattern,
+        );
         // Delete authority first. A crash from this point can leak an orphan,
         // but can never leave live authority pointing at removed assets.
         remove_file_if_present(&path)?;
@@ -651,7 +671,7 @@ impl CampaignRegistry {
     ) -> Result<Option<u64>, CampaignRegistryError> {
         let path = host_tuning_path(&self.state_dir, registration_id);
         if !path.exists() {
-            // Sidecar absence is the stable-v2 representation of the
+            // Sidecar absence is the stable representation of the
             // historical host default, not an unknown tuning value.
             return Ok(Some(DEFAULT_CAMPAIGN_PROJECTION_WAIT_MS));
         }
@@ -785,8 +805,12 @@ fn asset_manifest_path(generation_dir: &Path) -> PathBuf {
     generation_dir.join("assets-v1.json")
 }
 
-fn registration_path(state_dir: &Path, issue_url: &str) -> PathBuf {
-    let digest = Sha256::digest(issue_url.as_bytes());
+fn registration_path(state_dir: &Path, code_repository: &str, worklist_pattern: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(code_repository.as_bytes());
+    hasher.update([0]);
+    hasher.update(worklist_pattern.as_bytes());
+    let digest = hasher.finalize();
     authority_dir(state_dir).join(format!("{digest:x}.json"))
 }
 
@@ -1041,11 +1065,12 @@ fn sync_directory(path: &Path) -> Result<(), CampaignRegistryError> {
 
 fn validate_authority(
     path: &Path,
-    registration: &CampaignRegistrationV2,
+    registration: &CampaignRegistrationV3,
 ) -> Result<(), CampaignRegistryError> {
     let invalid = registration.schema_version != REGISTRY_SCHEMA_VERSION
         || uuid::Uuid::parse_str(&registration.registration_id).is_err()
-        || registration.issue_number == 0
+        || !safe_repository(&registration.code_repository)
+        || !safe_worklist_pattern(&registration.worklist_pattern)
         || registration.arm_serial == 0
         || !registration
             .approved_graph_digest
@@ -1056,54 +1081,38 @@ fn validate_authority(
                         .bytes()
                         .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             })
-        || !safe_github_login(&registration.authenticated_actor)
+        || !safe_local_actor(&registration.local_actor)
         || registration.allowed_actors.is_empty()
         || registration
             .allowed_actors
             .iter()
             .any(|actor| !safe_github_login(actor) || actor != &actor.to_ascii_lowercase())
-        || !registration
-            .allowed_actors
-            .contains(&registration.authenticated_actor)
         || !registration.flow.is_absolute()
         || !registration.driver.is_absolute()
         || !registration.workspace_root.is_absolute();
     if invalid {
         return Err(invalid_registration(
             path,
-            "record violates schema v2 invariants; explicitly disarm and re-arm legacy registrations",
-        ));
-    }
-    let Some((repository, issue_number)) = issue_locator(&registration.issue_url) else {
-        return Err(invalid_registration(
-            path,
-            "issueUrl is not a canonical GitHub issue URL",
-        ));
-    };
-    if repository != registration.repository || issue_number != registration.issue_number {
-        return Err(invalid_registration(
-            path,
-            "record has inconsistent locator fields",
+            "record violates schema v3 invariants; disarm and re-arm",
         ));
     }
     Ok(())
 }
 
-fn issue_locator(value: &str) -> Option<(String, u64)> {
-    let remainder = value.strip_prefix("https://github.com/")?;
-    if remainder.contains(['?', '#']) || remainder.ends_with('/') {
-        return None;
-    }
-    let parts = remainder.split('/').collect::<Vec<_>>();
-    if parts.len() != 4
-        || parts[2] != "issues"
-        || !safe_repo_part(parts[0])
-        || !safe_repo_part(parts[1])
-    {
-        return None;
-    }
-    let number = parts[3].parse::<u64>().ok().filter(|number| *number > 0)?;
-    Some((format!("{}/{}", parts[0], parts[1]), number))
+fn safe_repository(value: &str) -> bool {
+    let parts = value.split('/').collect::<Vec<_>>();
+    parts.len() == 2 && parts.into_iter().all(safe_repo_part)
+}
+
+fn safe_worklist_pattern(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1_024
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains('\0')
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn safe_repo_part(value: &str) -> bool {
@@ -1123,6 +1132,13 @@ fn safe_github_login(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn safe_local_actor(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains(['\0', '/', '\\'])
+        && !value.chars().any(char::is_whitespace)
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> CampaignRegistryError {
@@ -1232,62 +1248,87 @@ mod tests {
         }
     }
 
-    /// Literal copy of the closed reader shipped at commit 84b1bf0. This is a
-    /// compatibility oracle, not an alias to the current authority type.
+    /// Literal copy of the closed schema-2 reader. This is a compatibility
+    /// oracle, not an alias to the current authority type.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields, rename_all = "camelCase")]
-    struct NMinusOneCampaignRegistration {
+    struct NMinusOneCampaignRegistrationV2 {
         schema_version: u32,
         registration_id: String,
-        issue_url: String,
-        repository: String,
-        issue_number: u64,
+        #[serde(rename = "issueUrl")]
+        forge_locator: String,
+        #[serde(rename = "repository")]
+        forge_repository: String,
+        #[serde(rename = "issueNumber")]
+        forge_number: u64,
         armed_at: String,
         arm_serial: u64,
         approved_graph_digest: String,
-        authenticated_actor: String,
+        #[serde(rename = "authenticatedActor")]
+        forge_actor: String,
         allowed_actors: Vec<String>,
-        allow_test_local_forge: bool,
+        #[serde(rename = "allowTestLocalForge")]
+        local_forge_escape_hatch: bool,
         #[serde(default)]
-        sub_issue_walk: bool,
+        #[serde(rename = "subIssueWalk")]
+        native_projection_walk: bool,
         #[serde(default)]
         last_observation: Option<String>,
         #[serde(default)]
-        last_forge_observation: Option<String>,
+        #[serde(rename = "lastForgeObservation")]
+        forge_observation: Option<String>,
         flow: PathBuf,
         driver: PathBuf,
         workspace_root: PathBuf,
     }
 
-    fn authority() -> CampaignRegistrationV2 {
-        CampaignRegistrationV2 {
-            schema_version: REGISTRY_SCHEMA_VERSION,
-            registration_id: "0198a62b-41ee-7000-8000-000000000447".to_owned(),
-            issue_url: "https://github.com/mecattaf/tally.nix/issues/447".to_owned(),
-            repository: "mecattaf/tally.nix".to_owned(),
-            issue_number: 447,
-            armed_at: "2026-08-08T10:00:00Z".to_owned(),
-            arm_serial: 3,
-            approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
-            authenticated_actor: "operator".to_owned(),
-            allowed_actors: vec!["operator".to_owned(), "reviewer".to_owned()],
-            allow_test_local_forge: false,
-            sub_issue_walk: true,
+    fn n_minus_one_authority() -> NMinusOneCampaignRegistrationV2 {
+        NMinusOneCampaignRegistrationV2 {
+            schema_version: 2,
+            registration_id: "0198a62b-41ee-7000-8000-000000000446".to_owned(),
+            forge_locator: "https://github.com/mecattaf/tally.nix/issues/446".to_owned(),
+            forge_repository: "mecattaf/tally.nix".to_owned(),
+            forge_number: 446,
+            armed_at: "2026-08-07T10:00:00Z".to_owned(),
+            arm_serial: 2,
+            approved_graph_digest: format!("sha256:{}", "b".repeat(64)),
+            forge_actor: "operator".to_owned(),
+            allowed_actors: vec!["operator".to_owned()],
+            local_forge_escape_hatch: false,
+            native_projection_walk: true,
             last_observation: Some("observation".to_owned()),
-            last_forge_observation: Some("forge-observation".to_owned()),
+            forge_observation: Some("forge-observation".to_owned()),
             flow: PathBuf::from("/nix/store/flow/share/spec-build.js"),
             driver: PathBuf::from("/nix/store/driver/bin/spec-build-driver"),
             workspace_root: PathBuf::from("/var/lib/tally/campaigns"),
         }
     }
 
-    fn authority_with_assets(root: &Path) -> CampaignRegistrationV2 {
+    fn authority() -> CampaignRegistrationV3 {
+        CampaignRegistrationV3 {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            registration_id: "0198a62b-41ee-7000-8000-000000000447".to_owned(),
+            worklist_pattern: "silent-factory-worklists/ch2.json".to_owned(),
+            code_repository: "mecattaf/tally.nix".to_owned(),
+            armed_at: "2026-08-08T10:00:00Z".to_owned(),
+            arm_serial: 3,
+            approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
+            local_actor: "uid:1000".to_owned(),
+            allowed_actors: vec!["operator".to_owned(), "reviewer".to_owned()],
+            last_observation: Some("observation".to_owned()),
+            flow: PathBuf::from("/nix/store/flow/share/spec-build.js"),
+            driver: PathBuf::from("/nix/store/driver/bin/spec-build-driver"),
+            workspace_root: PathBuf::from("/var/lib/tally/campaigns"),
+        }
+    }
+
+    fn authority_with_assets(root: &Path) -> CampaignRegistrationV3 {
         let flow = root.join("source-flow.js");
         let driver = root.join("source-driver");
         fs::write(&flow, "flow-447\n").unwrap();
         fs::write(&driver, "driver-447\n").unwrap();
         fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).unwrap();
-        CampaignRegistrationV2 {
+        CampaignRegistrationV3 {
             flow,
             driver,
             ..authority()
@@ -1297,8 +1338,7 @@ mod tests {
     fn registration_with_assets(flow: PathBuf, driver: PathBuf) -> CampaignRegistration {
         let mut value = authority();
         value.registration_id = "0198a62b-41ee-7000-8000-000000000448".to_owned();
-        value.issue_url = "https://github.com/mecattaf/tally.nix/issues/448".to_owned();
-        value.issue_number = 448;
+        value.worklist_pattern = "silent-factory-worklists/ch3.json".to_owned();
         value.arm_serial = 1;
         value.flow = flow;
         value.driver = driver;
@@ -1315,8 +1355,15 @@ mod tests {
         (flow, driver)
     }
 
-    fn authority_bytes(registry: &CampaignRegistry, issue_url: &str) -> Vec<u8> {
-        fs::read(registry.registration_path(issue_url)).unwrap()
+    fn authority_bytes(
+        registry: &CampaignRegistry,
+        registration: &CampaignRegistration,
+    ) -> Vec<u8> {
+        fs::read(registry.registration_path(
+            &registration.code_repository,
+            &registration.worklist_pattern,
+        ))
+        .unwrap()
     }
 
     fn host_tuning_files(state_dir: &Path) -> Vec<PathBuf> {
@@ -1336,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn current_default_and_override_authority_are_literal_n_minus_one_bytes() {
+    fn current_authority_is_closed_v3_and_host_tuning_stays_in_its_sidecar() {
         for projection_wait_ms in [None, Some(240_000)] {
             let temporary = tempfile::tempdir().unwrap();
             let registry = CampaignRegistry::open(temporary.path()).unwrap();
@@ -1346,15 +1393,24 @@ mod tests {
             );
             registry.write(&mut registration).unwrap();
 
-            let bytes = authority_bytes(&registry, &registration.issue_url);
-            let decoded: NMinusOneCampaignRegistration = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(decoded.issue_url, registration.issue_url);
-            assert!(!String::from_utf8(bytes)
-                .unwrap()
-                .contains("projectionWaitMs"));
+            let bytes = authority_bytes(&registry, &registration);
+            let decoded: CampaignRegistrationV3 = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded, *registration.authority());
+            let encoded = String::from_utf8(bytes.clone()).unwrap();
+            assert!(!encoded.contains("projectionWaitMs"));
+            assert!(!encoded.contains("issueUrl"));
+            assert!(!encoded.contains("issueNumber"));
+            assert!(!encoded.contains("authenticatedActor"));
+            assert!(!encoded.contains("allowTestLocalForge"));
+            assert!(!encoded.contains("subIssueWalk"));
+            assert!(!encoded.contains("lastForgeObservation"));
+            assert!(serde_json::from_slice::<NMinusOneCampaignRegistrationV2>(&bytes).is_err());
 
             let current = registry
-                .read_issue(&registration.issue_url)
+                .read_campaign(
+                    &registration.code_repository,
+                    &registration.worklist_pattern,
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -1375,23 +1431,18 @@ mod tests {
     }
 
     #[test]
-    fn current_reader_accepts_literal_n_minus_one_bytes_without_changing_authority() {
+    fn current_reader_refuses_v2_bytes_with_disarm_and_rearm_remedy() {
         let temporary = tempfile::tempdir().unwrap();
         let registry = CampaignRegistry::open(temporary.path()).unwrap();
-        let expected = authority();
-        let legacy: NMinusOneCampaignRegistration =
-            serde_json::from_value(serde_json::to_value(&expected).unwrap()).unwrap();
+        let legacy = n_minus_one_authority();
         let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
-        let path = registry.registration_path(&expected.issue_url);
+        let path = authority_dir(temporary.path()).join("legacy-v2.json");
         fs::write(&path, &legacy_bytes).unwrap();
 
-        let loaded = registry.read(&path).unwrap();
-        assert_eq!(loaded.authority(), &expected);
-        assert_eq!(
-            loaded.projection_wait_ms,
-            Some(DEFAULT_CAMPAIGN_PROJECTION_WAIT_MS)
-        );
-        assert_eq!(fs::read(path).unwrap(), legacy_bytes);
+        let failure = registry.read(&path).unwrap_err().to_string();
+        assert!(failure.contains("authority schema 2 predates schema 3"));
+        assert!(failure.contains("disarm and re-arm"));
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         assert!(host_tuning_files(temporary.path()).is_empty());
     }
 
@@ -1404,14 +1455,17 @@ mod tests {
         let (flow, driver) = local_assets(&source_dir, "restart");
         let expected_arm_attempt = 7;
         let expected_registration_id;
-        let expected_issue_url;
+        let expected_identity;
 
         {
             let registry = CampaignRegistry::open(&state_dir).unwrap();
             let mut registration = registration_with_assets(flow, driver);
             registration.arm_serial = expected_arm_attempt;
             expected_registration_id = registration.registration_id.clone();
-            expected_issue_url = registration.issue_url.clone();
+            expected_identity = (
+                registration.code_repository.clone(),
+                registration.worklist_pattern.clone(),
+            );
             registry.write(&mut registration).unwrap();
         }
 
@@ -1424,14 +1478,17 @@ mod tests {
         );
         let recovered = &registrations[0].1;
         assert_eq!(recovered.registration_id, expected_registration_id);
-        assert_eq!(recovered.issue_url, expected_issue_url);
+        assert_eq!(
+            (&recovered.code_repository, &recovered.worklist_pattern),
+            (&expected_identity.0, &expected_identity.1)
+        );
         assert_eq!(
             recovered.arm_serial, expected_arm_attempt,
             "the armed registration's attempt counter is durable coordinator state"
         );
         assert_eq!(
             restarted
-                .read_issue(&expected_issue_url)
+                .read_campaign(&expected_identity.0, &expected_identity.1)
                 .unwrap()
                 .unwrap()
                 .arm_serial,
@@ -1441,31 +1498,34 @@ mod tests {
     }
 
     #[test]
-    fn downgrade_rewrite_keeps_sidecar_override_for_reupgrade() {
+    fn authority_rewrite_keeps_sidecar_override() {
         let temporary = tempfile::tempdir().unwrap();
         let registry = CampaignRegistry::open(temporary.path()).unwrap();
         let mut registration =
             CampaignRegistration::new(authority_with_assets(temporary.path()), Some(240_000));
         registry.write(&mut registration).unwrap();
-        let path = registry.registration_path(&registration.issue_url);
+        let path = registry.registration_path(
+            &registration.code_repository,
+            &registration.worklist_pattern,
+        );
 
-        let mut old_reader: NMinusOneCampaignRegistration =
+        let mut rewritten: CampaignRegistrationV3 =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        old_reader.last_observation = Some("written-by-n-minus-one".to_owned());
-        fs::write(&path, serde_json::to_vec_pretty(&old_reader).unwrap()).unwrap();
+        rewritten.last_observation = Some("written-by-current".to_owned());
+        fs::write(&path, serde_json::to_vec_pretty(&rewritten).unwrap()).unwrap();
 
-        let reupgraded = registry.read(&path).unwrap();
-        assert_eq!(reupgraded.projection_wait_ms, Some(240_000));
+        let reread = registry.read(&path).unwrap();
+        assert_eq!(reread.projection_wait_ms, Some(240_000));
         assert_eq!(
-            reupgraded.last_observation.as_deref(),
-            Some("written-by-n-minus-one")
+            reread.last_observation.as_deref(),
+            Some("written-by-current")
         );
         assert_eq!(
-            reupgraded.approved_graph_digest,
+            reread.approved_graph_digest,
             registration.approved_graph_digest
         );
-        assert_eq!(reupgraded.flow, registration.flow);
-        assert_eq!(reupgraded.driver, registration.driver);
+        assert_eq!(reread.flow, registration.flow);
+        assert_eq!(reread.driver, registration.driver);
     }
 
     #[test]
@@ -1490,8 +1550,12 @@ mod tests {
 
         assert_eq!(registration.flow, flow);
         assert_eq!(registration.driver, driver);
-        let authority: NMinusOneCampaignRegistration = serde_json::from_slice(
-            &fs::read(registry.registration_path(&registration.issue_url)).unwrap(),
+        let authority: CampaignRegistrationV3 = serde_json::from_slice(
+            &fs::read(registry.registration_path(
+                &registration.code_repository,
+                &registration.worklist_pattern,
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(authority.flow, flow);
@@ -1670,7 +1734,7 @@ mod tests {
         next.driver = driver_v2;
         registry.ensure_asset_generation(&mut next).unwrap();
         atomic_write_json(
-            &registry.registration_path(&next.issue_url),
+            &registry.registration_path(&next.code_repository, &next.worklist_pattern),
             next.authority(),
         )
         .unwrap();
@@ -1715,7 +1779,7 @@ mod tests {
         let registry = CampaignRegistry::open(temporary.path().join("state")).unwrap();
         let (flow, driver) = local_assets(&source_dir, "legacy");
         let legacy = registration_with_assets(flow.clone(), driver.clone());
-        let path = registry.registration_path(&legacy.issue_url);
+        let path = registry.registration_path(&legacy.code_repository, &legacy.worklist_pattern);
         atomic_write_json(&path, legacy.authority()).unwrap();
 
         let adopted = registry.registrations().unwrap().remove(0).1;
@@ -1736,7 +1800,9 @@ mod tests {
             registry.registrations(),
             Err(CampaignRegistryError::MissingAsset { role: "flow", .. })
         ));
-        assert!(registry.remove_issue(&missing.issue_url).unwrap());
+        assert!(registry
+            .remove_campaign(&missing.code_repository, &missing.worklist_pattern)
+            .unwrap());
         assert!(!path.exists());
     }
 
@@ -1758,8 +1824,12 @@ mod tests {
             &registry.state_dir,
             &AssetGeneration::from_registration(&disarmed),
         );
-        assert!(registry.remove_issue(&disarmed.issue_url).unwrap());
-        assert!(!registry.registration_path(&disarmed.issue_url).exists());
+        assert!(registry
+            .remove_campaign(&disarmed.code_repository, &disarmed.worklist_pattern)
+            .unwrap());
+        assert!(!registry
+            .registration_path(&disarmed.code_repository, &disarmed.worklist_pattern)
+            .exists());
         assert!(!host_tuning_path(&registry.state_dir, &disarmed.registration_id).exists());
         assert!(!disarmed_generation.exists());
         assert!(backend.roots().is_empty());
@@ -1768,8 +1838,7 @@ mod tests {
         let driver = backend.asset("driver-prune", "bin/driver", "driver-prune\n", 0o555);
         let mut pruned = registration_with_assets(flow, driver);
         pruned.registration_id = "0198a62b-41ee-7000-8000-000000000449".to_owned();
-        pruned.issue_url = "https://github.com/mecattaf/tally.nix/issues/449".to_owned();
-        pruned.issue_number = 449;
+        pruned.worklist_pattern = "silent-factory-worklists/ch4.json".to_owned();
         registry.write(&mut pruned).unwrap();
         let pruned_generation = asset_generation_dir(
             &registry.state_dir,
@@ -1778,7 +1847,9 @@ mod tests {
         // This is the lifecycle operation used by the closed-issue branch in
         // `campaign poll`; it deliberately shares disarm's ordering.
         registry.remove(&pruned).unwrap();
-        assert!(!registry.registration_path(&pruned.issue_url).exists());
+        assert!(!registry
+            .registration_path(&pruned.code_repository, &pruned.worklist_pattern)
+            .exists());
         assert!(!host_tuning_path(&registry.state_dir, &pruned.registration_id).exists());
         assert!(!pruned_generation.exists());
         assert!(backend.roots().is_empty());

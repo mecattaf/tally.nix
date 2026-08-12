@@ -41,12 +41,47 @@ fn legacy_campaign_continuation_token_remains_parseable() {
 }
 
 #[test]
+fn campaign_arm_takes_repository_and_committed_worklist_identity() {
+    let options = Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "arm",
+        "acme/widgets",
+        "specs/night/tasks.json",
+        "--allow-test-local-forge",
+        "--no-enqueue",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Campaign {
+            command: CampaignCommand::Arm(CampaignArmArgs {
+                code_repository,
+                worklist_pattern,
+                allow_test_local_forge: true,
+                no_enqueue: true,
+                ..
+            })
+        }) if code_repository == "acme/widgets"
+            && worklist_pattern == "specs/night/tasks.json"
+    ));
+    assert!(Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "arm",
+        "https://github.com/acme/widgets/issues/42",
+    ])
+    .is_err());
+}
+
+#[test]
 fn campaign_resume_requires_and_preserves_its_audit_reason() {
     let options = Opts::try_parse_from([
         "tally",
         "campaign",
         "resume",
-        "https://github.com/acme/widgets/issues/42",
+        "acme/widgets",
+        "specs/night/tasks.json",
         "--reason",
         "Reviewed the escalation and corrected the external dependency.",
         "--wait",
@@ -58,12 +93,14 @@ fn campaign_resume_requires_and_preserves_its_audit_reason() {
         options.command,
         Some(Command::Campaign {
             command: CampaignCommand::Resume(CampaignResumeArgs {
-                issue,
+                code_repository,
+                worklist_pattern,
                 reason,
                 wait: true,
                 state_dir: Some(state_dir),
             })
-        }) if issue == "https://github.com/acme/widgets/issues/42"
+        }) if code_repository == "acme/widgets"
+            && worklist_pattern == "specs/night/tasks.json"
             && reason == "Reviewed the escalation and corrected the external dependency."
             && state_dir == Path::new("/var/lib/tally/state")
     ));
@@ -71,18 +108,20 @@ fn campaign_resume_requires_and_preserves_its_audit_reason() {
         "tally",
         "campaign",
         "resume",
-        "https://github.com/acme/widgets/issues/42",
+        "acme/widgets",
+        "specs/night/tasks.json",
     ])
     .is_err());
 }
 
 #[test]
-fn campaign_status_accepts_the_master_url_and_machine_output() {
+fn campaign_status_accepts_the_campaign_identity_and_machine_output() {
     let options = Opts::try_parse_from([
         "tally",
         "campaign",
         "status",
-        "https://github.com/acme/widgets/issues/42",
+        "acme/widgets",
+        "specs/night/tasks.json",
         "--json",
         "--state-dir",
         "/var/lib/tally/state",
@@ -92,11 +131,13 @@ fn campaign_status_accepts_the_master_url_and_machine_output() {
         options.command,
         Some(Command::Campaign {
             command: CampaignCommand::Status(CampaignStatusArgs {
-                issue,
+                code_repository,
+                worklist_pattern,
                 json: true,
                 state_dir: Some(state_dir),
             })
-        }) if issue == "https://github.com/acme/widgets/issues/42"
+        }) if code_repository == "acme/widgets"
+            && worklist_pattern == "specs/night/tasks.json"
             && state_dir == Path::new("/var/lib/tally/state")
     ));
 }
