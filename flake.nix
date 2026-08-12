@@ -5503,7 +5503,7 @@
                   echo "forbidPaths constraint accepted an ambiguous ** component" >&2
                   exit 1
                 fi
-                grep -F "may use '**' only as a complete path component" \
+                grep -F "constraint gate.forbidPaths[0] is not canonical" \
                   "$TMPDIR/constraint-pattern-fail.err" >/dev/null
 
                 git -C "$TMPDIR/spec" switch --detach "$base_rev" >/dev/null

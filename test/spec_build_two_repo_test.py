@@ -174,6 +174,16 @@ class TwoRepositoryCampaign(unittest.TestCase):
         # two fails loudly rather than reading the wrong history.
         self.code_rev = self.code.commit("src/main.txt", "code\n", "fixture: code base")
         self.issues.commit("README.md", "board\n", "fixture: board base")
+        self.task_one = driver.action_worklist(
+            {
+                "repository": self.code.name,
+                "repositoryConfig": self.code.config,
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 4,
+                "maxParallel": 1,
+                "specRepository": self.spec.coordinate,
+            }
+        )["tasks"][0]
         self.workspaces = self.root / "workspaces"
         self.workspaces.mkdir()
 
@@ -182,7 +192,9 @@ class TwoRepositoryCampaign(unittest.TestCase):
 
     def land_task_one(self) -> str:
         """Put a merged task-1 on the code repository's publish branch."""
-        branch = driver.stable_publish_branch("fixture", "7", "task-1")
+        branch = driver.stable_publish_branch(
+            "fixture", "7", "task-1", self.task_one["revision"]
+        )
         landed = self.code.commit("src/task-1.txt", "done\n", "fixture: land task-1")
         git(
             "push", "--quiet", "origin", f"{landed}:refs/heads/{branch}",
@@ -278,7 +290,9 @@ class TwoRepositoryCampaign(unittest.TestCase):
         self.assertEqual([task["id"] for task in reconciliation["frontier"]], ["task-1"])
 
     def test_completion_is_read_from_the_code_repository(self) -> None:
-        branch = driver.stable_publish_branch("fixture", "7", "task-1")
+        branch = driver.stable_publish_branch(
+            "fixture", "7", "task-1", self.task_one["revision"]
+        )
         landed = self.land_task_one()
         reconciliation = driver.action_reconcile(self.brief())
         self.assertEqual(
@@ -420,9 +434,11 @@ class TwoRepositoryCampaign(unittest.TestCase):
             "workspace": pull_request_workspace(
                 "task-1",
                 self.code_rev,
-                driver.stable_publish_branch("fixture", "7", "task-1"),
+                driver.stable_publish_branch(
+                    "fixture", "7", "task-1", self.task_one["revision"]
+                ),
             ),
-            "task": implementation_task("task-1", "one"),
+            "task": self.task_one,
             **seam,
         }
         created = subprocess.CompletedProcess(
@@ -575,8 +591,9 @@ class TwoRepositoryCampaign(unittest.TestCase):
 
     def test_a_pull_request_on_a_foreign_repository_never_completes_a_task(self) -> None:
         """The walk's cross-repository reference must be checked, not trusted."""
-        marker = driver.pull_request_marker("fixture", "7", "task-1")
-        branch = driver.stable_publish_branch("fixture", "7", "task-1")
+        revision = self.task_one["revision"]
+        marker = driver.pull_request_marker("fixture", "7", "task-1", revision)
+        branch = driver.stable_publish_branch("fixture", "7", "task-1", revision)
         landed = self.code.commit("src/task-1.txt", "done\n", "fixture: land task-1")
         foreign = {
             "url": "https://github.com/acme/elsewhere/pull/9",
@@ -596,7 +613,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
                 "comments": [],
             }
         }
-        task = dict(implementation_task("task-1", "one"))
+        task = dict(self.task_one)
         task["brief"] = {"issue": {"number": "11", "url": "https://example.invalid/11"}}
         facts, restamps, warnings = driver.merged_github_tasks(
             self.code.name,
@@ -696,6 +713,8 @@ class SingleRepositoryControl(unittest.TestCase):
         self.assertEqual(reconciliation["baseRevision"], self.base_rev)
 
     def test_the_pull_request_body_and_summary_keep_their_pre_seam_shape(self) -> None:
+        reconciliation = driver.action_reconcile(self.brief())
+        task = reconciliation["tasks"][0]
         data = {
             "campaign": "fixture",
             "repository": self.repository.name,
@@ -703,9 +722,11 @@ class SingleRepositoryControl(unittest.TestCase):
             "workspace": pull_request_workspace(
                 "task-1",
                 self.base_rev,
-                driver.stable_publish_branch("fixture", "7", "task-1"),
+                driver.stable_publish_branch(
+                    "fixture", "7", "task-1", task["revision"]
+                ),
             ),
-            "task": implementation_task("task-1", "one"),
+            "task": task,
         }
         created = subprocess.CompletedProcess(
             [], 0, "https://github.com/acme/solo/pull/4\n", ""
@@ -723,7 +744,6 @@ class SingleRepositoryControl(unittest.TestCase):
         body = command[command.index("--body") + 1]
         self.assertIn(f"campaign progress for {self.repository.name}#7", body)
 
-        reconciliation = driver.action_reconcile(self.brief())
         summary = driver.render_campaign_summary(
             driver.campaign_digest(reconciliation, "quiescent")
         )

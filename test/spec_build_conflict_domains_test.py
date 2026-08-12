@@ -107,11 +107,14 @@ class ConflictDomainSemanticsTests(unittest.TestCase):
         self.assertTrue(driver.domains_overlap("Docs", "docs/guide.md"))
         self.assertTrue(driver.domains_overlap("SRC/Domain", "src/domain"))
 
-    def test_case_only_duplicate_domains_are_rejected(self) -> None:
-        with self.assertRaisesRegex(driver.DriverError, "contains duplicates"):
+    def test_case_only_domains_are_distinct_but_overlap_for_scheduling(self) -> None:
+        self.assertEqual(
             driver.normalize_conflict_domains(
                 ["Docs", "docs"], "task.conflictDomains", required=True
-            )
+            ),
+            ["Docs", "docs"],
+        )
+        self.assertTrue(driver.domains_overlap("Docs", "docs"))
 
     def test_underfilled_ready_frontier_names_the_domain_collisions(self) -> None:
         checkpoint = {"id": "checkpoint", "kind": "checkpoint"}
