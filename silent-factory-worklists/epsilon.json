@@ -344,7 +344,7 @@
       "id": "squash-rowversion-ladder",
       "kind": "implementation",
       "title": "Replace the row-migration ladder with a floor refusal",
-      "goal": "crates/tally-core/src/taskdb/migrations.rs carries the ROW_MIGRATIONS ladder (currently 5 entries at :17-38 era) upgrading pre-current row versions. Replace the ladder with a floor: rows below the current version are refused with a message naming the last pin that could upgrade them (the deployed estate is clean \u2014 the pre-arm migrate --plan reported isClean). Keep the migration frame (:40-70 era) per D42. Delete the remaining legacy row fixtures and their includes in taskdb.rs (the legacy-gh-origin fixture is your dependency's; the include list is why you serialize behind it), and the N_MINUS_1 usage fixture (usage.rs :1183 and :1999) with test/fixtures/usage/n-minus-1-records.json. Count entries, not braces: the acceptance grep counts ROW_MIGRATIONS entries remaining.",
+      "goal": "crates/tally-core/src/taskdb/migrations.rs carries the ROW_MIGRATIONS ladder (currently 5 entries at :17-38 era) upgrading pre-current row versions. Replace the ladder with a floor: rows below the current version are refused with a message naming the last pin that could upgrade them (the deployed estate is clean \u2014 the pre-arm migrate --plan reported isClean). Keep the migration frame (:40-70 era) per D42. Delete the remaining legacy row fixtures and their includes in taskdb.rs (the legacy-gh-origin fixture is your dependency's; the include list is why you serialize behind it), and the N_MINUS_1 usage fixture (usage.rs :1183 and :1999) with test/fixtures/usage/n-minus-1-records.json. Count entries, not braces: the acceptance grep counts ROW_MIGRATIONS entries remaining. Ownership correction from the machine's gate diagnosis: crates/tally-core/src/daemon/tests.rs runs non_empty_current_state_migrates_before_recovery_and_is_restart_stable, which loads the deleted legacy-no-origin fixture and expects the emptied ladder to migrate it \u2014 that stale test is yours to remove; the floor-refusal test replaces its coverage.",
       "deliveredBehaviors": [
         "Rows below the current version are refused with a named remedy",
         "No legacy row fixture or include survives",
@@ -385,7 +385,8 @@
         "crates/tally-core/src/taskdb.rs",
         "crates/tally-core/src/taskdb",
         "crates/tally-core/src/usage.rs",
-        "test/fixtures"
+        "test/fixtures",
+        "crates/tally-core/src/daemon/tests.rs"
       ]
     },
     {
