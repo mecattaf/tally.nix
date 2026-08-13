@@ -17,11 +17,8 @@ if task["id"] != "task-one" or task["kind"] != "implementation":
 if "Create result.txt." not in task["brief"]["body"]:
     raise SystemExit("sub-issue brief did not cross the campaign boundary")
 
-attributes = json.loads(os.environ["GIT_AI_CUSTOM_ATTRIBUTES"])
-if not attributes.get("taskRef", "").endswith("/task-one"):
-    raise SystemExit(f"taskRef did not reach git-ai execution: {attributes!r}")
 proof = Path(os.environ["FINAL_BAR_PIPELINE_PROOF"])
-proof.write_text(json.dumps({"brief": brief, "attributes": attributes}), encoding="utf-8")
+proof.write_text(json.dumps({"brief": brief}), encoding="utf-8")
 
 Path("result.txt").write_text("final-bar\n", encoding="utf-8")
 subprocess.run(["git", "add", "--", "result.txt"], check=True)

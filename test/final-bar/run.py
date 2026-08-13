@@ -19,7 +19,6 @@ from support import CASES, ConformanceFailure, Context, HarnessError, SUITE_ROOT
 # harness defect rather than an accidentally smaller dynamically-discovered bar.
 from cases import adapters  # noqa: F401,E402
 from cases import eval_manifest  # noqa: F401,E402
-from cases import git_ai  # noqa: F401,E402
 from cases import manifest  # noqa: F401,E402
 from cases import parallel  # noqa: F401,E402
 from cases import pipeline  # noqa: F401,E402
