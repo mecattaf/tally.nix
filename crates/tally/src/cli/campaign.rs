@@ -1777,6 +1777,95 @@ fn campaign_observation(
     }))
 }
 
+/// Arm an otherwise unchanged poll only when its latest pass is truly at rest
+/// and the admitted graph still contains work that pass can dispatch.
+///
+/// A terminal failed node projects its task as `blocked` even after the first
+/// (retryable) attempt. Dependency blockers and the local escalation ledger
+/// are the scheduling authorities, so both `pending` and directly `blocked`
+/// tasks remain dispatchable when `blockedBy` is empty and no active
+/// escalation names them.
+fn dispatchable_poll_liveness_arm(
+    graph: &CampaignGraph,
+    registration_id: &str,
+    escalated: &BTreeSet<String>,
+    status: &Value,
+) -> Result<Option<String>> {
+    let state = status["state"]
+        .as_str()
+        .ok_or_else(|| invalid("daemon returned campaign status without a state"))?;
+    let current_nodes = status["currentNodes"]
+        .as_array()
+        .ok_or_else(|| invalid("daemon returned campaign status without a current-node table"))?;
+    let running = status["counts"]["running"]
+        .as_u64()
+        .ok_or_else(|| invalid("daemon returned campaign status without a running-task count"))?;
+    // `currentNodes` excludes the flow root; the campaign state includes it.
+    if state == "running" || running != 0 || !current_nodes.is_empty() {
+        return Ok(None);
+    }
+    let tasks = match status.get("tasks") {
+        None => &[][..],
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| invalid("daemon returned an invalid campaign task table"))?,
+    };
+    for task in &graph.canonical.manifest.tasks {
+        if escalated.contains(&task.id) {
+            continue;
+        }
+        let expected_ref = format!("{registration_id}/{}", task.id);
+        let Some(projected) = tasks
+            .iter()
+            .find(|candidate| candidate["taskRef"].as_str() == Some(expected_ref.as_str()))
+        else {
+            continue;
+        };
+        let task_status = projected["status"]
+            .as_str()
+            .ok_or_else(|| invalid("daemon returned a campaign task without a status"))?;
+        let blocked_by = projected["blockedBy"]
+            .as_array()
+            .ok_or_else(|| invalid("daemon returned a campaign task without blockedBy"))?;
+        if matches!(task_status, "pending" | "blocked") && blocked_by.is_empty() {
+            let flow_run_id = status["flowRunId"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    invalid("daemon returned dispatchable campaign work without a flow run")
+                })?;
+            return Ok(Some(flow_run_id.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+async fn campaign_poll_liveness_arm(
+    host: CampaignHost<'_>,
+    graph: &CampaignGraph,
+    registration: &CampaignRegistration,
+    observation: &str,
+) -> Result<Option<String>> {
+    let params = json!({
+        "issueUrl": campaign_issue_url(
+            &registration.code_repository,
+            &registration.worklist_pattern,
+        ),
+        "registrationId": &registration.registration_id,
+        "latestObservation": observation,
+    });
+    // Select the unchanged observation explicitly. The status API treats a
+    // registered selector without one as a newly armed, never-enqueued
+    // campaign; within an observation it still resolves the newest pass, so
+    // an enqueue that committed before its registry write is observed here.
+    let client = connect_rpc(host.socket, host.config_path).await?;
+    let status = client
+        .call_with_deadline("__campaign.status", Some(params), host.rpc_timeout)
+        .await?;
+    let escalated = active_local_escalated_tasks(host.state_dir, graph)?;
+    dispatchable_poll_liveness_arm(graph, &registration.registration_id, &escalated, &status)
+}
+
 fn resolve_state_dir(value: Option<PathBuf>) -> Result<PathBuf> {
     let path = value.map_or_else(default_state_dir, Ok)?;
     if !path.is_absolute() {
@@ -3076,12 +3165,33 @@ impl CampaignHost<'_> {
     }
 }
 
+fn campaign_dispatch_dedup_key(
+    registration: &CampaignRegistration,
+    revision: &str,
+    liveness_arm: Option<&str>,
+) -> String {
+    match liveness_arm {
+        Some(flow_run_id) => format!(
+            "campaign:{}:{}:{}:liveness:{:x}",
+            registration.code_repository,
+            LOCAL_CAMPAIGN_ISSUE_NUMBER,
+            revision,
+            Sha256::digest(flow_run_id.as_bytes()),
+        ),
+        None => format!(
+            "campaign:{}:{}:{}",
+            registration.code_repository, LOCAL_CAMPAIGN_ISSUE_NUMBER, revision
+        ),
+    }
+}
+
 async fn dispatch_campaign(
     host: CampaignHost<'_>,
     graph: &CampaignGraph,
     repository_progress: &Value,
     registration: &mut CampaignRegistration,
     wait: bool,
+    liveness_arm: Option<&str>,
 ) -> Result<Value> {
     let CampaignHost {
         socket,
@@ -3198,9 +3308,15 @@ async fn dispatch_campaign(
         brief_path: None,
         resume_from: None,
         source: Some(EnqueueSource::Manual),
-        dedup_key: Some(format!(
-            "campaign:{}:{}:{}",
-            registration.code_repository, LOCAL_CAMPAIGN_ISSUE_NUMBER, revision
+        // An unchanged observation normally names the already-completed pass.
+        // A liveness recovery therefore needs a distinct, deterministic dedup
+        // arm or full-mode enqueue will correctly reuse that terminal witness
+        // and no reconcile work will actually run. The prior flow UUID makes
+        // one arm stable across poll races and advances after every real pass.
+        dedup_key: Some(campaign_dispatch_dedup_key(
+            registration,
+            &revision,
+            liveness_arm,
         )),
         submission: Some(SubmissionOptions {
             mode: SubmissionMode::Full,
@@ -3474,6 +3590,7 @@ async fn run_campaign_arm(
         &repository_progress,
         &mut registration,
         args.wait,
+        None,
     )
     .await?;
     registry.write(&mut registration)?;
@@ -3590,6 +3707,7 @@ async fn run_campaign_resume(
         &repository_progress,
         &mut registration,
         args.wait,
+        None,
     )
     .await?;
     registry.write(&mut registration)?;
@@ -3665,20 +3783,29 @@ async fn run_campaign_poll(
                 &repository_progress,
                 registration.arm_serial,
             )?;
-            if registration.last_observation.as_deref() == Some(&observation) {
-                return Ok(CampaignPollAttempt::Unchanged);
-            }
+            let host = CampaignHost {
+                socket,
+                config_path,
+                state_dir: &state_dir,
+                rpc_timeout,
+            };
+            let liveness_arm = if registration.last_observation.as_deref() == Some(&observation) {
+                let Some(flow_run_id) =
+                    campaign_poll_liveness_arm(host, &graph, &registration, &observation).await?
+                else {
+                    return Ok(CampaignPollAttempt::Unchanged);
+                };
+                Some(flow_run_id)
+            } else {
+                None
+            };
             let result = dispatch_campaign(
-                CampaignHost {
-                    socket,
-                    config_path,
-                    state_dir: &state_dir,
-                    rpc_timeout,
-                },
+                host,
                 &graph,
                 &repository_progress,
                 &mut registration,
                 args.wait,
+                liveness_arm.as_deref(),
             )
             .await?;
             registry.write(&mut registration)?;
@@ -4660,6 +4787,88 @@ mod tests {
         assert_ne!(
             campaign_observation(&graph, &quiet, &repository_progress, 1).unwrap(),
             campaign_observation(&graph, &steered, &repository_progress, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn unchanged_poll_arms_only_for_dispatchable_work_with_no_live_nodes() {
+        let graph = local_graph_for_test();
+        let registration_id = "0198a62b-41ee-7000-8000-000000000523";
+        let flow_run_id = "0198a62b-41ee-7000-8000-000000000524";
+        let resting = json!({
+            "flowRunId": flow_run_id,
+            "state": "idle",
+            "counts": {"done": 0, "running": 0, "blocked": 0, "pending": 1},
+            "tasks": [{
+                "taskRef": format!("{registration_id}/foundation"),
+                "status": "pending",
+                "blockedBy": [],
+            }],
+            "currentNodes": [],
+        });
+        assert_eq!(
+            dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &resting,)
+                .unwrap()
+                .as_deref(),
+            Some(flow_run_id),
+            "an unchanged resting campaign must wake when work is dispatchable"
+        );
+
+        let mut retryable = resting.clone();
+        retryable["counts"]["blocked"] = json!(1);
+        retryable["counts"]["pending"] = json!(0);
+        retryable["tasks"][0]["status"] = json!("blocked");
+        assert_eq!(
+            dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &retryable,)
+                .unwrap()
+                .as_deref(),
+            Some(flow_run_id),
+            "a direct failure remains dispatchable until its escalation is active"
+        );
+
+        let mut live = resting.clone();
+        live["state"] = json!("running");
+        live["counts"]["running"] = json!(1);
+        live["currentNodes"] = json!([{"state": "pending"}]);
+        assert_eq!(
+            dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &live,)
+                .unwrap(),
+            None,
+            "a live pass already owns campaign progress"
+        );
+
+        let escalated = BTreeSet::from(["foundation".to_owned()]);
+        assert_eq!(
+            dispatchable_poll_liveness_arm(&graph, registration_id, &escalated, &resting).unwrap(),
+            None,
+            "an escalated task must not create a periodic busy-loop"
+        );
+
+        let mut dependency_blocked = resting.clone();
+        dependency_blocked["tasks"][0]["status"] = json!("blocked");
+        dependency_blocked["tasks"][0]["blockedBy"] = json!(["prerequisite"]);
+        assert_eq!(
+            dispatchable_poll_liveness_arm(
+                &graph,
+                registration_id,
+                &BTreeSet::new(),
+                &dependency_blocked,
+            )
+            .unwrap(),
+            None,
+            "dependency-blocked work must remain at rest"
+        );
+
+        let mut complete = resting;
+        complete["state"] = json!("complete");
+        complete["counts"]["done"] = json!(1);
+        complete["counts"]["pending"] = json!(0);
+        complete["tasks"][0]["status"] = json!("done");
+        assert_eq!(
+            dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &complete,)
+                .unwrap(),
+            None,
+            "completed work must not create a periodic busy-loop"
         );
     }
 
