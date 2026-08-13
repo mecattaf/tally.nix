@@ -6,6 +6,17 @@ authorized.
 
 ## [Unreleased]
 
+### Make local campaign arm self-contained
+
+- `campaign arm OWNER/REPO WORKLIST` now derives campaign policy from the
+  committed remote-base worklist, accepts checkout/base/remote CLI bindings,
+  defaults to packaged flow and driver assets, and records the repository for
+  declaration-free resume and poll passes.
+- Worklists may carry the closed local `campaign` policy object; Rust and the
+  packaged driver share its bounds, gate and agent validation, while steward
+  roles resolve only the adapter configuration their direct subprocess can
+  apply.
+
 ### Audit campaign steering and failure doctrine (#516)
 
 - A 159-claim modality record now checks task-thread steering, arm authority and asset ownership,

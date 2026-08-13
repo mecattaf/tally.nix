@@ -88,35 +88,42 @@ The installed `tallyd` symlink with no arguments is equivalent to `tally daemon 
 Several `__...` helper commands exist for systemd units and producers. They are hidden,
 implementation-private, and not part of this CLI contract.
 
-## Forge-native campaigns
+## Local worklist campaigns
 
-Project a schema-versioned worklist into a GitHub master issue and native
-sub-issues, then register that issue as desired state:
+Register the committed worklist on a repository's remote base branch as the
+campaign authority:
 
 ```console
-$ tally campaign project WORKLIST.json --repo OWNER/REPO
-$ tally campaign project WORKLIST.json --repo OWNER/REPO --issue ISSUE-URL
-$ tally campaign arm ISSUE-URL [--allow-actor LOGIN]... [--wait]
-$ tally campaign disarm ISSUE-URL
+$ tally campaign arm OWNER/REPO PATH/TO/WORKLIST.json [--wait]
+$ tally campaign arm OWNER/REPO PATH/TO/WORKLIST.json \
+    --checkout /srv/repository --base-branch main --remote origin
+$ tally campaign resume OWNER/REPO PATH/TO/WORKLIST.json --reason TEXT
+$ tally campaign disarm OWNER/REPO PATH/TO/WORKLIST.json
 ```
 
-`project` accepts `--campaign-config PATH` when the worklist does not carry a
-top-level `campaign` object. `--title`, `--label`, and `--task-label` control
-the forge projection. On maintenance runs, omit `--title` to preserve the
-master title. Managed marker sections and projected task bodies are replaced;
-operator prose outside the master markers is preserved.
+`--checkout` defaults to the current directory; `--base-branch` and `--remote`
+default to `main` and `origin`. Arm fetches that remote and reads the single
+regular file matching the worklist pattern from the fetched base tree. Dirty
+working-tree bytes are never campaign authority. The registration records the
+canonical checkout and Git coordinates, so resume and poll never recover them
+from a rendered campaign declaration.
 
-`arm` accepts only canonical `https://github.com/OWNER/REPO/issues/NUMBER`
-locators. It binds the current `gh` identity, an actor allowlist, the checkout's
-GitHub remote, and the exact executable issue-graph digest. Polling refuses
-executable edits until explicit re-arm. `--no-enqueue` validates and registers
-without admitting the initial pass. `--flow`, `--driver`, `--state-dir`, and
-`--workspace-root` are mechanism overrides intended primarily for verification;
-`--allow-test-local-forge` is required for the non-continuing local test mode.
-Re-arming increments the retry generation even when the graph did not change.
-`disarm` removes only the locked local registration.
+The schema-version-1 worklist may carry a closed top-level `campaign` object.
+It owns the campaign name, task/parallelism limits, merge method, runtime
+limits, agent role, optional steward role, and the required non-empty gate
+list. Agent and steward names resolve through the host adapter catalog; the
+host does not declare per-campaign policy or a campaign mutex. The runner uses
+the reserved capacity-1 `campaign/OWNER/REPO` mutex.
 
-The Home Manager timer invokes the same bounded scan available to operators:
+`--no-enqueue` validates and registers without admitting the initial pass.
+Packaged installs default the flow and driver to
+`share/tally/flows/spec-build.js` and `libexec/tally/spec-build-driver` beside
+the installed binary; `--flow` and `--driver` override them. The workspace
+defaults to `<state-dir>/campaigns/<campaign-name>`, with `--workspace-root` as
+an override. Re-arming increments the retry generation even when the graph did
+not change. `disarm` removes only the locked local registration.
+
+The campaign poll timer invokes the same bounded scan available to operators:
 
 ```console
 $ tally campaign poll --once
@@ -124,11 +131,10 @@ $ tally campaign poll --once --wait
 $ tally campaign list
 ```
 
-All accept `--state-dir`. `poll` prints observed, dispatched, pruned, and failed
-registration counts and returns nonzero when any live registration cannot be
-validated or dispatched. It prunes closed masters. See
-[Campaigns](../flows/campaigns.md) for the manifest, task-brief, checkbox-proof,
-and host-mechanism contracts.
+All accept `--state-dir`. `poll` prints observed, dispatched, re-arm-required,
+and failed registration counts and returns nonzero when any live registration
+cannot be validated or dispatched. See [Campaigns](../flows/campaigns.md) for
+the graph, task-brief, and host-mechanism contracts.
 
 ## Adapter smoke
 
