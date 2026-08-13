@@ -86,6 +86,20 @@ def issue() -> dict[str, str]:
     return {"number": "7", "url": "https://github.com/acme/spec/issues/7"}
 
 
+def attempt_receipts(root: Path, campaign: str = "fixture") -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "kind": "local-jsonl",
+        "path": str(
+            root
+            / "campaigns"
+            / "attempt-receipts"
+            / campaign
+            / DRIVER.ATTEMPT_RECEIPTS_FILE
+        ),
+    }
+
+
 LOCAL_STEERING_REGISTRATION = "0198a62b-41ee-7000-8000-000000000571"
 LOCAL_STEERING_ACTOR = "uid:1000"
 
@@ -664,6 +678,183 @@ class RedactionVectorTests(unittest.TestCase):
     def test_receipts_written_by_a_superseded_redactor_stay_readable(self) -> None:
         self.assertIn("conservative-v1", DRIVER.PUBLIC_REDACTIONS)
         self.assertIn(DRIVER.PUBLIC_REDACTION, DRIVER.PUBLIC_REDACTIONS)
+
+
+class AttemptReceiptLogTests(unittest.TestCase):
+    @staticmethod
+    def diagnosis(task_id: str, attempt: int, text: str) -> dict[str, object]:
+        return {
+            "kind": "diagnosis",
+            "taskId": task_id,
+            "attempt": attempt,
+            "diagnosis": text,
+            "redaction": DRIVER.PUBLIC_REDACTION,
+        }
+
+    def test_a_torn_tail_is_ignored_then_repaired_before_the_next_append(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = attempt_receipts(root)
+            DRIVER.append_attempt_receipt(
+                source,
+                "fixture",
+                "7",
+                self.diagnosis("task-1", 1, "Observed the first failure."),
+            )
+            path = Path(source["path"])
+            baseline = DRIVER.forge_campaign_state(
+                "acme/spec",
+                {"forge": "local"},
+                "fixture",
+                "7",
+                {"task-1"},
+                attempt_receipts=source,
+            )
+            with path.open("ab") as log:
+                log.write(b'{"schemaVersion":1,"sequence":2,"kind":"diagn')
+
+            # A crash between write and newline contributes no fact.
+            self.assertEqual(
+                DRIVER.forge_campaign_state(
+                    "acme/spec",
+                    {"forge": "local"},
+                    "fixture",
+                    "7",
+                    {"task-1"},
+                    attempt_receipts=source,
+                ),
+                baseline,
+            )
+            DRIVER.append_attempt_receipt(
+                source,
+                "fixture",
+                "7",
+                self.diagnosis("task-1", 2, "Observed the second failure."),
+            )
+            self.assertTrue(path.read_bytes().endswith(b"\n"))
+            records = DRIVER.read_attempt_receipts(source, "fixture", "7")
+            self.assertEqual([record["sequence"] for record in records], [1, 2])
+            self.assertEqual(
+                [record["attempt"] for record in records],
+                [1, 2],
+            )
+
+    def test_pardon_generations_fold_in_log_order_without_deleting_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = attempt_receipts(root)
+            payloads = [
+                self.diagnosis("task-1", 1, "Observed failure one."),
+                self.diagnosis("task-1", 2, "Observed failure two."),
+                {
+                    "kind": "retry",
+                    "taskId": "task-1",
+                    "attempt": 1,
+                    "reason": "Stage `merge` faulted.",
+                    "redaction": DRIVER.PUBLIC_REDACTION,
+                },
+                {
+                    "kind": "retry",
+                    "taskId": "task-1",
+                    "attempt": 2,
+                    "reason": "Stage `rebase` faulted.",
+                    "redaction": DRIVER.PUBLIC_REDACTION,
+                },
+                {"kind": "escalation", "body": "Escalated the blocked frontier."},
+                {
+                    "kind": "pardon",
+                    "tasks": None,
+                    "reason": "Corrected the external dependency.",
+                    "actor": "uid:1000",
+                    "nonce": "018f47a0-7b9d-7cc2-92d6-2f7f19f505fd",
+                },
+                self.diagnosis("task-1", 1, "Observed the first post-pardon failure."),
+            ]
+            for payload in payloads:
+                DRIVER.append_attempt_receipt(source, "fixture", "7", payload)
+
+            diagnoses, retries, escalation, warnings = DRIVER.forge_campaign_state(
+                "acme/spec",
+                {"forge": "local"},
+                "fixture",
+                "7",
+                {"task-1"},
+                attempt_receipts=source,
+            )
+            self.assertEqual(
+                [(record["attempt"], record["diagnosis"]) for record in diagnoses],
+                [(1, "Observed the first post-pardon failure.")],
+            )
+            self.assertEqual(retries, [])
+            self.assertIsNone(escalation)
+            self.assertEqual(
+                warnings,
+                [
+                    "campaign pardon local://campaign/fixture/attempt-receipts/6 "
+                    "pardoned 5 earlier machine receipt(s)"
+                ],
+            )
+            self.assertEqual(
+                len(DRIVER.read_attempt_receipts(source, "fixture", "7")),
+                7,
+                "a pardon must retain the append-only audit trail",
+            )
+
+    def test_append_holds_flock_and_fsyncs_the_new_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = attempt_receipts(root)
+            path = Path(source["path"])
+            real_fsync = os.fsync
+            with mock.patch.object(DRIVER.os, "fsync", wraps=real_fsync) as fsync:
+                DRIVER.append_attempt_receipt(
+                    source,
+                    "fixture",
+                    "7",
+                    self.diagnosis("task-1", 1, "Observed the first failure."),
+                )
+            self.assertGreaterEqual(fsync.call_count, 2, "file and directory must be synced")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+            held = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+            real_flock = fcntl.flock
+            real_flock(held, fcntl.LOCK_EX)
+            attempted = threading.Event()
+            finished = threading.Event()
+            failures: list[Exception] = []
+
+            def append_second() -> None:
+                try:
+                    DRIVER.append_attempt_receipt(
+                        source,
+                        "fixture",
+                        "7",
+                        self.diagnosis("task-1", 2, "Observed the second failure."),
+                    )
+                except Exception as error:
+                    failures.append(error)
+                finally:
+                    finished.set()
+
+            def observed_flock(lock: object, operation: int) -> None:
+                if operation == fcntl.LOCK_EX:
+                    attempted.set()
+                real_flock(lock, operation)
+
+            with mock.patch.object(DRIVER.fcntl, "flock", side_effect=observed_flock):
+                worker = threading.Thread(target=append_second)
+                worker.start()
+                try:
+                    self.assertTrue(attempted.wait(2), "append never attempted the log lock")
+                    self.assertFalse(
+                        finished.wait(0.1), "append crossed a held attempt-receipts flock"
+                    )
+                finally:
+                    real_flock(held, fcntl.LOCK_UN)
+                    os.close(held)
+                    worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(failures, [])
 
 
 class GitHubForgeTests(unittest.TestCase):
@@ -1575,6 +1766,7 @@ class GitHubForgeTests(unittest.TestCase):
                 "worklist": "specs/*/tasks.json",
                 "maxTasks": 1,
                 "maxParallel": 1,
+                "attemptReceipts": attempt_receipts(root),
             }
 
             def retry(stage: str) -> dict[str, object]:
@@ -1587,6 +1779,7 @@ class GitHubForgeTests(unittest.TestCase):
                         "taskId": "task-1",
                         "stage": stage,
                         "detail": "the integration checkout could not be staged",
+                        "attemptReceipts": attempt_receipts(root),
                     }
                 )
 
@@ -2744,6 +2937,7 @@ class NativeSubIssueTests(unittest.TestCase):
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             state, brief = self.fixture(checkout, "local")
+            brief["attemptReceipts"] = attempt_receipts(root)
             digest = brief["campaignGraph"]["executableDigest"]
             base_revision = git(checkout, "rev-parse", "origin/main")
             graph = brief["campaignGraph"]
@@ -5200,6 +5394,7 @@ class SteeringGrammarTests(unittest.TestCase):
             "taskId": "task-1",
             "attempt": 1,
             "diagnosis": "Investigated the failure.",
+            "attemptReceipts": attempt_receipts(root),
         }
         base.update(overrides)
         return base
@@ -5207,8 +5402,10 @@ class SteeringGrammarTests(unittest.TestCase):
     def posted_blob(
         self, config: dict[str, object], steered: dict[str, object]
     ) -> dict[str, object]:
-        ref = steered["comment"].split("acme/spec/", 1)[1]
-        return DRIVER.read_local_blob(config, ref)
+        sequence = int(str(steered["comment"]).rsplit("/", 1)[1])
+        source = attempt_receipts(Path(config["checkout"]).parent)
+        records = DRIVER.read_attempt_receipts(source, "fixture", "7")
+        return records[sequence - 1]
 
     def posted_body(self, config: dict[str, object], steered: dict[str, object]) -> str:
         blob = self.posted_blob(config, steered)
@@ -5239,7 +5436,12 @@ class SteeringGrammarTests(unittest.TestCase):
             published_reason, _, _ = DRIVER.diagnosis_rejection_reason(body, None)
             self.assertIsNone(published_reason)
             diagnoses, retries, _, _ = DRIVER.forge_campaign_state(
-                "acme/spec", DRIVER.repo_config(config), "fixture", "7", {"task-1"}
+                "acme/spec",
+                DRIVER.repo_config(config),
+                "fixture",
+                "7",
+                {"task-1"},
+                attempt_receipts=attempt_receipts(root),
             )
             self.assertEqual(len(diagnoses), 1)
             self.assertEqual(retries, [])
@@ -5329,13 +5531,22 @@ class BreachSteeringTests(unittest.TestCase):
             "diagnosis": "Investigated the out-of-allowlist writes.",
             "breach": True,
             "breachDetail": self.DETAIL,
+            "attemptReceipts": attempt_receipts(checkout.parent),
         }
         base.update(overrides)
         return base
 
     def blob(self, config: dict[str, object], attempt: int) -> dict[str, object]:
-        prefix = DRIVER.local_state_prefix("fixture", "7")
-        return DRIVER.read_local_blob(config, f"{prefix}/diagnosis/task-1/{attempt}")
+        records = DRIVER.read_attempt_receipts(
+            attempt_receipts(Path(config["checkout"]).parent), "fixture", "7"
+        )
+        return next(
+            record
+            for record in records
+            if record["kind"] == "diagnosis"
+            and record["taskId"] == "task-1"
+            and record["attempt"] == attempt
+        )
 
     def test_a_breach_posts_both_receipts_in_one_call_and_blocks(self) -> None:
         """Kills MUT-4: a breach handled as an ordinary one-attempt gate-fail.
@@ -5355,7 +5566,7 @@ class BreachSteeringTests(unittest.TestCase):
             self.assertTrue(steered["posted"])
             self.assertTrue(steered["blocked"])
             self.assertEqual(steered["attempt"], 2)
-            # Both receipts, from this one call. `contiguous_receipts` would
+            # Both receipts, from this one call. The ordered fold would
             # drop a lone attempt 2, so attempt 1 has to be there too.
             for attempt in (1, 2):
                 blob = self.blob(config, attempt)
@@ -5363,7 +5574,12 @@ class BreachSteeringTests(unittest.TestCase):
                 self.assertEqual(blob["attempt"], attempt)
             # And the reconciler reads them back as a blocking pair.
             diagnoses, _, _, _ = DRIVER.forge_campaign_state(
-                "acme/spec", config, "fixture", "7", {"task-1"}
+                "acme/spec",
+                config,
+                "fixture",
+                "7",
+                {"task-1"},
+                attempt_receipts=attempt_receipts(root),
             )
             self.assertEqual(
                 [(item["taskId"], item["attempt"]) for item in diagnoses],

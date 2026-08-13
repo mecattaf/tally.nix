@@ -1469,6 +1469,7 @@ function driverNode(
 
 let effective = null;
 let campaignTaskIdentity = null;
+let attemptReceipts = null;
 
 // The campaign's three repository coordinates, resolved once. `code` is where
 // lanes, publish branches, pull requests and merges live; `spec` is where the
@@ -1650,7 +1651,7 @@ function machineDiagnoses(reconciliation, taskId) {
 // and a red checkpoint command are all evidence that the task's work is wrong,
 // and each one spends one of the task's two steering attempts. Preparing a
 // worktree, rebasing, publishing and merging are campaign machinery: when they
-// fault they say nothing about the work, so they buy a bounded forge-counted
+// fault they say nothing about the work, so they buy a bounded receipt-counted
 // retry instead. A checkpoint that runs while unrelated implementation work is
 // still outstanding is neither - its verdict is not yet meaningful.
 function failureClass(reconciliation, failure) {
@@ -2102,6 +2103,17 @@ function sweepDeferral(sweepNode) {
         steward: args.steward || null,
         gates: args.gates
       };
+  const campaignName = args.campaign || args.campaignGraph.manifest.name;
+  const captureRootSuffix = "/capture/archive";
+  const tallyStateRoot = args.captureRoot.slice(0, -captureRootSuffix.length);
+  // Attempt counters are local canonical state, not repository objects. Every
+  // driver node receives the same closed coordinate derived from the daemon
+  // state root already carried for checkpoint captures.
+  attemptReceipts = {
+    schemaVersion: 1,
+    kind: "local-jsonl",
+    path: `${tallyStateRoot}/campaigns/attempt-receipts/${campaignName}/attempt-receipts-v1.jsonl`
+  };
   let sweepNode = null;
   if (!forgeNative) {
     if (!effective.repositoryConfig) {
@@ -2121,6 +2133,7 @@ function sweepDeferral(sweepNode) {
         repository: codeRepository,
         issue: args.issue,
         worklist: args.worklist,
+        attemptReceipts,
         // Forward the already-normalized executable contract unchanged.
         campaignGraph: args.campaignGraph,
         // Preserve the additive receipt evidence when the producer carried
@@ -2136,7 +2149,8 @@ function sweepDeferral(sweepNode) {
         issue: args.issue,
         worklist: args.worklist,
         maxTasks: args.maxTasks,
-        maxParallel: args.maxParallel
+        maxParallel: args.maxParallel,
+        attemptReceipts
       });
   const reconciliationNode = await driverNode(
     "reconcile",
@@ -3035,7 +3049,7 @@ function sweepDeferral(sweepNode) {
     }
   }
 
-  // A machinery fault buys a retry only while the task's forge-counted retry
+  // A machinery fault buys a retry only while the task's receipt-counted retry
   // budget lasts. Once it is spent the fault is steered like any other failure,
   // so a permanently broken lane still reaches escalation instead of looping.
   const retryOutcomes = await parallel(
@@ -3048,6 +3062,7 @@ function sweepDeferral(sweepNode) {
         issue: args.issue,
         taskId: task.id,
         stage: failure.stage,
+        attemptReceipts,
         detail: bounded(
           failure.node && failure.node.error ? failure.node.error : failure.node,
           1500
@@ -3223,6 +3238,7 @@ function sweepDeferral(sweepNode) {
         taskId: task.id,
         attempt,
         diagnosis: diagnosed.result,
+        attemptReceipts,
         ...(gateEvidence ? { gateEvidence } : {}),
         ...(failure.breach
           ? {

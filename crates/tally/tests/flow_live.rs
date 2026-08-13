@@ -2826,6 +2826,9 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             // fixture hermetic: nothing drains it, so the file itself is the
             // observation.
             let continuation_events = temp.path().join("continuation-events");
+            let attempt_receipts_path = daemon_paths
+                .state_dir
+                .join("campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl");
             let arguments = |run_id: &str, priority: &str| {
                 json!({
                     "campaign": "fixture",
@@ -4152,23 +4155,18 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 .iter()
                 .all(|event| event.get("taskRef").is_none()));
 
-            let escalation_ref = fixture_git(
-                &checkout,
-                &[
-                    "ls-remote",
-                    "origin",
-                    "refs/tally/spec-build/v1/*/escalation",
-                ],
-            );
-            let escalation_oid = escalation_ref
-                .split_whitespace()
-                .next()
-                .expect("local forge omitted the escalation ref");
-            let escalation: Value = serde_json::from_str(&fixture_git(
-                &checkout,
-                &["cat-file", "blob", escalation_oid],
-            ))
-            .unwrap();
+            let attempt_receipts = fs::read_to_string(&attempt_receipts_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(attempt_receipts.len(), 5);
+            assert!(attempt_receipts.iter().enumerate().all(|(index, receipt)| {
+                receipt["schemaVersion"].as_u64() == Some(1)
+                    && receipt["sequence"].as_u64() == Some(index as u64 + 1)
+            }));
+            let escalation = &attempt_receipts[4];
+            assert_eq!(escalation["kind"], "escalation");
             let escalation_body = escalation["body"].as_str().unwrap();
             assert!(escalation_body.contains("Accumulated machine diagnoses"));
             assert!(escalation_body.contains("`task-1` attempt 1"));
@@ -4225,23 +4223,14 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "closing summary is missing {fragment}: {quiescent_body}"
                 );
             }
-            let task_1_diagnosis_ref = fixture_git(
-                &checkout,
-                &[
-                    "ls-remote",
-                    "origin",
-                    "refs/tally/spec-build/v1/*/diagnosis/task-1/1",
-                ],
-            );
-            let task_1_diagnosis_oid = task_1_diagnosis_ref
-                .split_whitespace()
-                .next()
-                .expect("local forge omitted task 1 diagnosis");
-            let task_1_diagnosis: Value = serde_json::from_str(&fixture_git(
-                &checkout,
-                &["cat-file", "blob", task_1_diagnosis_oid],
-            ))
-            .unwrap();
+            let task_1_diagnosis = attempt_receipts
+                .iter()
+                .find(|receipt| {
+                    receipt["kind"] == "diagnosis"
+                        && receipt["taskId"] == "task-1"
+                        && receipt["attempt"] == 1
+                })
+                .expect("attempt log omitted task 1 diagnosis");
             assert!(task_1_diagnosis["diagnosis"]
                 .as_str()
                 .unwrap()
@@ -4250,6 +4239,17 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 .as_str()
                 .unwrap()
                 .contains("ghp_"));
+            for pattern in [
+                "refs/tally/spec-build/v1/*/diagnosis/*",
+                "refs/tally/spec-build/v1/*/retry/*",
+                "refs/tally/spec-build/v1/*/escalation",
+            ] {
+                assert_eq!(
+                    fixture_git(&checkout, &["ls-remote", "origin", pattern]),
+                    "",
+                    "attempt counter leaked into the ref namespace: {pattern}"
+                );
+            }
 
             let ninth = runner(
                 &config_path,
@@ -4273,7 +4273,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert!(ninth_value["reconciled"]["escalation"]
                 .as_str()
                 .unwrap()
-                .ends_with("/escalation"));
+                .ends_with("/attempt-receipts/5"));
             assert_eq!(ninth_value["escalation"], Value::Null);
             let ninth_submitted = runner_events(&ninth, "node-submitted");
             assert_eq!(
@@ -4516,7 +4516,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert!(renamed_value["reconciled"]["escalation"]
                 .as_str()
                 .unwrap()
-                .ends_with("/escalation"));
+                .ends_with("/attempt-receipts/5"));
 
             // Campaign machinery, not the task's work: an unwritable workspace
             // root denies the merge node the integration checkout it stages
@@ -4568,19 +4568,20 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 true,
                 "the pass must write the event that resumes the retry"
             );
-            let retry_ref = fixture_git(
-                &checkout,
-                &["ls-remote", "origin", "refs/tally/spec-build/v1/*/retry/task-2b/1"],
-            );
-            let retry_oid = retry_ref
-                .split_whitespace()
-                .next()
-                .expect("local forge omitted the machinery retry receipt");
-            let retry: Value = serde_json::from_str(&fixture_git(
-                &checkout,
-                &["cat-file", "blob", retry_oid],
-            ))
-            .unwrap();
+            let attempt_receipts = fs::read_to_string(&attempt_receipts_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let retry = attempt_receipts
+                .iter()
+                .find(|receipt| {
+                    receipt["kind"] == "retry"
+                        && receipt["taskId"] == "task-2b"
+                        && receipt["attempt"] == 1
+                })
+                .expect("attempt log omitted the machinery retry receipt");
+            assert_eq!(retry["sequence"], 6);
             assert_eq!(retry["kind"], "retry");
             assert_eq!(retry["taskId"], "task-2b");
             assert!(retry["reason"].as_str().unwrap().contains("`merge`"));
