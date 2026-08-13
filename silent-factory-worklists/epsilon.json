@@ -613,6 +613,48 @@
       ]
     },
     {
+      "id": "producers-config-variant-box",
+      "kind": "implementation",
+      "title": "Box the Calendar producer variant for the post-deletion enum shape",
+      "goal": "The gh deletion left crates/tally-core/src/producers/config.rs with a 744-byte Calendar variant beside a 32-byte EventsDir variant, tripping clippy::large_enum_variant under -D warnings at the chapter gate (in-lane gates run cargo test, not clippy \u2014 this lint class only surfaces at the gate). Change the variant to Calendar(Box<CalendarProducer>), wrap its two direct test constructors with Box::new, and verify with clippy exactly as the gate runs it. Formatting and workspace tests already passed at the gate; touch nothing else.",
+      "deliveredBehaviors": [
+        "cargo clippy --workspace --all-targets --all-features -D warnings passes",
+        "No behavior change: the producers suites pass untouched"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "boxed",
+          "description": "The Calendar variant is boxed.",
+          "argv": [
+            "bash",
+            "-lc",
+            "grep -q 'Calendar(Box<' crates/tally-core/src/producers/config.rs"
+          ]
+        },
+        {
+          "id": "clippy-green",
+          "description": "Clippy passes exactly as the gate runs it.",
+          "argv": [
+            "bash",
+            "-lc",
+            "nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -5"
+          ]
+        }
+      ],
+      "dependencies": [
+        "delete-gh-inbound-core"
+      ],
+      "conflictDomains": [
+        "crates/tally-core/src/producers"
+      ]
+    },
+    {
       "id": "chapter-gate",
       "kind": "checkpoint",
       "title": "Epsilon stage 1 gate: full gate ladder plus the final conformance bar",
@@ -634,7 +676,8 @@
         "brief-carries-conflict-domains",
         "ownership-preflight-warn",
         "poll-liveness-arm",
-        "status-renders-reconciled-truth"
+        "status-renders-reconciled-truth",
+        "producers-config-variant-box"
       ]
     }
   ]
