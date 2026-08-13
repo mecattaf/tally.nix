@@ -48,7 +48,6 @@ fn campaign_arm_takes_repository_and_committed_worklist_identity() {
         "arm",
         "acme/widgets",
         "specs/night/tasks.json",
-        "--allow-test-local-forge",
         "--no-enqueue",
     ])
     .unwrap();
@@ -58,7 +57,6 @@ fn campaign_arm_takes_repository_and_committed_worklist_identity() {
             command: CampaignCommand::Arm(CampaignArmArgs {
                 code_repository,
                 worklist_pattern,
-                allow_test_local_forge: true,
                 no_enqueue: true,
                 ..
             })

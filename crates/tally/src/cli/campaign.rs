@@ -2525,7 +2525,6 @@ fn validate_host(
     config_path: Option<&Path>,
     flow: &Path,
     driver: &Path,
-    allow_test_local_forge: bool,
 ) -> Result<Vec<String>> {
     let manifest = &graph.canonical.manifest;
     let config = load_client_config(config_path)?;
@@ -2592,11 +2591,6 @@ fn validate_host(
     }
     if manifest.repository.forge != "local" {
         return Err(invalid("campaign repository.forge must equal local"));
-    }
-    if !allow_test_local_forge {
-        return Err(invalid(
-            "forge=local is test-only for issue campaigns; pass --allow-test-local-forge only in an isolated mechanism test",
-        ));
     }
     // Checkpoint and command-gate argvs run through the flow `sh` native, so
     // their hazards depend on the resolved shell adapter rather than the agent.
@@ -2789,13 +2783,7 @@ async fn dispatch_campaign(
             registration.worklist_pattern,
         );
     }
-    let _ = validate_host(
-        graph,
-        config_path,
-        &registration.flow,
-        &registration.driver,
-        true,
-    )?;
+    let _ = validate_host(graph, config_path, &registration.flow, &registration.driver)?;
     // A steer racing this boundary has exactly two outcomes. If its append
     // wins the lock, its embargo must expire and this dispatch includes it. If
     // enqueue wins, the append follows the committed cursor and necessarily
@@ -3113,7 +3101,6 @@ async fn run_campaign_arm(
         config_path,
         &registration.flow,
         &registration.driver,
-        args.allow_test_local_forge,
     )?);
     let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
     for pardon in &pardon_plan {
@@ -3232,17 +3219,11 @@ async fn run_campaign_resume(
             ))
         })?;
     let graph = local_campaign_graph_from_worklist(declaration, &worklist_pattern)?;
-    if graph.canonical.manifest.repository.forge != "github" {
-        return Err(invalid(
-            "campaign resume requires repository.forge=github; the local forge is test-only and has no GitHub comment boundary",
-        ));
-    }
     let _ = validate_host(
         &graph,
         config_path,
         &registration.flow,
         &registration.driver,
-        true,
     )?;
 
     let next_arm_serial = registration
