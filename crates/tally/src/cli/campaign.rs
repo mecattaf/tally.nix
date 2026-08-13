@@ -2,9 +2,10 @@ use super::text::compact_text;
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::process::{Command as ProcessCommand, Stdio};
 
 use chrono::{DateTime, SecondsFormat};
@@ -14,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tally_core::adapters::{AdapterConfig, AdapterHardening};
 use tally_core::campaign_contract::{
     admit_manifest_value, task_completion_revision, validate_argv, validate_manifest,
-    CampaignAgent, CampaignGate, CampaignManifest, CanonicalCampaignGraphV1,
+    CampaignAgent, CampaignGate, CampaignManifest, CampaignRepository, CanonicalCampaignGraphV1,
     CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
 };
 use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
@@ -40,6 +41,13 @@ const CAMPAIGN_STEERING_EMBARGO_MILLISECONDS: i64 = 1_000;
 const MAX_CAMPAIGN_STEERING_LOG_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CAMPAIGN_STEERING_BODY_CHARS: usize = 64_000;
 const MAX_CAMPAIGN_STEERING_PER_TARGET: usize = 1_000;
+const ATTEMPT_RECEIPTS_SCHEMA_VERSION: u64 = 1;
+const ATTEMPT_RECEIPTS_FILE: &str = "attempt-receipts-v1.jsonl";
+const MAX_ATTEMPT_RECEIPTS_LOG_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DIAGNOSIS_CHARS: usize = 12_000;
+const MAX_RETRY_CHARS: usize = 2_000;
+const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
+const LOCAL_ALLOWED_ACTOR: &str = "local";
 
 #[derive(Debug, Clone)]
 struct ProjectTask {
@@ -52,6 +60,28 @@ struct ProjectTask {
     conflict_domains: Option<Vec<String>>,
     argv: Option<Vec<String>>,
     runtime_max_sec: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedWorklist {
+    manifest: CampaignManifest,
+    tasks: Vec<ProjectTask>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalCampaignDeclaration {
+    manifest_config: Value,
+    worklist_repository: CampaignRepository,
+    flow: PathBuf,
+    driver: PathBuf,
+    workspace_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct CommittedLocalWorklist {
+    document: Value,
+    source_revision: String,
+    sha256: String,
 }
 
 struct ProjectCheckpointBrief<'a> {
@@ -258,6 +288,14 @@ enum PardonScope {
 struct PardonBoundary {
     id: u64,
     scope: PardonScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalAttemptReceiptV1 {
+    Diagnosis { task_id: String, attempt: u8 },
+    Retry,
+    Escalation,
+    Pardon { tasks: Option<BTreeSet<String>> },
 }
 
 impl PardonBoundary {
@@ -1486,6 +1524,545 @@ impl LocalSteeringDispatch {
     }
 }
 
+fn local_attempt_receipts_path(state_dir: &Path, campaign: &str) -> Result<PathBuf> {
+    if !safe_component(campaign) {
+        return Err(invalid(
+            "campaign name cannot identify a local attempt-receipts log",
+        ));
+    }
+    Ok(state_dir
+        .join("campaigns/attempt-receipts")
+        .join(campaign)
+        .join(ATTEMPT_RECEIPTS_FILE))
+}
+
+fn local_attempt_receipt_url(campaign: &str, sequence: u64) -> String {
+    format!("local://campaign/{campaign}/attempt-receipts/{sequence}")
+}
+
+fn validate_attempt_receipt_text(value: &Value, context: &str, maximum: usize) -> Result<()> {
+    let text = value
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| invalid(format!("{context} must be non-empty text")))?;
+    if text.chars().count() > maximum {
+        return Err(invalid(format!("{context} exceeds {maximum} characters")));
+    }
+    if text
+        .chars()
+        .any(|character| character < '\u{20}' && !matches!(character, '\n' | '\t' | '\r'))
+    {
+        return Err(invalid(format!(
+            "{context} contains unsupported control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_attempt_receipt_string(value: &Value, context: &str, maximum: usize) -> Result<()> {
+    value
+        .as_str()
+        .filter(|text| {
+            !text.is_empty()
+                && !text.chars().any(|character| character < '\u{20}')
+                && text.chars().count() <= maximum
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "{context} must be a non-empty bounded string without control characters"
+            ))
+        })?;
+    Ok(())
+}
+
+fn validate_local_attempt_receipt(
+    candidate: Value,
+    path: &Path,
+    expected_sequence: u64,
+    campaign: &str,
+    issue_number: u64,
+) -> Result<LocalAttemptReceiptV1> {
+    let context = format!("attempt receipt {expected_sequence} in {}", path.display());
+    let object = candidate
+        .as_object()
+        .ok_or_else(|| invalid(format!("{context} must be an object")))?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid(format!("{context}.kind must be a string")))?;
+    let common = [
+        "schemaVersion",
+        "sequence",
+        "kind",
+        "campaign",
+        "issueNumber",
+    ];
+    let (required, allowed): (Vec<&str>, BTreeSet<&str>) = match kind {
+        "diagnosis" => {
+            let specific = ["taskId", "attempt", "diagnosis", "redaction"];
+            (
+                common.into_iter().chain(specific).collect(),
+                common.into_iter().chain(specific).collect(),
+            )
+        }
+        "retry" => {
+            let specific = ["taskId", "attempt", "reason", "redaction"];
+            (
+                common.into_iter().chain(specific).collect(),
+                common.into_iter().chain(specific).collect(),
+            )
+        }
+        "escalation" => {
+            let specific = ["body"];
+            (
+                common.into_iter().chain(specific).collect(),
+                common.into_iter().chain(specific).collect(),
+            )
+        }
+        "pardon" => (
+            common.into_iter().chain(["tasks"]).collect(),
+            common
+                .into_iter()
+                .chain(["tasks", "reason", "actor", "nonce"])
+                .collect(),
+        ),
+        _ => return Err(invalid(format!("{context} has unknown kind {kind:?}"))),
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(field.as_str()))
+    {
+        return Err(invalid(format!(
+            "{context} has unsupported field {field:?}"
+        )));
+    }
+    if let Some(field) = required
+        .into_iter()
+        .find(|field| !object.contains_key(*field))
+    {
+        return Err(invalid(format!("{context} is missing field {field:?}")));
+    }
+    let expected_issue_number = issue_number.to_string();
+    if object.get("schemaVersion").and_then(Value::as_u64) != Some(ATTEMPT_RECEIPTS_SCHEMA_VERSION)
+        || object.get("sequence").and_then(Value::as_u64) != Some(expected_sequence)
+        || object.get("campaign").and_then(Value::as_str) != Some(campaign)
+        || object.get("issueNumber").and_then(Value::as_str) != Some(expected_issue_number.as_str())
+    {
+        return Err(invalid(format!(
+            "{context} has invalid identity or sequence"
+        )));
+    }
+
+    let task_attempt = |payload: &str, maximum: usize| -> Result<(String, u8)> {
+        let task_id = object
+            .get("taskId")
+            .and_then(Value::as_str)
+            .filter(|task_id| safe_task_id(task_id))
+            .ok_or_else(|| invalid(format!("{context}.taskId is unsafe")))?;
+        let attempt = object
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .and_then(|attempt| u8::try_from(attempt).ok())
+            .filter(|attempt| matches!(attempt, 1 | 2))
+            .ok_or_else(|| invalid(format!("{context}.attempt must equal 1 or 2")))?;
+        if !matches!(
+            object.get("redaction").and_then(Value::as_str),
+            Some("conservative-v1" | "conservative-v2")
+        ) {
+            return Err(invalid(format!("{context}.redaction is unsupported")));
+        }
+        validate_attempt_receipt_text(
+            object
+                .get(payload)
+                .expect("receipt payload is required above"),
+            &format!("{context}.{payload}"),
+            maximum,
+        )?;
+        Ok((task_id.to_owned(), attempt))
+    };
+
+    match kind {
+        "diagnosis" => {
+            let (task_id, attempt) = task_attempt("diagnosis", MAX_DIAGNOSIS_CHARS)?;
+            Ok(LocalAttemptReceiptV1::Diagnosis { task_id, attempt })
+        }
+        "retry" => {
+            task_attempt("reason", MAX_RETRY_CHARS)?;
+            Ok(LocalAttemptReceiptV1::Retry)
+        }
+        "escalation" => {
+            validate_attempt_receipt_text(
+                object
+                    .get("body")
+                    .expect("escalation body is required above"),
+                &format!("{context}.body"),
+                60_000,
+            )?;
+            Ok(LocalAttemptReceiptV1::Escalation)
+        }
+        "pardon" => {
+            let tasks = match object.get("tasks") {
+                Some(Value::Null) => None,
+                Some(Value::Array(values)) if !values.is_empty() => {
+                    let mut tasks = BTreeSet::new();
+                    for (index, value) in values.iter().enumerate() {
+                        validate_attempt_receipt_string(
+                            value,
+                            &format!("{context}.tasks[{index}]"),
+                            80,
+                        )?;
+                        let task_id = value.as_str().expect("validated task id is a string");
+                        if !safe_task_id(task_id) || !tasks.insert(task_id.to_owned()) {
+                            return Err(invalid(format!(
+                                "{context}.tasks must contain unique safe task IDs"
+                            )));
+                        }
+                    }
+                    Some(tasks)
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "{context}.tasks must be null or a non-empty array"
+                    )))
+                }
+            };
+            if let Some(reason) = object.get("reason") {
+                validate_attempt_receipt_text(reason, &format!("{context}.reason"), 4_000)?;
+            }
+            if let Some(actor) = object.get("actor") {
+                validate_attempt_receipt_string(actor, &format!("{context}.actor"), 128)?;
+            }
+            if let Some(value) = object.get("nonce") {
+                validate_attempt_receipt_string(value, &format!("{context}.nonce"), 36)?;
+                let nonce = value.as_str().expect("validated pardon nonce is a string");
+                uuid::Uuid::parse_str(nonce)
+                    .map_err(|_| invalid(format!("{context}.nonce must be a UUID")))?;
+            }
+            Ok(LocalAttemptReceiptV1::Pardon { tasks })
+        }
+        _ => unreachable!("receipt kind was checked above"),
+    }
+}
+
+fn read_local_attempt_receipts_locked(
+    file: &mut fs::File,
+    path: &Path,
+    campaign: &str,
+    issue_number: u64,
+    repair_tail: bool,
+) -> Result<Vec<LocalAttemptReceiptV1>> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_ATTEMPT_RECEIPTS_LOG_BYTES
+    {
+        bail!(
+            "attempt-receipts log is not a bounded private regular file: {}",
+            path.display()
+        );
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let complete = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if repair_tail && complete != bytes.len() {
+        file.set_len(u64::try_from(complete)?)?;
+        file.sync_all()?;
+    }
+    let mut records = Vec::new();
+    if complete == 0 {
+        return Ok(records);
+    }
+    for (index, line) in bytes[..complete - 1]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        if line.is_empty() {
+            bail!(
+                "attempt-receipts log {} contains a blank record at line {}",
+                path.display(),
+                index + 1
+            );
+        }
+        let candidate: Value = serde_json::from_slice(line).with_context(|| {
+            format!(
+                "attempt receipt {} in {} is invalid JSON",
+                index + 1,
+                path.display()
+            )
+        })?;
+        let sequence = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| invalid("attempt-receipts sequence is exhausted"))?;
+        records.push(validate_local_attempt_receipt(
+            candidate,
+            path,
+            sequence,
+            campaign,
+            issue_number,
+        )?);
+    }
+    Ok(records)
+}
+
+fn read_local_attempt_receipts(
+    state_dir: &Path,
+    campaign: &str,
+    issue_number: u64,
+) -> Result<Vec<LocalAttemptReceiptV1>> {
+    let path = local_attempt_receipts_path(state_dir, campaign)?;
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open attempt-receipts log {}", path.display()))
+        }
+    };
+    FileExt::lock_shared(&file)
+        .with_context(|| format!("cannot lock attempt-receipts log {}", path.display()))?;
+    let read = read_local_attempt_receipts_locked(&mut file, &path, campaign, issue_number, false);
+    let unlock = FileExt::unlock(&file)
+        .with_context(|| format!("cannot unlock attempt-receipts log {}", path.display()));
+    match (read, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(records), Ok(())) => Ok(records),
+    }
+}
+
+fn active_escalated_tasks_from_receipts(
+    records: &[LocalAttemptReceiptV1],
+    current_tasks: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    #[derive(Default)]
+    struct Escalation {
+        contributors: BTreeSet<String>,
+        covered: BTreeSet<String>,
+    }
+
+    let mut diagnoses = BTreeMap::<String, Vec<u8>>::new();
+    let mut escalations = Vec::<Escalation>::new();
+    for record in records {
+        match record {
+            LocalAttemptReceiptV1::Diagnosis {
+                task_id, attempt, ..
+            } if current_tasks.contains(task_id) => {
+                diagnoses.entry(task_id.clone()).or_default().push(*attempt);
+            }
+            LocalAttemptReceiptV1::Diagnosis { .. } => {}
+            LocalAttemptReceiptV1::Retry => {}
+            LocalAttemptReceiptV1::Escalation => {
+                let contributors = diagnoses
+                    .iter()
+                    .filter(|(_, attempts)| {
+                        attempts.iter().copied().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2])
+                    })
+                    .map(|(task_id, _)| task_id.clone())
+                    .collect();
+                escalations.push(Escalation {
+                    contributors,
+                    covered: BTreeSet::new(),
+                });
+            }
+            LocalAttemptReceiptV1::Pardon { tasks: None, .. } => {
+                diagnoses.clear();
+                escalations.clear();
+            }
+            LocalAttemptReceiptV1::Pardon {
+                tasks: Some(scope), ..
+            } => {
+                for task_id in scope {
+                    diagnoses.remove(task_id);
+                }
+                for escalation in &mut escalations {
+                    escalation
+                        .covered
+                        .extend(scope.intersection(&escalation.contributors).cloned());
+                }
+                escalations.retain(|escalation| {
+                    escalation.contributors.is_empty()
+                        || escalation.contributors != escalation.covered
+                });
+            }
+        }
+    }
+    if escalations.len() > 1 {
+        return Err(invalid("multiple machine escalations claim this campaign"));
+    }
+    Ok(escalations
+        .into_iter()
+        .flat_map(|escalation| {
+            escalation
+                .contributors
+                .difference(&escalation.covered)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|task_id| current_tasks.contains(task_id))
+        .collect())
+}
+
+fn active_local_escalated_tasks(
+    state_dir: &Path,
+    graph: &CampaignGraph,
+) -> Result<BTreeSet<String>> {
+    let current_tasks = graph
+        .canonical
+        .manifest
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    let records = read_local_attempt_receipts(
+        state_dir,
+        &graph.canonical.manifest.name,
+        graph.locator.number,
+    )?;
+    active_escalated_tasks_from_receipts(&records, &current_tasks)
+}
+
+fn append_local_campaign_pardon(
+    state_dir: &Path,
+    graph: &CampaignGraph,
+    actor: &str,
+    reason: &str,
+    scope: &PardonScope,
+) -> Result<String> {
+    let campaign = &graph.canonical.manifest.name;
+    let issue_number = graph.locator.number;
+    let path = local_attempt_receipts_path(state_dir, campaign)?;
+    let directory = path
+        .parent()
+        .expect("attempt-receipts path always has a parent");
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "cannot create attempt-receipts directory {}",
+            directory.display()
+        )
+    })?;
+    let directory_metadata = fs::symlink_metadata(directory)?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        bail!(
+            "attempt-receipts parent must be a real directory: {}",
+            directory.display()
+        );
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+
+    let normalized_reason = reason
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_owned();
+    validate_attempt_receipt_text(
+        &Value::String(normalized_reason.clone()),
+        "campaign pardon reason",
+        4_000,
+    )?;
+    validate_attempt_receipt_string(
+        &Value::String(actor.to_owned()),
+        "campaign pardon actor",
+        128,
+    )?;
+    let nonce = uuid::Uuid::now_v7().to_string();
+    let tasks = match scope {
+        PardonScope::All => Value::Null,
+        PardonScope::Tasks(tasks) => {
+            if tasks.is_empty() || tasks.iter().any(|task_id| !safe_task_id(task_id)) {
+                return Err(invalid("campaign pardon scope must name safe task ids"));
+            }
+            json!(tasks)
+        }
+    };
+
+    let create = fs::OpenOptions::new()
+        .create(true)
+        .create_new(true)
+        .read(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path);
+    let (mut file, created) = match create {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .with_context(|| format!("cannot open attempt-receipts log {}", path.display()))?;
+            (file, false)
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot create attempt-receipts log {}", path.display()))
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        bail!(
+            "attempt-receipts log is not a private regular file: {}",
+            path.display()
+        );
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    FileExt::lock_exclusive(&file)
+        .with_context(|| format!("cannot lock attempt-receipts log {}", path.display()))?;
+    if created {
+        file.sync_all()?;
+        fs::File::open(directory)?.sync_all()?;
+    }
+    let append = (|| -> Result<String> {
+        let records =
+            read_local_attempt_receipts_locked(&mut file, &path, campaign, issue_number, true)?;
+        let sequence = u64::try_from(records.len())?
+            .checked_add(1)
+            .ok_or_else(|| invalid("attempt-receipts sequence is exhausted"))?;
+        let candidate = json!({
+            "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+            "sequence": sequence,
+            "kind": "pardon",
+            "campaign": campaign,
+            "issueNumber": issue_number.to_string(),
+            "tasks": tasks,
+            "reason": normalized_reason,
+            "actor": actor,
+            "nonce": nonce,
+        });
+        validate_local_attempt_receipt(candidate.clone(), &path, sequence, campaign, issue_number)?;
+        let mut encoded = serde_json::to_vec(&candidate)?;
+        encoded.push(b'\n');
+        let final_size = file
+            .metadata()?
+            .len()
+            .checked_add(u64::try_from(encoded.len())?)
+            .ok_or_else(|| invalid("attempt-receipts log size is exhausted"))?;
+        if final_size > MAX_ATTEMPT_RECEIPTS_LOG_BYTES {
+            bail!("attempt-receipts log exceeds 128 MiB");
+        }
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        Ok(local_attempt_receipt_url(campaign, sequence))
+    })();
+    let unlock = FileExt::unlock(&file)
+        .with_context(|| format!("cannot unlock attempt-receipts log {}", path.display()));
+    match (append, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(receipt), Ok(())) => Ok(receipt),
+    }
+}
+
 fn machine_marker_fields<'a>(body: &'a str, kind: &str) -> Option<BTreeMap<&'a str, &'a str>> {
     let prefix = format!("<!-- tally:spec-build:{kind}:v1 ");
     let content = body
@@ -2176,7 +2753,7 @@ fn committed_worklist_coordinate(
 ) -> Result<(String, String, String)> {
     if worklist == Path::new("-") {
         return Err(invalid(
-            "campaign project requires a committed worklist file; stdin has no repository identity",
+            "a committed campaign worklist cannot be read from stdin",
         ));
     }
     let checkout = fs::canonicalize(&manifest.repository.checkout).with_context(|| {
@@ -2254,6 +2831,397 @@ fn committed_worklist_coordinate(
     }
     let digest = format!("sha256:{:x}", Sha256::digest(&committed.stdout));
     Ok((pattern, revision, digest))
+}
+
+fn local_campaign_declaration(
+    config_path: Option<&Path>,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> Result<Option<LocalCampaignDeclaration>> {
+    let path = config_path.map_or_else(default_config_path, |path| Ok(path.to_owned()))?;
+    let document = read_json_document(&path, "tally configuration")?;
+    local_campaign_declaration_from_document(&document, code_repository, worklist_pattern)
+}
+
+fn local_campaign_declaration_from_document(
+    config: &Value,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> Result<Option<LocalCampaignDeclaration>> {
+    let mut candidates = Vec::new();
+    let Some(producers) = config.get("producers").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    for (producer_name, producer) in producers {
+        let Some(producer) = producer.as_object() else {
+            continue;
+        };
+        if producer.get("kind").and_then(Value::as_str) != Some("gh")
+            || producer.get("enable").and_then(Value::as_bool) != Some(true)
+        {
+            continue;
+        }
+        let Some(brief) = producer
+            .get("enqueue")
+            .and_then(Value::as_object)
+            .and_then(|enqueue| enqueue.get("brief"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        if brief.get("worklist").and_then(Value::as_str) != Some(worklist_pattern) {
+            continue;
+        }
+        let Some(campaign) = brief
+            .get("campaign")
+            .and_then(Value::as_str)
+            .filter(|campaign| safe_component(campaign))
+        else {
+            continue;
+        };
+        if producer_name != &format!("campaign-{campaign}") {
+            continue;
+        }
+        if let Some(declared) = brief.get("codeRepository") {
+            if declared.as_str() != Some(code_repository) {
+                continue;
+            }
+        }
+        let Some(repositories) = brief.get("repositories").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(code_repository_config) = repositories.get(code_repository) else {
+            continue;
+        };
+        if code_repository_config.get("forge").and_then(Value::as_str) != Some("local") {
+            continue;
+        }
+        let spec_repository = brief
+            .get("specRepository")
+            .and_then(Value::as_str)
+            .unwrap_or(code_repository);
+        let worklist_repository: CampaignRepository = serde_json::from_value(
+            repositories
+                .get(spec_repository)
+                .cloned()
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "local campaign {campaign:?} specRepository {spec_repository:?} is not configured"
+                    ))
+                })?,
+        )
+        .with_context(|| {
+            format!("local campaign {campaign:?} has an invalid worklist repository")
+        })?;
+        if worklist_repository.forge != "local" {
+            return Err(invalid(format!(
+                "local campaign {campaign:?} worklist repository must use forge=local"
+            )));
+        }
+        let pool = config
+            .get("flows")
+            .and_then(Value::as_object)
+            .and_then(|flows| flows.get(campaign))
+            .and_then(Value::as_object)
+            .and_then(|flow| flow.get("workloadMutex"))
+            .and_then(Value::as_str)
+            .filter(|pool| !pool.is_empty())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "local campaign {campaign:?} flow has no campaign mutex"
+                ))
+            })?
+            .to_owned();
+        let continuation = brief
+            .get("continuation")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "local campaign {campaign:?} has no continuation configuration"
+                ))
+            })?;
+        let required = |field: &str| {
+            brief.get(field).cloned().ok_or_else(|| {
+                invalid(format!(
+                    "local campaign {campaign:?} is missing declaration field {field:?}"
+                ))
+            })
+        };
+        let mut manifest_config = json!({
+            "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
+            "name": campaign,
+            "repository": code_repository_config,
+            "maxTasks": required("maxTasks")?,
+            "maxParallel": required("maxParallel")?,
+            "driverRuntimeMaxSec": required("driverRuntimeMaxSec")?,
+            "runtimeMaxSec": continuation.get("runtimeMaxSec").cloned().unwrap_or(Value::Null),
+            "pool": pool,
+            "mergeMethod": required("mergeMethod")?,
+            "agent": required("agent")?,
+            "steward": required("steward")?,
+            "gates": required("gates")?,
+            "tasks": [],
+        });
+        for field in ["gitAiBinding", "gitAiAwaitSec"] {
+            if let Some(value) = brief.get(field) {
+                manifest_config
+                    .as_object_mut()
+                    .expect("local manifest configuration is an object")
+                    .insert(field.to_owned(), value.clone());
+            }
+        }
+        let declared_path = |field: &str| -> Result<PathBuf> {
+            let value = brief
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "local campaign {campaign:?} declaration field {field:?} must be a path"
+                    ))
+                })?;
+            Ok(PathBuf::from(value))
+        };
+        let flow = config
+            .get("flows")
+            .and_then(Value::as_object)
+            .and_then(|flows| flows.get(campaign))
+            .and_then(Value::as_object)
+            .and_then(|flow| flow.get("script"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "local campaign {campaign:?} flow has no script path"
+                ))
+            })?;
+        candidates.push(LocalCampaignDeclaration {
+            manifest_config,
+            worklist_repository,
+            flow,
+            driver: declared_path("driver")?,
+            workspace_root: declared_path("workspaceRoot")?,
+        });
+    }
+    if candidates.len() > 1 {
+        bail!(
+            "campaign {code_repository}/{worklist_pattern} matches multiple enabled local campaign declarations ({})",
+            candidates.len()
+        );
+    }
+    Ok(candidates.pop())
+}
+
+fn committed_local_worklist(
+    repository: &CampaignRepository,
+    worklist_pattern: &str,
+) -> Result<CommittedLocalWorklist> {
+    let checkout = fs::canonicalize(&repository.checkout).with_context(|| {
+        format!(
+            "cannot resolve campaign worklist checkout {}",
+            repository.checkout.display()
+        )
+    })?;
+    let git = |arguments: &[&str], context: &str| -> Result<std::process::Output> {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(arguments)
+            .output()
+            .with_context(|| format!("cannot execute git while {context}"))?;
+        if !output.status.success() {
+            bail!(
+                "cannot {context}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(output)
+    };
+    git(
+        &["fetch", "--prune", "--no-tags", &repository.remote],
+        "fetching the local campaign worklist authority",
+    )?;
+    let base_ref = format!(
+        "{}/{}^{{commit}}",
+        repository.remote, repository.base_branch
+    );
+    let revision = String::from_utf8(
+        git(
+            &["rev-parse", "--verify", &base_ref],
+            "resolving the local campaign worklist authority revision",
+        )?
+        .stdout,
+    )
+    .context("campaign worklist authority revision is not valid UTF-8")?
+    .trim()
+    .to_ascii_lowercase();
+    let literal_prefix = worklist_pattern
+        .split('/')
+        .take_while(|component| !component.contains(['*', '?', '[']))
+        .collect::<Vec<_>>()
+        .join("/");
+    let mut tree_arguments = vec!["ls-tree", "-r", "-z", "--full-tree", &revision];
+    if !literal_prefix.is_empty() {
+        tree_arguments.extend(["--", &literal_prefix]);
+    }
+    let tree = git(
+        &tree_arguments,
+        "resolving the local campaign worklist pattern",
+    )?;
+    let pattern = CString::new(worklist_pattern)
+        .map_err(|_| invalid("campaign worklist pattern contains a NUL byte"))?;
+    let mut matches = Vec::new();
+    for entry in tree.stdout.split(|byte| *byte == b'\0') {
+        if entry.is_empty() {
+            continue;
+        }
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| invalid("remote base tree contains a malformed worklist candidate"))?;
+        let metadata = std::str::from_utf8(&entry[..tab])
+            .context("remote base tree worklist metadata is not valid ASCII")?;
+        let mut fields = metadata.split(' ');
+        let (Some(mode), Some(object_type), Some(object_id), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(invalid(
+                "remote base tree contains malformed worklist metadata",
+            ));
+        };
+        let path = std::str::from_utf8(&entry[tab + 1..])
+            .context("remote base tree worklist path is not valid UTF-8")?;
+        let candidate = CString::new(path)
+            .map_err(|_| invalid("remote base tree worklist path contains a NUL byte"))?;
+        // SAFETY: both pointers come from live `CString`s, and `fnmatch` only
+        // reads their NUL-terminated bytes for the duration of this call.
+        let matched = unsafe {
+            libc::fnmatch(
+                pattern.as_ptr(),
+                candidate.as_ptr(),
+                libc::FNM_PATHNAME | libc::FNM_PERIOD,
+            )
+        } == 0;
+        if !matched {
+            continue;
+        }
+        if object_type == "blob" && matches!(mode, "100644" | "100755") {
+            matches.push((path.to_owned(), object_id.to_owned()));
+        }
+    }
+    let [(source_path, source_object)] = matches.as_slice() else {
+        bail!(
+            "campaign worklist pattern {worklist_pattern:?} matched {} regular files at fetched base revision {revision}; expected exactly one",
+            matches.len()
+        );
+    };
+    let raw = git(
+        &["cat-file", "blob", source_object],
+        "reading the committed local campaign worklist",
+    )?
+    .stdout;
+    let document = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "campaign worklist {source_path:?} at fetched base revision {revision} is invalid JSON"
+        )
+    })?;
+    Ok(CommittedLocalWorklist {
+        document,
+        source_revision: revision,
+        sha256: format!("sha256:{:x}", Sha256::digest(&raw)),
+    })
+}
+
+fn local_campaign_graph_from_worklist(
+    declaration: LocalCampaignDeclaration,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> Result<(CampaignGraph, CampaignProjectionV1)> {
+    let committed = committed_local_worklist(&declaration.worklist_repository, worklist_pattern)?;
+    let validated =
+        validate_local_worklist_document(&committed.document, &declaration.manifest_config)?;
+    if validated.manifest.repository.forge != "local" {
+        return Err(invalid(
+            "the local worklist arm path requires campaign.repository.forge=local",
+        ));
+    }
+    let projection = CampaignProjectionV1 {
+        schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
+        code_repository: code_repository.to_owned(),
+        worklist_pattern: worklist_pattern.to_owned(),
+        source_revision: committed.source_revision,
+        worklist_sha256: committed.sha256,
+        issue: None,
+        sub_issue_walk: Some(false),
+    };
+    let graph = local_campaign_graph(validated, code_repository, &projection)?;
+    Ok((graph, projection))
+}
+
+fn local_campaign_graph(
+    validated: ValidatedWorklist,
+    code_repository: &str,
+    projection: &CampaignProjectionV1,
+) -> Result<CampaignGraph> {
+    if validated.tasks.len() != validated.manifest.tasks.len() {
+        return Err(invalid(
+            "validated worklist task content does not match its manifest references",
+        ));
+    }
+    let task_content = validated
+        .tasks
+        .iter()
+        .zip(&validated.manifest.tasks)
+        .map(|(task, reference)| CanonicalCampaignTaskV1 {
+            number: reference.issue,
+            title: task.title.clone(),
+            body: task.body.clone(),
+        })
+        .collect::<Vec<_>>();
+    let canonical = CanonicalCampaignGraphV1::new(validated.manifest, task_content)?;
+    let campaign = &canonical.manifest.name;
+    let updated_at = projection.source_revision.clone();
+    let tasks = canonical
+        .manifest
+        .tasks
+        .iter()
+        .zip(&canonical.tasks)
+        .map(|(reference, content)| GithubIssue {
+            number: reference.issue,
+            title: content.title.clone(),
+            body: Some(content.body.clone()),
+            state: "open".to_owned(),
+            html_url: format!("local://campaign/{campaign}/task/{}", reference.id),
+            updated_at: updated_at.clone(),
+            user: GithubActor {
+                login: LOCAL_ALLOWED_ACTOR.to_owned(),
+            },
+            pull_request: None,
+        })
+        .collect::<Vec<_>>();
+    let url = format!("local://campaign/{campaign}");
+    Ok(CampaignGraph {
+        locator: IssueLocator {
+            repository: code_repository.to_owned(),
+            number: LOCAL_CAMPAIGN_ISSUE_NUMBER,
+            url: url.clone(),
+        },
+        master: GithubIssue {
+            number: LOCAL_CAMPAIGN_ISSUE_NUMBER,
+            title: campaign.clone(),
+            body: None,
+            state: "open".to_owned(),
+            html_url: url,
+            updated_at,
+            user: GithubActor {
+                login: LOCAL_ALLOWED_ACTOR.to_owned(),
+            },
+            pull_request: None,
+        },
+        canonical,
+        tasks,
+    })
 }
 
 fn approved_graph_directory(state_dir: &Path, registration_id: &str) -> PathBuf {
@@ -3355,34 +4323,103 @@ async fn run_campaign_arm(
     if let Some(registration) = &prior {
         require_local_actor(registration)?;
     }
-    let mut projection = read_campaign_projection(&state_dir, &code_repository, &worklist_pattern)?;
-    let locator = projection.locator()?;
     let local_actor = local_actor();
-    let forge_actor = authenticated_actor()?;
-    let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &forge_actor)?;
-    let graph = fetch_campaign_graph(&locator)?;
-    require_allowed_issue_authors(&graph, &allowed_actors)?;
-    // Probe once, at arm, and record the answer. A pass never has to discover
-    // mid-flight that half its projection is unavailable.
-    let sub_issue_walk = probe_sub_issue_walk(&locator)?;
-    projection.sub_issue_walk = Some(sub_issue_walk);
+    let projection_path = campaign_projection_path(&state_dir, &code_repository, &worklist_pattern);
+    let existing_projection = match fs::metadata(&projection_path) {
+        Ok(_) => Some(read_campaign_projection(
+            &state_dir,
+            &code_repository,
+            &worklist_pattern,
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect campaign projection {}",
+                    projection_path.display()
+                )
+            })
+        }
+    };
+    let local_declaration =
+        local_campaign_declaration(config_path, &code_repository, &worklist_pattern)?;
+    let declared_assets = local_declaration.as_ref().map(|declaration| {
+        (
+            declaration.flow.clone(),
+            declaration.driver.clone(),
+            declaration.workspace_root.clone(),
+        )
+    });
+    let (projection, graph, forge_actor, allowed_actors, sub_issue_walk) = if let Some(
+        declaration,
+    ) = local_declaration
+    {
+        let (graph, projection) =
+            local_campaign_graph_from_worklist(declaration, &code_repository, &worklist_pattern)?;
+        let allowed_actors = normalize_allowed_actors(&args.allowed_actors, LOCAL_ALLOWED_ACTOR)?;
+        (projection, graph, None, allowed_actors, false)
+    } else if existing_projection
+        .as_ref()
+        .is_some_and(|projection| projection.issue.is_some())
+    {
+        let mut projection = existing_projection.expect("projection was checked above");
+        let locator = projection.locator()?;
+        let forge_actor = authenticated_actor()?;
+        let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &forge_actor)?;
+        let graph = fetch_campaign_graph(&locator)?;
+        require_allowed_issue_authors(&graph, &allowed_actors)?;
+        // Probe once, at arm, and record the answer. A pass never has to
+        // discover mid-flight that half its projection is unavailable.
+        let sub_issue_walk = probe_sub_issue_walk(&locator)?;
+        projection.sub_issue_walk = Some(sub_issue_walk);
+        (
+            projection,
+            graph,
+            Some(forge_actor),
+            allowed_actors,
+            sub_issue_walk,
+        )
+    } else {
+        bail!(
+            "campaign {code_repository}/{worklist_pattern} has neither an enabled local declaration nor a forge issue projection"
+        )
+    };
+    let locator = graph.locator.clone();
     let prior_graph = prior
         .as_ref()
         .map(|registration| read_approved_graph_snapshot(&state_dir, registration))
         .transpose()?
         .flatten();
-    let escalated = if prior.is_some() && graph.canonical.manifest.repository.forge == "github" {
-        active_escalated_tasks(&graph, &forge_actor, sub_issue_walk)?
-    } else {
+    let escalated = if prior.is_none() {
         BTreeSet::new()
+    } else if graph.canonical.manifest.repository.forge == "github" {
+        active_escalated_tasks(
+            &graph,
+            forge_actor
+                .as_deref()
+                .ok_or_else(|| invalid("GitHub campaign arm has no forge actor"))?,
+            sub_issue_walk,
+        )?
+    } else {
+        active_local_escalated_tasks(&state_dir, &graph)?
     };
     let (pardon_plan, mut arm_warnings) =
         amendment_pardon_plan(prior_graph.as_ref(), &graph.canonical, &escalated);
-    let flow = resolve_flow(args.flow)?;
-    let driver = resolve_driver(args.driver)?;
-    let workspace_root = args
-        .workspace_root
-        .map_or_else(default_campaign_workspace_root, Ok)?;
+    let (flow, driver, workspace_root) =
+        if let Some((flow, driver, workspace_root)) = declared_assets {
+            (
+                args.flow.unwrap_or(flow),
+                args.driver.unwrap_or(driver),
+                args.workspace_root.unwrap_or(workspace_root),
+            )
+        } else {
+            (
+                resolve_flow(args.flow)?,
+                resolve_driver(args.driver)?,
+                args.workspace_root
+                    .map_or_else(default_campaign_workspace_root, Ok)?,
+            )
+        };
     if !workspace_root.is_absolute() {
         return Err(invalid("campaign workspace root must be absolute"));
     }
@@ -3425,7 +4462,8 @@ async fn run_campaign_arm(
     )?);
     let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
     for pardon in &pardon_plan {
-        let receipt = post_campaign_auto_pardon(&graph, &forge_actor, pardon)?;
+        let pardon_actor = forge_actor.as_deref().unwrap_or(&registration.local_actor);
+        let receipt = post_campaign_auto_pardon(&state_dir, &graph, pardon_actor, pardon)?;
         auto_pardons.push(AutoPardonReceipt {
             task_id: pardon.task_id.clone(),
             added_dependencies: pardon.added_dependencies.clone(),
@@ -3587,16 +4625,18 @@ fn auto_pardon_reason(pardon: &PlannedAutoPardon) -> String {
 }
 
 fn post_campaign_auto_pardon(
+    state_dir: &Path,
     graph: &CampaignGraph,
     actor: &str,
     pardon: &PlannedAutoPardon,
 ) -> Result<String> {
-    post_campaign_pardon(
-        graph,
-        actor,
-        &auto_pardon_reason(pardon),
-        PardonScope::Tasks(BTreeSet::from([pardon.task_id.clone()])),
-    )
+    let reason = auto_pardon_reason(pardon);
+    let scope = PardonScope::Tasks(BTreeSet::from([pardon.task_id.clone()]));
+    if graph.canonical.manifest.repository.forge == "local" {
+        append_local_campaign_pardon(state_dir, graph, actor, &reason, &scope)
+    } else {
+        post_campaign_pardon(graph, actor, &reason, scope)
+    }
 }
 
 async fn run_campaign_resume(
@@ -4810,6 +5850,241 @@ fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<Campa
     })
 }
 
+/// Parse one JSON worklist into the exact manifest and immutable task content
+/// admitted at the campaign boundary. Both forge projection and local arming
+/// call this function; rendering issues is never a second validator.
+fn validate_worklist_document(
+    document: &Value,
+    separate_config: Option<&Value>,
+) -> Result<ValidatedWorklist> {
+    let raw_config = project_config(document, separate_config)?;
+    let campaign_name = raw_config
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| safe_component(value))
+        .ok_or_else(|| invalid("campaign configuration name is missing or invalid"))?;
+    let tasks = project_tasks(document, campaign_name)?;
+    let manifest = validate_project_shape(&raw_config, &tasks)?;
+    Ok(ValidatedWorklist { manifest, tasks })
+}
+
+fn require_local_fields(
+    object: &serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    context: &str,
+) -> Result<()> {
+    let allowed = required
+        .iter()
+        .chain(optional)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(field.as_str()))
+    {
+        return Err(invalid(format!(
+            "{context} contains unsupported field {field:?}"
+        )));
+    }
+    if let Some(field) = required.iter().find(|field| !object.contains_key(**field)) {
+        return Err(invalid(format!("{context} is missing field {field:?}")));
+    }
+    Ok(())
+}
+
+fn local_bounded_string<'a>(value: &'a Value, context: &str, maximum: usize) -> Result<&'a str> {
+    let text = value
+        .as_str()
+        .filter(|text| {
+            !text.is_empty()
+                && text.chars().count() <= maximum
+                && !text.chars().any(|character| character < '\u{20}')
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "{context} must be a non-empty string of at most {maximum} characters without control characters"
+            ))
+        })?;
+    Ok(text)
+}
+
+fn local_string_list(value: &Value, context: &str, nonempty: bool) -> Result<Vec<String>> {
+    let values = value
+        .as_array()
+        .filter(|values| !nonempty || !values.is_empty())
+        .ok_or_else(|| {
+            invalid(format!(
+                "{context} must be {} array",
+                if nonempty { "a non-empty" } else { "an" }
+            ))
+        })?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            local_bounded_string(value, &format!("{context}[{index}]"), usize::MAX)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+/// The local file format is intentionally narrower than the compatibility
+/// input accepted by `campaign project`: declaration belongs to the host and
+/// the committed file contains only immutable task briefs.
+fn validate_local_worklist_document(
+    document: &Value,
+    manifest_config: &Value,
+) -> Result<ValidatedWorklist> {
+    let object = document
+        .as_object()
+        .ok_or_else(|| invalid("local campaign worklist must be an object"))?;
+    require_local_fields(object, &["schemaVersion", "tasks"], &[], "local worklist")?;
+    let tasks = object
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("local worklist.tasks must be an array"))?;
+    for (index, candidate) in tasks.iter().enumerate() {
+        let context = format!("tasks[{index}]");
+        let item = candidate
+            .as_object()
+            .ok_or_else(|| invalid(format!("{context} must be an object")))?;
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid(format!("{context}.kind must be a string")))?;
+        match kind {
+            "checkpoint" => require_local_fields(
+                item,
+                &[
+                    "id",
+                    "kind",
+                    "title",
+                    "argv",
+                    "runtimeMaxSec",
+                    "dependencies",
+                ],
+                &[],
+                &context,
+            )?,
+            "implementation" => {
+                require_local_fields(
+                    item,
+                    &[
+                        "id",
+                        "kind",
+                        "title",
+                        "goal",
+                        "deliveredBehaviors",
+                        "readFirst",
+                        "acceptanceCriteria",
+                        "dependencies",
+                    ],
+                    &["conflictDomains"],
+                    &context,
+                )?;
+                local_bounded_string(
+                    item.get("goal").expect("goal is required above"),
+                    &format!("{context}.goal"),
+                    12_000,
+                )?;
+                local_string_list(
+                    item.get("deliveredBehaviors")
+                        .expect("deliveredBehaviors is required above"),
+                    &format!("{context}.deliveredBehaviors"),
+                    true,
+                )?;
+                let read_first = item
+                    .get("readFirst")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| invalid(format!("{context}.readFirst must be an object")))?;
+                require_local_fields(
+                    read_first,
+                    &["specSections", "styleReferences"],
+                    &[],
+                    &format!("{context}.readFirst"),
+                )?;
+                local_string_list(
+                    read_first
+                        .get("specSections")
+                        .expect("specSections is required above"),
+                    &format!("{context}.readFirst.specSections"),
+                    true,
+                )?;
+                local_string_list(
+                    read_first
+                        .get("styleReferences")
+                        .expect("styleReferences is required above"),
+                    &format!("{context}.readFirst.styleReferences"),
+                    false,
+                )?;
+                let acceptance = item
+                    .get("acceptanceCriteria")
+                    .and_then(Value::as_array)
+                    .filter(|acceptance| !acceptance.is_empty())
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "{context}.acceptanceCriteria must be a non-empty array"
+                        ))
+                    })?;
+                let mut acceptance_ids = BTreeSet::new();
+                for (criterion_index, candidate) in acceptance.iter().enumerate() {
+                    let criterion_context =
+                        format!("{context}.acceptanceCriteria[{criterion_index}]");
+                    let criterion = candidate
+                        .as_object()
+                        .ok_or_else(|| invalid(format!("{criterion_context} must be an object")))?;
+                    require_local_fields(
+                        criterion,
+                        &["id", "description", "argv"],
+                        &[],
+                        &criterion_context,
+                    )?;
+                    let identifier = local_bounded_string(
+                        criterion.get("id").expect("id is required above"),
+                        &format!("{criterion_context}.id"),
+                        80,
+                    )?;
+                    if !safe_component(identifier) || !acceptance_ids.insert(identifier) {
+                        return Err(invalid(format!(
+                            "{context}.acceptanceCriteria ids must be safe and unique"
+                        )));
+                    }
+                    local_bounded_string(
+                        criterion
+                            .get("description")
+                            .expect("description is required above"),
+                        &format!("{criterion_context}.description"),
+                        4_000,
+                    )?;
+                    let argv = local_string_list(
+                        criterion.get("argv").expect("argv is required above"),
+                        &format!("{criterion_context}.argv"),
+                        true,
+                    )?;
+                    validate_argv(&argv, &format!("{criterion_context}.argv"))?;
+                }
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "{context}.kind must equal implementation or checkpoint"
+                )))
+            }
+        }
+        local_bounded_string(
+            item.get("id").expect("task id is required above"),
+            &format!("{context}.id"),
+            80,
+        )?;
+        local_bounded_string(
+            item.get("title").expect("task title is required above"),
+            &format!("{context}.title"),
+            300,
+        )?;
+    }
+    validate_worklist_document(document, Some(manifest_config))
+}
+
 fn reconcile_dependencies(repository: &str, tasks: &[ProjectTask]) -> Result<()> {
     let campaign_numbers = tasks
         .iter()
@@ -4891,14 +6166,10 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
         .as_deref()
         .map(|path| read_json_document(path, "campaign configuration"))
         .transpose()?;
-    let raw_config = project_config(&document, separate.as_ref())?;
-    let name = raw_config
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|value| safe_component(value))
-        .ok_or_else(|| invalid("campaign configuration name is missing or invalid"))?;
-    let mut tasks = project_tasks(&document, name)?;
-    let canonical_preview = validate_project_shape(&raw_config, &tasks)?;
+    let validated = validate_worklist_document(&document, separate.as_ref())?;
+    let canonical_preview = validated.manifest;
+    let mut tasks = validated.tasks;
+    let name = canonical_preview.name.clone();
     let (worklist_pattern, source_revision, worklist_sha256) =
         committed_worklist_coordinate(&args.worklist, &canonical_preview)?;
     let mut config = serde_json::to_value(canonical_preview)?;
@@ -5670,8 +6941,13 @@ mod tests {
             added_dependencies: vec!["prerequisite".to_owned()],
         };
 
-        let receipt =
-            post_campaign_auto_pardon(&graph_for_forge_observation(), "operator", &pardon).unwrap();
+        let receipt = post_campaign_auto_pardon(
+            temporary.path(),
+            &graph_for_forge_observation(),
+            "operator",
+            &pardon,
+        )
+        .unwrap();
         assert!(receipt.ends_with("#issuecomment-100"));
         let body = fs::read_to_string(captured).unwrap();
         let marker = body.lines().next().unwrap();
@@ -5764,6 +7040,109 @@ esac"#,
                 .unwrap()
                 .is_empty(),
             "the task-scoped resume marker must pardon only that task's active generation"
+        );
+    }
+
+    #[test]
+    fn local_attempt_receipts_drive_escalation_and_scoped_pardons() {
+        let temporary = tempfile::tempdir().unwrap();
+        let campaign = "night-build";
+        let issue_number = LOCAL_CAMPAIGN_ISSUE_NUMBER;
+        let path = local_attempt_receipts_path(temporary.path(), campaign).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let diagnosis = |sequence: u64, task_id: &str, attempt: u8| {
+            json!({
+                "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                "sequence": sequence,
+                "kind": "diagnosis",
+                "campaign": campaign,
+                "issueNumber": issue_number.to_string(),
+                "taskId": task_id,
+                "attempt": attempt,
+                "diagnosis": format!("diagnosis {task_id} attempt {attempt}"),
+                "redaction": "conservative-v2",
+            })
+        };
+        let records = [
+            diagnosis(1, "foundation", 1),
+            diagnosis(2, "foundation", 2),
+            diagnosis(3, "finish", 1),
+            diagnosis(4, "finish", 2),
+            json!({
+                "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                "sequence": 5,
+                "kind": "escalation",
+                "campaign": campaign,
+                "issueNumber": issue_number.to_string(),
+                "body": "The local frontier is quiescent.",
+            }),
+            json!({
+                "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                "sequence": 6,
+                "kind": "pardon",
+                "campaign": campaign,
+                "issueNumber": issue_number.to_string(),
+                "tasks": ["foundation"],
+            }),
+        ];
+        let mut encoded = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        encoded.extend_from_slice(b"\n{\"interrupted\"");
+        fs::write(&path, encoded).unwrap();
+
+        let loaded = read_local_attempt_receipts(temporary.path(), campaign, issue_number).unwrap();
+        assert_eq!(loaded.len(), 6, "an interrupted append is not a fact");
+        let current = BTreeSet::from(["finish".to_owned(), "foundation".to_owned()]);
+        assert_eq!(
+            active_escalated_tasks_from_receipts(&loaded, &current).unwrap(),
+            BTreeSet::from(["finish".to_owned()])
+        );
+
+        let mut graph = graph_for_forge_observation();
+        graph.locator.number = issue_number;
+        graph.canonical.manifest.repository.forge = "local".to_owned();
+        let receipt = append_local_campaign_pardon(
+            temporary.path(),
+            &graph,
+            "uid:1000",
+            "The amended graph now addresses the failed task.",
+            &PardonScope::Tasks(BTreeSet::from(["finish".to_owned()])),
+        )
+        .unwrap();
+        assert_eq!(receipt, "local://campaign/night-build/attempt-receipts/7");
+        let repaired = fs::read_to_string(&path).unwrap();
+        assert!(!repaired.contains("interrupted"));
+        let loaded = read_local_attempt_receipts(temporary.path(), campaign, issue_number).unwrap();
+        assert_eq!(loaded.len(), 7);
+        assert!(
+            active_escalated_tasks_from_receipts(&loaded, &current)
+                .unwrap()
+                .is_empty(),
+            "the two scoped pardons jointly cover the escalation contributors"
+        );
+
+        let removed_task_history = [
+            LocalAttemptReceiptV1::Diagnosis {
+                task_id: "removed".to_owned(),
+                attempt: 1,
+            },
+            LocalAttemptReceiptV1::Diagnosis {
+                task_id: "removed".to_owned(),
+                attempt: 2,
+            },
+            LocalAttemptReceiptV1::Escalation,
+            LocalAttemptReceiptV1::Pardon {
+                tasks: Some(BTreeSet::from(["removed".to_owned()])),
+            },
+            LocalAttemptReceiptV1::Escalation,
+        ];
+        assert!(
+            active_escalated_tasks_from_receipts(&removed_task_history, &BTreeSet::new()).is_err(),
+            "removed tasks are dropped before escalation causality is folded"
         );
     }
 
@@ -6245,6 +7624,193 @@ esac"#,
         let tasks = project_tasks(&document, "night-build").unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].dependencies, ["foundation"]);
+    }
+
+    #[test]
+    fn local_arm_ingests_worklist_briefs_without_a_forge_projection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        let remote = temporary.path().join("remote.git");
+        fs::create_dir(&checkout).unwrap();
+        let run_git = |directory: &Path, arguments: &[&str]| {
+            let output = ProcessCommand::new("git")
+                .args(arguments)
+                .current_dir(directory)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(&checkout, &["config", "user.name", "Campaign Test"]);
+        run_git(
+            &checkout,
+            &["config", "user.email", "campaign@example.invalid"],
+        );
+        run_git(
+            temporary.path(),
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &checkout,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let checkout = fs::canonicalize(checkout).unwrap();
+        let document = json!({
+            "schemaVersion": 1,
+            "tasks": [
+                {
+                    "id": "foundation",
+                    "kind": "implementation",
+                    "title": "Foundation",
+                    "goal": "Build the local foundation.",
+                    "deliveredBehaviors": ["The local foundation exists"],
+                    "readFirst": {"specSections": ["Foundation"], "styleReferences": []},
+                    "acceptanceCriteria": [{
+                        "id": "foundation-green",
+                        "description": "The foundation test passes.",
+                        "argv": ["true"]
+                    }],
+                    "dependencies": [],
+                    "conflictDomains": ["src"]
+                },
+                {
+                    "id": "finish",
+                    "kind": "implementation",
+                    "title": "Finish",
+                    "goal": "Finish from the admitted local brief.",
+                    "deliveredBehaviors": ["The campaign is finished"],
+                    "readFirst": {"specSections": ["Finish"], "styleReferences": []},
+                    "acceptanceCriteria": [{
+                        "id": "finish-green",
+                        "description": "The finish test passes.",
+                        "argv": ["true"]
+                    }],
+                    "dependencies": ["foundation"],
+                    "conflictDomains": ["tests"]
+                }
+            ]
+        });
+        let worklist = checkout.join("specs/night/tasks.json");
+        fs::create_dir_all(worklist.parent().unwrap()).unwrap();
+        fs::write(&worklist, serde_json::to_vec(&document).unwrap()).unwrap();
+        run_git(&checkout, &["add", "specs/night/tasks.json"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "worklist"]);
+        run_git(&checkout, &["push", "--quiet", "-u", "origin", "main"]);
+
+        let repository_config = json!({
+            "checkout": checkout,
+            "baseBranch": "main",
+            "remote": "origin",
+            "forge": "local"
+        });
+        let brief = json!({
+            "campaign": "night-build",
+            "repository": "${gh.repo}",
+            "issue": {"number": "${gh.number}", "url": "${gh.url}"},
+            "runId": "${gh.eventId}",
+            "repositories": {"acme/widgets": repository_config},
+            "worklist": "specs/*/tasks.json",
+            "maxTasks": 4,
+            "maxParallel": 1,
+            "continuation": {
+                "argv": ["tally", "flow", "run"],
+                "pool": ["flow", "campaign"],
+                "priority": "low",
+                "runtimeMaxSec": null,
+                "eventsDir": temporary.path().join("events")
+            },
+            "workspaceRoot": temporary.path().join("workspaces"),
+            "captureRoot": temporary.path().join("capture"),
+            "tally": "/bin/tally",
+            "driver": "/bin/spec-build-driver",
+            "driverRuntimeMaxSec": 900,
+            "postFailureEvidence": false,
+            "postFailureStderr": false,
+            "mergeMethod": "squash",
+            "agent": {},
+            "steward": null,
+            "gates": [{
+                "kind": "command",
+                "id": "test",
+                "preflightArgv": ["true"],
+                "argv": ["true"],
+                "runtimeMaxSec": 900
+            }]
+        });
+        let config = json!({
+            "producers": {
+                "campaign-night-build": {
+                    "kind": "gh",
+                    "enable": true,
+                    "enqueue": {"brief": brief}
+                }
+            },
+            "flows": {
+                "night-build": {
+                    "script": "/nix/store/spec-build.js",
+                    "workloadMutex": "campaign"
+                }
+            }
+        });
+        let declaration =
+            local_campaign_declaration_from_document(&config, "acme/widgets", "specs/*/tasks.json")
+                .unwrap()
+                .expect("the local module declaration must match");
+        assert_eq!(declaration.flow, Path::new("/nix/store/spec-build.js"));
+        assert_eq!(
+            declaration.workspace_root,
+            temporary.path().join("workspaces")
+        );
+
+        // The checkout may be dirty; the fetched remote base remains the only
+        // authority admitted by arm.
+        fs::write(&worklist, b"not json\n").unwrap();
+        let committed =
+            committed_local_worklist(&declaration.worklist_repository, "specs/*/tasks.json")
+                .unwrap();
+        assert_eq!(committed.document, document);
+        let validated =
+            validate_local_worklist_document(&committed.document, &declaration.manifest_config)
+                .unwrap();
+        assert_eq!(
+            validated
+                .manifest
+                .tasks
+                .iter()
+                .map(|task| task.issue)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let projection = CampaignProjectionV1 {
+            schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
+            code_repository: "acme/widgets".to_owned(),
+            worklist_pattern: "specs/night/tasks.json".to_owned(),
+            source_revision: committed.source_revision,
+            worklist_sha256: committed.sha256,
+            issue: None,
+            sub_issue_walk: Some(false),
+        };
+        let graph = local_campaign_graph(validated, "acme/widgets", &projection).unwrap();
+        assert_eq!(graph.locator.url, "local://campaign/night-build");
+        assert!(graph.canonical.tasks[0]
+            .body
+            .contains("Build the local foundation."));
+        assert_eq!(graph.canonical.tasks[1].number, 2);
+        assert!(graph.tasks[1].html_url.ends_with("/task/finish"));
+
+        let mut invalid = document;
+        invalid["campaign"] = json!({});
+        assert!(validate_local_worklist_document(&invalid, &declaration.manifest_config).is_err());
     }
 
     #[test]
