@@ -1535,8 +1535,7 @@ async fn matching_durable_exit_is_adopted_without_reexecution() {
     let base = executor(temp.path());
     let paths = base.prepare_paths(&request.identity).unwrap();
     std::fs::write(&paths.stdout, b"completed-once").unwrap();
-    std::fs::remove_file(&paths.stderr).unwrap();
-    std::fs::write(&paths.failure_stderr, b"legacy adapter stderr").unwrap();
+    std::fs::write(&paths.stderr, b"adapter stderr").unwrap();
     let unit = base.unit_name(&request.identity);
     let record = UnitExitRecord {
         accounting: None,
@@ -1564,10 +1563,7 @@ async fn matching_durable_exit_is_adopted_without_reexecution() {
     assert_eq!(outcome.backend, ExecutionBackend::Adopted);
     assert_eq!(outcome.record, record);
     assert_eq!(std::fs::read(&paths.stdout).unwrap(), b"completed-once");
-    assert_eq!(
-        std::fs::read(&paths.stderr).unwrap(),
-        b"legacy adapter stderr"
-    );
+    assert_eq!(std::fs::read(&paths.stderr).unwrap(), b"adapter stderr");
     assert!(!paths.failure_stderr.exists());
 }
 
@@ -2938,8 +2934,7 @@ fn a_record_with_a_measured_accounting_sample_round_trips() {
 /// The question the issue leaves open is whether that strands anything an
 /// operator can see. It does. `retained_capture_paths` is what `query.run`
 /// calls to attach `capturePath` and `stderrTail` to a failure, and it resolves
-/// every stream through `capture_stem` with no fallback to the bare-uuid name —
-/// the only fallbacks it carries are `.err`-versus-`.adapter.err` suffix ones.
+/// every stream through `capture_stem` with no fallback to the bare-uuid name.
 /// The capture generation is keyed on the bare uuid, so it still matches, which
 /// is exactly what makes the failure quiet: the lookup succeeds and reports no
 /// failure capture rather than reporting that it could not find one.
