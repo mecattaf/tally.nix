@@ -107,6 +107,15 @@ NARRATION_ATTEMPTS = 2
 # the proof (§7). Reject a narrator that proposes one: the
 # provenance line is the node's authority, not the model's.
 ASSISTED_BY_PREFIX = "Assisted-by:"
+# Completion is public commit metadata now, using the same git-trailer grammar
+# as provenance. These keys are node-owned: model-authored narration may not
+# claim either one, in any casing Git would treat as equivalent.
+TALLY_TASK_PREFIX = "Tally-Task:"
+TALLY_REVISION_PREFIX = "Tally-Revision:"
+NARRATION_COMPLETION_TRAILER = re.compile(
+    r"(?im)^(?:" + re.escape(TALLY_TASK_PREFIX) + "|" + re.escape(TALLY_REVISION_PREFIX) + r")"
+)
+TRAILER_LINE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*:[ \t]+\S(?:.*\S)?$")
 # Git matches trailer keys case-insensitively, so `assisted-by:` is the same
 # trailer to every git-native reader. The refusal below matches the way git
 # reads the line, not the way the node happens to spell it -- the same reason
@@ -118,10 +127,6 @@ ASSISTED_BY_MAX = 200
 UUID_TEXT = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
-# Every managed campaign marker starts here. A narrator that proposes one is
-# proposing to forge campaign state, so its proposal is refused outright — the
-# same line the worklist reader holds when a body repeats a managed marker.
-MANAGED_MARKER_PREFIX = "<!-- tally:"
 # Release narration can become both commit prose and public projection prose.
 # Closing keywords and mentions carry side effects there, so neither belongs
 # to the model-authored slot. A bare `#<n>` cross reference stays allowed: it
@@ -1103,8 +1108,8 @@ def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
         if len(line) > NARRATION_BODY_LINE_MAX:
             return None, f"body wraps past {NARRATION_BODY_LINE_MAX} columns"
     for text in (header, body):
-        if MANAGED_MARKER_PREFIX in text:
-            return None, "proposal contains a managed campaign marker"
+        if NARRATION_COMPLETION_TRAILER.search(text):
+            return None, "proposal contains a managed completion trailer"
         if NARRATION_ASSISTED_BY.search(text):
             # The merge node appends the real trailer from the witnessed
             # attempt. A model-authored one would be a provenance claim nothing
@@ -2495,17 +2500,14 @@ def task_revision(task: dict[str, Any]) -> str | None:
     return value
 
 
-def pull_request_marker(
-    campaign: str, issue_number: str, task_id: str, revision: str
-) -> str:
+def completion_trailer_block(task_id: str, revision: str) -> str:
+    if not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id):
+        fail("completion trailer task must be a safe task ID")
     if not isinstance(revision, str) or not re.fullmatch(
         r"sha256:[0-9a-f]{64}", revision
     ):
-        fail("pull request marker revision must be a lowercase SHA-256 identity")
-    return (
-        "<!-- tally:spec-build:v2 "
-        f"campaign={campaign} issue={issue_number} task={task_id} revision={revision} -->"
-    )
+        fail("completion trailer revision must be a lowercase SHA-256 identity")
+    return f"{TALLY_TASK_PREFIX} {task_id}\n{TALLY_REVISION_PREFIX} {revision}"
 
 
 def checkpoint_identity(
@@ -2540,7 +2542,7 @@ def merge_receipt_ref(
     """Where a local squash records the layer commit it produced.
 
     The ref is an audit index, never completion authority. The local oracle
-    independently reads exact task markers from the campaign's witnessed
+    independently reads exact task trailers from the campaign's witnessed
     integration history, so a missing or damaged index cannot change truth.
     """
     suffix = "" if revision is None else "-" + revision.removeprefix("sha256:")[:16]
@@ -2611,11 +2613,10 @@ def merged_local_tasks(
     config: dict[str, Any],
     campaign: str,
     campaign_id: str,
-    issue_number: str,
     base_rev: str | None,
     tasks: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
-    """Read completion solely from marked integration-branch commits."""
+    """Read completion solely from integration commits' final trailer blocks."""
     checkout: Path = config["checkout"]
     branch_tip = local_branch_oid(checkout, integration_branch(campaign, campaign_id))
     if branch_tip is None:
@@ -2633,23 +2634,48 @@ def merged_local_tasks(
             check=False,
         ).returncode:
             fail("witnessed local integration revision is not on the integration branch")
+    # Git's trailer formatter is the grammar oracle. It only exposes the
+    # contiguous trailer block at the end of each commit, so lookalike lines in
+    # prose and trailer-shaped blocks followed by more prose cannot complete a
+    # task. NUL separates records and fields; commit messages cannot contain it.
+    history = git(
+        checkout,
+        "log",
+        "--first-parent",
+        "-z",
+        "--format=%H%x00"
+        "%(trailers:key=Tally-Task,valueonly,unfold=true,separator=%x1f)%x00"
+        "%(trailers:key=Tally-Revision,valueonly,unfold=true,separator=%x1f)",
+        base_rev,
+    ).stdout.split("\0")
+    if history and history[-1] == "":
+        history.pop()
+    if len(history) % 3:
+        fail("local integration trailer listing returned malformed output")
+    claims: dict[tuple[str, str], list[str]] = {}
+    for index in range(0, len(history), 3):
+        commit, task_values, revision_values = history[index : index + 3]
+        if not GIT_OID.fullmatch(commit):
+            fail("local integration trailer listing returned a malformed commit")
+        task_claims = task_values.split("\x1f") if task_values else []
+        revision_claims = revision_values.split("\x1f") if revision_values else []
+        if len(task_claims) != 1 or len(revision_claims) != 1:
+            continue
+        task_id, revision = task_claims[0], revision_claims[0]
+        if not TASK_ID.fullmatch(task_id) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", revision
+        ):
+            continue
+        claims.setdefault((task_id, revision), []).append(commit)
+
     facts: list[dict[str, str]] = []
     implementations = [task for task in tasks if task["kind"] == "implementation"]
     for task in implementations:
         revision = task_revision(task)
         if revision is None:
-            fail(f"local completion task {task['id']!r} carries no revision marker")
-        marker = pull_request_marker(campaign, issue_number, task["id"], revision)
+            fail(f"local completion task {task['id']!r} carries no revision trailer")
         branch = stable_publish_branch(campaign, campaign_id, task["id"], revision)
-        matches = git(
-            checkout,
-            "log",
-            "--first-parent",
-            "--format=%H",
-            "--fixed-strings",
-            f"--grep={marker}",
-            base_rev,
-        ).stdout.split()
+        matches = claims.get((task["id"], revision), [])
         if len(matches) > 1:
             fail(
                 f"multiple local integration commits claim campaign task "
@@ -3184,7 +3210,6 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         code["config"],
         campaign,
         local_campaign_id,
-        issue["number"],
         base_rev,
         worklist["tasks"],
     )
@@ -6692,38 +6717,51 @@ def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
     return {"taskId": task_id, "cleaned": True}
 
 
-def local_completion_marker(data: dict[str, Any]) -> str:
+def local_completion_trailers(data: dict[str, Any]) -> str:
     task = data.get("task")
     if not isinstance(task, dict):
         fail("local merge task must be an object")
     revision = task_revision(task)
     if revision is None:
         fail("local merge task must carry a completion revision")
-    return pull_request_marker(
-        required_string(data.get("campaign"), "campaign"),
-        campaign_issue(data.get("issue"))["number"],
-        required_string(task.get("id"), "task.id"),
-        revision,
-    )
+    return completion_trailer_block(required_string(task.get("id"), "task.id"), revision)
+
+
+def validated_trailer_lines(block: str, context: str) -> list[str]:
+    """Validate one contribution to the final, contiguous trailer block."""
+    if not isinstance(block, str) or not block or "\r" in block:
+        fail(f"{context} must be a non-empty git trailer block")
+    lines = block.split("\n")
+    if any(not TRAILER_LINE.fullmatch(line) for line in lines):
+        fail(f"{context} must be one contiguous git trailer block")
+    return lines
 
 
 def merge_commit_body(
     narration: dict[str, Any],
     trailer: str | None,
-    marker: str | None = None,
+    completion: str | None = None,
 ) -> str:
-    """Validated prose plus the node's own provenance pointer, in that order."""
-    parts = [part for part in (narration["body"], marker, trailer) if part]
+    """Validated prose followed by one final, contiguous trailer block."""
+    trailer_lines: list[str] = []
+    for block, context in (
+        (completion, "completion trailers"),
+        (trailer, "provenance trailers"),
+    ):
+        if block is not None:
+            trailer_lines.extend(validated_trailer_lines(block, context))
+    trailer_block = "\n".join(trailer_lines)
+    parts = [part for part in (narration["body"], trailer_block) if part]
     return "\n\n".join(parts)
 
 
 def merge_commit_message(
     narration: dict[str, Any],
     trailer: str | None = None,
-    marker: str | None = None,
+    completion: str | None = None,
 ) -> str:
     """The validated message the node writes. The model never runs git."""
-    body = merge_commit_body(narration, trailer, marker)
+    body = merge_commit_body(narration, trailer, completion)
     if body:
         return f"{narration['subject']}\n\n{body}\n"
     return f"{narration['subject']}\n"
@@ -6742,7 +6780,7 @@ def merge_local(
     campaign = required_string(data.get("campaign"), "campaign")
     identity = campaign_id(data)
     message = merge_commit_message(
-        narration, trailer, local_completion_marker(data)
+        narration, trailer, local_completion_trailers(data)
     )
     integration_name = integration_branch(campaign, identity)
     integration_ref = f"refs/heads/{integration_name}"

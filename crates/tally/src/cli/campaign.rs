@@ -24,7 +24,7 @@ use tally_core::campaign_registry::{
 use tally_core::config::{PoolConfig, ResourceKind};
 use tally_core::lease::{is_campaign_pool_name, CAMPAIGN_POOL_PREFIX};
 
-const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
+const COMPLETION_TRAILER_PREFIXES: [&str; 2] = ["Tally-Task:", "Tally-Revision:"];
 const APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_APPROVED_GRAPH_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 const CAMPAIGN_STEERING_SCHEMA_VERSION: u32 = 1;
@@ -489,6 +489,15 @@ fn valid_steering_observation(value: &str) -> bool {
     })
 }
 
+fn contains_completion_trailer(value: &str) -> bool {
+    value.lines().any(|line| {
+        COMPLETION_TRAILER_PREFIXES.iter().any(|prefix| {
+            line.get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        })
+    })
+}
+
 fn validate_local_steering_record(
     record: &LocalSteeringRecordV1,
     expected_sequence: u64,
@@ -505,7 +514,7 @@ fn validate_local_steering_record(
             .is_some_and(|task_id| !safe_task_id(task_id))
         || record.comment.body.contains('\0')
         || record.comment.body.chars().count() > MAX_CAMPAIGN_STEERING_BODY_CHARS
-        || record.comment.body.contains(SYSTEM_COMMENT_PREFIX)
+        || contains_completion_trailer(&record.comment.body)
     {
         bail!(
             "campaign steering record {} violates steering-v1 invariants",
@@ -803,9 +812,9 @@ fn append_local_steering_at(
     if body.trim().is_empty() {
         return Err(invalid("campaign steering text must not be empty"));
     }
-    if body.contains(SYSTEM_COMMENT_PREFIX) {
+    if contains_completion_trailer(&body) {
         return Err(invalid(
-            "campaign steering text contains a reserved tally receipt marker",
+            "campaign steering text contains a reserved tally completion trailer",
         ));
     }
     if task_id
@@ -5252,6 +5261,25 @@ print(json.dumps({
                 "updatedAt": "2026-08-13T10:00:00.000Z",
             })
         );
+        for forged in [
+            "Tally-Task: task-1",
+            "tally-revision: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let error = append_local_steering_at(
+                temporary.path(),
+                &registration,
+                None,
+                forged.to_owned(),
+                now,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserved tally completion trailer"),
+                "{error:#}"
+            );
+        }
 
         let paths = local_steering_paths(temporary.path(), &registration.registration_id);
         assert!(!paths.cursor.exists());
