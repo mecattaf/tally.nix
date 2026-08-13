@@ -2597,11 +2597,54 @@ class OutcomeFirstGrammarTests(unittest.TestCase):
         reason = DRIVER.validate_outcome_first("Fixed it.", max_chars=4, context="body")
         self.assertIn("character cap", reason)
 
-    def test_an_exclamation_mark_anywhere_is_refused(self) -> None:
+    def test_a_bare_exclamation_mark_in_prose_is_refused(self) -> None:
         reason = DRIVER.validate_outcome_first(
             "Fixed the drift!", max_chars=1000, context="body"
         )
         self.assertIn("exclamation", reason)
+
+    def test_a_shell_negation_inside_inline_code_is_accepted(self) -> None:
+        self.assertIsNone(
+            DRIVER.validate_outcome_first(
+                "Recorded a failing check. Reproduce with `! grep -n stale test/x.py`.",
+                max_chars=4000,
+                context="diagnosis",
+            )
+        )
+
+    def test_an_inline_code_span_does_not_hide_a_prose_exclamation(self) -> None:
+        reason = DRIVER.validate_outcome_first(
+            "Recorded a failing check! Reproduce with `! grep -n stale test/x.py`.",
+            max_chars=4000,
+            context="diagnosis",
+        )
+        self.assertIn("exclamation", reason)
+
+    def test_an_unclosed_inline_code_span_does_not_hide_an_exclamation(self) -> None:
+        reason = DRIVER.validate_outcome_first(
+            "Recorded a failing check. Reproduce with `! grep -n stale test/x.py.",
+            max_chars=4000,
+            context="diagnosis",
+        )
+        self.assertIn("exclamation", reason)
+
+    def test_rejected_excerpt_preserves_code_but_sanitizes_prose_bangs(self) -> None:
+        rejected = "Investigating now! Reproduce with `! grep -n stale test/x.py`."
+        reason = DRIVER.validate_outcome_first(
+            rejected, max_chars=4000, context="diagnosis"
+        )
+        self.assertIsNotNone(reason)
+        fallback = DRIVER.diagnosis_fallback_note(reason, None, None, rejected)
+        self.assertIn(
+            "Investigating now. Reproduce with `! grep -n stale test/x.py`.",
+            fallback,
+        )
+        self.assertNotIn("Investigating now!", fallback)
+        self.assertIsNone(
+            DRIVER.validate_outcome_first(
+                fallback, max_chars=DRIVER.MAX_DIAGNOSIS_CHARS, context="diagnosis"
+            )
+        )
 
     def test_a_list_opening_the_text_is_refused(self) -> None:
         reason = DRIVER.validate_outcome_first(
