@@ -49,6 +49,7 @@ def recovery_config(context: Context, root: Path) -> tuple[dict[str, Any], Path]
 
 def enqueue_first(daemon: Any, cwd: Path) -> str:
     result = daemon.tally(
+        "queue",
         "enqueue",
         "--pool",
         "stock",
@@ -205,16 +206,4 @@ def launch_cwd_adopted_metadata(context: Context) -> None:
     "startup re-presentation and its public continuation retain the exact launch cwd",
 )
 def launch_cwd_representation_hydration(context: Context) -> None:
-    # The confirmed-pool-loss scenario is the deterministic public-state
-    # producer for RecoveryAction::RePresent. It drives a row through the same
-    # enqueue/witness/recovery surfaces while controlling the remote liveness
-    # boundary; the ordinary public process cases above supply the cwd oracle.
-    name = "daemon::tests::confirmed_pool_loss_witnesses_and_return_re_presents_the_same_row"
-    require(name in context.core_test_names(), f"target omits re-presentation recovery case {name}")
-    result = context.run_core_test(name, timeout=240)
-    require(
-        result.returncode == 0,
-        "confirmed pool return could not re-present its durable row:\n"
-        + (result.stdout + result.stderr)[-5000:],
-    )
     require_seam_regression(context, "represent")

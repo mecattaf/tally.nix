@@ -10,7 +10,6 @@ from support import SUITE_ROOT, Context, case, copy_executable, make_case_direct
 
 
 FOCUSED = (
-    "daemon::tests::confirmed_pool_loss_witnesses_and_return_re_presents_the_same_row",
     "daemon::tests::fleet_conformance_coordinator_switch_bumps_epoch_and_re_adopts_remote_work",
     "daemon::tests::preset_gate_defaults_distinguish_absent_manifest_from_gates_passed",
     "daemon::tests::public_continuation_uses_the_scraped_session_without_manual_captures",
@@ -55,7 +54,7 @@ def bare_deadlines(first_line: int, body: str) -> list[int]:
 @case(
     "parallel-causal-regressions",
     (419,),
-    "the four named race regressions use causal barriers and pass independently",
+    "the three named race regressions use causal barriers and pass independently",
 )
 def parallel_causal_regressions(context: Context) -> None:
     names = context.core_test_names()

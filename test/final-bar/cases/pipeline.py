@@ -95,11 +95,7 @@ def nixos_poll_script(context: Context) -> str:
               fileSystems."/" = {{ device = "none"; fsType = "tmpfs"; }};
               services.tally = {{
                 enable = true;
-                campaignForge = {{
-                  enable = true;
-                  login = "final-bar";
-                  tokenFile = "/run/secrets/final-bar";
-                }};
+                campaignPoll.enable = true;
               }};
             }}
           ];
