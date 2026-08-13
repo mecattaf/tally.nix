@@ -33,14 +33,14 @@ fn registry() -> BTreeMap<String, ProducerConfig> {
     BTreeMap::from([
         (
             "daily".to_owned(),
-            ProducerConfig::Calendar(CalendarProducer {
+            ProducerConfig::Calendar(Box::new(CalendarProducer {
                 credentials: BTreeMap::new(),
                 on_calendar: "daily".to_owned(),
                 enqueue: ProducerEnqueue {
                     dedup_key: Some("daily-%Y%m%d".to_owned()),
                     ..enqueue("calendar-job")
                 },
-            }),
+            })),
         ),
         (
             "drop".to_owned(),
