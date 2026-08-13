@@ -75,6 +75,7 @@ def create_rows(
             )
             program = "false" if count > 1 else "true"
             submitted = daemon.tally(
+                "queue",
                 "enqueue",
                 "--pool",
                 "stock",

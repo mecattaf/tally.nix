@@ -268,6 +268,7 @@ def codex_model_recovery(context: Context) -> None:
         program = Path(adapter["argv"][0])
         with context.daemon(lane / "daemon", daemon_config(adapter)) as daemon:
             command: list[str] = [
+                "queue",
                 "enqueue",
                 "--pool",
                 "stock",
