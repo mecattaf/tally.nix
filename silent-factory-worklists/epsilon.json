@@ -183,6 +183,51 @@
       ]
     },
     {
+      "id": "gate-local-audit",
+      "kind": "implementation",
+      "title": "Teach the fleet gate to audit a local campaign head",
+      "goal": "test/fleet-gate.sh cannot audit a commit that exists only locally, which every local-first campaign integration head does. Two forge-native assumptions falsify it: resolve_pull_request_metadata (around line 132) runs 'gh api repos/<repo>/commits/<sha>/pulls' and calls fail('cannot list pull requests ... is the commit pushed?') when the SHA is absent from the remote (HTTP 422), aborting the whole gate before any stage runs; and run_changelog_stage (lines 168-193) fails any head that is neither an open pull-request head nor the tip of main. Add a third classified audit subject: when the SHA has no remote presence or no open pull request and is not the tip of main, classify it as a local audit (changelog-subject names it honestly, e.g. 'local head; no pull request'), let every substantive stage run exactly as today, and have the changelog stage report itself not-run for a local audit ('the changelog policy is a pull-request policy; no pull request exists for a local head') instead of failing. Pull-request and tip-of-main behavior must stay byte-identical, including the no-changelog label path and the pinned-at-script-start decision. Keep the usage contract intact. Your change is independent of the merged --keep-going edit (line ~231); the hunks do not overlap.",
+      "deliveredBehaviors": [
+        "The fleet gate runs its full ladder against a commit that exists only in the local repository",
+        "The changelog stage reports not-run with an honest subject for a local audit instead of failing",
+        "Pull-request and tip-of-main audits behave exactly as before"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 sections 7.1 and 7.3"
+        ],
+        "styleReferences": [
+          "test/fleet-gate.sh"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "script-parses",
+          "description": "The script parses and still pins the usage contract.",
+          "argv": [
+            "bash",
+            "-lc",
+            "bash -n test/fleet-gate.sh && test/fleet-gate.sh 2>&1 | grep -qi 'usage: .* <full-commit-sha>'"
+          ]
+        },
+        {
+          "id": "local-audit-classified",
+          "description": "A local-only commit is classified as a local audit at metadata resolution instead of aborting the gate.",
+          "argv": [
+            "bash",
+            "-lc",
+            "grep -qi 'local' test/fleet-gate.sh && grep -q 'gate_changelog_subject' test/fleet-gate.sh"
+          ]
+        }
+      ],
+      "dependencies": [
+        "gate-keep-going"
+      ],
+      "conflictDomains": [
+        "test/fleet-gate.sh"
+      ]
+    },
+    {
       "id": "chapter-gate",
       "kind": "checkpoint",
       "title": "Epsilon stage 0 gate: full gate ladder plus the final conformance bar",
@@ -195,7 +240,8 @@
       "dependencies": [
         "final-bar-local-forge-repair",
         "gate-keep-going",
-        "steering-grammar-negation"
+        "steering-grammar-negation",
+        "gate-local-audit"
       ]
     }
   ]
