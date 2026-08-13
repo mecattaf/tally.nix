@@ -616,7 +616,7 @@
       "id": "producers-config-variant-box",
       "kind": "implementation",
       "title": "Box the Calendar producer variant for the post-deletion enum shape",
-      "goal": "The gh deletion left crates/tally-core/src/producers/config.rs with a 744-byte Calendar variant beside a 32-byte EventsDir variant, tripping clippy::large_enum_variant under -D warnings at the chapter gate (in-lane gates run cargo test, not clippy \u2014 this lint class only surfaces at the gate). Change the variant to Calendar(Box<CalendarProducer>), wrap its two direct test constructors with Box::new, and verify with clippy exactly as the gate runs it. Formatting and workspace tests already passed at the gate; touch nothing else.",
+      "goal": "The gh deletion left crates/tally-core/src/producers/config.rs with a 744-byte Calendar variant beside a 32-byte EventsDir variant, tripping clippy::large_enum_variant under -D warnings at the chapter gate (in-lane gates run cargo test, not clippy \u2014 this lint class only surfaces at the gate). Change the variant to Calendar(Box<CalendarProducer>), wrap its two direct test constructors with Box::new, and verify with clippy exactly as the gate runs it. Formatting and workspace tests already passed at the gate; touch nothing else. Granted after the first attempt's boundary refusal: producer_query.rs (around line 283) also constructs the variant and needs Box::new \u2014 it is yours.",
       "deliveredBehaviors": [
         "cargo clippy --workspace --all-targets --all-features -D warnings passes",
         "No behavior change: the producers suites pass untouched"
@@ -651,7 +651,8 @@
         "delete-gh-inbound-core"
       ],
       "conflictDomains": [
-        "crates/tally-core/src/producers"
+        "crates/tally-core/src/producers",
+        "crates/tally-core/src/producer_query.rs"
       ]
     },
     {
