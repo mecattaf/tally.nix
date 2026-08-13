@@ -249,11 +249,7 @@ pub struct ExecutionOutcome {
     /// Structured execution/gate/acceptance facts computed on the filesystem
     /// that owns the declared gate manifest.
     pub semantic_completion: Option<SemanticCompletion>,
-    /// Historical result/authorship payloads remain representable for the
-    /// passive read side; new execution outcomes leave these fields unset.
     pub result_revision: Option<String>,
-    pub authorship: Option<Authorship>,
-    pub authorship_sessions: Option<Vec<AuthorshipSession>>,
     /// Host that owned the child process. This is authoritative for remote
     /// execution and lets the coordinator stamp the worker hostname.
     pub host_id: Option<String>,
