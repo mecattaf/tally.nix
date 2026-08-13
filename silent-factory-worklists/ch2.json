@@ -440,7 +440,8 @@
         "flake.nix",
         "examples/flows/spec-build.js",
         "crates/tally-flow/tests",
-        "crates/tally/tests/flow_live.rs"
+        "crates/tally/tests/flow_live.rs",
+        "crates/tally/tests/campaign_poll.rs"
       ]
     },
     {
