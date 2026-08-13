@@ -1100,22 +1100,13 @@ fn parse_runner_related_trigger(
             "query.job response did not identify the running flow parent",
         ));
     }
-    let source = job
-        .get("source")
-        .and_then(Value::as_str)
-        .ok_or_else(|| protocol_error("query.job response omitted the parent source"))?;
-    // A fallback reference on another non-GitHub row is not authority to relay
-    // that reference again. Only the directly triggered GitHub parent threads it.
-    if source != "gh" {
-        return Ok(None);
-    }
-    let related_trigger = job
+    let Some(related_trigger) = job
         .get("relatedTrigger")
         .filter(|value| !value.is_null())
         .cloned()
-        .ok_or_else(|| {
-            protocol_error("GitHub flow parent query omitted its trigger receipt reference")
-        })?;
+    else {
+        return Ok(None);
+    };
     let related_trigger =
         serde_json::from_value::<RelatedTrigger>(related_trigger).map_err(|error| {
             protocol_error(format!(
@@ -1284,8 +1275,8 @@ mod tests {
 
     fn related_trigger() -> RelatedTrigger {
         RelatedTrigger {
-            producer: "github-flow".to_owned(),
-            event_id: "comment-61".to_owned(),
+            producer: "calendar-flow".to_owned(),
+            event_id: "tick-61".to_owned(),
             outcome: RelatedTriggerOutcome::NotObserved,
             receipt_id: Some("receipt-61".to_owned()),
         }
@@ -1394,7 +1385,7 @@ mod tests {
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(payload["orchestration"]["skillRevision"], "review-agent-v3");
-        assert_eq!(payload["relatedTrigger"]["eventId"], "comment-61");
+        assert_eq!(payload["relatedTrigger"]["eventId"], "tick-61");
         assert_eq!(payload["relatedTrigger"]["outcome"], "not-observed");
         assert_eq!(payload["adapterOptions"]["environment"]["SAFE"], "yes");
         assert!(payload.get("payloadHash").is_none());
@@ -1402,14 +1393,14 @@ mod tests {
     }
 
     #[test]
-    fn runner_resolves_query_projected_receipt_and_fails_closed_for_github_without_one() {
+    fn runner_resolves_an_optional_query_projected_receipt() {
         let task_uuid = "00000000-0000-4000-8000-000000000048";
         let projected = json!({
             "schemaVersion": 1,
             "protocolVersion": QUERY_PROTOCOL_VERSION,
             "job": {
                 "taskUuid": task_uuid,
-                "source": "gh",
+                "source": "orchestrator",
                 "relatedTrigger": related_trigger()
             }
         });
@@ -1427,7 +1418,7 @@ mod tests {
             parse_runner_related_trigger(&manual, task_uuid).unwrap(),
             None
         );
-        let fallback_only = json!({
+        let fallback = json!({
             "schemaVersion": 1,
             "protocolVersion": QUERY_PROTOCOL_VERSION,
             "job": {
@@ -1437,19 +1428,19 @@ mod tests {
             }
         });
         assert_eq!(
-            parse_runner_related_trigger(&fallback_only, task_uuid).unwrap(),
-            None
+            parse_runner_related_trigger(&fallback, task_uuid).unwrap(),
+            Some(related_trigger())
         );
 
         let missing = json!({
             "schemaVersion": 1,
             "protocolVersion": QUERY_PROTOCOL_VERSION,
-            "job": {"taskUuid": task_uuid, "source": "gh"}
+            "job": {"taskUuid": task_uuid, "source": "orchestrator"}
         });
-        assert!(parse_runner_related_trigger(&missing, task_uuid)
-            .unwrap_err()
-            .message
-            .contains("omitted its trigger receipt"));
+        assert_eq!(
+            parse_runner_related_trigger(&missing, task_uuid).unwrap(),
+            None
+        );
     }
 
     #[test]

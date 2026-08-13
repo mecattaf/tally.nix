@@ -6,7 +6,6 @@ pub fn validate_registry(
     adapters: &BTreeSet<String>,
     executors: &BTreeSet<String>,
 ) -> Result<(), ProducerError> {
-    let mut reachability_owners = BTreeMap::new();
     for (name, producer) in producers {
         validate_producer_name(name)?;
         validate_credentials(producer.credentials(), &format!("producer {name:?}"))?;
@@ -19,152 +18,12 @@ pub fn validate_registry(
                         "calendar producer {name:?} requires a non-empty onCalendar"
                     )));
                 }
-                validate_enqueue(
-                    name,
-                    "enqueue",
-                    &config.enqueue,
-                    pools,
-                    adapters,
-                    executors,
-                    false,
-                )?;
+                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters, executors)?;
             }
             ProducerConfig::EventsDir(config) => {
                 if config.poll_interval_sec == 0 {
                     return Err(ProducerError::InvalidConfig(format!(
                         "events-dir producer {name:?} requires positive pollIntervalSec"
-                    )));
-                }
-            }
-            ProducerConfig::Gh(config) => {
-                if config.poll_interval_sec == 0 {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "gh producer {name:?} requires positive pollIntervalSec"
-                    )));
-                }
-                if config.enable && config.sources.is_empty() {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "enabled gh producer {name:?} requires at least one source"
-                    )));
-                }
-                let mut sources = BTreeSet::new();
-                for source in &config.sources {
-                    let encoded = serde_json::to_string(source)?;
-                    if !sources.insert(encoded) {
-                        return Err(ProducerError::InvalidConfig(format!(
-                            "gh producer {name:?} repeats source {source:?}"
-                        )));
-                    }
-                    validate_gh_source(name, source)?;
-                }
-                validate_name(&config.actor_exclude, "GitHub actorExclude")?;
-                let mut allowed_actors = BTreeSet::new();
-                for actor in &config.allowed_actors {
-                    validate_name(actor, "GitHub allowedActors entry")?;
-                    if !allowed_actors.insert(actor) {
-                        return Err(ProducerError::InvalidConfig(format!(
-                            "gh producer {name:?} repeats allowedActors entry {actor:?}"
-                        )));
-                    }
-                }
-                validate_gh_triggers(name, &config.triggers)?;
-                let mut reviewers = BTreeSet::new();
-                for reviewer in &config.reviewers {
-                    validate_gh_login(name, reviewer)?;
-                    if !reviewers.insert(reviewer) {
-                        return Err(ProducerError::InvalidConfig(format!(
-                            "gh producer {name:?} repeats reviewers entry {reviewer:?}"
-                        )));
-                    }
-                }
-                if config.request_review && config.reviewers.is_empty() {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "gh producer {name:?} requestReview=true requires a non-empty reviewers list"
-                    )));
-                }
-                if config.close_on_pass == Some(true) && !config.post_evidence {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "gh producer {name:?} closeOnPass=true requires postEvidence=true"
-                    )));
-                }
-                if config.post_failure_stderr && !config.post_failure_evidence {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "gh producer {name:?} postFailureStderr=true requires postFailureEvidence=true"
-                    )));
-                }
-                if (config.post_gate_summary || config.close_on_acceptance)
-                    && config.enqueue.gate_manifest.is_none()
-                {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "gh producer {name:?} postGateSummary/closeOnAcceptance requires enqueue.gateManifest"
-                    )));
-                }
-                validate_enqueue(
-                    name,
-                    "enqueue",
-                    &config.enqueue,
-                    pools,
-                    adapters,
-                    executors,
-                    true,
-                )?;
-            }
-            ProducerConfig::BuildEffect(config) => {
-                if !config.path.is_absolute() {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "build-effect producer {name:?} path must be absolute"
-                    )));
-                }
-                validate_safe_path(
-                    &config.path,
-                    &format!("build-effect producer {name:?} path"),
-                )?;
-                validate_enqueue(
-                    name,
-                    "onKey",
-                    &config.on_key,
-                    pools,
-                    adapters,
-                    executors,
-                    false,
-                )?;
-            }
-            ProducerConfig::PoolReachability(config) => {
-                if config.interval_sec == 0 || config.hysteresis == 0 {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "pool-reachability producer {name:?} requires positive intervalSec and hysteresis"
-                    )));
-                }
-                if !pools.contains(&config.probe_pool) {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "pool-reachability producer {name:?} references unknown probePool {:?}",
-                        config.probe_pool
-                    )));
-                }
-                if let Some(existing) =
-                    reachability_owners.insert(config.probe_pool.clone(), name.clone())
-                {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "pool-reachability producers {existing:?} and {name:?} both own probePool {:?}",
-                        config.probe_pool
-                    )));
-                }
-                for (field, enqueue) in [
-                    ("onLost", config.on_lost.as_ref()),
-                    ("onReturn", config.on_return.as_ref()),
-                    ("onReturnAttest", config.on_return_attest.as_ref()),
-                ] {
-                    if let Some(enqueue) = enqueue {
-                        validate_enqueue(name, field, enqueue, pools, adapters, executors, false)?;
-                    }
-                }
-                if config
-                    .on_return_attest
-                    .as_ref()
-                    .is_some_and(|enqueue| !enqueue.no_enqueue)
-                {
-                    return Err(ProducerError::InvalidConfig(format!(
-                        "pool-reachability producer {name:?} onReturnAttest requires noEnqueue=true"
                     )));
                 }
             }
@@ -180,7 +39,6 @@ pub(super) fn validate_enqueue(
     pools: &BTreeSet<String>,
     adapters: &BTreeSet<String>,
     executors: &BTreeSet<String>,
-    allow_origin_templates: bool,
 ) -> Result<(), ProducerError> {
     if enqueue.argv.is_empty() {
         return Err(ProducerError::InvalidConfig(format!(
@@ -237,35 +95,32 @@ pub(super) fn validate_enqueue(
         )));
     }
     for argument in &enqueue.argv {
-        validate_origin_template(argument, allow_origin_templates).map_err(|detail| {
+        validate_literal_template(argument).map_err(|detail| {
             ProducerError::InvalidConfig(format!(
-                "producer {producer:?} {field} argv template is invalid: {detail}"
+                "producer {producer:?} {field} argv is invalid: {detail}"
             ))
         })?;
     }
     if let Some(brief) = &enqueue.brief {
-        validate_origin_value(brief, allow_origin_templates).map_err(|detail| {
+        validate_literal_value(brief).map_err(|detail| {
             ProducerError::InvalidConfig(format!(
-                "producer {producer:?} {field} brief template is invalid: {detail}"
+                "producer {producer:?} {field} brief is invalid: {detail}"
             ))
         })?;
     }
     if let Some(cwd) = &enqueue.cwd {
-        let cwd = cwd.to_str().ok_or_else(|| {
+        let cwd_text = cwd.to_str().ok_or_else(|| {
             ProducerError::InvalidConfig(format!(
                 "producer {producer:?} {field} cwd must be valid UTF-8"
             ))
         })?;
-        validate_origin_template(cwd, allow_origin_templates).map_err(|detail| {
-            ProducerError::InvalidConfig(format!(
-                "producer {producer:?} {field} cwd template is invalid: {detail}"
-            ))
-        })?;
-        validate_resolved_path_template(cwd).map_err(|detail| {
+        validate_literal_template(cwd_text).map_err(|detail| {
             ProducerError::InvalidConfig(format!(
                 "producer {producer:?} {field} cwd is invalid: {detail}"
             ))
         })?;
+        validate_resolved_path(cwd, &format!("producer {producer:?} {field} cwd"))
+            .map_err(|error| ProducerError::InvalidConfig(error.to_string()))?;
     }
     if let Some(workspace) = &enqueue.workspace {
         workspace.validate().map_err(|error| {
@@ -293,194 +148,24 @@ pub(super) fn validate_enqueue(
     Ok(())
 }
 
-pub(super) const ORIGIN_TEMPLATE_FIELDS: &[&str] = &[
-    "repoName",
-    "gh.source",
-    "gh.repo",
-    "gh.repoName",
-    "gh.number",
-    "gh.url",
-    "gh.type",
-    "gh.headSha",
-    "gh.nodeId",
-    "gh.itemAuthor",
-    "gh.triggerActor",
-    "gh.selfActor",
-    "gh.notificationReason",
-    "gh.triggerKind",
-    "gh.eventId",
-    "gh.commentId",
-    "gh.triggerTimestamp",
-    "gh.triggerValue",
-];
-
-pub(super) fn validate_origin_template(template: &str, allowed: bool) -> Result<(), String> {
-    if template.contains('\0') {
-        return Err("template contains a NUL byte".to_owned());
-    }
-    let fields = origin_template_fields(template)?;
-    if !allowed && !fields.is_empty() {
-        return Err(
-            "GitHub origin placeholders are valid only in a gh producer enqueue".to_owned(),
-        );
-    }
-    for field in fields {
-        if !ORIGIN_TEMPLATE_FIELDS.contains(&field) {
-            return Err(format!("unknown placeholder {field:?}"));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn origin_template_fields(mut template: &str) -> Result<Vec<&str>, String> {
-    let mut fields = Vec::new();
-    while let Some(start) = template.find("${") {
-        template = &template[start + 2..];
-        let end = template
-            .find('}')
-            .ok_or_else(|| "unclosed '${field}' placeholder".to_owned())?;
-        let field = &template[..end];
-        if field.is_empty()
-            || !field
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
-        {
-            return Err(format!("invalid placeholder name {field:?}"));
-        }
-        fields.push(field);
-        template = &template[end + 1..];
-    }
-    Ok(fields)
-}
-
-pub(super) fn render_origin_template(
-    template: &str,
-    origin: Option<&GhOrigin>,
-) -> Result<String, ProducerError> {
-    render_origin_template_with_limit(template, origin, Some(64 * 1024))
-}
-
-fn render_origin_template_with_limit(
-    template: &str,
-    origin: Option<&GhOrigin>,
-    max_bytes: Option<usize>,
-) -> Result<String, ProducerError> {
-    validate_origin_template(template, origin.is_some())
-        .map_err(ProducerError::InvalidObservation)?;
-    let mut rendered = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find("${") {
-        rendered.push_str(&rest[..start]);
-        rest = &rest[start + 2..];
-        let end = rest
-            .find('}')
-            .expect("validated origin templates have closing braces");
-        let field = &rest[..end];
-        let origin = origin.ok_or_else(|| {
-            ProducerError::InvalidObservation(
-                "GitHub origin placeholder has no GitHub observation".to_owned(),
-            )
-        })?;
-        rendered.push_str(origin_template_value(origin, field)?.as_str());
-        rest = &rest[end + 1..];
-    }
-    rendered.push_str(rest);
-    if max_bytes.is_some_and(|max_bytes| rendered.len() > max_bytes) {
-        return Err(ProducerError::InvalidObservation(
-            "rendered origin template exceeds 65536 bytes".to_owned(),
-        ));
-    }
-    Ok(rendered)
-}
-
-pub(super) fn validate_origin_value(value: &Value, allowed: bool) -> Result<(), String> {
+pub(super) fn validate_literal_value(value: &Value) -> Result<(), String> {
     match value {
-        Value::String(value) => validate_origin_template(value, allowed),
-        Value::Array(values) => values
-            .iter()
-            .try_for_each(|value| validate_origin_value(value, allowed)),
+        Value::String(value) => validate_literal_template(value),
+        Value::Array(values) => values.iter().try_for_each(validate_literal_value),
         Value::Object(values) => values.iter().try_for_each(|(name, value)| {
-            validate_origin_template(name, allowed)?;
-            validate_origin_value(value, allowed)
+            validate_literal_template(name)?;
+            validate_literal_value(value)
         }),
-        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        _ => Ok(()),
     }
 }
 
-pub(super) fn render_origin_value(
-    value: &Value,
-    origin: Option<&GhOrigin>,
-) -> Result<Value, ProducerError> {
-    match value {
-        Value::String(value) => {
-            render_origin_template_with_limit(value, origin, None).map(Value::String)
-        }
-        Value::Array(values) => values
-            .iter()
-            .map(|value| render_origin_value(value, origin))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        Value::Object(values) => {
-            let mut rendered = serde_json::Map::new();
-            for (name, value) in values {
-                let name = render_origin_template_with_limit(name, origin, None)?;
-                let value = render_origin_value(value, origin)?;
-                if rendered.insert(name.clone(), value).is_some() {
-                    return Err(ProducerError::InvalidObservation(format!(
-                        "rendered producer brief contains duplicate field {name:?}"
-                    )));
-                }
-            }
-            Ok(Value::Object(rendered))
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(value.clone()),
+pub(super) fn validate_literal_template(value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err("string contains a NUL byte".to_owned());
     }
-}
-
-pub(super) fn origin_template_value(
-    origin: &GhOrigin,
-    field: &str,
-) -> Result<String, ProducerError> {
-    let value = match field {
-        "gh.source" => Some(origin.source.clone()),
-        "gh.repo" => Some(origin.repo.clone()),
-        "repoName" | "gh.repoName" => origin
-            .repo
-            .rsplit_once('/')
-            .map(|(_, name)| name.to_owned()),
-        "gh.number" => Some(origin.number.to_string()),
-        "gh.url" => Some(origin.html_url.clone()),
-        "gh.type" => origin.item_type.map(|kind| kind.as_str().to_owned()),
-        "gh.headSha" => origin.head_sha.clone(),
-        "gh.nodeId" => Some(origin.node_id.clone()),
-        "gh.itemAuthor" => Some(origin.item_author.clone()),
-        "gh.triggerActor" => Some(origin.trigger_actor.clone()),
-        "gh.selfActor" => Some(origin.self_actor.clone()),
-        "gh.notificationReason" => origin.notification_reason.clone(),
-        "gh.triggerKind" => Some(origin.trigger_kind.clone()),
-        "gh.eventId" => origin.event_id.clone(),
-        "gh.commentId" => origin.comment_id.clone(),
-        "gh.triggerTimestamp" => origin.trigger_timestamp.clone(),
-        "gh.triggerValue" => origin.trigger_value.clone(),
-        _ => None,
-    };
-    value.ok_or_else(|| {
-        ProducerError::InvalidObservation(format!(
-            "origin field {field:?} is absent for this GitHub item"
-        ))
-    })
-}
-
-pub(super) fn validate_resolved_path_template(path: &str) -> Result<(), String> {
-    if !path.starts_with('/')
-        || path.contains('%')
-        || path.contains('\0')
-        || path.chars().any(char::is_control)
-    {
-        return Err(
-            "path must be absolute and contain no control characters or systemd specifiers"
-                .to_owned(),
-        );
+    if value.contains("${") {
+        return Err("placeholders are not supported by this producer kind".to_owned());
     }
     Ok(())
 }
@@ -489,206 +174,16 @@ pub(super) fn validate_resolved_path(path: &Path, label: &str) -> Result<(), Pro
     let path = path
         .to_str()
         .ok_or_else(|| ProducerError::InvalidObservation(format!("{label} must be valid UTF-8")))?;
-    validate_resolved_path_template(path)
-        .map_err(|detail| ProducerError::InvalidObservation(format!("{label}: {detail}")))
-}
-
-pub(super) fn validate_name(value: &str, label: &str) -> Result<(), ProducerError> {
-    if value.trim().is_empty()
-        || value.len() > MAX_GH_ORIGIN_FIELD_BYTES
-        || value.chars().any(char::is_control)
+    if !path.starts_with('/')
+        || path.contains('%')
+        || path.contains('\0')
+        || path.chars().any(char::is_control)
     {
-        return Err(ProducerError::InvalidConfig(format!(
-            "{label} must be non-empty, at most {MAX_GH_ORIGIN_FIELD_BYTES} bytes, and contain no control characters"
+        return Err(ProducerError::InvalidObservation(format!(
+            "{label}: path must be absolute and contain no control characters or systemd specifiers"
         )));
     }
     Ok(())
-}
-
-/// The GitHub login length bound, shared with `nix/lib/gh-login.nix` through the
-/// pinned corpus at `test/fixtures/gh-login/vectors.json`.
-pub(super) const MAX_GH_LOGIN_LENGTH: usize = 39;
-
-/// A reviewer login is rendered straight into an `@mention` on a public issue
-/// and into a GraphQL user lookup, so it is held to GitHub's own login grammar
-/// rather than the permissive field bound: alphanumerics and interior hyphens,
-/// at most 39 characters. Nothing that could carry markdown, a second mention,
-/// or a query fragment gets past configuration validation.
-///
-/// The Nix modules gate the same list at evaluation. Both sides run the pinned
-/// corpus below, because a login one side accepts and the other rejects is a
-/// deployment that goes green through `nixos-rebuild` or Home Manager and then
-/// fails at daemon config load — a green deploy with a dead daemon.
-pub(super) fn validate_gh_login(producer: &str, login: &str) -> Result<(), ProducerError> {
-    let valid = !login.is_empty()
-        && login.len() <= MAX_GH_LOGIN_LENGTH
-        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        && !login.starts_with('-')
-        && !login.ends_with('-')
-        && !login.contains("--");
-    if !valid {
-        return Err(ProducerError::InvalidConfig(format!(
-            "gh producer {producer:?} reviewers entry {login:?} is not a GitHub login"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_gh_source(producer: &str, source: &GhSource) -> Result<(), ProducerError> {
-    let constraints = source.constraints();
-    let mut repositories = constraints.repositories.clone();
-    if let Some(repo) = &constraints.repo {
-        repositories.push(repo.clone());
-    }
-    validate_unique_values(
-        &repositories,
-        &format!("gh producer {producer:?} {} repositories", source.kind()),
-    )?;
-    for repo in &repositories {
-        validate_repo_constraint(repo)?;
-    }
-    for (label, values) in [
-        ("owners", &constraints.owners),
-        ("labels", &constraints.labels),
-        ("notificationReasons", &constraints.notification_reasons),
-        ("itemAllowlist", &constraints.item_allowlist),
-    ] {
-        validate_unique_values(
-            values,
-            &format!("gh producer {producer:?} {} {label}", source.kind()),
-        )?;
-    }
-    for owner in &constraints.owners {
-        validate_login(owner, "GitHub source owner")?;
-    }
-    if let Some(assignee) = &constraints.assignee {
-        validate_login(assignee, "GitHub source assignee")?;
-    }
-    for item in &constraints.item_allowlist {
-        parse_gh_item_url(item).map_err(|reason| {
-            ProducerError::InvalidConfig(format!(
-                "gh producer {producer:?} {} itemAllowlist entry {item:?} is invalid: {reason}",
-                source.kind()
-            ))
-        })?;
-    }
-    if let Some(query) = &constraints.query {
-        validate_name(query, "GitHub raw query")?;
-        if !matches!(source, GhSource::Search(_)) {
-            return Err(ProducerError::InvalidConfig(format!(
-                "gh producer {producer:?} notification source cannot carry query"
-            )));
-        }
-    }
-    if !constraints.notification_reasons.is_empty() && !matches!(source, GhSource::Notifications(_))
-    {
-        return Err(ProducerError::InvalidConfig(format!(
-            "gh producer {producer:?} search source cannot carry notificationReasons"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_gh_triggers(
-    producer: &str,
-    triggers: &GhTriggers,
-) -> Result<(), ProducerError> {
-    for (label, values) in [
-        ("commandComments", &triggers.command_comments),
-        ("mentions", &triggers.mentions),
-        ("assignments", &triggers.assignments),
-        ("labels", &triggers.labels),
-    ] {
-        validate_unique_values(
-            values,
-            &format!("gh producer {producer:?} triggers.{label}"),
-        )?;
-    }
-    for command in &triggers.command_comments {
-        if !valid_explicit_comment_command(command, '/') {
-            return Err(ProducerError::InvalidConfig(format!(
-                "gh producer {producer:?} command comment {command:?} is not an explicit slash-command grammar"
-            )));
-        }
-    }
-    for mention in &triggers.mentions {
-        if !valid_explicit_comment_command(mention, '@') {
-            return Err(ProducerError::InvalidConfig(format!(
-                "gh producer {producer:?} mention {mention:?} is not an explicit mention-command grammar"
-            )));
-        }
-    }
-    for actor in &triggers.assignments {
-        validate_login(actor, "GitHub assignment trigger")?;
-    }
-    Ok(())
-}
-
-pub(super) fn validate_unique_values(values: &[String], label: &str) -> Result<(), ProducerError> {
-    let mut unique = BTreeSet::new();
-    for value in values {
-        validate_name(value, label)?;
-        if !unique.insert(value) {
-            return Err(ProducerError::InvalidConfig(format!(
-                "{label} contains duplicate value {value:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn validate_repo_constraint(repo: &str) -> Result<(), ProducerError> {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return Err(ProducerError::InvalidConfig(format!(
-            "GitHub repository {repo:?} must be owner/name"
-        )));
-    };
-    validate_login(owner, "GitHub repository owner")?;
-    if name.is_empty()
-        || name.contains('/')
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-    {
-        return Err(ProducerError::InvalidConfig(format!(
-            "GitHub repository {repo:?} must be a safe owner/name pair"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_login(login: &str, label: &str) -> Result<(), ProducerError> {
-    validate_name(login, label)?;
-    if !login
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return Err(ProducerError::InvalidConfig(format!(
-            "{label} {login:?} is not a safe GitHub login"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn valid_explicit_comment_command(command: &str, prefix: char) -> bool {
-    if command.len() > 128
-        || command.trim() != command
-        || command.chars().any(char::is_control)
-        || !command.starts_with(prefix)
-    {
-        return false;
-    }
-    let mut tokens = command.split(' ');
-    let Some(first) = tokens.next() else {
-        return false;
-    };
-    let valid_token = |token: &str| {
-        !token.is_empty()
-            && token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-    };
-    valid_token(&first[1..]) && tokens.all(valid_token)
 }
 
 pub(super) fn validate_producer_name(value: &str) -> Result<(), ProducerError> {
@@ -769,59 +264,4 @@ pub(super) fn expand_dedup_key(
         ));
     }
     Ok(expanded)
-}
-
-#[cfg(test)]
-mod gh_login_vector_tests {
-    use super::{validate_gh_login, MAX_GH_LOGIN_LENGTH};
-    use serde_json::Value;
-
-    /// `nix/lib/gh-login.nix` gates the same reviewer list at module evaluation
-    /// and runs this corpus from `checks.gh-login-grammar`. Both sides assert
-    /// against the committed vector so neither can drift alone: a login the
-    /// module accepts and the daemon rejects deploys green and then dies at
-    /// config load.
-    const VECTORS: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../test/fixtures/gh-login/vectors.json"
-    ));
-
-    #[test]
-    fn shared_gh_login_vector_holds_for_reviewer_validation() {
-        let corpus: Value = serde_json::from_str(VECTORS).unwrap();
-        assert_eq!(
-            corpus["maxLength"].as_u64().unwrap() as usize,
-            MAX_GH_LOGIN_LENGTH,
-            "the corpus and the Rust bound must name the same length"
-        );
-        let cases = corpus["cases"].as_array().unwrap();
-        assert!(!cases.is_empty());
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            let login = case["login"].as_str().unwrap();
-            let expected = case["valid"].as_bool().unwrap();
-            assert_eq!(
-                validate_gh_login("vector", login).is_ok(),
-                expected,
-                "verdict for {name}"
-            );
-        }
-    }
-
-    /// The bound is the half the Nix side used to be missing, so it gets its own
-    /// witness rather than living only inside the loop above.
-    #[test]
-    fn the_corpus_pins_both_sides_of_the_length_bound() {
-        let corpus: Value = serde_json::from_str(VECTORS).unwrap();
-        let cases = corpus["cases"].as_array().unwrap();
-        let at_bound = cases.iter().any(|case| {
-            case["login"].as_str().unwrap().len() == MAX_GH_LOGIN_LENGTH
-                && case["valid"].as_bool().unwrap()
-        });
-        let past_bound = cases.iter().any(|case| {
-            case["login"].as_str().unwrap().len() == MAX_GH_LOGIN_LENGTH + 1
-                && !case["valid"].as_bool().unwrap()
-        });
-        assert!(at_bound && past_bound);
-    }
 }

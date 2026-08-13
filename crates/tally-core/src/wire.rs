@@ -62,11 +62,7 @@ pub const RPC_METHODS: &[&str] = &[
     "query.pools",
 ];
 
-pub const INTERNAL_RPC_METHODS: &[&str] = &[
-    "__campaign.status",
-    "__producer.pool-transition",
-    "__producer.runtime-observed",
-];
+pub const INTERNAL_RPC_METHODS: &[&str] = &["__campaign.status", "__producer.runtime-observed"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodClass {
@@ -98,7 +94,7 @@ pub fn method_class(method: &str) -> Option<MethodClass> {
         | "query.pools"
         | "__campaign.status" => Some(MethodClass::Client),
         "lease.acquire" | "lease.release" | "lease.status" => Some(MethodClass::Job),
-        "__producer.pool-transition" | "__producer.runtime-observed" => Some(MethodClass::Producer),
+        "__producer.runtime-observed" => Some(MethodClass::Producer),
         "queue.pause" | "queue.resume" | "queue.cancel" | "queue.retry" | "queue.drain"
         | "flow.supersede" => Some(MethodClass::Admin),
         _ => None,

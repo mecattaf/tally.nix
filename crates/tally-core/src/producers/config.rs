@@ -1,12 +1,6 @@
 use super::*;
 
-pub const IN_SCOPE_PRODUCER_KINDS: &[&str] = &[
-    "calendar",
-    "events-dir",
-    "gh",
-    "build-effect",
-    "pool-reachability",
-];
+pub const IN_SCOPE_PRODUCER_KINDS: &[&str] = &["calendar", "events-dir"];
 pub const PRODUCER_RUNTIME_SCHEMA_VERSION: u32 = 1;
 
 pub(super) const MAX_INGRESS_BYTES: u64 = 1024 * 1024;
@@ -108,26 +102,6 @@ pub(super) const fn default_poll_interval() -> u64 {
     60
 }
 
-pub(super) const fn default_probe_interval() -> u64 {
-    30
-}
-
-pub(super) const fn default_hysteresis() -> u32 {
-    3
-}
-
-pub(super) fn default_actor_exclude() -> String {
-    "self".to_owned()
-}
-
-pub(super) const fn default_true() -> bool {
-    true
-}
-
-pub(super) const fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProducerEnqueue {
@@ -181,7 +155,6 @@ impl ProducerEnqueue {
         source: EnqueueSource,
         producer: Option<&str>,
         now: DateTime<Utc>,
-        github: Option<&GhOrigin>,
     ) -> Result<EnqueuePayload, ProducerError> {
         let mut pools = self.pools.clone();
         crate::poolset::canonicalize(&mut pools).map_err(|error| {
@@ -192,53 +165,39 @@ impl ProducerEnqueue {
             .as_deref()
             .map(|key| expand_dedup_key(key, now))
             .transpose()?;
-        let argv = self
-            .argv
-            .iter()
-            .map(|argument| render_origin_template(argument, github))
-            .collect::<Result<Vec<_>, _>>()?;
-        let cwd = self
-            .cwd
-            .as_ref()
-            .map(|path| {
-                let path = path.to_str().ok_or_else(|| {
-                    ProducerError::InvalidObservation(
-                        "producer cwd template must be valid UTF-8".to_owned(),
-                    )
-                })?;
-                let rendered = render_origin_template(path, github)?;
-                let rendered = PathBuf::from(rendered);
-                validate_resolved_path(&rendered, "producer cwd")?;
-                Ok::<PathBuf, ProducerError>(rendered)
-            })
-            .transpose()?;
-        let brief = self
-            .brief
-            .as_ref()
-            .map(|brief| render_origin_value(brief, github))
-            .transpose()?;
-        if let Some(brief) = &brief {
-            let rendered_bytes = serde_json::to_vec(brief)?.len() as u64;
-            if rendered_bytes > crate::brief::MAX_BRIEF_BYTES {
+        for argument in &self.argv {
+            validate_literal_template(argument).map_err(ProducerError::InvalidObservation)?;
+        }
+        if let Some(brief) = &self.brief {
+            validate_literal_value(brief).map_err(ProducerError::InvalidObservation)?;
+            let bytes = serde_json::to_vec(brief)?.len() as u64;
+            if bytes > crate::brief::MAX_BRIEF_BYTES {
                 return Err(ProducerError::InvalidObservation(format!(
-                    "rendered producer brief exceeds {} bytes",
+                    "producer brief exceeds {} bytes",
                     crate::brief::MAX_BRIEF_BYTES
                 )));
             }
         }
+        if let Some(cwd) = &self.cwd {
+            let cwd_text = cwd.to_str().ok_or_else(|| {
+                ProducerError::InvalidObservation("producer cwd must be valid UTF-8".to_owned())
+            })?;
+            validate_literal_template(cwd_text).map_err(ProducerError::InvalidObservation)?;
+            validate_resolved_path(cwd, "producer cwd")?;
+        }
         Ok(EnqueuePayload {
             invocation: None,
-            argv: Some(argv),
+            argv: Some(self.argv.clone()),
             pools: Some(pools),
             executor: self.executor.clone(),
             priority: Some(self.priority),
             adapter: Some(self.adapter.clone()),
-            cwd,
+            cwd: self.cwd.clone(),
             workspace: self.workspace.clone(),
             adapter_options: (!self.adapter_options.is_default())
                 .then(|| self.adapter_options.clone()),
             gate_manifest: self.gate_manifest.clone(),
-            brief,
+            brief: self.brief.clone(),
             brief_path: None,
             resume_from: None,
             source: Some(source),
@@ -254,10 +213,9 @@ impl ProducerEnqueue {
             runtime_max_sec: self.runtime_max_sec,
             no_enqueue: self.no_enqueue,
             credentials: self.credentials.clone(),
-            origin: Some(match (producer, github) {
-                (Some(name), Some(github)) => AdmissionOrigin::github(name, github.clone()),
-                (Some(name), None) => AdmissionOrigin::producer(name, source),
-                (None, _) => AdmissionOrigin::direct(source),
+            origin: Some(match producer {
+                Some(name) => AdmissionOrigin::producer(name, source),
+                None => AdmissionOrigin::direct(source),
             }),
             caller_job_id: None,
             caller_job_token: None,
@@ -289,182 +247,11 @@ pub struct EventsDirProducer {
     pub poll_interval_sec: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GhSourceItemKind {
-    Issue,
-    PullRequest,
-}
-
-impl GhSourceItemKind {
-    pub(super) const fn matches(self, item_type: GhItemType) -> bool {
-        matches!(
-            (self, item_type),
-            (Self::Issue, GhItemType::Issue) | (Self::PullRequest, GhItemType::PullRequest)
-        )
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GhSourceConstraints {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
-    #[serde(default, alias = "repos")]
-    pub repositories: Vec<String>,
-    #[serde(default)]
-    pub owners: Vec<String>,
-    #[serde(default)]
-    pub labels: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<GhItemState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assignee: Option<String>,
-    #[serde(default)]
-    pub kinds: Vec<GhSourceItemKind>,
-    #[serde(default)]
-    pub notification_reasons: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    #[serde(default, alias = "items")]
-    pub item_allowlist: Vec<String>,
-}
-
-impl GhSourceConstraints {
-    pub(super) fn has_identity_scope(&self) -> bool {
-        self.repo.is_some()
-            || !self.repositories.is_empty()
-            || !self.owners.is_empty()
-            || !self.item_allowlist.is_empty()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GhSource {
-    Notifications(GhSourceConstraints),
-    Search(GhSourceConstraints),
-}
-
-impl GhSource {
-    pub(super) const fn kind(&self) -> &'static str {
-        match self {
-            Self::Notifications(_) => "notifications",
-            Self::Search(_) => "search",
-        }
-    }
-
-    pub(super) const fn constraints(&self) -> &GhSourceConstraints {
-        match self {
-            Self::Notifications(constraints) | Self::Search(constraints) => constraints,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GhTriggers {
-    #[serde(default)]
-    pub command_comments: Vec<String>,
-    #[serde(default)]
-    pub mentions: Vec<String>,
-    #[serde(default)]
-    pub assignments: Vec<String>,
-    #[serde(default)]
-    pub labels: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GhProducer {
-    #[serde(default)]
-    pub credentials: BTreeMap<String, PathBuf>,
-    pub enable: bool,
-    #[serde(default)]
-    pub sources: Vec<GhSource>,
-    #[serde(default)]
-    pub triggers: GhTriggers,
-    #[serde(default = "default_actor_exclude")]
-    pub actor_exclude: String,
-    #[serde(default)]
-    pub allow_self_triggered: bool,
-    #[serde(default)]
-    pub allowed_actors: Vec<String>,
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_sec: u64,
-    #[serde(default = "default_true")]
-    pub post_receipt: bool,
-    #[serde(default)]
-    pub post_evidence: bool,
-    #[serde(default)]
-    pub post_failure_evidence: bool,
-    #[serde(default)]
-    pub post_failure_stderr: bool,
-    #[serde(default)]
-    pub post_gate_summary: bool,
-    #[serde(default)]
-    pub request_review: bool,
-    /// GitHub logins to request a review from when `requestReview` fires.
-    /// Validation requires this non-empty whenever `requestReview` is on:
-    /// a switch that claims to request a human review has to name the humans.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reviewers: Vec<String>,
-    #[serde(default)]
-    pub close_on_acceptance: bool,
-    #[serde(default)]
-    pub never_mutate: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_on_pass: Option<bool>,
-    pub enqueue: ProducerEnqueue,
-}
-
-impl GhProducer {
-    /// Absent means off. The Nix module has always rendered the field
-    /// explicitly, and pre-field serializations are not a supported input, so
-    /// nothing may close a GitHub item merely because evidence posting is on:
-    /// closing is its own opt-in. `closeOnPass = true` still requires
-    /// `postEvidence = true`, which validation enforces.
-    pub fn close_on_pass(&self) -> bool {
-        self.close_on_pass.unwrap_or(false)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BuildEffectWatch {
-    #[default]
-    GcRootsDir,
-    Jsonl,
-    PostBuildHook,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct BuildEffectProducer {
-    #[serde(default)]
-    pub credentials: BTreeMap<String, PathBuf>,
-    #[serde(default)]
-    pub watch: BuildEffectWatch,
-    pub path: PathBuf,
-    pub on_key: ProducerEnqueue,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PoolReachabilityProducer {
-    #[serde(default)]
-    pub credentials: BTreeMap<String, PathBuf>,
-    pub probe_pool: String,
-    #[serde(default = "default_probe_interval")]
-    pub interval_sec: u64,
-    #[serde(default = "default_hysteresis")]
-    pub hysteresis: u32,
-    #[serde(default)]
-    pub on_lost: Option<ProducerEnqueue>,
-    #[serde(default)]
-    pub on_return: Option<ProducerEnqueue>,
-    #[serde(default)]
-    pub on_return_attest: Option<ProducerEnqueue>,
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ProducerObservation {
+    Calendar,
+    EventsDir,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,9 +259,6 @@ pub struct PoolReachabilityProducer {
 pub enum ProducerConfig {
     Calendar(CalendarProducer),
     EventsDir(EventsDirProducer),
-    Gh(GhProducer),
-    BuildEffect(BuildEffectProducer),
-    PoolReachability(Box<PoolReachabilityProducer>),
 }
 
 impl ProducerConfig {
@@ -482,9 +266,6 @@ impl ProducerConfig {
         match self {
             Self::Calendar(_) => "calendar",
             Self::EventsDir(_) => "events-dir",
-            Self::Gh(_) => "gh",
-            Self::BuildEffect(_) => "build-effect",
-            Self::PoolReachability(_) => "pool-reachability",
         }
     }
 
@@ -492,9 +273,6 @@ impl ProducerConfig {
         match self {
             Self::Calendar(config) => &config.credentials,
             Self::EventsDir(config) => &config.credentials,
-            Self::Gh(config) => &config.credentials,
-            Self::BuildEffect(config) => &config.credentials,
-            Self::PoolReachability(config) => &config.credentials,
         }
     }
 }

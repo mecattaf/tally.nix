@@ -124,7 +124,7 @@ fn project_producer(name: &str, producer: &ProducerConfig, state_dir: &Path) -> 
     let (calendar_expression, poll_cadence_sec) = schedule(producer);
     let (next_trigger, next_trigger_unavailable_reason) =
         next_trigger(producer, runtime_record.as_ref(), poll_cadence_sec);
-    let enabled = !matches!(producer, ProducerConfig::Gh(config) if !config.enable);
+    let enabled = true;
     let runtime_projection = match runtime {
         Ok(Some(record)) if record.last_error.is_some() => ProducerRuntimeProjection {
             state: "failed".to_owned(),
@@ -198,9 +198,6 @@ fn schedule(producer: &ProducerConfig) -> (Option<String>, Option<u64>) {
     match producer {
         ProducerConfig::Calendar(config) => (Some(config.on_calendar.clone()), None),
         ProducerConfig::EventsDir(config) => (None, Some(config.poll_interval_sec)),
-        ProducerConfig::Gh(config) => (None, Some(config.poll_interval_sec)),
-        ProducerConfig::PoolReachability(config) => (None, Some(config.interval_sec)),
-        ProducerConfig::BuildEffect(_) => (None, None),
     }
 }
 
@@ -254,20 +251,6 @@ fn enqueue_summaries(producer: &ProducerConfig) -> Vec<ProducerEnqueueSummary> {
         ProducerConfig::Calendar(config) => {
             vec![enqueue_summary("calendar", "calendar", &config.enqueue)]
         }
-        ProducerConfig::Gh(config) => vec![enqueue_summary("trigger", "gh", &config.enqueue)],
-        ProducerConfig::BuildEffect(config) => {
-            vec![enqueue_summary("key", "build-effect", &config.on_key)]
-        }
-        ProducerConfig::PoolReachability(config) => [
-            ("lost", config.on_lost.as_ref()),
-            ("return", config.on_return.as_ref()),
-            ("return-attest", config.on_return_attest.as_ref()),
-        ]
-        .into_iter()
-        .filter_map(|(action, enqueue)| {
-            enqueue.map(|enqueue| enqueue_summary(action, "pool-reachability", enqueue))
-        })
-        .collect(),
         ProducerConfig::EventsDir(_) => Vec::new(),
     }
 }

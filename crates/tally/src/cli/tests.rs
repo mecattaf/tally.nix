@@ -356,7 +356,7 @@ fn flow_failure_taxonomy_has_distinguished_exit_codes() {
 fn full_top_level_surface_is_visible() {
     let help = Opts::command().render_long_help().to_string();
     for verb in [
-        "enqueue", "queue", "producer", "adapter", "witness", "lease", "daemon", "query", "flow",
+        "enqueue", "queue", "adapter", "witness", "lease", "daemon", "query", "flow",
     ] {
         assert!(help.contains(verb), "missing {verb} from help");
     }
@@ -542,9 +542,9 @@ fn hidden_producer_dispatch_parses_a_typed_observation() {
         "--config",
         "/tmp/config.json",
         "__producer-dispatch",
-        "health",
+        "daily",
         "--event",
-        r#"{"kind":"pool-reachability","reachable":false}"#,
+        r#"{"kind":"calendar"}"#,
         "--state-dir",
         "/tmp/state",
         "--data-dir",
@@ -558,7 +558,7 @@ fn hidden_producer_dispatch_parses_a_typed_observation() {
             state_dir: Some(state_dir),
             data_dir,
             ..
-        })) if producer == "health"
+        })) if producer == "daily"
             && state_dir == Path::new("/tmp/state")
             && data_dir == Path::new("/tmp/data")
     ));
@@ -575,9 +575,9 @@ fn hidden_producer_dispatch_requires_the_data_directory() {
         "--config",
         "/tmp/config.json",
         "__producer-dispatch",
-        "health",
+        "daily",
         "--event",
-        r#"{"kind":"pool-reachability","reachable":false}"#,
+        r#"{"kind":"calendar"}"#,
         "--state-dir",
         "/tmp/state",
     ])
@@ -955,34 +955,7 @@ fn enqueue_wave_three_options_and_public_continuation_parse_directly() {
 }
 
 #[test]
-fn producer_diagnostics_and_related_trigger_fallback_parse_strictly() {
-    let test = Opts::try_parse_from([
-        "tally",
-        "producer",
-        "test",
-        "github",
-        "--item",
-        "https://github.com/acme/widgets/issues/42",
-        "--event",
-        "command-comment",
-        "--actor",
-        "maintainer",
-        "--no-enqueue",
-    ])
-    .unwrap();
-    assert!(matches!(
-        test.command,
-        Some(Command::Producer {
-            command: ProducerCommand::Test {
-                name,
-                event: GhDiagnosticEvent::CommandComment,
-                no_enqueue: true,
-                promote: false,
-                ..
-            }
-        }) if name == "github"
-    ));
-
+fn related_trigger_fallback_parses_strictly() {
     let fallback = Opts::try_parse_from([
         "tally",
         "enqueue",

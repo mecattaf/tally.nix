@@ -345,16 +345,14 @@ impl DaemonHandler {
             .filter(|job| {
                 job.state == JobState::Paused
                     && job.row.pools.iter().any(|pool| pools.contains(pool))
-                    && !job.row.pools.iter().any(|pool| {
-                        context.paused_pools.contains(pool)
-                            || context.unreachable_pools.contains(pool)
-                    })
+                    && !job
+                        .row
+                        .pools
+                        .iter()
+                        .any(|pool| context.paused_pools.contains(pool))
             })
             .map(|job| job.job_id)
             .collect::<Vec<_>>();
-        for job_id in &paused_jobs {
-            context.unreachable_paused_jobs.remove(job_id);
-        }
         let launches = resume_paused_jobs_locked(&mut context, &self.executor, paused_jobs);
         drop(context);
         for job in launches {

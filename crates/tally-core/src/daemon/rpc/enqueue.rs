@@ -253,17 +253,12 @@ impl DaemonHandler {
         let stable_key = task_uuid.to_string();
         let barrier = context.barriers.register_job(&stable_key, next_attempt);
         let mut launch = None;
-        if row.pools.iter().any(|pool| {
-            context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
-        }) {
+        if row
+            .pools
+            .iter()
+            .any(|pool| context.paused_pools.contains(pool))
+        {
             job.state = JobState::Paused;
-            if row
-                .pools
-                .iter()
-                .any(|pool| context.unreachable_pools.contains(pool))
-            {
-                context.unreachable_paused_jobs.insert(task_uuid);
-            }
         } else {
             match context.lease.admit(request, Utc::now()) {
                 Ok(AdmitOutcome::Granted(grant)) => {
@@ -498,13 +493,6 @@ impl DaemonHandler {
         // Tree and SQLite measurement stay on the periodic blocking sampler,
         // but the cheap statvfs guard must be current for every admission.
         let storage = self.refresh_storage_for_intake();
-        let warning_origin = payload.gh_origin.clone().or_else(|| {
-            payload
-                .origin
-                .as_ref()
-                .and_then(|origin| origin.github.clone())
-        });
-        self.post_storage_warning_receipts(warning_origin, &storage.active_warnings);
         if !storage.intake.accepting {
             return Err(storage_intake_wire(&storage));
         }
@@ -609,16 +597,6 @@ impl DaemonHandler {
             .adapter
             .clone()
             .unwrap_or_else(|| "shell".to_owned());
-        if let Some(origin) = &payload.gh_origin {
-            ProducerEngine::new(
-                &context.config.producers,
-                context.paths.events_dir(),
-                &context.paths.state_dir,
-                &context.paths.data_dir,
-            )
-            .validate_gh_origin(origin)
-            .map_err(|error| WireError::invalid(error.to_string()))?;
-        }
         let mut requested_pools = payload
             .pools
             .clone()
@@ -1309,7 +1287,6 @@ impl DaemonHandler {
                     // written just above are what answers for it afterwards.
                     let evidence = serde_json::to_string(&row.evidence).map_err(internal_wire)?;
                     drop(context);
-                    self.complete_gh_post_ack(job.row.clone(), result.clone());
                     self.emit_post_ack(enqueued_event(&job));
                     self.emit_post_ack(completed_event(&job, &result, evidence));
                     let mut response = json!({
@@ -1403,17 +1380,12 @@ impl DaemonHandler {
 
         let barrier = context.barriers.register_job(&stable_key, row.attempt);
         let mut launch = None;
-        if row.pools.iter().any(|pool| {
-            context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
-        }) {
+        if row
+            .pools
+            .iter()
+            .any(|pool| context.paused_pools.contains(pool))
+        {
             job.state = JobState::Paused;
-            if row
-                .pools
-                .iter()
-                .any(|pool| context.unreachable_pools.contains(pool))
-            {
-                context.unreachable_paused_jobs.insert(job_id);
-            }
         } else {
             match context.lease.admit(request, Utc::now()) {
                 Ok(AdmitOutcome::Granted(grant)) => {

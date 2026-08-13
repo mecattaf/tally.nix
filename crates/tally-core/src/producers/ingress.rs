@@ -458,48 +458,6 @@ pub(super) fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(
     sync_directory(parent)
 }
 
-pub(super) fn read_reachability_state(path: &Path) -> Result<ReachabilityState, ProducerError> {
-    if !path.exists() {
-        return Ok(ReachabilityState::default());
-    }
-    let bytes = read_bounded_regular(path, 64 * 1024)?;
-    let state: ReachabilityState = serde_json::from_slice(&bytes)?;
-    let candidate_is_coherent = matches!(
-        (state.candidate_reachable, state.consecutive),
-        (None, 0) | (Some(_), 1..)
-    );
-    let generation_is_coherent = matches!(
-        (state.stable, state.generation % 2),
-        (ReachabilityStable::Reachable, 0) | (ReachabilityStable::Lost, 1)
-    );
-    if !candidate_is_coherent
-        || !generation_is_coherent
-        || (state.probe_pool.is_none() && state.generation > 0)
-        || state.notified_generation > state.generation
-    {
-        return Err(ProducerError::InvalidObservation(format!(
-            "reachability state {} is internally inconsistent",
-            path.display()
-        )));
-    }
-    Ok(state)
-}
-
-pub(super) fn validate_reachability_binding(
-    state: &ReachabilityState,
-    path: &Path,
-    probe_pool: &str,
-) -> Result<(), ProducerError> {
-    if state.probe_pool.as_deref() == Some(probe_pool) {
-        Ok(())
-    } else {
-        Err(ProducerError::InvalidObservation(format!(
-            "reachability state {} is not bound to configured probePool {probe_pool:?}",
-            path.display()
-        )))
-    }
-}
-
 pub(super) fn read_bounded_regular(path: &Path, limit: u64) -> Result<Vec<u8>, ProducerError> {
     let preopen_metadata = std::fs::symlink_metadata(path).map_err(|source| ProducerError::Io {
         path: path.to_owned(),
