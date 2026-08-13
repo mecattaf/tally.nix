@@ -2829,6 +2829,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let attempt_receipts_path = daemon_paths
                 .state_dir
                 .join("campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl");
+            let integration_branch = "tally/fixture-campaign-fixture/integration";
             let arguments = |run_id: &str, priority: &str| {
                 json!({
                     "campaign": "fixture",
@@ -3276,32 +3277,59 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 json!(["task-1", "task-3"])
             );
             assert_eq!(second_value["merged"][0]["taskId"], "task-3");
-            // The campaign default is squash, so the base branch must carry a
-            // single-parent commit per merged task, not a merge commit. Every
-            // commit on main having at most one parent is the whole assertion:
-            // a `--no-ff` merge would show two.
+            // The campaign default is squash, so the local integration branch
+            // must carry a single-parent commit per merged task, not a merge
+            // commit. A `--no-ff` merge would show two parents here.
             fixture_git(&checkout, &["fetch", "--prune", "origin"]);
-            let parents = fixture_git(&checkout, &["log", "--format=%P", "origin/main"]);
+            let parents = fixture_git(
+                &checkout,
+                &["log", "--format=%P", integration_branch],
+            );
             assert!(
                 parents
                     .lines()
                     .all(|line| line.split_whitespace().count() <= 1),
-                "squash merges must leave no merge commit on base:\n{parents}"
+                "squash merges must leave no merge commit on integration:\n{parents}"
             );
-            // A squash leaves the task head unreachable from base, so the
-            // local read path proves merged-ness from this receipt instead.
+            // The receipt is a local audit index. Completion itself is the
+            // exact task marker on first-parent integration history.
             let receipts = fixture_git(
                 &checkout,
-                &["ls-remote", "origin", "refs/tally/spec-build/v1/*/merge/*"],
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname) %(refname)",
+                    "refs/tally/spec-build/v1/",
+                ],
             );
             assert!(
                 receipts.contains("/merge/task-3"),
-                "squash merge must publish a task-3 receipt ref:\n{receipts}"
+                "squash merge must record a local task-3 receipt ref:\n{receipts}"
             );
+            let task_3_merge = second_value["merged"][0]["mergeCommit"]
+                .as_str()
+                .unwrap();
+            assert!(receipts.lines().any(|line| {
+                line.starts_with(task_3_merge) && line.contains("/merge/task-3")
+            }));
+            let task_3_markers = fixture_git(
+                &checkout,
+                &[
+                    "log",
+                    "--first-parent",
+                    "--format=%H",
+                    "--fixed-strings",
+                    "--grep=campaign=fixture issue=7 task=task-3 revision=sha256:",
+                    integration_branch,
+                ],
+            );
+            assert_eq!(task_3_markers, task_3_merge);
             // With no steward configured the narration is the brief-derived
             // template, and it is what the squash commit says.
             assert_eq!(
-                fixture_git(&checkout, &["log", "-1", "--format=%s", "origin/main"]),
+                fixture_git(
+                    &checkout,
+                    &["log", "-1", "--format=%s", integration_branch],
+                ),
                 "task-3: Create an independent fixture artifact"
             );
             // §7's provenance pointer is the node's own, assembled from the
@@ -3316,10 +3344,18 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert!(trailer.ends_with(')'), "{trailer}");
             assert!(trailer.contains(" witness:"), "{trailer}");
-            let message = fixture_git(&checkout, &["log", "-1", "--format=%B", "origin/main"]);
+            let message = fixture_git(
+                &checkout,
+                &["log", "-1", "--format=%B", integration_branch],
+            );
             assert!(
                 message.contains(trailer),
                 "the squash message must carry the trailer:\n{message}"
+            );
+            assert_eq!(
+                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
+                "1",
+                "task integration must not advance the shared remote base"
             );
             // gitAiBinding defaults to off, so the merge node binds nothing
             // and says so rather than leaving the reader to guess.
@@ -3555,16 +3591,22 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 );
             }
 
-            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/three.txt"]),
+                fixture_git(
+                    &checkout,
+                    &["show", &format!("{integration_branch}:build/three.txt")],
+                ),
                 "three"
             );
             assert!(
                 StdCommand::new("git")
                     .arg("-C")
                     .arg(&checkout)
-                    .args(["cat-file", "-e", "origin/main:build/one.txt"])
+                    .args([
+                        "cat-file",
+                        "-e",
+                        &format!("{integration_branch}:build/one.txt"),
+                    ])
                     .status()
                     .unwrap()
                     .code()
@@ -3646,13 +3688,21 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 3
             );
 
-            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/one.txt"]),
+                fixture_git(
+                    &checkout,
+                    &["show", &format!("{integration_branch}:build/one.txt")],
+                ),
                 "one"
             );
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/checkpoint-red"]),
+                fixture_git(
+                    &checkout,
+                    &[
+                        "show",
+                        &format!("{integration_branch}:build/checkpoint-red"),
+                    ],
+                ),
                 "pending phase validation"
             );
 
@@ -3780,20 +3830,29 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             )
             .contains("phase one checkpoint has no prior steering"));
 
-            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/four.txt"]),
+                fixture_git(
+                    &checkout,
+                    &["show", &format!("{integration_branch}:build/four.txt")],
+                ),
                 "four"
             );
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/six.txt"]),
+                fixture_git(
+                    &checkout,
+                    &["show", &format!("{integration_branch}:build/six.txt")],
+                ),
                 "six"
             );
             assert!(
                 StdCommand::new("git")
                     .arg("-C")
                     .arg(&checkout)
-                    .args(["cat-file", "-e", "origin/main:build/checkpoint-red"])
+                    .args([
+                        "cat-file",
+                        "-e",
+                        &format!("{integration_branch}:build/checkpoint-red"),
+                    ])
                     .status()
                     .unwrap()
                     .code()
@@ -3887,7 +3946,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 .unwrap();
             assert_eq!(
                 checkpoint_revision,
-                fixture_git(&checkout, &["rev-parse", "origin/main"])
+                fixture_git(&checkout, &["rev-parse", integration_branch])
             );
             let checkpoint_ref = checkpoint_value["checkpoints"][0]["ref"].as_str().unwrap();
             // Hidden namespace, never a tag: a public target repository must
@@ -3925,8 +3984,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     && item["orchestration"]["nodeLabel"] != "merge-phase-one-checkpoint"
             }));
 
-            fixture_git(&checkout, &["fetch", "origin"]);
-            let task_2_base = fixture_git(&checkout, &["rev-parse", "origin/main"]);
+            let task_2_base = fixture_git(&checkout, &["rev-parse", integration_branch]);
 
             let sixth = runner(
                 &config_path,
@@ -3985,28 +4043,36 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 "a failure-only pass must sweep, reconcile, and post one continuation"
             );
 
-            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/four.txt"]),
+                fixture_git(
+                    &checkout,
+                    &["show", &format!("{integration_branch}:build/four.txt")],
+                ),
                 "four"
             );
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/six.txt"]),
+                fixture_git(
+                    &checkout,
+                    &["show", &format!("{integration_branch}:build/six.txt")],
+                ),
                 "six"
             );
-            let main_paths = fixture_git(
+            let integration_paths = fixture_git(
                 &checkout,
-                &["ls-tree", "-r", "--name-only", "origin/main"],
+                &["ls-tree", "-r", "--name-only", integration_branch],
             );
-            assert!(!main_paths.lines().any(|path| path == "build/two.txt"));
-            assert!(!main_paths.lines().any(|path| path == "build/five.txt"));
+            assert!(!integration_paths.lines().any(|path| path == "build/two.txt"));
+            assert!(!integration_paths.lines().any(|path| path == "build/five.txt"));
             assert_eq!(
-                fixture_git(&checkout, &["rev-parse", "origin/main"]),
+                fixture_git(&checkout, &["rev-parse", integration_branch]),
                 task_2_base,
-                "the first failed task-2 attempt must leave main unchanged"
+                "the first failed task-2 attempt must leave integration unchanged"
             );
             assert!(
-                !fixture_git(&checkout, &["ls-tree", "-r", "--name-only", "origin/main"])
+                !fixture_git(
+                    &checkout,
+                    &["ls-tree", "-r", "--name-only", integration_branch],
+                )
                     .lines()
                     .any(|path| {
                         let basename = path.rsplit('/').next().unwrap_or(path);
@@ -4018,10 +4084,20 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             let first_parent = fixture_git(
                 &checkout,
-                &["rev-list", "--first-parent", "--reverse", "origin/main"],
+                &[
+                    "rev-list",
+                    "--first-parent",
+                    "--reverse",
+                    integration_branch,
+                ],
             );
             let commits = first_parent.lines().collect::<Vec<_>>();
             assert_eq!(commits.len(), 5, "initial commit plus four task merges");
+            assert_eq!(
+                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
+                "1",
+                "the shared remote base must still contain only its authority commit"
+            );
 
             let replay = runner(
                 &config_path,
@@ -4622,9 +4698,11 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(recovered_value["state"], "advanced");
             assert_eq!(recovered_value["merged"][0]["taskId"], "task-2b");
 
-            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
+                fixture_git(
+                    &checkout,
+                    &["show", &format!("{integration_branch}:build/two.txt")],
+                ),
                 "two"
             );
 
