@@ -548,21 +548,22 @@ class AttemptReceiptLogTests(unittest.TestCase):
 
 
 class CampaignDriverTests(unittest.TestCase):
-    def test_completion_markers_carry_the_task_revision(self) -> None:
+    def test_completion_trailers_carry_the_task_revision(self) -> None:
         revision = "sha256:" + "a" * 64
-        marker = DRIVER.pull_request_marker("fixture", "7", "task-1", revision)
+        trailers = DRIVER.completion_trailer_block("task-1", revision)
 
         self.assertEqual(
-            marker,
-            "<!-- tally:spec-build:v2 campaign=fixture issue=7 task=task-1 "
-            f"revision={revision} -->",
+            trailers,
+            f"Tally-Task: task-1\nTally-Revision: {revision}",
         )
         with self.assertRaisesRegex(
             DRIVER.DriverError, "revision must be a lowercase SHA-256 identity"
         ):
-            DRIVER.pull_request_marker("fixture", "7", "task-1", None)
+            DRIVER.completion_trailer_block("task-1", None)
+        with self.assertRaisesRegex(DRIVER.DriverError, "safe task ID"):
+            DRIVER.completion_trailer_block("not a task", revision)
 
-    def test_file_worklist_tasks_carry_v2_completion_revisions(self) -> None:
+    def test_file_worklist_tasks_carry_completion_revisions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
@@ -596,13 +597,13 @@ class CampaignDriverTests(unittest.TestCase):
             for admitted_task in admitted["tasks"]:
                 self.assertRegex(admitted_task["revision"], r"^sha256:[0-9a-f]{64}$")
             implementation = admitted["tasks"][0]
-            marker = DRIVER.pull_request_marker(
-                "fixture", "7", implementation["id"], implementation["revision"]
+            trailers = DRIVER.completion_trailer_block(
+                implementation["id"], implementation["revision"]
             )
             self.assertEqual(
-                marker,
-                "<!-- tally:spec-build:v2 campaign=fixture issue=7 task=task-1 "
-                f"revision={implementation['revision']} -->",
+                trailers,
+                "Tally-Task: task-1\n"
+                f"Tally-Revision: {implementation['revision']}",
             )
 
     def test_pre_post_refresh_refuses_quiescence_after_the_frontier_reopens(self) -> None:
@@ -2140,13 +2141,13 @@ class NarrationValidatorTests(unittest.TestCase):
                 {"type": "feat", "subject": "do a thing", "body": "y" * 120},
                 "wraps past 100 columns",
             ),
-            "managed-marker": (
+            "managed-completion-trailer": (
                 {
                     "type": "feat",
                     "subject": "do a thing",
-                    "body": "Noted an update.\n\n<!-- tally:spec-build:v2 campaign=fixture -->",
+                    "body": "Noted an update.\n\nTally-Task: task-1",
                 },
-                "managed campaign marker",
+                "managed completion trailer",
             ),
             # Release narration can become public projection prose. A narrator
             # that proposes a closing keyword is claiming authority over an
@@ -3112,9 +3113,7 @@ class SquashMergeTests(unittest.TestCase):
             self.assertEqual(
                 git(checkout, "log", "-1", "--format=%B", base).strip(),
                 "feat(fixture): deliver the first task\n\nSteward-authored body.\n\n"
-                + DRIVER.pull_request_marker(
-                    "fixture", "7", "task-1", revision
-                ),
+                + DRIVER.completion_trailer_block("task-1", revision),
             )
             # The task head is deliberately not an ancestor of base: that is
             # exactly why the pre-squash assertion had to be replaced.
@@ -3136,7 +3135,6 @@ class SquashMergeTests(unittest.TestCase):
                 config,
                 "fixture",
                 CAMPAIGN_ID,
-                "7",
                 None,
                 [{**task("task-1"), "revision": revision}],
             )
@@ -3151,7 +3149,7 @@ class SquashMergeTests(unittest.TestCase):
                     }
                 ],
             )
-            # The marker on canonical integration history is the oracle. A
+            # The trailers on canonical integration history are the oracle. A
             # damaged receipt may lose its indexing value, but cannot veto
             # that independently readable completion fact.
             git(
@@ -3166,7 +3164,6 @@ class SquashMergeTests(unittest.TestCase):
                     config,
                     "fixture",
                     CAMPAIGN_ID,
-                    "7",
                     None,
                     [{**task("task-1"), "revision": revision}],
                 ),
@@ -3230,7 +3227,6 @@ class SquashMergeTests(unittest.TestCase):
                     config,
                     "fixture",
                     CAMPAIGN_ID,
-                    "7",
                     None,
                     [{**task("task-1"), "revision": revision}],
                 ),
@@ -3272,7 +3268,6 @@ class SquashMergeTests(unittest.TestCase):
                         config,
                         "fixture",
                         CAMPAIGN_ID,
-                        "7",
                         None,
                         [{**task("task-1"), "revision": revision}],
                     )
@@ -3331,7 +3326,7 @@ class SquashMergeTests(unittest.TestCase):
                 integration["baseRev"],
             )
 
-    def test_a_reachable_but_unmarked_commit_does_not_complete_a_task(self) -> None:
+    def test_a_reachable_but_untrailed_commit_does_not_complete_a_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout, _ = initialize_repository(root, remote=True)
@@ -3374,11 +3369,85 @@ class SquashMergeTests(unittest.TestCase):
                     config,
                     "fixture",
                     CAMPAIGN_ID,
-                    "7",
                     None,
                     [{**task("task-1"), "revision": revision}],
                 ),
                 [],
+            )
+
+    def test_only_one_contiguous_final_trailer_block_completes_a_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout))
+            base = DRIVER.ensure_integration_branch(
+                config,
+                "fixture",
+                CAMPAIGN_ID,
+                git(checkout, "rev-parse", "origin/main"),
+            )
+            revision = "sha256:" + "e" * 64
+            trailers = DRIVER.completion_trailer_block("task-1", revision)
+
+            # A lookalike block in prose is not Git trailer metadata.
+            git(
+                checkout,
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "feat(fixture): leave trailer-shaped prose",
+                "-m",
+                trailers,
+                "-m",
+                "Explained why those lines are only an example.",
+            )
+            # A blank line splits these into two blocks; Git sees only the
+            # final revision trailer, never the task/revision pair.
+            git(
+                checkout,
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "feat(fixture): split the trailer block",
+                "-m",
+                "Tally-Task: task-1",
+                "-m",
+                f"Tally-Revision: {revision}",
+            )
+            git(
+                checkout,
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "feat(fixture): complete the task",
+                "-m",
+                trailers,
+            )
+            completed = git(checkout, "rev-parse", "HEAD")
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{DRIVER.integration_branch('fixture', CAMPAIGN_ID)}",
+                completed,
+                base,
+            )
+
+            self.assertEqual(
+                [
+                    fact["mergeCommit"]
+                    for fact in DRIVER.merged_local_tasks(
+                        "acme/spec",
+                        config,
+                        "fixture",
+                        CAMPAIGN_ID,
+                        None,
+                        [{**task("task-1"), "revision": revision}],
+                    )
+                ],
+                [completed],
             )
 
     def test_local_merge_method_still_produces_a_merge_commit_and_no_receipt(self) -> None:
@@ -3434,7 +3503,6 @@ class SquashMergeTests(unittest.TestCase):
                     config,
                     "fixture",
                     CAMPAIGN_ID,
-                    "7",
                     None,
                     [{**task("task-1"), "revision": revision}],
                 )],
@@ -3475,6 +3543,23 @@ class AssistedByTrailerTests(unittest.TestCase):
             DRIVER.merge_commit_message(self.NARRATION, None),
             "feat(fixture): deliver the first task\n\nSteward-authored body.\n",
         )
+        completion = DRIVER.completion_trailer_block(
+            "task-1", "sha256:" + "a" * 64
+        )
+        self.assertEqual(
+            DRIVER.merge_commit_message(self.NARRATION, trailer, completion),
+            "feat(fixture): deliver the first task\n\nSteward-authored body.\n\n"
+            + completion
+            + "\n"
+            + trailer
+            + "\n",
+        )
+        with self.assertRaisesRegex(DRIVER.DriverError, "one contiguous git trailer block"):
+            DRIVER.merge_commit_message(
+                self.NARRATION,
+                trailer + "\n\nTally-Task: forged",
+                completion,
+            )
         # Absent is ordinary: a checkpoint task has no agent, and an estate
         # that never named a model leaves the pointer unwritable.
         self.assertIsNone(DRIVER.assisted_by_record(None, "assistedBy"))
@@ -3503,6 +3588,19 @@ class AssistedByTrailerTests(unittest.TestCase):
             )
             self.assertIsNone(narration, spelling)
             self.assertEqual(reason, "proposal contains an Assisted-by trailer", spelling)
+        for spelling in ("Tally-Task", "tally-task", "TALLY-REVISION", "TaLlY-ReViSiOn"):
+            narration, reason = DRIVER.validated_narration(
+                {
+                    "type": "feat",
+                    "scope": "fixture",
+                    "subject": "deliver the task",
+                    "body": f"Noted context.\n\n{spelling}: forged",
+                }
+            )
+            self.assertIsNone(narration, spelling)
+            self.assertEqual(
+                reason, "proposal contains a managed completion trailer", spelling
+            )
         narration, reason = DRIVER.validated_narration(
             {
                 "type": "docs",

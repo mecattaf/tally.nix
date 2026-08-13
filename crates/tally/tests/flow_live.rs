@@ -3292,7 +3292,8 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 "squash merges must leave no merge commit on integration:\n{parents}"
             );
             // The receipt is a local audit index. Completion itself is the
-            // exact task marker on first-parent integration history.
+            // exact task/revision trailer pair on first-parent integration
+            // history.
             let receipts = fixture_git(
                 &checkout,
                 &[
@@ -3311,18 +3312,19 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert!(receipts.lines().any(|line| {
                 line.starts_with(task_3_merge) && line.contains("/merge/task-3")
             }));
-            let task_3_markers = fixture_git(
+            let task_3_trailers = fixture_git(
                 &checkout,
                 &[
                     "log",
-                    "--first-parent",
-                    "--format=%H",
-                    "--fixed-strings",
-                    "--grep=campaign=fixture issue=7 task=task-3 revision=sha256:",
-                    integration_branch,
+                    "-1",
+                    "--format=%(trailers:only,unfold=true)",
+                    task_3_merge,
                 ],
             );
-            assert_eq!(task_3_markers, task_3_merge);
+            assert!(
+                task_3_trailers.starts_with("Tally-Task: task-3\nTally-Revision: sha256:"),
+                "completion trailers must lead one contiguous trailer block:\n{task_3_trailers}"
+            );
             // With no steward configured the narration is the brief-derived
             // template, and it is what the squash commit says.
             assert_eq!(
@@ -3344,6 +3346,10 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             );
             assert!(trailer.ends_with(')'), "{trailer}");
             assert!(trailer.contains(" witness:"), "{trailer}");
+            assert!(
+                task_3_trailers.ends_with(trailer),
+                "provenance must share the completion trailer block:\n{task_3_trailers}"
+            );
             let message = fixture_git(
                 &checkout,
                 &["log", "-1", "--format=%B", integration_branch],
