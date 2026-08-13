@@ -9,10 +9,11 @@ import shutil
 from typing import Any
 
 from cases.manifest import (
-    ISSUE_URL,
+    CODE_REPOSITORY,
+    WORKLIST_PATTERN,
     base_manifest,
+    commit_worklist,
     host_config,
-    issue_state,
     repository,
 )
 from support import SUITE_ROOT, Context, case, copy_executable, make_case_directory, require
@@ -28,22 +29,14 @@ def arm_fixture(
     extra_env: dict[str, str] | None = None,
 ) -> tuple[Path, Path, dict[str, str]]:
     checkout, _ = repository(context, root)
-    manifest = base_manifest(checkout)
-    forge = root / "forge.json"
-    issue_state(forge, manifest)
+    document = base_manifest(checkout)
+    commit_worklist(context, checkout, document)
     config = root / "config.json"
     host_config(context, config)
-    fake_bin = root / "bin"
-    fake_bin.mkdir()
-    copy_executable(SUITE_ROOT / "fixtures/pipeline/fake-gh.py", fake_bin / "gh")
     state = root / "registry"
     chosen_flow = flow or context.tally.parent.parent / "share/tally/flows/spec-build.js"
     chosen_driver = driver or context.driver
-    environment = context.environment(
-        TALLY_GH_PROGRAM=fake_bin / "gh",
-        FINAL_BAR_FORGE_STATE=forge,
-        PATH=f"{fake_bin}:{os.environ.get('PATH', '')}",
-    )
+    environment = context.environment()
     if extra_env:
         environment.update(extra_env)
     command: list[os.PathLike[str] | str] = [
@@ -54,9 +47,11 @@ def arm_fixture(
         root / "unused.sock",
         "campaign",
         "arm",
-        ISSUE_URL,
+        CODE_REPOSITORY,
+        WORKLIST_PATTERN,
+        "--checkout",
+        checkout,
         "--no-enqueue",
-        "--allow-test-local-forge",
         "--flow",
         chosen_flow,
         "--driver",
@@ -70,7 +65,7 @@ def arm_fixture(
         command.extend(["--projection-wait-ms", str(projection_wait_ms)])
     armed = context.command(*command, env=environment, timeout=90)
     require(armed.returncode == 0, f"campaign arm fixture failed: {(armed.stderr or armed.stdout)[-3000:]}")
-    return state, forge, environment
+    return state, checkout, environment
 
 
 def authority_file(state: Path) -> Path:
@@ -93,7 +88,7 @@ def list_with(context: Context, executable: Path, state: Path) -> tuple[int, Any
 @case(
     "campaign-registry-n-minus-one",
     (447,),
-    "current default/override authorities decode in actual N-1 and tuning stays in an ignored sidecar",
+    "schema-4 authority is self-contained, tuning stays in a sidecar, and actual N-1 refuses it",
     long=True,
 )
 def campaign_registry_n_minus_one(context: Context) -> None:
@@ -102,13 +97,23 @@ def campaign_registry_n_minus_one(context: Context) -> None:
     for label, wait in (("default", None), ("explicit", 240_000)):
         lane = root / label
         lane.mkdir()
-        state, _, _ = arm_fixture(context, lane, projection_wait_ms=wait)
+        state, checkout, _ = arm_fixture(context, lane, projection_wait_ms=wait)
         authority_path = authority_file(state)
+        encoded = authority_path.read_bytes()
         authority = json.loads(authority_path.read_text(encoding="utf-8"))
-        if authority.get("schemaVersion") != 2:
-            failures.append(f"{label}: authority schema is {authority.get('schemaVersion')!r}, expected 2")
+        if authority.get("schemaVersion") != 4:
+            failures.append(f"{label}: authority schema is {authority.get('schemaVersion')!r}, expected 4")
+        for field, expected in (
+            ("codeRepository", CODE_REPOSITORY),
+            ("worklistPattern", WORKLIST_PATTERN),
+            ("checkout", str(checkout)),
+            ("baseBranch", "main"),
+            ("remote", "origin"),
+        ):
+            if authority.get(field) != expected:
+                failures.append(f"{label}: self-contained authority {field}={authority.get(field)!r}, expected {expected!r}")
         if "projectionWaitMs" in authority:
-            failures.append(f"{label}: host tuning leaked into closed v2 authority JSON")
+            failures.append(f"{label}: host tuning leaked into closed v4 authority JSON")
         tuning_files = sorted((state / "campaigns/host-tuning").glob("*.json"))
         if wait is None:
             if tuning_files:
@@ -122,32 +127,21 @@ def campaign_registry_n_minus_one(context: Context) -> None:
                 tuning = json.loads(tuning_files[0].read_text(encoding="utf-8"))
                 if not isinstance(tuning.get("schemaVersion"), int) or tuning.get("projectionWaitMs") != wait:
                     failures.append(f"explicit: malformed tuning sidecar: {tuning!r}")
-        code, values, detail = list_with(context, context.n_minus_one_tally, state)
-        if code != 0 or not isinstance(values, list) or len(values) != 1:
-            failures.append(f"{label}: actual N-1 could not decode authority: rc={code} {detail[-1600:]}")
-        else:
-            n_minus = values[0]
-            for field in (
-                "registrationId",
-                "issueUrl",
-                "repository",
-                "issueNumber",
-                "approvedGraphDigest",
-                "authenticatedActor",
-                "allowedActors",
-                "flow",
-                "driver",
-                "workspaceRoot",
-            ):
-                if n_minus.get(field) != authority.get(field):
-                    failures.append(f"{label}: rollback drifted authority field {field}")
+        current_code, current_values, current_detail = list_with(context, context.tally, state)
+        if current_code != 0 or not isinstance(current_values, list) or len(current_values) != 1:
+            failures.append(f"{label}: current reader rejected v4 authority: {current_detail[-1600:]}")
+        code, _, detail = list_with(context, context.n_minus_one_tally, state)
+        if code == 0:
+            failures.append(f"{label}: actual N-1 silently accepted the newer v4 authority")
+        if authority_path.read_bytes() != encoded:
+            failures.append(f"{label}: N-1 refusal rewrote current authority bytes")
     require(not failures, "N/N-1 registry failures:\n- " + "\n- ".join(failures))
 
 
 @case(
     "campaign-registry-forward-read",
     (447,),
-    "current reader accepts literal N-1 v2 authority and supplies default host tuning without rewriting it",
+    "current reader refuses literal schema-3 authority with the disarm/re-arm remedy and no rewrite",
 )
 def campaign_registry_forward_read(context: Context) -> None:
     root = make_case_directory(context, "campaign-registry-forward-read")
@@ -156,20 +150,16 @@ def campaign_registry_forward_read(context: Context) -> None:
     armed.mkdir(parents=True)
     flow = context.tally.parent.parent / "share/tally/flows/spec-build.js"
     original = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "registrationId": "019f1000-0000-7000-8000-000000000447",
-        "issueUrl": ISSUE_URL,
-        "repository": "acme/spec",
-        "issueNumber": 7,
+        "worklistPattern": WORKLIST_PATTERN,
+        "codeRepository": CODE_REPOSITORY,
         "armedAt": "2026-08-08T00:00:00Z",
         "armSerial": 1,
         "approvedGraphDigest": "sha256:" + "a" * 64,
-        "authenticatedActor": "operator",
-        "allowedActors": ["operator"],
-        "allowTestLocalForge": True,
-        "subIssueWalk": False,
+        "localActor": "uid:1000",
+        "allowedActors": ["local"],
         "lastObservation": None,
-        "lastForgeObservation": None,
         "flow": str(flow),
         "driver": str(context.driver),
         "workspaceRoot": str(root / "workspaces"),
@@ -178,14 +168,12 @@ def campaign_registry_forward_read(context: Context) -> None:
     encoded = json.dumps(original, sort_keys=True).encode()
     path.write_bytes(encoded)
     code, values, detail = list_with(context, context.tally, state)
-    require(code == 0, f"current reader rejected literal N-1 v2: {detail[-2000:]}")
-    require(isinstance(values, list) and len(values) == 1, f"current list shape invalid: {values!r}")
-    current = values[0]
-    for field, expected in original.items():
-        require(current.get(field) == expected, f"forward read drifted {field}: {current.get(field)!r} != {expected!r}")
-    require(path.read_bytes() == encoded, "forward read rewrote authority bytes")
-    effective = current.get("projectionWaitMs", 10_000)
-    require(effective == 10_000, f"absent N-1 tuning did not supply 10s default: {effective!r}")
+    require(code != 0, "current reader silently accepted pre-self-contained schema 3")
+    lowered = detail.lower()
+    for text in ("schema 3", "schema 4", "disarm and re-arm"):
+        require(text in lowered, f"schema refusal omitted {text!r}: {detail[-2000:]}")
+    require(values is None, f"refused schema unexpectedly produced a list: {values!r}")
+    require(path.read_bytes() == encoded, "schema refusal rewrote authority bytes")
 
 
 def store_object(path: Path) -> str:
@@ -213,7 +201,7 @@ def root_calls(log: Path) -> list[tuple[Path, Path]]:
 @case(
     "campaign-store-asset-ownership",
     (448,),
-    "flow and driver get independent indirect roots before visibility and cleanup on disarm/prune",
+    "flow and driver get independent indirect roots before visibility and cleanup on disarm",
 )
 def campaign_store_asset_ownership(context: Context) -> None:
     root = make_case_directory(context, "campaign-store-asset-ownership")
@@ -224,7 +212,7 @@ def campaign_store_asset_ownership(context: Context) -> None:
         "TALLY_NIX_STORE_PROGRAM": str(fake),
         "FINAL_BAR_NIX_STORE_LOG": str(log),
     }
-    state, forge, arm_env = arm_fixture(context, root / "disarm", extra_env=environment)
+    state, _, arm_env = arm_fixture(context, root / "disarm", extra_env=environment)
     authority = json.loads(authority_file(state).read_text(encoding="utf-8"))
     calls = root_calls(log)
     expected_targets = {store_object(Path(authority["flow"])), store_object(Path(authority["driver"]))}
@@ -238,7 +226,8 @@ def campaign_store_asset_ownership(context: Context) -> None:
         context.tally,
         "campaign",
         "disarm",
-        ISSUE_URL,
+        CODE_REPOSITORY,
+        WORKLIST_PATTERN,
         "--state-dir",
         state,
         env=arm_env,
@@ -248,43 +237,37 @@ def campaign_store_asset_ownership(context: Context) -> None:
     if any(link.exists() or link.is_symlink() for link, _ in calls):
         failures.append("disarm left an asset GC root")
 
-    prune_root = root / "prune"
-    prune_log = prune_root / "nix-store.jsonl"
-    prune_fake = prune_root / "fake-nix-store"
-    prune_root.mkdir()
-    copy_executable(SUITE_ROOT / "fixtures/registry/fake-nix-store.py", prune_fake)
-    state2, forge2, env2 = arm_fixture(
+    repeat_root = root / "repeat-disarm"
+    repeat_log = repeat_root / "nix-store.jsonl"
+    repeat_fake = repeat_root / "fake-nix-store"
+    repeat_root.mkdir()
+    copy_executable(SUITE_ROOT / "fixtures/registry/fake-nix-store.py", repeat_fake)
+    state2, _, env2 = arm_fixture(
         context,
-        prune_root / "arm",
+        repeat_root / "arm",
         extra_env={
-            "TALLY_NIX_STORE_PROGRAM": str(prune_fake),
-            "FINAL_BAR_NIX_STORE_LOG": str(prune_log),
+            "TALLY_NIX_STORE_PROGRAM": str(repeat_fake),
+            "FINAL_BAR_NIX_STORE_LOG": str(repeat_log),
         },
     )
-    prune_calls = root_calls(prune_log)
-    forge_value = json.loads(forge2.read_text(encoding="utf-8"))
-    forge_value["master"]["state"] = "closed"
-    forge2.write_text(json.dumps(forge_value), encoding="utf-8")
-    polled = context.command(
+    repeat_calls = root_calls(repeat_log)
+    disarmed2 = context.command(
         context.tally,
-        "--config",
-        prune_root / "arm/config.json",
-        "--socket",
-        prune_root / "unused.sock",
         "campaign",
-        "poll",
-        "--once",
+        "disarm",
+        CODE_REPOSITORY,
+        WORKLIST_PATTERN,
         "--state-dir",
         state2,
         env=env2,
         timeout=60,
     )
-    if polled.returncode != 0:
-        failures.append(f"closed-issue prune failed: {(polled.stderr or polled.stdout)[-1200:]}")
+    if disarmed2.returncode != 0:
+        failures.append(f"second local disarm failed: {(disarmed2.stderr or disarmed2.stdout)[-1200:]}")
     if list((state2 / "campaigns/armed").glob("*.json")):
-        failures.append("closed-issue poll did not prune authority")
-    if any(link.exists() or link.is_symlink() for link, _ in prune_calls):
-        failures.append("closed-issue prune left an asset GC root")
+        failures.append("second local disarm did not remove authority")
+    if any(link.exists() or link.is_symlink() for link, _ in repeat_calls):
+        failures.append("second local disarm left an asset GC root")
     require(not failures, "store ownership failures:\n- " + "\n- ".join(failures))
 
 
@@ -328,7 +311,14 @@ def campaign_nonstore_snapshots(context: Context) -> None:
     if code != 0 or not values:
         failures.append(f"registration became unreadable after source deletion: {detail[-1200:]}")
     disarmed = context.command(
-        context.tally, "campaign", "disarm", ISSUE_URL, "--state-dir", state, env=environment
+        context.tally,
+        "campaign",
+        "disarm",
+        CODE_REPOSITORY,
+        WORKLIST_PATTERN,
+        "--state-dir",
+        state,
+        env=environment,
     )
     if disarmed.returncode != 0:
         failures.append(f"snapshot disarm failed: {disarmed.stderr[-1200:]}")

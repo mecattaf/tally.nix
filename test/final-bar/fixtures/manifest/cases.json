@@ -2,8 +2,9 @@
   "schemaVersion": 1,
   "cases": [
     {"name": "valid-maximal", "expect": "accept"},
-    {"name": "valid-minimal-steward", "expect": "accept", "ops": [
-      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"]}}
+    {"name": "valid-steward", "expect": "accept", "ops": [
+      {"op": "set", "path": ["campaign", "steward"], "value": "narrator"},
+      {"op": "set", "path": ["campaign", "stewardArgv"], "value": ["narrate"]}
     ]},
     {"name": "valid-checkout-symlink", "expect": "accept", "checkout": "symlink"},
     {"name": "valid-checkout-dotdot", "expect": "accept", "checkout": "dotdot"},
@@ -19,64 +20,55 @@
     {"name": "valid-model-127", "expect": "accept", "modelLength": 127},
     {"name": "valid-model-128", "expect": "accept", "modelLength": 128},
 
-    {"name": "reject-manifest-unknown", "expect": "reject", "ops": [
+    {"name": "reject-worklist-unknown", "expect": "reject", "ops": [
       {"op": "set", "path": ["typo"], "value": true}
     ]},
-    {"name": "reject-repository-unknown", "expect": "reject", "ops": [
-      {"op": "set", "path": ["repository", "typo"], "value": true}
+    {"name": "reject-campaign-unknown", "expect": "reject", "ops": [
+      {"op": "set", "path": ["campaign", "typo"], "value": true}
     ]},
     {"name": "reject-agent-unknown", "expect": "reject", "ops": [
-      {"op": "set", "path": ["agent", "typo"], "value": true}
+      {"op": "set", "path": ["campaign", "agent", "typo"], "value": true}
     ]},
-    {"name": "reject-steward-unknown", "expect": "reject", "ops": [
-      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "typo": true}}
+    {"name": "reject-steward-shape", "expect": "reject", "ops": [
+      {"op": "set", "path": ["campaign", "steward"], "value": {"adapter": "narrator"}}
+    ]},
+    {"name": "reject-steward-argv", "expect": "reject", "ops": [
+      {"op": "set", "path": ["campaign", "steward"], "value": "narrator"},
+      {"op": "set", "path": ["campaign", "stewardArgv"], "value": [""]}
     ]},
     {"name": "reject-command-gate-unknown", "expect": "reject", "ops": [
-      {"op": "set", "path": ["gates", 0, "typo"], "value": true}
+      {"op": "set", "path": ["campaign", "gates", 0, "typo"], "value": true}
     ]},
     {"name": "reject-forbid-gate-unknown", "expect": "reject", "ops": [
-      {"op": "set", "path": ["gates", 0], "value": {"kind": "forbidPaths", "id": "paths", "forbidPaths": ["*.tmp"], "runtimeMaxSec": 30, "typo": true}}
+      {"op": "set", "path": ["campaign", "gates", 0], "value": {"kind": "forbidPaths", "id": "paths", "forbidPaths": ["*.tmp"], "runtimeMaxSec": 30, "typo": true}}
     ]},
     {"name": "reject-task-unknown", "expect": "reject", "ops": [
       {"op": "set", "path": ["tasks", 0, "typo"], "value": true}
     ]},
     {"name": "reject-gate-enum", "expect": "reject", "ops": [
-      {"op": "set", "path": ["gates", 0, "kind"], "value": "futureGate"}
+      {"op": "set", "path": ["campaign", "gates", 0, "kind"], "value": "futureGate"}
     ]},
     {"name": "reject-task-enum", "expect": "reject", "ops": [
       {"op": "set", "path": ["tasks", 0, "kind"], "value": "futureTask"}
     ]},
     {"name": "reject-merge-enum", "expect": "reject", "ops": [
-      {"op": "set", "path": ["mergeMethod"], "value": "rebase"}
+      {"op": "set", "path": ["campaign", "mergeMethod"], "value": "rebase"}
     ]},
     {"name": "reject-priority-enum", "expect": "reject", "ops": [
-      {"op": "set", "path": ["agent", "priority"], "value": "background"}
+      {"op": "set", "path": ["campaign", "agent", "priority"], "value": "background"}
     ]},
     {"name": "reject-parallel-domains-omitted", "expect": "reject", "ops": [
-      {"op": "set", "path": ["maxParallel"], "value": 2},
-      {"op": "set", "path": ["maxTasks"], "value": 2},
-      {"op": "set", "path": ["tasks"], "value": [
-        {"id": "task-one", "kind": "implementation", "issue": 8, "dependencies": []},
-        {"id": "task-two", "kind": "implementation", "issue": 9, "dependencies": [], "conflictDomains": ["second.txt"]}
-      ]}
+      {"op": "set", "path": ["campaign", "maxParallel"], "value": 2},
+      {"op": "set", "path": ["campaign", "maxTasks"], "value": 2},
+      {"op": "delete", "path": ["tasks", 0, "conflictDomains"]},
+      {"op": "set", "path": ["tasks", 1], "value": {"id": "task-two", "kind": "implementation", "title": "Task two", "goal": "Create second.txt.", "deliveredBehaviors": ["The second result is committed."], "readFirst": {"specSections": ["Fixture specification"], "styleReferences": []}, "acceptanceCriteria": [{"id": "second-green", "description": "The second result exists.", "argv": ["test", "-f", "second.txt"]}], "dependencies": [], "conflictDomains": ["second.txt"]}}
     ]},
     {"name": "reject-forbid-trailing-slash", "expect": "reject", "ops": [
-      {"op": "set", "path": ["gates", 0], "value": {"kind": "forbidPaths", "id": "paths", "forbidPaths": ["build/"], "runtimeMaxSec": 30}}
+      {"op": "set", "path": ["campaign", "gates", 0], "value": {"kind": "forbidPaths", "id": "paths", "forbidPaths": ["build/"], "runtimeMaxSec": 30}}
     ]},
-    {"name": "reject-regex-syntax", "expect": "reject", "ops": [
-      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "("}}
-    ]},
-    {"name": "reject-regex-zero-groups", "expect": "reject", "ops": [
-      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "message"}}
-    ]},
-    {"name": "valid-regex-one-group", "expect": "accept", "ops": [
-      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "^message=(.*)$", "runtimeMaxSec": 120, "env": {}}}
-    ]},
-    {"name": "reject-regex-two-groups", "expect": "reject", "ops": [
-      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": "(a)(b)"}}
-    ]},
-    {"name": "reject-regex-null", "expect": "reject", "ops": [
-      {"op": "set", "path": ["steward"], "value": {"adapter": "narrator", "argv": ["narrate"], "finalMessagePattern": null}}
+    {"name": "reject-zero-steward-runtime", "expect": "reject", "ops": [
+      {"op": "set", "path": ["campaign", "steward"], "value": "narrator"},
+      {"op": "set", "path": ["campaign", "stewardRuntimeMaxSec"], "value": 0}
     ]},
     {"name": "reject-model-129", "expect": "reject", "modelLength": 129}
   ]

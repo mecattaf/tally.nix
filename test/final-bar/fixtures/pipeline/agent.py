@@ -14,8 +14,8 @@ brief = json.loads(brief_path.read_text(encoding="utf-8"))
 task = brief["task"]
 if task["id"] != "task-one" or task["kind"] != "implementation":
     raise SystemExit(f"unexpected task: {task!r}")
-if "Create result.txt." not in task["brief"]["body"]:
-    raise SystemExit("sub-issue brief did not cross the campaign boundary")
+if task.get("goal") != "Create result.txt.":
+    raise SystemExit("committed local task goal did not cross the campaign boundary")
 
 proof = Path(os.environ["FINAL_BAR_PIPELINE_PROOF"])
 proof.write_text(json.dumps({"brief": brief}), encoding="utf-8")
