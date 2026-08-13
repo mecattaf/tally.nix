@@ -1266,7 +1266,6 @@ mod tests {
             no_enqueue: false,
             credentials: BTreeMap::new(),
             origin: Some(AdmissionOrigin::direct(EnqueueSource::EventsDir)),
-            gh_origin: None,
             related_trigger: None,
             evidence_class: None,
             manifest_hash: None,

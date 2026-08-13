@@ -390,7 +390,6 @@ impl Executor {
                 lease_epoch: request.lease_epoch,
             },
         )?;
-        self.materialize_gh_context(&request)?;
         self.prepare_hardening_files(&request)?;
         let args = self.build_systemd_argv(&request)?;
         let output = match Command::new(&self.systemd_run).args(&args).output().await {
@@ -722,11 +721,6 @@ impl Executor {
             }
             validate_systemd_path(source, "credential source")?;
         }
-        if let Some(origin) = &request.gh_origin {
-            origin
-                .validate()
-                .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
-        }
         for path in &request.extra_writable_paths {
             if !path.is_absolute() {
                 return Err(ExecutorError::InvalidRequest(format!(
@@ -737,28 +731,6 @@ impl Executor {
             validate_systemd_path(path, "extra writable path")?;
         }
         Ok(())
-    }
-
-    pub(super) fn materialize_gh_context(
-        &self,
-        request: &ExecutionRequest,
-    ) -> Result<Option<PathBuf>, ExecutorError> {
-        let Some(origin) = request
-            .gh_origin
-            .as_ref()
-            .filter(|origin| origin.is_current())
-        else {
-            return Ok(None);
-        };
-        let context = origin.context.as_ref().ok_or_else(|| {
-            ExecutorError::InvalidRequest("current GitHub origin omitted context".to_owned())
-        })?;
-        context
-            .validate()
-            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
-        let path = self.gh_context_path(&request.identity);
-        replace_private_file(&path, &serde_json::to_vec(context)?)?;
-        Ok(Some(path))
     }
 
     fn prepare_hardening_files(&self, request: &ExecutionRequest) -> Result<(), ExecutorError> {
@@ -921,12 +893,7 @@ impl Executor {
         for name in environment_to_unset(&request) {
             command.env_remove(name);
         }
-        let gh_context_path = request
-            .gh_origin
-            .as_ref()
-            .filter(|origin| origin.is_current())
-            .map(|_| self.gh_context_path(&request.identity));
-        let environment = execution_environment(&request, gh_context_path.as_deref())?;
+        let environment = execution_environment(&request)?;
         for (name, value) in environment {
             command.env(name, value);
         }

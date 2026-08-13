@@ -33,7 +33,7 @@ use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
 use crate::exec_attestation::{ExecAttestationContext, EXEC_ATTESTATION_LEDGER};
 use crate::provenance::TaskRef;
-use crate::taskdb::{GhOrigin, WorkspaceMetadata};
+use crate::taskdb::WorkspaceMetadata;
 
 mod captures;
 mod launch;
@@ -300,12 +300,6 @@ impl Executor {
             required_gate_ids: Vec::new(),
             acceptance_policy: AcceptancePolicy::Manual,
         })
-    }
-
-    pub fn gh_context_path(&self, identity: &ExecutionIdentity) -> PathBuf {
-        self.state_dir
-            .join(GH_CONTEXT_DIRECTORY)
-            .join(format!("{}.json", identity.unit_uuid()))
     }
 
     pub fn brief_path(&self, hash: &str) -> Result<PathBuf, ExecutorError> {

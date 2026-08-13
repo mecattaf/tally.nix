@@ -37,7 +37,6 @@ fn request() -> ExecutionRequest {
         tally_socket: Some("/run/user/1000/tally.sock".to_owned()),
         job_token: Some("ab".repeat(32)),
         environment: BTreeMap::from([("ADAPTER_COLOR".to_owned(), "never".to_owned())]),
-        gh_origin: None,
         brief_hash: None,
         brief_path: None,
         brief_document: None,
@@ -740,7 +739,7 @@ fn gate_manifest_path_is_exported_or_scrubbed_and_defaults_per_target() {
         required_gate_ids: Vec::new(),
         acceptance_policy: AcceptancePolicy::Manual,
     });
-    let environment = execution_environment(&declared, None).unwrap();
+    let environment = execution_environment(&declared).unwrap();
     assert!(environment
         .iter()
         .any(|(name, value)| { name == "TALLY_GATE_MANIFEST" && value == "/work/gates.json" }));
@@ -779,14 +778,14 @@ fn gate_manifest_path_is_exported_or_scrubbed_and_defaults_per_target() {
 #[test]
 fn execution_environment_preserves_scalar_compatibility_and_encodes_multi_pool_sets() {
     let singleton = request();
-    let singleton_environment = execution_environment(&singleton, None).unwrap();
+    let singleton_environment = execution_environment(&singleton).unwrap();
     assert!(singleton_environment
         .iter()
         .any(|(name, value)| name == "TALLY_POOL" && value == "gpu"));
 
     let mut multi = request();
     multi.pools = vec!["alpha".to_owned(), "zeta".to_owned()];
-    let multi_environment = execution_environment(&multi, None).unwrap();
+    let multi_environment = execution_environment(&multi).unwrap();
     assert!(multi_environment
         .iter()
         .any(|(name, value)| { name == "TALLY_POOL" && value == r#"["alpha","zeta"]"# }));
@@ -821,7 +820,7 @@ fn transported_brief_materializes_privately_and_provisions_exact_path() {
         std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    let environment = execution_environment(&request, None).unwrap();
+    let environment = execution_environment(&request).unwrap();
     assert!(environment
         .iter()
         .any(|(name, value)| name == "TALLY_BRIEF" && value == &path.to_string_lossy()));
@@ -870,7 +869,6 @@ fn rowless_identity_uses_job_uuid_and_optional_env_stays_absent() {
     for name in OPTIONAL_TALLY_ENVIRONMENT
         .into_iter()
         .chain(["CREDENTIALS_DIRECTORY"])
-        .chain(GH_TALLY_ENVIRONMENT)
     {
         assert!(unset_names.split_whitespace().any(|word| word == name));
     }
@@ -2375,7 +2373,6 @@ fn fixture_request(pool: &str) -> ExecutionRequest {
         tally_socket: None,
         job_token: None,
         environment: BTreeMap::new(),
-        gh_origin: None,
         brief_hash: None,
         brief_path: None,
         brief_document: None,

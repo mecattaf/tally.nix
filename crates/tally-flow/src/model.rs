@@ -619,24 +619,6 @@ pub const FLOW_ENQUEUE_FIELD_PARITY: &[FlowEnqueueFieldParity] = &[
         ),
     },
     FlowEnqueueFieldParity {
-        kernel_field: "ghTriggerActor",
-        disposition: FlowEnqueueFieldDisposition::Excluded(
-            "GitHub trigger identity belongs to producer ingress, not flow nodes",
-        ),
-    },
-    FlowEnqueueFieldParity {
-        kernel_field: "ghSelfActor",
-        disposition: FlowEnqueueFieldDisposition::Excluded(
-            "GitHub self identity belongs to producer ingress, not flow nodes",
-        ),
-    },
-    FlowEnqueueFieldParity {
-        kernel_field: "ghOrigin",
-        disposition: FlowEnqueueFieldDisposition::Excluded(
-            "the live client inherits GitHub provenance from the admitted runner",
-        ),
-    },
-    FlowEnqueueFieldParity {
         kernel_field: "taskUuid",
         disposition: FlowEnqueueFieldDisposition::Excluded(
             "the engine derives the stable child UUID from flow admission identity",

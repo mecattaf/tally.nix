@@ -631,7 +631,6 @@ pub(super) fn execution_request(
             .flatten()
             .map(str::to_owned),
         environment: job.invocation.env.clone(),
-        gh_origin: job.row.gh_origin.clone(),
         brief_hash: job.row.brief_hash.clone(),
         brief_path,
         brief_document: None,

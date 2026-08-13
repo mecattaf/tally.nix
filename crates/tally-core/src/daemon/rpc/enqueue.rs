@@ -582,13 +582,6 @@ impl DaemonHandler {
             if payload.adapter_options.is_none() {
                 payload.adapter_options = Some(previous.adapter_options.clone());
             }
-            if previous.source == EnqueueSource::Gh {
-                payload.gh_origin.clone_from(&previous.gh_origin);
-                if let Some(origin) = &previous.gh_origin {
-                    payload.gh_trigger_actor = Some(origin.trigger_actor.clone());
-                    payload.gh_self_actor = Some(origin.self_actor.clone());
-                }
-            }
             Some(previous)
         } else {
             None
@@ -829,7 +822,6 @@ impl DaemonHandler {
             no_enqueue: resolved.no_enqueue,
             credentials: resolved.credentials,
             origin: Some(resolved.origin),
-            gh_origin: resolved.gh_origin,
             related_trigger: resolved.related_trigger,
             evidence_class: resolved.evidence_class,
             manifest_hash: resolved.manifest_hash.map(Value::String),

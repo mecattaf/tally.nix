@@ -59,12 +59,7 @@ impl Executor {
         if let Some(cwd) = &request.cwd {
             push_pair(&mut args, "--working-directory", cwd.as_os_str());
         }
-        let gh_context_path = request
-            .gh_origin
-            .as_ref()
-            .filter(|origin| origin.is_current())
-            .map(|_| self.gh_context_path(&request.identity));
-        let environment = execution_environment(request, gh_context_path.as_deref())?;
+        let environment = execution_environment(request)?;
         for (name, value) in environment {
             push_pair(&mut args, "--setenv", format!("{name}={value}"));
         }
@@ -172,9 +167,9 @@ impl Executor {
             // Keep the transient unit's state writers explicit. systemd opens
             // the two capture files, ExecStopPost atomically replaces a record
             // in unit-exit, the optional exec wrapper appends its ledger, and a
-            // job may write its declared gate manifest. GitHub context is
-            // scoped to this identity. The yield hook only calls the daemon
-            // socket and receives no state-directory-wide write exception.
+            // job may write its declared gate manifest. The yield hook only
+            // calls the daemon socket and receives no state-directory-wide
+            // write exception.
             let paths = self.paths(&request.identity);
             writable.push(
                 paths
@@ -187,13 +182,6 @@ impl Executor {
             writable.push(paths.stderr);
             if request.exec_attestation.is_some() {
                 writable.push(self.state_dir.join(EXEC_ATTESTATION_LEDGER));
-            }
-            if request
-                .gh_origin
-                .as_ref()
-                .is_some_and(|origin| origin.is_current())
-            {
-                writable.push(self.gh_context_path(&request.identity));
             }
             if let Some(manifest) = &request.gate_manifest {
                 writable.push(manifest.path.clone());
@@ -238,7 +226,6 @@ pub(super) fn priority_name(priority: Priority) -> &'static str {
 
 pub(super) fn execution_environment(
     request: &ExecutionRequest,
-    gh_context_path: Option<&Path>,
 ) -> Result<Vec<(String, String)>, ExecutorError> {
     let mut environment = request
         .environment
@@ -321,49 +308,6 @@ pub(super) fn execution_environment(
             ),
         ]);
     }
-    if let Some(origin) = request
-        .gh_origin
-        .as_ref()
-        .filter(|origin| origin.is_current())
-    {
-        let item_type = origin.item_type.ok_or_else(|| {
-            ExecutorError::InvalidRequest("current GitHub origin omitted itemType".to_owned())
-        })?;
-        let context_path = gh_context_path.ok_or_else(|| {
-            ExecutorError::InvalidRequest("current GitHub origin omitted context path".to_owned())
-        })?;
-        environment.extend([
-            ("TALLY_GH_REPO".to_owned(), origin.repo.clone()),
-            ("TALLY_GH_NUMBER".to_owned(), origin.number.to_string()),
-            ("TALLY_GH_URL".to_owned(), origin.html_url.clone()),
-            ("TALLY_GH_TYPE".to_owned(), item_type.as_str().to_owned()),
-            (
-                "TALLY_GH_HEAD_SHA".to_owned(),
-                origin.head_sha.clone().unwrap_or_default(),
-            ),
-            ("TALLY_GH_NODE_ID".to_owned(), origin.node_id.clone()),
-            (
-                "TALLY_GH_TRIGGER_KIND".to_owned(),
-                origin.trigger_kind.clone(),
-            ),
-            (
-                "TALLY_GH_TRIGGER_ACTOR".to_owned(),
-                origin.trigger_actor.clone(),
-            ),
-            (
-                "TALLY_GH_EVENT_ID".to_owned(),
-                origin.event_id.clone().unwrap_or_default(),
-            ),
-            (
-                "TALLY_GH_COMMENT_ID".to_owned(),
-                origin.comment_id.clone().unwrap_or_default(),
-            ),
-            (
-                "TALLY_GH_CONTEXT".to_owned(),
-                display_path(context_path)?.to_owned(),
-            ),
-        ]);
-    }
     Ok(environment)
 }
 
@@ -413,13 +357,6 @@ pub(super) fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static s
     }
     if request.gate_manifest.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[14]);
-    }
-    if request
-        .gh_origin
-        .as_ref()
-        .is_none_or(|origin| !origin.is_current())
-    {
-        names.extend(GH_TALLY_ENVIRONMENT);
     }
     names
 }
