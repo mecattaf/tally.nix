@@ -307,7 +307,6 @@ impl Executor {
                 if record.attempt == request.attempt && record.lease_epoch == request.lease_epoch {
                     let termination = classify_termination(&record)?;
                     let paths = self.paths(&request.identity);
-                    self.normalize_legacy_stderr_capture(&paths)?;
                     return Ok(ExecutionOutcome {
                         unit: observed.unit,
                         backend: ExecutionBackend::Adopted,
@@ -522,7 +521,6 @@ impl Executor {
                     }
                     let termination = classify_termination(&record)?;
                     let paths = self.paths(&request.identity);
-                    self.normalize_legacy_stderr_capture(&paths)?;
                     return Ok(ExecutionOutcome {
                         unit: observed.unit,
                         backend: ExecutionBackend::Adopted,

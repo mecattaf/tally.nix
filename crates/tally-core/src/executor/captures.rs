@@ -136,16 +136,9 @@ impl Executor {
     ) -> Result<Option<RetainedCapturePaths>, ExecutorError> {
         if self.capture_generation_matches(identity, attempt, lease_epoch)? {
             let paths = self.paths(identity);
-            let stderr = if paths.stderr.exists() {
-                paths.stderr
-            } else {
-                // Captures written before the adapter/failure split used
-                // `<uuid>.err` for the raw stream. Keep them queryable.
-                paths.failure_stderr.clone()
-            };
             return Ok(Some(RetainedCapturePaths {
                 stdout: paths.stdout,
-                stderr,
+                stderr: paths.stderr,
                 failure_stderr: paths
                     .failure_stderr
                     .exists()
@@ -162,13 +155,6 @@ impl Executor {
                 .as_ref()
                 .is_some_and(|path| path.exists())
         {
-            if !paths.stderr.exists() {
-                // The earliest archives also used `.err` for the raw stream.
-                paths.stderr = paths
-                    .failure_stderr
-                    .clone()
-                    .expect("an existing legacy stderr path was checked");
-            }
             Ok(Some(paths))
         } else {
             Ok(None)
@@ -199,13 +185,11 @@ impl Executor {
         identity: &ExecutionIdentity,
     ) -> Result<(), ExecutorError> {
         let current = self.paths(identity);
-        let raw_stderr = if current.stderr.exists() {
-            &current.stderr
-        } else {
-            // Compatibility with generations created before `.adapter.err`.
-            &current.failure_stderr
-        };
-        for path in [&current.stdout, raw_stderr, &current.capture_generation] {
+        for path in [
+            &current.stdout,
+            &current.stderr,
+            &current.capture_generation,
+        ] {
             let metadata = match std::fs::symlink_metadata(path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -229,7 +213,7 @@ impl Executor {
         create_private_directory(archive_directory)?;
         for (source, destination) in [
             (&current.stdout, &archived.stdout),
-            (raw_stderr, &archived.stderr),
+            (&current.stderr, &archived.stderr),
         ] {
             match std::fs::symlink_metadata(destination) {
                 Ok(metadata) => {
@@ -249,7 +233,7 @@ impl Executor {
                 Err(source_error) => return Err(io_error(destination, source_error)),
             }
         }
-        if current.failure_stderr.exists() && current.failure_stderr != *raw_stderr {
+        if current.failure_stderr.exists() {
             let destination = archived
                 .failure_stderr
                 .as_ref()
@@ -326,28 +310,6 @@ impl Executor {
         let excerpt = read_capture_excerpt(&paths.stderr)?;
         replace_private_file(&paths.failure_stderr, excerpt.text.as_bytes())?;
         Ok(Some(excerpt))
-    }
-
-    /// Move a capture written by a pre-split in-flight unit to the raw adapter
-    /// path before scraping or classifying its terminal result. `rename` keeps
-    /// the transition crash-atomic: a healthy adopted job must not retain the
-    /// legacy `.err` name and look failed after an upgrade.
-    pub(super) fn normalize_legacy_stderr_capture(
-        &self,
-        paths: &ExecutionPaths,
-    ) -> Result<(), ExecutorError> {
-        if paths.stderr.exists() || !paths.failure_stderr.exists() {
-            return Ok(());
-        }
-        ensure_private_file(&paths.failure_stderr)?;
-        std::fs::rename(&paths.failure_stderr, &paths.stderr)
-            .map_err(|source| io_error(&paths.stderr, source))?;
-        sync_directory(
-            paths
-                .stderr
-                .parent()
-                .expect("capture stream always has a parent"),
-        )
     }
 }
 
