@@ -14,9 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::{AdapterConfig, AdapterHardening};
 use tally_core::campaign_contract::{
-    admit_manifest_value, task_completion_revision, validate_argv, validate_manifest,
-    CampaignAgent, CampaignGate, CampaignManifest, CampaignRepository, CanonicalCampaignGraphV1,
-    CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
+    admit_manifest_value, validate_argv, CampaignAgent, CampaignGate, CampaignManifest,
+    CampaignRepository, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
 };
 use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
@@ -25,16 +24,9 @@ use tally_core::campaign_registry::{
 use tally_core::config::{PoolConfig, ResourceKind};
 use tally_core::lease::{is_campaign_pool_name, CAMPAIGN_POOL_PREFIX};
 
-const CAMPAIGN_BEGIN: &str = "<!-- tally:campaign:v1 -->";
-const CAMPAIGN_END: &str = "<!-- tally:campaign:v1:end -->";
-const WORKLIST_BEGIN: &str = "<!-- tally:campaign-worklist:v1 -->";
-const WORKLIST_END: &str = "<!-- tally:campaign-worklist:v1:end -->";
-const TASK_MARKER_PREFIX: &str = "<!-- tally:campaign-task:v1 id=";
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
 const APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_APPROVED_GRAPH_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
-const CAMPAIGN_PROJECTION_SCHEMA_VERSION: u32 = 1;
-const MAX_CAMPAIGN_PROJECTION_BYTES: u64 = 1024 * 1024;
 const CAMPAIGN_STEERING_SCHEMA_VERSION: u32 = 1;
 const CAMPAIGN_STEERING_CURSOR_SCHEMA_VERSION: u32 = 1;
 const CAMPAIGN_STEERING_EMBARGO_MILLISECONDS: i64 = 1_000;
@@ -50,7 +42,7 @@ const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
 const LOCAL_ALLOWED_ACTOR: &str = "local";
 
 #[derive(Debug, Clone)]
-struct ProjectTask {
+struct WorklistTask {
     id: String,
     kind: String,
     title: String,
@@ -65,7 +57,7 @@ struct ProjectTask {
 #[derive(Debug, Clone)]
 struct ValidatedWorklist {
     manifest: CampaignManifest,
-    tasks: Vec<ProjectTask>,
+    tasks: Vec<WorklistTask>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,94 +72,18 @@ struct LocalCampaignDeclaration {
 #[derive(Debug, Clone)]
 struct CommittedLocalWorklist {
     document: Value,
-    source_revision: String,
-    sha256: String,
 }
 
-struct ProjectCheckpointBrief<'a> {
+struct CheckpointBrief<'a> {
     campaign_name: &'a str,
     argv: &'a [String],
     runtime_max_sec: u64,
     dependencies: &'a [String],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GithubActor {
-    login: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GithubIssue {
-    number: u64,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    body: Option<String>,
-    state: String,
-    html_url: String,
-    updated_at: String,
-    user: GithubActor,
-    #[serde(default)]
-    pull_request: Option<Value>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubComment {
-    id: u64,
-    body: String,
-    user: GithubActor,
-}
-
-#[derive(Debug, Clone)]
-struct IssueLocator {
-    repository: String,
-    number: u64,
-    url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CampaignProjectionV1 {
-    schema_version: u32,
-    code_repository: String,
-    worklist_pattern: String,
-    source_revision: String,
-    worklist_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    issue: Option<ProjectedIssueV1>,
-    #[serde(default)]
-    sub_issue_walk: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ProjectedIssueV1 {
-    repository: String,
-    number: u64,
-    url: String,
-}
-
-impl CampaignProjectionV1 {
-    fn locator(&self) -> Result<IssueLocator> {
-        let issue = self.issue.as_ref().ok_or_else(|| {
-            invalid("campaign has no forge issue projection; use the local worklist arm path")
-        })?;
-        let locator = parse_issue_url(&issue.url)?;
-        if locator.repository != issue.repository || locator.number != issue.number {
-            return Err(invalid(
-                "campaign projection has inconsistent issue coordinates",
-            ));
-        }
-        Ok(locator)
-    }
-}
-
 #[derive(Debug, Clone)]
 struct CampaignGraph {
-    locator: IssueLocator,
     canonical: CanonicalCampaignGraphV1,
-    master: GithubIssue,
-    tasks: Vec<GithubIssue>,
 }
 
 /// The six-field object an implementation brief has always consumed.
@@ -252,7 +168,7 @@ enum LocalSteeringDispatchState {
 
 /// The prior executable graph needed to interpret a later amendment.
 ///
-/// This projection snapshot is generation-scoped beside authority, so
+/// This graph snapshot is generation-scoped beside authority, so
 /// publishing arm N+1 cannot make an arm-N reader observe a graph that
 /// disagrees with its authority digest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,12 +201,6 @@ enum PardonScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PardonBoundary {
-    id: u64,
-    scope: PardonScope,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalAttemptReceiptV1 {
     Diagnosis { task_id: String, attempt: u8 },
     Retry,
@@ -298,19 +208,9 @@ enum LocalAttemptReceiptV1 {
     Pardon { tasks: Option<BTreeSet<String>> },
 }
 
-impl PardonBoundary {
-    fn applies_to(&self, task_id: &str) -> bool {
-        match &self.scope {
-            PardonScope::All => true,
-            PardonScope::Tasks(tasks) => tasks.contains(task_id),
-        }
-    }
-}
-
 #[derive(Debug)]
 enum CampaignPollAttempt {
     Dispatched,
-    Complete,
     Unchanged,
     RearmRequired {
         approved_graph_digest: String,
@@ -332,7 +232,6 @@ pub(super) async fn run_campaign(
         CampaignCommand::Resume(args) => {
             run_campaign_resume(socket, config_path, rpc_timeout, args).await
         }
-        CampaignCommand::Project(args) => run_campaign_project(args),
         CampaignCommand::Poll(args) => {
             run_campaign_poll(socket, config_path, rpc_timeout, args).await
         }
@@ -343,38 +242,6 @@ pub(super) async fn run_campaign(
         CampaignCommand::Quiescent(args) => run_campaign_quiescent(args),
         CampaignCommand::Disarm(args) => run_campaign_disarm(args),
     }
-}
-
-fn parse_issue_url(value: &str) -> Result<IssueLocator> {
-    let prefix = "https://github.com/";
-    let remainder = value.strip_prefix(prefix).ok_or_else(|| {
-        invalid("campaign issue must use an https://github.com/OWNER/REPO/issues/NUMBER URL")
-    })?;
-    if remainder.contains(['?', '#']) || remainder.ends_with('/') {
-        return Err(invalid(
-            "campaign issue URL must not contain a query, fragment, or trailing slash",
-        ));
-    }
-    let parts = remainder.split('/').collect::<Vec<_>>();
-    if parts.len() != 4
-        || parts[2] != "issues"
-        || !safe_repo_part(parts[0])
-        || !safe_repo_part(parts[1])
-    {
-        return Err(invalid(
-            "campaign issue must use an https://github.com/OWNER/REPO/issues/NUMBER URL",
-        ));
-    }
-    let number = parts[3]
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number > 0)
-        .ok_or_else(|| invalid("campaign issue number must be positive"))?;
-    Ok(IssueLocator {
-        repository: format!("{}/{}", parts[0], parts[1]),
-        number,
-        url: value.to_owned(),
-    })
 }
 
 fn parse_repository(value: &str) -> Result<String> {
@@ -407,6 +274,10 @@ fn campaign_identity(code_repository: &str, worklist_pattern: &str) -> Result<(S
         parse_repository(code_repository)?,
         parse_worklist_pattern(worklist_pattern)?,
     ))
+}
+
+fn campaign_issue_url(code_repository: &str, worklist_pattern: &str) -> String {
+    format!("local://{code_repository}/{worklist_pattern}")
 }
 
 fn safe_repo_part(value: &str) -> bool {
@@ -448,69 +319,6 @@ fn safe_task_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn gh_program() -> OsString {
-    std::env::var_os("TALLY_GH_PROGRAM").unwrap_or_else(|| OsString::from("gh"))
-}
-
-/// Run one `gh` invocation and hand back its raw result.
-///
-/// Every ordinary caller wants `run_gh`, which turns a non-zero exit into an
-/// error. The capability probe is the exception: it has to read what the forge
-/// actually said before it decides whether the failure was an answer.
-fn run_gh_output(arguments: &[OsString], stdin: Option<&str>) -> Result<std::process::Output> {
-    let program = gh_program();
-    let mut command = ProcessCommand::new(&program);
-    command
-        .args(arguments)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("cannot execute {}", PathBuf::from(&program).display()))?;
-    if let Some(input) = stdin {
-        use std::io::Write as _;
-        child
-            .stdin
-            .take()
-            .context("gh stdin was unavailable")?
-            .write_all(input.as_bytes())?;
-    }
-    Ok(child.wait_with_output()?)
-}
-
-fn run_gh(arguments: &[OsString], stdin: Option<&str>) -> Result<String> {
-    let output = run_gh_output(arguments, stdin)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        bail!(
-            "gh {:?} exited {}: {}",
-            arguments,
-            output.status,
-            if detail.is_empty() {
-                "no output"
-            } else {
-                &detail
-            }
-        );
-    }
-    String::from_utf8(output.stdout).context("gh stdout was not valid UTF-8")
-}
-
-fn gh_json<T: for<'de> Deserialize<'de>>(arguments: &[OsString]) -> Result<T> {
-    let output = run_gh(arguments, None)?;
-    serde_json::from_str(&output)
-        .with_context(|| format!("gh {:?} returned invalid JSON", arguments))
-}
-
-fn os_arguments(values: &[&str]) -> Vec<OsString> {
-    values.iter().map(OsString::from).collect()
-}
-
 fn safe_github_login(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 39
@@ -519,14 +327,6 @@ fn safe_github_login(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-fn authenticated_actor() -> Result<String> {
-    let actor: GithubActor = gh_json(&os_arguments(&["api", "user"]))?;
-    if !safe_github_login(&actor.login) {
-        return Err(invalid("gh api user returned an invalid GitHub login"));
-    }
-    Ok(actor.login.to_ascii_lowercase())
 }
 
 fn local_actor() -> String {
@@ -568,329 +368,13 @@ fn require_local_actor(registration: &CampaignRegistration) -> Result<()> {
     Ok(())
 }
 
-fn require_allowed_issue_authors(graph: &CampaignGraph, allowed: &[String]) -> Result<()> {
-    let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    for (context, issue) in std::iter::once(("master", &graph.master))
-        .chain(graph.tasks.iter().map(|issue| ("task", issue)))
-    {
-        let actor = issue.user.login.to_ascii_lowercase();
-        if !allowed.contains(actor.as_str()) {
-            bail!(
-                "campaign {context} issue #{} was authored by unapproved actor {:?}; arm with --allow-actor only after reviewing that actor's input",
-                issue.number,
-                issue.user.login
-            );
-        }
-    }
-    Ok(())
-}
-
-fn fetch_issue_comments(locator: &IssueLocator) -> Result<Vec<GithubComment>> {
-    let endpoint = format!(
-        "repos/{}/issues/{}/comments?per_page=100",
-        locator.repository, locator.number
-    );
-    let pages: Vec<Vec<GithubComment>> =
-        gh_json(&os_arguments(&["api", "--paginate", "--slurp", &endpoint]))?;
-    Ok(pages.into_iter().flatten().collect())
-}
-
-fn fetch_issue(locator: &IssueLocator) -> Result<GithubIssue> {
-    let endpoint = format!("repos/{}/issues/{}", locator.repository, locator.number);
-    let issue: GithubIssue = gh_json(&os_arguments(&["api", &endpoint]))?;
-    if issue.pull_request.is_some() {
-        return Err(invalid(
-            "campaign master URL names a pull request, not an issue",
-        ));
-    }
-    if issue.number != locator.number || issue.html_url != locator.url {
-        bail!("GitHub returned a different issue than the requested campaign locator");
-    }
-    Ok(issue)
-}
-
-fn fetch_subissues(locator: &IssueLocator) -> Result<Vec<GithubIssue>> {
-    let endpoint = format!(
-        "repos/{}/issues/{}/sub_issues?per_page=100",
-        locator.repository, locator.number
-    );
-    gh_json(&os_arguments(&["api", &endpoint]))
-}
-
-/// The sub-issue surface the reconciler's remaining forge read path needs.
-///
-/// One bounded GraphQL query walks the parent's sub-issues, the pull requests
-/// that close each of them, and each thread's comments. `arm` runs it once as
-/// a capability probe; every pass afterwards runs it for real.
-const SUB_ISSUE_THREAD_QUERY: &str = r"
-query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
-  repository(owner: $owner, name: $name) {
-    issue(number: $number) {
-      subIssues(first: 50, after: $cursor) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          number
-          closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {
-            nodes { url merged }
-          }
-          comments(last: 100) {
-            nodes { databaseId body author { login } }
-          }
-        }
-      }
-    }
-  }
-}
-";
-/// The parent's sub-issue ceiling is 100 and a manifest caps at that number,
-/// so two pages of 50 always cover an admitted graph.
-const MAX_SUB_ISSUE_PAGES: usize = 2;
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphqlComment {
-    #[serde(default)]
-    database_id: Option<u64>,
-    body: String,
-    #[serde(default)]
-    author: Option<GithubActor>,
-}
-
-fn sub_issue_walk_arguments(
-    owner: &str,
-    name: &str,
-    number: u64,
-    cursor: Option<&str>,
-) -> Vec<OsString> {
-    let mut arguments = os_arguments(&["api", "graphql", "-f"]);
-    arguments.push(format!("query={SUB_ISSUE_THREAD_QUERY}").into());
-    arguments.extend(os_arguments(&["-F"]));
-    arguments.push(format!("owner={owner}").into());
-    arguments.extend(os_arguments(&["-F"]));
-    arguments.push(format!("name={name}").into());
-    arguments.extend(os_arguments(&["-F"]));
-    arguments.push(format!("number={number}").into());
-    if let Some(cursor) = cursor {
-        arguments.extend(os_arguments(&["-F"]));
-        arguments.push(format!("cursor={cursor}").into());
-    }
-    arguments
-}
-
-/// One bounded walk of the parent's sub-issue threads.
-#[derive(Debug, Clone, Default)]
-struct SubIssueThreads {
-    threads: BTreeMap<u64, Vec<GraphqlComment>>,
-}
-
-fn sub_issue_threads(locator: &IssueLocator) -> Result<SubIssueThreads> {
-    let (owner, name) = locator
-        .repository
-        .split_once('/')
-        .ok_or_else(|| invalid("campaign repository is not in owner/name form"))?;
-    let mut walked = SubIssueThreads::default();
-    let threads = &mut walked.threads;
-    let mut cursor: Option<String> = None;
-    for _ in 0..MAX_SUB_ISSUE_PAGES {
-        let arguments = sub_issue_walk_arguments(owner, name, locator.number, cursor.as_deref());
-        let payload: Value = gh_json(&arguments)?;
-        let connection = payload
-            .pointer("/data/repository/issue/subIssues")
-            .ok_or_else(|| invalid("campaign sub-issue walk returned no sub-issue connection"))?;
-        let nodes = connection
-            .get("nodes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid("campaign sub-issue walk returned a malformed node list"))?;
-        for node in nodes {
-            let number = node
-                .get("number")
-                .and_then(Value::as_u64)
-                .filter(|number| *number > 0)
-                .ok_or_else(|| invalid("campaign sub-issue walk returned an invalid number"))?;
-            let comments = node
-                .pointer("/comments/nodes")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new()));
-            let comments: Vec<GraphqlComment> = serde_json::from_value(comments)
-                .map_err(|error| invalid(format!("campaign sub-issue #{number}: {error}")))?;
-            if threads.insert(number, comments).is_some() {
-                bail!("campaign sub-issue walk repeated sub-issue #{number}");
-            }
-        }
-        if connection.pointer("/pageInfo/hasNextPage") != Some(&Value::Bool(true)) {
-            return Ok(walked);
-        }
-        cursor = Some(
-            connection
-                .pointer("/pageInfo/endCursor")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("campaign sub-issue walk returned no page cursor"))?
-                .to_owned(),
-        );
-    }
-    Err(invalid(
-        "campaign parent carries more sub-issues than the 100-task cap admits",
-    ))
-}
-
-/// Did the forge answer "my schema has no such field" in a typed `errors[]`
-/// entry?
-///
-/// This reads the response's own top-level `errors` array and nothing else.
-/// GitHub types a schema refusal `UNDEFINED_FIELD`; older responses spell the
-/// same thing as `extensions.code = "undefinedField"`.
-fn typed_undefined_field(payload: &Value) -> bool {
-    payload
-        .get("errors")
-        .and_then(Value::as_array)
-        .is_some_and(|errors| {
-            errors.iter().any(|error| {
-                error
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("UNDEFINED_FIELD"))
-                    || error
-                        .pointer("/extensions/code")
-                        .and_then(Value::as_str)
-                        .is_some_and(|code| code.eq_ignore_ascii_case("undefinedField"))
-            })
-        })
-}
-
-/// Does one line of forge-authored *error* text name a missing schema field?
-///
-/// Only ever applied to `errors[].message` and to `gh`'s own stderr, and only
-/// on a call that actually failed. It must never see a response body: the walk
-/// payload carries `comments { nodes { body } }`, and a comment body on a
-/// public repository is writable by any account — including, through the
-/// machine diagnosis receipts tally posts to task threads, by the campaign's
-/// own agents. Scanning the whole payload made a stranger quoting an ordinary
-/// GraphQL error (or quoting issue #334, which contains the literal string
-/// `UNDEFINED_FIELD`) enough to answer the capability gate, and the gate fails
-/// *open into degraded mode*: a campaign armed with no per-task steering
-/// threads and no merged-oracle walk for the life of that arm.
-fn undefined_field_message(text: &str) -> bool {
-    let lowered = text.to_ascii_lowercase();
-    lowered.contains("undefined_field")
-        || lowered.contains("undefinedfield")
-        || lowered.contains("doesn't exist on type")
-        || lowered.contains("does not exist on type")
-}
-
-/// The `message` of every entry in a GraphQL response's `errors` array.
-fn graphql_error_messages(payload: &Value) -> impl Iterator<Item = &str> {
-    payload
-        .get("errors")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|error| error.get("message").and_then(Value::as_str))
-}
-
-/// Probe whether this forge serves the sub-issue walk the native read path
-/// needs.
-///
-/// A schema refusal is a capability answer, not a campaign failure: the
-/// campaign arms in degraded mode and keeps the checkbox projection. Anything
-/// else fails the arm. Treating every failure as an answer meant one flaky
-/// round trip could arm a campaign with no per-task steering threads, no
-/// merged-oracle walk and no anomaly surface, for the rest of its life, and
-/// the only evidence would be the projection label.
-fn probe_sub_issue_walk(locator: &IssueLocator) -> Result<bool> {
-    let (owner, name) = locator
-        .repository
-        .split_once('/')
-        .ok_or_else(|| invalid("campaign repository is not in owner/name form"))?;
-    let arguments = sub_issue_walk_arguments(owner, name, locator.number, None);
-    let output = run_gh_output(&arguments, None)?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let payload = serde_json::from_str::<Value>(&stdout).ok();
-    // The typed answer is safe to read whatever the exit status was: it looks
-    // at the response's own `errors` array, which no comment body can occupy.
-    if payload.as_ref().is_some_and(typed_undefined_field) {
-        return Ok(false);
-    }
-    if !output.status.success() {
-        // Only now, and only over text the forge produced as an error.
-        let refused = payload
-            .as_ref()
-            .is_some_and(|payload| graphql_error_messages(payload).any(undefined_field_message))
-            || undefined_field_message(&stderr);
-        if refused {
-            return Ok(false);
-        }
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        bail!(
-            "campaign sub-issue capability probe failed: gh exited {}: {}; \
-             this is not a capability answer, so the campaign is not armed degraded",
-            output.status,
-            if detail.is_empty() {
-                "no output"
-            } else {
-                detail
-            }
-        );
-    }
-    // A call that succeeded and carries no typed refusal served the walk. What
-    // its payload happens to *say* is not a capability answer.
-    let payload = payload.context("campaign sub-issue capability probe returned invalid JSON")?;
-    payload
-        .pointer("/data/repository/issue/subIssues")
-        .ok_or_else(|| {
-            invalid("campaign sub-issue capability probe returned no sub-issue connection")
-        })?;
-    Ok(true)
-}
-
-const fn projection_label(sub_issue_walk: bool) -> &'static str {
-    if sub_issue_walk {
-        "native-sub-issues"
+fn arm_receipt(result: &Value, auto_pardons: &[AutoPardonReceipt], warnings: &[String]) -> Value {
+    let mut value = if result.is_object() {
+        result.clone()
     } else {
-        "degraded-checkboxes"
-    }
-}
-
-/// Say which projection the campaign just armed with, on every arm path.
-///
-/// A campaign that armed degraded behaves differently in ways an operator
-/// cannot see from the forge: no per-task steering threads, no merged-oracle
-/// walk, no anomalies, checkbox writes back on the master. Reporting it only
-/// on the `--no-enqueue` branch made the ordinary path silent about the one
-/// fact that explains all of that.
-fn armed_projection(result: &Value, sub_issue_walk: bool) -> Value {
-    let mut value = result.clone();
-    match value.as_object_mut() {
-        Some(object) => {
-            object.insert("subIssueWalk".to_owned(), json!(sub_issue_walk));
-            object.insert(
-                "projection".to_owned(),
-                json!(projection_label(sub_issue_walk)),
-            );
-            value
-        }
-        None => json!({
-            "result": value,
-            "subIssueWalk": sub_issue_walk,
-            "projection": projection_label(sub_issue_walk),
-        }),
-    }
-}
-
-fn arm_receipt(
-    result: &Value,
-    sub_issue_walk: bool,
-    auto_pardons: &[AutoPardonReceipt],
-    warnings: &[String],
-) -> Value {
-    let mut value = armed_projection(result, sub_issue_walk);
-    let object = value
-        .as_object_mut()
-        .expect("armed_projection always returns an object");
+        json!({"result": result})
+    };
+    let object = value.as_object_mut().expect("arm receipt is an object");
     object.insert("autoPardons".to_owned(), json!(auto_pardons));
     let mut combined = object
         .remove("warnings")
@@ -902,7 +386,7 @@ fn arm_receipt(
 }
 
 /// Every steering surface a pass reads: campaign-wide records plus records
-/// addressed to one task. Task keys are task IDs, never forge issue numbers.
+/// addressed to one task. Task keys are task IDs, never task numbers.
 #[derive(Debug, Clone, Default)]
 struct CampaignSteering {
     master: Vec<Value>,
@@ -1925,7 +1409,7 @@ fn active_local_escalated_tasks(
     let records = read_local_attempt_receipts(
         state_dir,
         &graph.canonical.manifest.name,
-        graph.locator.number,
+        LOCAL_CAMPAIGN_ISSUE_NUMBER,
     )?;
     active_escalated_tasks_from_receipts(&records, &current_tasks)
 }
@@ -1938,7 +1422,7 @@ fn append_local_campaign_pardon(
     scope: &PardonScope,
 ) -> Result<String> {
     let campaign = &graph.canonical.manifest.name;
-    let issue_number = graph.locator.number;
+    let issue_number = LOCAL_CAMPAIGN_ISSUE_NUMBER;
     let path = local_attempt_receipts_path(state_dir, campaign)?;
     let directory = path
         .parent()
@@ -2063,202 +1547,6 @@ fn append_local_campaign_pardon(
     }
 }
 
-fn machine_marker_fields<'a>(body: &'a str, kind: &str) -> Option<BTreeMap<&'a str, &'a str>> {
-    let prefix = format!("<!-- tally:spec-build:{kind}:v1 ");
-    let content = body
-        .lines()
-        .next()?
-        .strip_prefix(&prefix)?
-        .strip_suffix(" -->")?;
-    let mut fields = BTreeMap::new();
-    for token in content.split(' ') {
-        let (name, value) = token.split_once('=')?;
-        if name.is_empty() || value.is_empty() || fields.insert(name, value).is_some() {
-            return None;
-        }
-    }
-    Some(fields)
-}
-
-fn diagnosis_marker_task(body: &str, campaign: &str, issue_number: u64) -> Option<(String, u8)> {
-    let fields = machine_marker_fields(body, "diagnosis")?;
-    if fields.len() != 4
-        || fields.get("campaign").copied() != Some(campaign)
-        || fields
-            .get("issue")
-            .and_then(|value| value.parse::<u64>().ok())
-            != Some(issue_number)
-    {
-        return None;
-    }
-    let task_id = fields.get("task").copied()?;
-    let attempt = fields.get("attempt")?.parse::<u8>().ok()?;
-    (safe_task_id(task_id) && matches!(attempt, 1 | 2)).then(|| (task_id.to_owned(), attempt))
-}
-
-fn escalation_comment(body: &str, campaign: &str, issue_number: u64) -> bool {
-    body.lines().next()
-        == Some(
-            format!(
-                "<!-- tally:spec-build:escalation:v1 campaign={campaign} issue={issue_number} -->"
-            )
-            .as_str(),
-        )
-}
-
-fn resume_marker_scope(
-    body: &str,
-    campaign: &str,
-    issue_number: u64,
-) -> Result<Option<PardonScope>> {
-    let Some(fields) = machine_marker_fields(body, "resume") else {
-        return Ok(None);
-    };
-    if !matches!(fields.len(), 3 | 4)
-        || fields
-            .keys()
-            .any(|field| !matches!(*field, "campaign" | "issue" | "nonce" | "tasks"))
-        || fields.get("campaign").copied() != Some(campaign)
-        || fields
-            .get("issue")
-            .and_then(|value| value.parse::<u64>().ok())
-            != Some(issue_number)
-    {
-        return Ok(None);
-    }
-    let Some(nonce) = fields.get("nonce") else {
-        return Ok(None);
-    };
-    if uuid::Uuid::parse_str(nonce).is_err() {
-        return Err(invalid("campaign resume marker carries an invalid nonce"));
-    }
-    if !body.contains("\n\n### Campaign resumed\n\n") || !body.contains("\n\nReason: ") {
-        return Err(invalid("campaign resume receipt has malformed content"));
-    }
-    let Some(tasks) = fields.get("tasks") else {
-        return Ok(Some(PardonScope::All));
-    };
-    let tasks = tasks.split(',').map(str::to_owned).collect::<Vec<_>>();
-    let unique = tasks.iter().cloned().collect::<BTreeSet<_>>();
-    if tasks.is_empty()
-        || tasks.len() != unique.len()
-        || tasks.iter().any(|task_id| !safe_task_id(task_id))
-    {
-        return Err(invalid(
-            "campaign resume receipt carries invalid scoped tasks",
-        ));
-    }
-    Ok(Some(PardonScope::Tasks(unique)))
-}
-
-fn active_escalated_tasks(
-    graph: &CampaignGraph,
-    authenticated_actor: &str,
-    sub_issue_walk: bool,
-) -> Result<BTreeSet<String>> {
-    let campaign = &graph.canonical.manifest.name;
-    let issue_number = graph.locator.number;
-    let mut boundaries = Vec::new();
-    let mut diagnoses: BTreeMap<String, Vec<(u64, u8)>> = BTreeMap::new();
-    let mut escalations = Vec::new();
-
-    let master_comments = fetch_issue_comments(&graph.locator)?;
-    for comment in &master_comments {
-        if !comment.user.login.eq_ignore_ascii_case(authenticated_actor) {
-            continue;
-        }
-        if let Some(scope) = resume_marker_scope(&comment.body, campaign, issue_number)? {
-            boundaries.push(PardonBoundary {
-                id: comment.id,
-                scope,
-            });
-        }
-        if let Some((task_id, attempt)) =
-            diagnosis_marker_task(&comment.body, campaign, issue_number)
-        {
-            diagnoses
-                .entry(task_id)
-                .or_default()
-                .push((comment.id, attempt));
-        }
-        if escalation_comment(&comment.body, campaign, issue_number) {
-            escalations.push(comment.id);
-        }
-    }
-
-    if sub_issue_walk {
-        let task_by_issue = graph
-            .canonical
-            .manifest
-            .tasks
-            .iter()
-            .map(|task| (task.issue, task.id.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        let walked = sub_issue_threads(&graph.locator)?;
-        for (issue, comments) in walked.threads {
-            let Some(expected_task) = task_by_issue.get(&issue) else {
-                continue;
-            };
-            for comment in comments {
-                let Some(author) = comment.author.as_ref() else {
-                    continue;
-                };
-                if !author.login.eq_ignore_ascii_case(authenticated_actor) {
-                    continue;
-                }
-                let Some((task_id, attempt)) =
-                    diagnosis_marker_task(&comment.body, campaign, issue_number)
-                else {
-                    continue;
-                };
-                if task_id != *expected_task {
-                    continue;
-                }
-                if let Some(id) = comment.database_id {
-                    diagnoses.entry(task_id).or_default().push((id, attempt));
-                }
-            }
-        }
-    }
-
-    let current_tasks = graph
-        .canonical
-        .manifest
-        .tasks
-        .iter()
-        .map(|task| task.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut active = BTreeSet::new();
-    for (task_id, receipts) in diagnoses {
-        if !current_tasks.contains(task_id.as_str()) {
-            continue;
-        }
-        let boundary = boundaries
-            .iter()
-            .filter(|candidate| candidate.applies_to(&task_id))
-            .map(|candidate| candidate.id)
-            .max()
-            .unwrap_or(0);
-        let current = receipts
-            .into_iter()
-            .filter(|(id, _)| *id > boundary)
-            .collect::<Vec<_>>();
-        let attempts = current
-            .iter()
-            .map(|(_, attempt)| *attempt)
-            .collect::<BTreeSet<_>>();
-        let last_diagnosis = current.iter().map(|(id, _)| *id).max().unwrap_or(0);
-        if attempts == BTreeSet::from([1, 2])
-            && escalations
-                .iter()
-                .any(|escalation| *escalation > boundary && *escalation > last_diagnosis)
-        {
-            active.insert(task_id);
-        }
-    }
-    Ok(active)
-}
-
 fn amendment_pardon_plan(
     prior: Option<&CanonicalCampaignGraphV1>,
     current: &CanonicalCampaignGraphV1,
@@ -2314,198 +1602,9 @@ fn amendment_pardon_plan(
     (pardons, warnings)
 }
 
-fn extract_managed_section<'a>(body: &'a str, start: &str, end: &str) -> Result<&'a str> {
-    let start_index = body
-        .find(start)
-        .ok_or_else(|| invalid(format!("campaign issue body is missing {start}")))?;
-    let content_start = start_index + start.len();
-    let remainder = &body[content_start..];
-    let relative_end = remainder
-        .find(end)
-        .ok_or_else(|| invalid(format!("campaign issue body is missing {end}")))?;
-    let tail = &remainder[relative_end + end.len()..];
-    if tail.contains(start) || tail.contains(end) {
-        return Err(invalid(format!(
-            "campaign issue body repeats a {start}/{end} marker"
-        )));
-    }
-    Ok(remainder[..relative_end].trim())
-}
-
-fn parse_manifest(body: &str, repository: &str) -> Result<CampaignManifest> {
-    let section = extract_managed_section(body, CAMPAIGN_BEGIN, CAMPAIGN_END)?;
-    let json = section
-        .strip_prefix("```json")
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim)
-        .ok_or_else(|| invalid("campaign manifest must be one fenced JSON object"))?;
-    let mut value: Value = serde_json::from_str(json)
-        .map_err(|error| invalid(format!("campaign manifest is invalid: {error}")))?;
-    if let Some(manifest) = value.as_object_mut() {
-        let repository_pool = format!("{CAMPAIGN_POOL_PREFIX}{repository}");
-        match manifest.get("pool") {
-            None => {
-                manifest.insert("pool".to_owned(), json!(repository_pool));
-            }
-            Some(Value::String(pool)) if pool.starts_with(CAMPAIGN_POOL_PREFIX) => {
-                if !is_campaign_pool_name(pool) {
-                    return Err(invalid(
-                        "campaign namespace pool must use campaign/OWNER/REPO form",
-                    ));
-                }
-                if pool != &repository_pool {
-                    return Err(invalid(format!(
-                        "campaign namespace pool must match issue repository {repository:?}"
-                    )));
-                }
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(admit_manifest_value(value)?)
-}
-
-fn fetch_campaign_graph(locator: &IssueLocator) -> Result<CampaignGraph> {
-    let master = fetch_issue(locator)?;
-    campaign_graph_from(locator, master)
-}
-
-/// Build the graph from a master issue the caller has already read.
-///
-/// The poll reads it first anyway, because a closed master prunes the
-/// registration rather than failing the scan, and re-reading it here made every
-/// idle tick pay for the same issue twice.
-fn campaign_graph_from(locator: &IssueLocator, master: GithubIssue) -> Result<CampaignGraph> {
-    if master.state != "open" {
-        return Err(invalid("campaign master issue must be open"));
-    }
-    let manifest = parse_manifest(
-        master.body.as_deref().unwrap_or_default(),
-        &locator.repository,
-    )?;
-    validate_worklist_projection(master.body.as_deref().unwrap_or_default(), &manifest)?;
-    let subissues = fetch_subissues(locator)?;
-    let subissue_count = subissues.len();
-    let by_number = subissues
-        .into_iter()
-        .map(|issue| (issue.number, issue))
-        .collect::<BTreeMap<_, _>>();
-    if by_number.len() != subissue_count {
-        return Err(invalid(
-            "GitHub returned duplicate native sub-issue numbers",
-        ));
-    }
-    let expected = manifest
-        .tasks
-        .iter()
-        .map(|task| task.issue)
-        .collect::<BTreeSet<_>>();
-    let actual = by_number.keys().copied().collect::<BTreeSet<_>>();
-    if expected != actual {
-        bail!(
-            "campaign manifest task issues and GitHub native sub-issues differ (manifest: {:?}; sub-issues: {:?})",
-            expected,
-            actual
-        );
-    }
-    let mut tasks = Vec::with_capacity(manifest.tasks.len());
-    for reference in &manifest.tasks {
-        let issue = by_number
-            .get(&reference.issue)
-            .expect("sets were compared above")
-            .clone();
-        if issue.pull_request.is_some() {
-            return Err(invalid(format!(
-                "campaign task {} names pull request #{}",
-                reference.id, reference.issue
-            )));
-        }
-        if issue.state != "open" && issue.state != "closed" {
-            bail!("campaign task issue #{} has unknown state", issue.number);
-        }
-        let expected_url = format!(
-            "https://github.com/{}/issues/{}",
-            locator.repository, reference.issue
-        );
-        if issue.html_url != expected_url {
-            bail!("campaign task {} issue URL is not canonical", reference.id);
-        }
-        if issue.title.trim().is_empty()
-            || issue.title.chars().count() > 300
-            || issue.title.chars().any(char::is_control)
-        {
-            return Err(invalid(format!(
-                "campaign task {} issue #{} has an invalid title",
-                reference.id, reference.issue
-            )));
-        }
-        let body = issue.body.as_deref().unwrap_or_default();
-        if body.trim().is_empty() || body.contains('\0') || body.chars().count() > 64_000 {
-            return Err(invalid(format!(
-                "campaign task {} issue #{} brief must contain 1..=64000 characters without NUL bytes",
-                reference.id, reference.issue
-            )));
-        }
-        tasks.push(issue);
-    }
-    // Managed checkbox state, issue open/closed projection, update timestamps,
-    // and master prose outside the fenced manifest are deliberately excluded.
-    // This canonical value is both what Rust hashes and what the flow carries.
-    let canonical = CanonicalCampaignGraphV1::new(
-        manifest,
-        tasks
-            .iter()
-            .map(|issue| CanonicalCampaignTaskV1 {
-                number: issue.number,
-                title: issue.title.clone(),
-                body: issue.body.as_deref().unwrap_or_default().to_owned(),
-            })
-            .collect(),
-    )?;
-    Ok(CampaignGraph {
-        locator: locator.clone(),
-        canonical,
-        master,
-        tasks,
-    })
-}
-
 fn sha256_json(value: &Value) -> Result<String> {
     let canonical = tally_core::campaign_contract::canonical_json(value)?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
-}
-
-fn forge_state_value(graph: &CampaignGraph) -> Value {
-    json!({
-        "master": {
-            "state": graph.master.state,
-            "updatedAt": graph.master.updated_at,
-        },
-        "tasks": graph.tasks.iter().map(|issue| json!({
-            "number": issue.number,
-            "state": issue.state,
-            "updatedAt": issue.updated_at,
-        })).collect::<Vec<_>>(),
-    })
-}
-
-/// Forge facts with scheduling meaning after the steering read has completed.
-///
-/// `updated_at` belongs in the cheap precondition above because it tells the
-/// poll when comments may need rereading. It does not belong in the admitted
-/// observation itself: Tally's own comments and checkbox projection bump that
-/// timestamp, while the filtered steering and executable graph stay exactly
-/// the same.
-fn campaign_state_value(graph: &CampaignGraph) -> Value {
-    json!({
-        "master": {
-            "state": graph.master.state,
-        },
-        "tasks": graph.tasks.iter().map(|issue| json!({
-            "number": issue.number,
-            "state": issue.state,
-        })).collect::<Vec<_>>(),
-    })
 }
 
 fn campaign_state_ref_prefix(campaign: &str, issue_number: u64) -> String {
@@ -2518,14 +1617,13 @@ fn campaign_state_ref_prefix(campaign: &str, issue_number: u64) -> String {
 ///
 /// The driver treats the remote base plus its campaign-scoped hidden refs as
 /// the source of truth for local merges, checkpoints, and continuation
-/// receipts. Public polls must read the same facts: otherwise a completed
-/// local pass is indistinguishable from an idle campaign when the forge issue
-/// itself did not move.
+/// receipts. Polls must read the same facts: otherwise a completed local pass
+/// is indistinguishable from an idle campaign when its durable Git state moves.
 fn repository_progress_value(graph: &CampaignGraph) -> Result<Value> {
     let repository = &graph.canonical.manifest.repository;
     let base_ref = format!("refs/heads/{}", repository.base_branch);
     let state_prefix =
-        campaign_state_ref_prefix(&graph.canonical.manifest.name, graph.locator.number);
+        campaign_state_ref_prefix(&graph.canonical.manifest.name, LOCAL_CAMPAIGN_ISSUE_NUMBER);
     let state_pattern = format!("{state_prefix}/*");
     let listed = ProcessCommand::new("git")
         .arg("-C")
@@ -2588,51 +1686,6 @@ fn repository_progress_value(graph: &CampaignGraph) -> Result<Value> {
     }))
 }
 
-/// The cheap external-state half of the full campaign observation.
-///
-/// The two REST reads cover every forge surface the expensive GraphQL steering
-/// walk can reveal through issue `updated_at` or `state`. The one bounded
-/// `ls-remote` covers driver progress that moves only Git. If both are stable,
-/// the full observation is stable and the poll can skip the walk; if either
-/// moves, the full revision and enqueue identity include the same change.
-#[cfg(test)]
-fn forge_observation(
-    graph: &CampaignGraph,
-    repository_progress: &Value,
-    arm_serial: u64,
-) -> Result<String> {
-    sha256_json(&json!({
-        "graph": graph.canonical.executable_digest,
-        "forgeState": forge_state_value(graph),
-        "repositoryProgress": repository_progress,
-        "armSerial": arm_serial,
-    }))
-}
-
-/// A bounded confirmation identity for an unapproved executable graph.
-///
-/// The first mismatch is retained here but is not yet called
-/// `rearm-required`. A second identical registry scan confirms that the graph
-/// is stable. This absorbs the one-read intermediate views GitHub can expose
-/// while Tally is applying its own sequence of issue mutations, without ever
-/// dispatching unapproved content.
-#[cfg(test)]
-fn graph_mismatch_observation(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
-    sha256_json(&json!({
-        "kind": "campaign-graph-mismatch-v1",
-        "graph": graph.canonical.executable_digest,
-        "forgeState": forge_state_value(graph),
-        "armSerial": arm_serial,
-    }))
-}
-
-fn graph_poll_snapshot(graph: &CampaignGraph) -> Result<String> {
-    sha256_json(&json!({
-        "graph": graph.canonical.executable_digest,
-        "forgeState": forge_state_value(graph),
-    }))
-}
-
 fn campaign_observation(
     graph: &CampaignGraph,
     steering: &CampaignSteering,
@@ -2641,7 +1694,6 @@ fn campaign_observation(
 ) -> Result<String> {
     sha256_json(&json!({
         "graph": graph.canonical.executable_digest,
-        "forgeState": campaign_state_value(graph),
         "repositoryProgress": repository_progress,
         "steering": steering.master,
         // A task-addressed local record must nudge the campaign exactly like a
@@ -2657,180 +1709,6 @@ fn resolve_state_dir(value: Option<PathBuf>) -> Result<PathBuf> {
         return Err(invalid("campaign state directory must be absolute"));
     }
     Ok(path)
-}
-
-fn campaign_projection_path(
-    state_dir: &Path,
-    code_repository: &str,
-    worklist_pattern: &str,
-) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(code_repository.as_bytes());
-    hasher.update([0]);
-    hasher.update(worklist_pattern.as_bytes());
-    state_dir
-        .join("campaigns/projections")
-        .join(format!("{:x}.projection-v1.json", hasher.finalize()))
-}
-
-fn read_campaign_projection(
-    state_dir: &Path,
-    code_repository: &str,
-    worklist_pattern: &str,
-) -> Result<CampaignProjectionV1> {
-    let path = campaign_projection_path(state_dir, code_repository, worklist_pattern);
-    let metadata = fs::metadata(&path).with_context(|| {
-        format!(
-            "campaign {code_repository}/{worklist_pattern} has no local forge projection at {}; run `tally campaign project` first when this campaign still uses a forge projection",
-            path.display()
-        )
-    })?;
-    if !metadata.is_file() || metadata.len() > MAX_CAMPAIGN_PROJECTION_BYTES {
-        bail!(
-            "campaign projection {} is not a bounded regular file",
-            path.display()
-        );
-    }
-    let projection: CampaignProjectionV1 = serde_json::from_slice(&fs::read(&path)?)
-        .with_context(|| format!("campaign projection {} is invalid", path.display()))?;
-    if projection.schema_version != CAMPAIGN_PROJECTION_SCHEMA_VERSION
-        || projection.code_repository != code_repository
-        || projection.worklist_pattern != worklist_pattern
-        || !projection
-            .worklist_sha256
-            .strip_prefix("sha256:")
-            .is_some_and(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            })
-        || !matches!(projection.source_revision.len(), 40 | 64)
-        || !projection
-            .source_revision
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        bail!(
-            "campaign projection {} violates projection-v1 invariants",
-            path.display()
-        );
-    }
-    if projection.issue.is_some() {
-        projection.locator()?;
-    }
-    Ok(projection)
-}
-
-fn write_campaign_projection(state_dir: &Path, projection: &CampaignProjectionV1) -> Result<()> {
-    let path = campaign_projection_path(
-        state_dir,
-        &projection.code_repository,
-        &projection.worklist_pattern,
-    );
-    let directory = path
-        .parent()
-        .expect("campaign projection path always has a parent");
-    fs::create_dir_all(directory)?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::now_v7()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    serde_json::to_writer(&mut file, projection)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, &path)?;
-    fs::File::open(directory)?.sync_all()?;
-    Ok(())
-}
-
-fn committed_worklist_coordinate(
-    worklist: &Path,
-    manifest: &CampaignManifest,
-) -> Result<(String, String, String)> {
-    if worklist == Path::new("-") {
-        return Err(invalid(
-            "a committed campaign worklist cannot be read from stdin",
-        ));
-    }
-    let checkout = fs::canonicalize(&manifest.repository.checkout).with_context(|| {
-        format!(
-            "cannot resolve campaign checkout {}",
-            manifest.repository.checkout.display()
-        )
-    })?;
-    let worklist = fs::canonicalize(worklist)
-        .with_context(|| format!("cannot resolve campaign worklist {}", worklist.display()))?;
-    let relative = worklist.strip_prefix(&checkout).map_err(|_| {
-        invalid(format!(
-            "campaign worklist {} is outside code checkout {}",
-            worklist.display(),
-            checkout.display()
-        ))
-    })?;
-    let pattern = relative
-        .to_str()
-        .ok_or_else(|| invalid("campaign worklist path is not valid UTF-8"))?
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    let pattern = parse_worklist_pattern(&pattern)?;
-
-    let git = |arguments: &[&str], context: &str| -> Result<std::process::Output> {
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&checkout)
-            .args(arguments)
-            .output()
-            .with_context(|| format!("cannot execute git while {context}"))
-    };
-    let fetched = git(
-        &["fetch", "--prune", "--no-tags", &manifest.repository.remote],
-        "fetching the worklist authority revision",
-    )?;
-    if !fetched.status.success() {
-        bail!(
-            "cannot fetch campaign worklist authority revision: {}",
-            String::from_utf8_lossy(&fetched.stderr).trim()
-        );
-    }
-    let base_ref = format!(
-        "{}/{}^{{commit}}",
-        manifest.repository.remote, manifest.repository.base_branch
-    );
-    let resolved = git(
-        &["rev-parse", "--verify", &base_ref],
-        "resolving the worklist authority revision",
-    )?;
-    if !resolved.status.success() {
-        bail!(
-            "cannot resolve campaign worklist authority revision {base_ref}: {}",
-            String::from_utf8_lossy(&resolved.stderr).trim()
-        );
-    }
-    let revision = String::from_utf8(resolved.stdout)?
-        .trim()
-        .to_ascii_lowercase();
-    let object = format!("{revision}:{pattern}");
-    let committed = git(
-        &["show", &object],
-        "reading the committed campaign worklist",
-    )?;
-    if !committed.status.success() {
-        bail!(
-            "campaign worklist pattern {pattern:?} is not a regular file at fetched base revision {revision}"
-        );
-    }
-    let local = fs::read(&worklist)?;
-    if committed.stdout != local {
-        bail!(
-            "campaign worklist {} differs from {pattern:?} at fetched base revision {revision}; commit and push it before projecting",
-            worklist.display()
-        );
-    }
-    let digest = format!("sha256:{:x}", Sha256::digest(&committed.stdout));
-    Ok((pattern, revision, digest))
 }
 
 fn local_campaign_declaration(
@@ -3126,18 +2004,13 @@ fn committed_local_worklist(
             "campaign worklist {source_path:?} at fetched base revision {revision} is invalid JSON"
         )
     })?;
-    Ok(CommittedLocalWorklist {
-        document,
-        source_revision: revision,
-        sha256: format!("sha256:{:x}", Sha256::digest(&raw)),
-    })
+    Ok(CommittedLocalWorklist { document })
 }
 
 fn local_campaign_graph_from_worklist(
     declaration: LocalCampaignDeclaration,
-    code_repository: &str,
     worklist_pattern: &str,
-) -> Result<(CampaignGraph, CampaignProjectionV1)> {
+) -> Result<CampaignGraph> {
     let committed = committed_local_worklist(&declaration.worklist_repository, worklist_pattern)?;
     let validated =
         validate_local_worklist_document(&committed.document, &declaration.manifest_config)?;
@@ -3146,24 +2019,10 @@ fn local_campaign_graph_from_worklist(
             "the local worklist arm path requires campaign.repository.forge=local",
         ));
     }
-    let projection = CampaignProjectionV1 {
-        schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
-        code_repository: code_repository.to_owned(),
-        worklist_pattern: worklist_pattern.to_owned(),
-        source_revision: committed.source_revision,
-        worklist_sha256: committed.sha256,
-        issue: None,
-        sub_issue_walk: Some(false),
-    };
-    let graph = local_campaign_graph(validated, code_repository, &projection)?;
-    Ok((graph, projection))
+    local_campaign_graph(validated)
 }
 
-fn local_campaign_graph(
-    validated: ValidatedWorklist,
-    code_repository: &str,
-    projection: &CampaignProjectionV1,
-) -> Result<CampaignGraph> {
+fn local_campaign_graph(validated: ValidatedWorklist) -> Result<CampaignGraph> {
     if validated.tasks.len() != validated.manifest.tasks.len() {
         return Err(invalid(
             "validated worklist task content does not match its manifest references",
@@ -3180,48 +2039,7 @@ fn local_campaign_graph(
         })
         .collect::<Vec<_>>();
     let canonical = CanonicalCampaignGraphV1::new(validated.manifest, task_content)?;
-    let campaign = &canonical.manifest.name;
-    let updated_at = projection.source_revision.clone();
-    let tasks = canonical
-        .manifest
-        .tasks
-        .iter()
-        .zip(&canonical.tasks)
-        .map(|(reference, content)| GithubIssue {
-            number: reference.issue,
-            title: content.title.clone(),
-            body: Some(content.body.clone()),
-            state: "open".to_owned(),
-            html_url: format!("local://campaign/{campaign}/task/{}", reference.id),
-            updated_at: updated_at.clone(),
-            user: GithubActor {
-                login: LOCAL_ALLOWED_ACTOR.to_owned(),
-            },
-            pull_request: None,
-        })
-        .collect::<Vec<_>>();
-    let url = format!("local://campaign/{campaign}");
-    Ok(CampaignGraph {
-        locator: IssueLocator {
-            repository: code_repository.to_owned(),
-            number: LOCAL_CAMPAIGN_ISSUE_NUMBER,
-            url: url.clone(),
-        },
-        master: GithubIssue {
-            number: LOCAL_CAMPAIGN_ISSUE_NUMBER,
-            title: campaign.clone(),
-            body: None,
-            state: "open".to_owned(),
-            html_url: url,
-            updated_at,
-            user: GithubActor {
-                login: LOCAL_ALLOWED_ACTOR.to_owned(),
-            },
-            pull_request: None,
-        },
-        canonical,
-        tasks,
-    })
+    Ok(CampaignGraph { canonical })
 }
 
 fn approved_graph_directory(state_dir: &Path, registration_id: &str) -> PathBuf {
@@ -3387,76 +2205,6 @@ fn remove_approved_graph_snapshots(state_dir: &Path, registration_id: &str) -> R
             )
         }),
     }
-}
-
-fn default_campaign_workspace_root() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return Ok(PathBuf::from(path).join("tally/campaigns/workspaces"));
-    }
-    let home = std::env::var_os("HOME").context("HOME and XDG_CACHE_HOME are both unset")?;
-    Ok(PathBuf::from(home).join(".cache/tally/campaigns/workspaces"))
-}
-
-fn resolve_asset(
-    explicit: Option<PathBuf>,
-    environment: &str,
-    installed_relative: &str,
-    development_relative: &str,
-) -> Result<PathBuf> {
-    let candidate = if let Some(path) = explicit {
-        path
-    } else if let Some(path) = std::env::var_os(environment) {
-        PathBuf::from(path)
-    } else {
-        let installed = std::env::current_exe().ok().and_then(|executable| {
-            executable
-                .parent()
-                .and_then(Path::parent)
-                .map(|root| root.join(installed_relative))
-        });
-        installed.filter(|path| path.is_file()).unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(development_relative)
-        })
-    };
-    let candidate = candidate
-        .canonicalize()
-        .with_context(|| format!("cannot resolve campaign asset {}", candidate.display()))?;
-    if !candidate.is_file() {
-        bail!(
-            "campaign asset is not a regular file: {}",
-            candidate.display()
-        );
-    }
-    Ok(candidate)
-}
-
-fn resolve_flow(value: Option<PathBuf>) -> Result<PathBuf> {
-    resolve_asset(
-        value,
-        "TALLY_CAMPAIGN_FLOW",
-        "share/tally/flows/spec-build.js",
-        "examples/flows/spec-build.js",
-    )
-}
-
-fn resolve_driver(value: Option<PathBuf>) -> Result<PathBuf> {
-    resolve_asset(
-        value,
-        "TALLY_CAMPAIGN_DRIVER",
-        "libexec/tally/spec-build-driver",
-        "drivers/spec_build_driver.py",
-    )
-}
-
-fn github_repository_from_remote(value: &str) -> Option<String> {
-    let value = value.trim().trim_end_matches('/').trim_end_matches(".git");
-    let path = value
-        .strip_prefix("https://github.com/")
-        .or_else(|| value.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| value.strip_prefix("git@github.com:"))?;
-    parse_repository(path).ok()
 }
 
 /// Arming is the last moment before a campaign spends real agent time, so a
@@ -3790,7 +2538,7 @@ fn validate_host(
     for pool in ["flow", "campaign-agent", "campaign-control"] {
         if !config.pools.contains_key(pool) {
             return Err(invalid(format!(
-                "forge-native campaigns require configured pool {pool:?}"
+                "campaigns require configured pool {pool:?}"
             )));
         }
     }
@@ -3809,7 +2557,7 @@ fn validate_host(
     for adapter in required_adapters {
         if !config.adapters.contains_key(adapter) {
             return Err(invalid(format!(
-                "forge-native campaigns require configured adapter {adapter:?}"
+                "campaigns require configured adapter {adapter:?}"
             )));
         }
     }
@@ -3841,38 +2589,13 @@ fn validate_host(
             checkout.display()
         )));
     }
-    if manifest.repository.forge == "local" {
-        if !allow_test_local_forge {
-            return Err(invalid(
-                "forge=local is test-only for issue campaigns; pass --allow-test-local-forge only in an isolated mechanism test",
-            ));
-        }
-    } else {
-        let remote = ProcessCommand::new("git")
-            .arg("-C")
-            .arg(checkout)
-            .args(["remote", "get-url", manifest.repository.remote.as_str()])
-            .output()
-            .context("cannot execute git while binding campaign remote")?;
-        if !remote.status.success() {
-            bail!(
-                "cannot resolve campaign remote {:?}: {}",
-                manifest.repository.remote,
-                String::from_utf8_lossy(&remote.stderr).trim()
-            );
-        }
-        let remote =
-            String::from_utf8(remote.stdout).context("campaign remote URL was not valid UTF-8")?;
-        let bound = github_repository_from_remote(&remote).ok_or_else(|| {
-            invalid("GitHub issue campaigns require an https or SSH github.com checkout remote")
-        })?;
-        if !bound.eq_ignore_ascii_case(&graph.locator.repository) {
-            bail!(
-                "campaign issue repository {} does not match checkout remote repository {}",
-                graph.locator.repository,
-                bound
-            );
-        }
+    if manifest.repository.forge != "local" {
+        return Err(invalid("campaign repository.forge must equal local"));
+    }
+    if !allow_test_local_forge {
+        return Err(invalid(
+            "forge=local is test-only for issue campaigns; pass --allow-test-local-forge only in an isolated mechanism test",
+        ));
     }
     // Checkpoint and command-gate argvs run through the flow `sh` native, so
     // their hazards depend on the resolved shell adapter rather than the agent.
@@ -3892,11 +2615,9 @@ fn validate_campaign_runner_pool(pool: &str, pools: &BTreeMap<String, PoolConfig
             "campaign namespace pool must use campaign/OWNER/REPO form",
         ));
     }
-    let runner = pools.get(pool).ok_or_else(|| {
-        invalid(format!(
-            "forge-native campaigns require configured pool {pool:?}"
-        ))
-    })?;
+    let runner = pools
+        .get(pool)
+        .ok_or_else(|| invalid(format!("campaigns require configured pool {pool:?}")))?;
     if runner.resource() != ResourceKind::Mutex || runner.capacity != 1 {
         return Err(invalid(format!(
             "campaign runner pool {pool:?} must be a capacity-1 mutex"
@@ -3959,8 +2680,8 @@ fn validated_projection_wait_ms(value: Option<u64>) -> Result<Option<u64>> {
 
 /// Argv the pass writes into the events directory to admit its own successor.
 ///
-/// It is the poll the timer already runs: one registry scan that refetches the
-/// issue graph, recomputes the observation revision, and dispatches through
+/// It is the poll the timer already runs: one registry scan that reloads the
+/// committed worklist graph, recomputes the observation revision, and dispatches through
 /// `dispatch_campaign`, so the next pass inherits the `campaign:<repo>:<number>:<revision>`
 /// dedup identity. A duplicate event, or a race with `tally-campaign-poll.timer`,
 /// therefore collapses in the enqueue kernel instead of starting a second pass.
@@ -4049,7 +2770,6 @@ async fn dispatch_campaign(
     graph: &CampaignGraph,
     repository_progress: &Value,
     registration: &mut CampaignRegistration,
-    sub_issue_walk: bool,
     wait: bool,
 ) -> Result<Value> {
     let CampaignHost {
@@ -4061,7 +2781,7 @@ async fn dispatch_campaign(
     let manifest = &graph.canonical.manifest;
     if graph.canonical.executable_digest != registration.approved_graph_digest {
         bail!(
-            "campaign executable graph changed from admitted {} to {}; inspect the projection and run `tally campaign arm {} {}` to approve it",
+            "campaign executable graph changed from admitted {} to {}; inspect the worklist and run `tally campaign arm {} {}` to approve it",
             registration.approved_graph_digest,
             graph.canonical.executable_digest,
             registration.code_repository,
@@ -4099,12 +2819,16 @@ async fn dispatch_campaign(
         registration.arm_serial,
     )?;
     let executable = std::env::current_exe().context("cannot resolve tally executable")?;
+    let issue_url = campaign_issue_url(
+        &registration.code_repository,
+        &registration.worklist_pattern,
+    );
     let brief = json!({
         "campaignIdentity": &registration.registration_id,
-        "repository": &graph.locator.repository,
+        "repository": &registration.code_repository,
         "issue": {
-            "number": graph.locator.number.to_string(),
-            "url": &graph.locator.url,
+            "number": LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+            "url": &issue_url,
         },
         "runId": &revision,
         "worklist": {
@@ -4117,7 +2841,7 @@ async fn dispatch_campaign(
         // the driver must reconstruct and verify the omitted task envelope.
         "armedManifest": manifest,
         // The complete graph Rust normalized and hashed. The packaged driver
-        // consumes this envelope; it never reparses the issue manifest into a
+        // consumes this envelope; it never reparses another manifest into a
         // second executable contract.
         "campaignGraph": &graph.canonical,
         "steering": steering.master,
@@ -4127,10 +2851,10 @@ async fn dispatch_campaign(
         // a record that happens to be present in the log.
         "localActor": &registration.local_actor,
         "steeringSource": &steering_dispatch.snapshot.source,
-        // Kept while the surrounding forge transport is removed by later
-        // Chapter 2 tasks; local steering authorization does not consult it.
+        // Kept until the paired driver contract moves entirely to local names;
+        // local steering authorization does not consult it.
         "allowedActors": &registration.allowed_actors,
-        "capabilities": {"subIssueWalk": sub_issue_walk},
+        "capabilities": {"subIssueWalk": false},
         "workspaceRoot": &registration.workspace_root,
         // Checkpoint snapshots join the executor's existing archive so the
         // ordinary captureArchiveHorizon sweep owns their lifecycle.
@@ -4171,7 +2895,7 @@ async fn dispatch_campaign(
         source: Some(EnqueueSource::Manual),
         dedup_key: Some(format!(
             "campaign:{}:{}:{}",
-            graph.locator.repository, graph.locator.number, revision
+            registration.code_repository, LOCAL_CAMPAIGN_ISSUE_NUMBER, revision
         )),
         submission: Some(SubmissionOptions {
             mode: SubmissionMode::Full,
@@ -4182,7 +2906,7 @@ async fn dispatch_campaign(
         drv: None,
         evidence_class: Some(json!({
             "kind": "forge-native-campaign",
-            "issue": &graph.locator.url,
+            "issue": &issue_url,
             "registrationId": &registration.registration_id,
             "revision": &revision,
             "approvedBy": &registration.local_actor,
@@ -4324,67 +3048,17 @@ async fn run_campaign_arm(
         require_local_actor(registration)?;
     }
     let local_actor = local_actor();
-    let projection_path = campaign_projection_path(&state_dir, &code_repository, &worklist_pattern);
-    let existing_projection = match fs::metadata(&projection_path) {
-        Ok(_) => Some(read_campaign_projection(
-            &state_dir,
-            &code_repository,
-            &worklist_pattern,
-        )?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "cannot inspect campaign projection {}",
-                    projection_path.display()
-                )
-            })
-        }
-    };
-    let local_declaration =
-        local_campaign_declaration(config_path, &code_repository, &worklist_pattern)?;
-    let declared_assets = local_declaration.as_ref().map(|declaration| {
-        (
-            declaration.flow.clone(),
-            declaration.driver.clone(),
-            declaration.workspace_root.clone(),
-        )
-    });
-    let (projection, graph, forge_actor, allowed_actors, sub_issue_walk) = if let Some(
-        declaration,
-    ) = local_declaration
-    {
-        let (graph, projection) =
-            local_campaign_graph_from_worklist(declaration, &code_repository, &worklist_pattern)?;
-        let allowed_actors = normalize_allowed_actors(&args.allowed_actors, LOCAL_ALLOWED_ACTOR)?;
-        (projection, graph, None, allowed_actors, false)
-    } else if existing_projection
-        .as_ref()
-        .is_some_and(|projection| projection.issue.is_some())
-    {
-        let mut projection = existing_projection.expect("projection was checked above");
-        let locator = projection.locator()?;
-        let forge_actor = authenticated_actor()?;
-        let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &forge_actor)?;
-        let graph = fetch_campaign_graph(&locator)?;
-        require_allowed_issue_authors(&graph, &allowed_actors)?;
-        // Probe once, at arm, and record the answer. A pass never has to
-        // discover mid-flight that half its projection is unavailable.
-        let sub_issue_walk = probe_sub_issue_walk(&locator)?;
-        projection.sub_issue_walk = Some(sub_issue_walk);
-        (
-            projection,
-            graph,
-            Some(forge_actor),
-            allowed_actors,
-            sub_issue_walk,
-        )
-    } else {
-        bail!(
-            "campaign {code_repository}/{worklist_pattern} has neither an enabled local declaration nor a forge issue projection"
-        )
-    };
-    let locator = graph.locator.clone();
+    let declaration = local_campaign_declaration(config_path, &code_repository, &worklist_pattern)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "campaign {code_repository}/{worklist_pattern} has no enabled local declaration"
+            ))
+        })?;
+    let declared_flow = declaration.flow.clone();
+    let declared_driver = declaration.driver.clone();
+    let declared_workspace_root = declaration.workspace_root.clone();
+    let graph = local_campaign_graph_from_worklist(declaration, &worklist_pattern)?;
+    let allowed_actors = normalize_allowed_actors(&args.allowed_actors, LOCAL_ALLOWED_ACTOR)?;
     let prior_graph = prior
         .as_ref()
         .map(|registration| read_approved_graph_snapshot(&state_dir, registration))
@@ -4392,34 +3066,14 @@ async fn run_campaign_arm(
         .flatten();
     let escalated = if prior.is_none() {
         BTreeSet::new()
-    } else if graph.canonical.manifest.repository.forge == "github" {
-        active_escalated_tasks(
-            &graph,
-            forge_actor
-                .as_deref()
-                .ok_or_else(|| invalid("GitHub campaign arm has no forge actor"))?,
-            sub_issue_walk,
-        )?
     } else {
         active_local_escalated_tasks(&state_dir, &graph)?
     };
     let (pardon_plan, mut arm_warnings) =
         amendment_pardon_plan(prior_graph.as_ref(), &graph.canonical, &escalated);
-    let (flow, driver, workspace_root) =
-        if let Some((flow, driver, workspace_root)) = declared_assets {
-            (
-                args.flow.unwrap_or(flow),
-                args.driver.unwrap_or(driver),
-                args.workspace_root.unwrap_or(workspace_root),
-            )
-        } else {
-            (
-                resolve_flow(args.flow)?,
-                resolve_driver(args.driver)?,
-                args.workspace_root
-                    .map_or_else(default_campaign_workspace_root, Ok)?,
-            )
-        };
+    let flow = args.flow.unwrap_or(declared_flow);
+    let driver = args.driver.unwrap_or(declared_driver);
+    let workspace_root = args.workspace_root.unwrap_or(declared_workspace_root);
     if !workspace_root.is_absolute() {
         return Err(invalid("campaign workspace root must be absolute"));
     }
@@ -4462,37 +3116,32 @@ async fn run_campaign_arm(
     )?);
     let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
     for pardon in &pardon_plan {
-        let pardon_actor = forge_actor.as_deref().unwrap_or(&registration.local_actor);
-        let receipt = post_campaign_auto_pardon(&state_dir, &graph, pardon_actor, pardon)?;
+        let receipt =
+            post_campaign_auto_pardon(&state_dir, &graph, &registration.local_actor, pardon)?;
         auto_pardons.push(AutoPardonReceipt {
             task_id: pardon.task_id.clone(),
             added_dependencies: pardon.added_dependencies.clone(),
             resume_receipt: receipt,
         });
     }
-    write_campaign_projection(&state_dir, &projection)?;
     write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
     prune_approved_graph_snapshots(&state_dir, &registration)?;
     if args.no_enqueue {
+        let issue_url = campaign_issue_url(&code_repository, &worklist_pattern);
         let receipt = json!({
             "status": "armed",
-            "issue": locator.url,
+            "issue": issue_url,
             "codeRepository": code_repository,
             "worklistPattern": worklist_pattern,
-            "tasks": graph.tasks.len(),
+            "tasks": graph.canonical.tasks.len(),
             "graphDigest": graph.canonical.executable_digest,
             "allowedActors": registration.allowed_actors,
             "enqueued": false,
         });
         outln!(
             "{}",
-            serde_json::to_string(&arm_receipt(
-                &receipt,
-                sub_issue_walk,
-                &auto_pardons,
-                &arm_warnings,
-            ))?
+            serde_json::to_string(&arm_receipt(&receipt, &auto_pardons, &arm_warnings,))?
         );
         return Ok(());
     }
@@ -4507,19 +3156,13 @@ async fn run_campaign_arm(
         &graph,
         &repository_progress,
         &mut registration,
-        sub_issue_walk,
         args.wait,
     )
     .await?;
     registry.write(&mut registration)?;
     outln!(
         "{}",
-        serde_json::to_string(&arm_receipt(
-            &result,
-            sub_issue_walk,
-            &auto_pardons,
-            &arm_warnings,
-        ))?
+        serde_json::to_string(&arm_receipt(&result, &auto_pardons, &arm_warnings,))?
     );
     if args.wait {
         let code = waited_exit_code(&result);
@@ -4531,78 +3174,6 @@ async fn run_campaign_arm(
         }
     }
     Ok(())
-}
-
-fn post_campaign_pardon(
-    graph: &CampaignGraph,
-    actor: &str,
-    reason: &str,
-    scope: PardonScope,
-) -> Result<String> {
-    let reason = reason.trim();
-    if reason.is_empty() || reason.chars().count() > 4_000 || reason.contains('\0') {
-        return Err(invalid(
-            "campaign resume --reason must contain 1..=4000 characters without NUL bytes",
-        ));
-    }
-    let nonce = uuid::Uuid::now_v7();
-    let marker = format!(
-        "<!-- tally:spec-build:resume:v1 campaign={} issue={} nonce={} -->",
-        graph.canonical.manifest.name, graph.locator.number, nonce
-    );
-    let (marker, pardon) = match scope {
-        PardonScope::All => (
-            marker,
-            "Pardoned prior machine-diagnosis, machinery-retry, and escalation receipts without deleting the audit trail."
-                .to_owned(),
-        ),
-        PardonScope::Tasks(tasks) => {
-            if tasks.is_empty() || tasks.iter().any(|task_id| !safe_task_id(task_id)) {
-                return Err(invalid("campaign pardon scope must name safe task ids"));
-            }
-            let joined = tasks.iter().cloned().collect::<Vec<_>>().join(",");
-            let marker = marker
-                .strip_suffix(" -->")
-                .expect("resume marker has a fixed suffix");
-            let rendered = tasks
-                .iter()
-                .map(|task_id| format!("`{task_id}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            (
-                format!("{marker} tasks={joined} -->"),
-                format!(
-                    "Pardoned prior machine-diagnosis, machinery-retry, and escalation receipts for {rendered} without deleting the audit trail."
-                ),
-            )
-        }
-    };
-    let body = format!(
-        "{marker}\n\n### Campaign resumed\n\n{pardon}\n\nReason: {reason}\n\nRequested by `@{actor}`."
-    );
-    let output = run_gh(
-        &os_arguments(&[
-            "issue",
-            "comment",
-            &graph.locator.number.to_string(),
-            "--repo",
-            &graph.locator.repository,
-            "--body-file",
-            "-",
-        ]),
-        Some(&body),
-    )?;
-    output
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .map(str::to_owned)
-        .ok_or_else(|| invalid("gh issue comment returned no campaign resume receipt URL"))
-}
-
-fn post_campaign_resume(graph: &CampaignGraph, actor: &str, reason: &str) -> Result<String> {
-    post_campaign_pardon(graph, actor, reason, PardonScope::All)
 }
 
 fn auto_pardon_reason(pardon: &PlannedAutoPardon) -> String {
@@ -4632,11 +3203,7 @@ fn post_campaign_auto_pardon(
 ) -> Result<String> {
     let reason = auto_pardon_reason(pardon);
     let scope = PardonScope::Tasks(BTreeSet::from([pardon.task_id.clone()]));
-    if graph.canonical.manifest.repository.forge == "local" {
-        append_local_campaign_pardon(state_dir, graph, actor, &reason, &scope)
-    } else {
-        post_campaign_pardon(graph, actor, &reason, scope)
-    }
+    append_local_campaign_pardon(state_dir, graph, actor, &reason, &scope)
 }
 
 async fn run_campaign_resume(
@@ -4649,8 +3216,6 @@ async fn run_campaign_resume(
         campaign_identity(&args.code_repository, &args.worklist_pattern)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
-    let mut projection = read_campaign_projection(&state_dir, &code_repository, &worklist_pattern)?;
-    let locator = projection.locator()?;
     let mut registration = registry
         .read_campaign(&code_repository, &worklist_pattern)?
         .ok_or_else(|| {
@@ -4659,16 +3224,18 @@ async fn run_campaign_resume(
         ))
     })?;
     require_local_actor(&registration)?;
-    let forge_actor = authenticated_actor()?;
-    let graph = fetch_campaign_graph(&locator)?;
-    require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
+    let declaration = local_campaign_declaration(config_path, &code_repository, &worklist_pattern)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "campaign {code_repository}/{worklist_pattern} has no enabled local declaration"
+            ))
+        })?;
+    let graph = local_campaign_graph_from_worklist(declaration, &worklist_pattern)?;
     if graph.canonical.manifest.repository.forge != "github" {
         return Err(invalid(
             "campaign resume requires repository.forge=github; the local forge is test-only and has no GitHub comment boundary",
         ));
     }
-    let sub_issue_walk = probe_sub_issue_walk(&locator)?;
-    projection.sub_issue_walk = Some(sub_issue_walk);
     let _ = validate_host(
         &graph,
         config_path,
@@ -4682,14 +3249,19 @@ async fn run_campaign_resume(
         .checked_add(1)
         .ok_or_else(|| invalid("campaign resume counter is exhausted"))?;
     let prior_digest = registration.approved_graph_digest.clone();
-    let receipt = post_campaign_resume(&graph, &forge_actor, &args.reason)?;
+    let receipt = append_local_campaign_pardon(
+        &state_dir,
+        &graph,
+        &registration.local_actor,
+        &args.reason,
+        &PardonScope::All,
+    )?;
     registration.arm_serial = next_arm_serial;
     registration.armed_at = Utc::now().to_rfc3339();
     registration.approved_graph_digest = graph.canonical.executable_digest.clone();
     // Publish the new authority before dispatch. Once this write succeeds, the
-    // timer can recover an interrupted dispatch without comment deletion or
-    // another manual state edit.
-    write_campaign_projection(&state_dir, &projection)?;
+    // timer can recover an interrupted dispatch without another manual state
+    // edit.
     write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
     prune_approved_graph_snapshots(&state_dir, &registration)?;
@@ -4705,13 +3277,16 @@ async fn run_campaign_resume(
         &graph,
         &repository_progress,
         &mut registration,
-        sub_issue_walk,
         args.wait,
     )
     .await?;
     registry.write(&mut registration)?;
 
-    let mut output = armed_projection(&result, sub_issue_walk);
+    let mut output = if result.is_object() {
+        result.clone()
+    } else {
+        json!({"result": result})
+    };
     if let Some(object) = output.as_object_mut() {
         object.insert("status".to_owned(), json!("resumed"));
         object.insert("resumeReceipt".to_owned(), json!(receipt));
@@ -4754,51 +3329,25 @@ async fn run_campaign_poll(
     let entries = registry.registrations()?;
     let mut had_failures = false;
     for (path, mut registration) in entries {
-        let projection = read_campaign_projection(
-            &state_dir,
+        let event_issue = campaign_issue_url(
             &registration.code_repository,
             &registration.worklist_pattern,
         );
-        let event_issue = projection
-            .as_ref()
-            .ok()
-            .and_then(|value| value.locator().ok())
-            .map_or_else(
-                || {
-                    format!(
-                        "local://{}/{}",
-                        registration.code_repository, registration.worklist_pattern
-                    )
-                },
-                |locator| locator.url,
-            );
         let attempt = async {
             require_local_actor(&registration)?;
-            let mut projection = projection?;
-            let locator = projection.locator()?;
-            let sub_issue_walk = match projection.sub_issue_walk {
-                Some(value) => value,
-                None => {
-                    let value = probe_sub_issue_walk(&locator)?;
-                    projection.sub_issue_walk = Some(value);
-                    write_campaign_projection(&state_dir, &projection)?;
-                    value
-                }
-            };
-            let master = fetch_issue(&locator)?;
-            match master.state.as_str() {
-                "closed" => {
-                    // Canonical locator validation happened in `fetch_issue`.
-                    // Completion is therefore allowed to clean up before any
-                    registry.remove(&registration)?;
-                    remove_approved_graph_snapshots(&state_dir, &registration.registration_id)?;
-                    return Ok(CampaignPollAttempt::Complete);
-                }
-                "open" => {}
-                state => bail!("campaign master issue returned unknown state {state:?}"),
-            }
-            let graph = campaign_graph_from(&locator, master)?;
-            require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
+            let declaration = local_campaign_declaration(
+                config_path,
+                &registration.code_repository,
+                &registration.worklist_pattern,
+            )?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "campaign {}/{} has no enabled local declaration",
+                    registration.code_repository, registration.worklist_pattern
+                ))
+            })?;
+            let graph =
+                local_campaign_graph_from_worklist(declaration, &registration.worklist_pattern)?;
             if graph.canonical.executable_digest != registration.approved_graph_digest {
                 return Ok(CampaignPollAttempt::RearmRequired {
                     approved_graph_digest: registration.approved_graph_digest.clone(),
@@ -4816,26 +3365,6 @@ async fn run_campaign_poll(
             if registration.last_observation.as_deref() == Some(&observation) {
                 return Ok(CampaignPollAttempt::Unchanged);
             }
-
-            // The scan above crosses several forge and Git reads. Refresh the
-            // public issue graph immediately before enqueue and refuse to act
-            // on a mixed snapshot. Most importantly, a master that closed
-            // while this poll was reading becomes completion here rather than
-            // a queued pass whose driver later says it should have been open.
-            let refreshed_master = fetch_issue(&locator)?;
-            match refreshed_master.state.as_str() {
-                "closed" => {
-                    registry.remove(&registration)?;
-                    remove_approved_graph_snapshots(&state_dir, &registration.registration_id)?;
-                    return Ok(CampaignPollAttempt::Complete);
-                }
-                "open" => {}
-                state => bail!("campaign master issue returned unknown state {state:?}"),
-            }
-            let refreshed_graph = campaign_graph_from(&locator, refreshed_master)?;
-            if graph_poll_snapshot(&refreshed_graph)? != graph_poll_snapshot(&graph)? {
-                return Ok(CampaignPollAttempt::Unchanged);
-            }
             let result = dispatch_campaign(
                 CampaignHost {
                     socket,
@@ -4846,7 +3375,6 @@ async fn run_campaign_poll(
                 &graph,
                 &repository_progress,
                 &mut registration,
-                sub_issue_walk,
                 args.wait,
             )
             .await?;
@@ -4873,11 +3401,6 @@ async fn run_campaign_poll(
                 &event_issue,
                 &registration_path,
                 CampaignPollStatus::Dispatched,
-            ),
-            Ok(CampaignPollAttempt::Complete) => CampaignPollEvent::complete(
-                &registration.registration_id,
-                &event_issue,
-                &registration_path,
             ),
             Ok(CampaignPollAttempt::Unchanged) => CampaignPollEvent::new(
                 &registration.registration_id,
@@ -4929,10 +3452,9 @@ async fn run_campaign_status(
     if let Some(registration) = &registration {
         require_local_actor(registration)?;
     }
-    let projection = read_campaign_projection(&state_dir, &code_repository, &worklist_pattern)?;
-    let locator = projection.locator()?;
+    let issue_url = campaign_issue_url(&code_repository, &worklist_pattern);
     let params = json!({
-        "issueUrl": locator.url,
+        "issueUrl": issue_url,
         "registrationId": registration
             .as_ref()
             .map(|registration| registration.registration_id.as_str()),
@@ -5057,7 +3579,7 @@ fn read_json_document(path: &Path, context: &str) -> Result<Value> {
         .with_context(|| format!("{context} {} is not valid JSON", path.display()))
 }
 
-fn required_project_string<'a>(
+fn required_worklist_string<'a>(
     object: &'a serde_json::Map<String, Value>,
     field: &str,
     context: &str,
@@ -5069,7 +3591,7 @@ fn required_project_string<'a>(
         .ok_or_else(|| invalid(format!("{context}.{field} must be a non-empty string")))
 }
 
-fn project_string_list(value: Option<&Value>, context: &str) -> Result<Vec<String>> {
+fn worklist_string_list(value: Option<&Value>, context: &str) -> Result<Vec<String>> {
     value.map_or_else(
         || Ok(Vec::new()),
         |value| {
@@ -5091,10 +3613,10 @@ fn project_string_list(value: Option<&Value>, context: &str) -> Result<Vec<Strin
     )
 }
 
-fn render_project_task_body(
+fn render_worklist_task_body(
     object: &serde_json::Map<String, Value>,
     context: &str,
-    checkpoint: Option<ProjectCheckpointBrief<'_>>,
+    checkpoint: Option<CheckpointBrief<'_>>,
 ) -> Result<String> {
     if let Some(body) = object.get("body") {
         return body
@@ -5111,8 +3633,8 @@ fn render_project_task_body(
             checkpoint.campaign_name, checkpoint.runtime_max_sec
         ));
     }
-    let goal = required_project_string(object, "goal", context)?;
-    let delivered = project_string_list(
+    let goal = required_worklist_string(object, "goal", context)?;
+    let delivered = worklist_string_list(
         object.get("deliveredBehaviors"),
         &format!("{context}.deliveredBehaviors"),
     )?;
@@ -5132,7 +3654,7 @@ fn render_project_task_body(
     if let Some(read_first) = object.get("readFirst").and_then(Value::as_object) {
         body.push_str("\n\n## Read first\n");
         for field in ["specSections", "styleReferences"] {
-            for item in project_string_list(
+            for item in worklist_string_list(
                 read_first.get(field),
                 &format!("{context}.readFirst.{field}"),
             )? {
@@ -5147,19 +3669,19 @@ fn render_project_task_body(
                 "{context}.acceptanceCriteria[{index}] must be an object"
             ))
         })?;
-        let identifier = required_project_string(
+        let identifier = required_worklist_string(
             item,
             "id",
             &format!("{context}.acceptanceCriteria[{index}]"),
         )?;
-        let description = required_project_string(
+        let description = required_worklist_string(
             item,
             "description",
             &format!("{context}.acceptanceCriteria[{index}]"),
         )?;
         body.push_str(&format!("\n- [ ] `{identifier}` — {description}"));
         if let Some(arguments) = item.get("argv") {
-            let rendered = project_string_list(
+            let rendered = worklist_string_list(
                 Some(arguments),
                 &format!("{context}.acceptanceCriteria[{index}].argv"),
             )?;
@@ -5172,7 +3694,7 @@ fn render_project_task_body(
     Ok(body)
 }
 
-fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTask>> {
+fn worklist_tasks(document: &Value, campaign_name: &str) -> Result<Vec<WorklistTask>> {
     let object = document
         .as_object()
         .ok_or_else(|| invalid("campaign worklist must be an object"))?;
@@ -5192,7 +3714,7 @@ fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTas
         let item = candidate
             .as_object()
             .ok_or_else(|| invalid(format!("{context} must be an object")))?;
-        let kind = required_project_string(item, "kind", &context)?.to_owned();
+        let kind = required_worklist_string(item, "kind", &context)?.to_owned();
         if !matches!(kind.as_str(), "implementation" | "checkpoint") {
             return Err(invalid(format!(
                 "{context}.kind must be implementation or checkpoint"
@@ -5229,11 +3751,11 @@ fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTas
                 "{context} contains unsupported field {field:?} for kind {kind}"
             )));
         }
-        let id = required_project_string(item, "id", &context)?.to_owned();
+        let id = required_worklist_string(item, "id", &context)?.to_owned();
         if !safe_task_id(&id) || !prior.insert(id.clone()) {
             return Err(invalid(format!("{context}.id is invalid or duplicated")));
         }
-        let title = required_project_string(item, "title", &context)?.to_owned();
+        let title = required_worklist_string(item, "title", &context)?.to_owned();
         if title.len() > 300 || title.contains(['\r', '\n']) {
             return Err(invalid(format!(
                 "{context}.title must fit on one line and be at most 300 bytes"
@@ -5248,10 +3770,10 @@ fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTas
                 })
                 .transpose()?;
         if issue.is_some_and(|number| !issues.insert(number)) {
-            return Err(invalid("campaign worklist repeats a task issue number"));
+            return Err(invalid("campaign worklist repeats a task number"));
         }
         let dependencies =
-            project_string_list(item.get("dependencies"), &format!("{context}.dependencies"))?;
+            worklist_string_list(item.get("dependencies"), &format!("{context}.dependencies"))?;
         let mut seen_dependencies = BTreeSet::new();
         for dependency in &dependencies {
             if !prior.contains(dependency)
@@ -5266,14 +3788,14 @@ fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTas
         let conflict_domains = if kind == "implementation" {
             item.get("conflictDomains")
                 .map(|value| {
-                    project_string_list(Some(value), &format!("{context}.conflictDomains"))
+                    worklist_string_list(Some(value), &format!("{context}.conflictDomains"))
                 })
                 .transpose()?
         } else {
             None
         };
         let argv = if kind == "checkpoint" {
-            let values = project_string_list(item.get("argv"), &format!("{context}.argv"))?;
+            let values = worklist_string_list(item.get("argv"), &format!("{context}.argv"))?;
             validate_argv(&values, &format!("{context}.argv"))?;
             Some(values)
         } else {
@@ -5293,7 +3815,7 @@ fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTas
         } else {
             None
         };
-        let checkpoint = (kind == "checkpoint").then(|| ProjectCheckpointBrief {
+        let checkpoint = (kind == "checkpoint").then(|| CheckpointBrief {
             campaign_name,
             argv: argv
                 .as_deref()
@@ -5301,13 +3823,13 @@ fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTas
             runtime_max_sec: runtime_max_sec.expect("checkpoint runtime was validated above"),
             dependencies: &dependencies,
         });
-        let body = render_project_task_body(item, &context, checkpoint)?;
+        let body = render_worklist_task_body(item, &context, checkpoint)?;
         if body.chars().count() > 64_000 {
             return Err(invalid(format!(
                 "{context} task brief must contain at most 64000 characters"
             )));
         }
-        tasks.push(ProjectTask {
+        tasks.push(WorklistTask {
             id,
             kind,
             title,
@@ -5322,7 +3844,7 @@ fn project_tasks(document: &Value, campaign_name: &str) -> Result<Vec<ProjectTas
     Ok(tasks)
 }
 
-fn project_config(document: &Value, separate: Option<&Value>) -> Result<Value> {
+fn worklist_manifest_config(document: &Value, separate: Option<&Value>) -> Result<Value> {
     let config = match separate {
         Some(value) => value.clone(),
         None => document
@@ -5339,7 +3861,7 @@ fn project_config(document: &Value, separate: Option<&Value>) -> Result<Value> {
     Ok(Value::Object(object))
 }
 
-fn task_references(tasks: &[ProjectTask]) -> Result<Value> {
+fn task_references(tasks: &[WorklistTask]) -> Result<Value> {
     Ok(Value::Array(
         tasks
             .iter()
@@ -5347,7 +3869,7 @@ fn task_references(tasks: &[ProjectTask]) -> Result<Value> {
                 let mut reference = json!({
                     "id": task.id,
                     "kind": task.kind,
-                    "issue": task.issue.ok_or_else(|| invalid(format!("task {} has no projected issue", task.id)))?,
+                    "issue": task.issue.ok_or_else(|| invalid(format!("task {} has no task number", task.id)))?,
                     "dependencies": task.dependencies,
                 });
                 let object = reference.as_object_mut().expect("reference is an object");
@@ -5365,466 +3887,16 @@ fn task_references(tasks: &[ProjectTask]) -> Result<Value> {
     ))
 }
 
-fn manifest_value(config: &Value, tasks: &[ProjectTask]) -> Result<Value> {
+fn manifest_value(config: &Value, tasks: &[WorklistTask]) -> Result<Value> {
     let mut value = config.clone();
     value
         .as_object_mut()
-        .expect("project_config returns an object")
+        .expect("worklist_manifest_config returns an object")
         .insert("tasks".to_owned(), task_references(tasks)?);
     Ok(value)
 }
 
-fn upsert_managed_section(body: &str, start: &str, end: &str, content: &str) -> Result<String> {
-    match (body.find(start), body.find(end)) {
-        (None, None) => Ok(format!(
-            "{}{}{}\n{}\n{}\n",
-            body.trim_end(),
-            if body.trim().is_empty() { "" } else { "\n\n" },
-            start,
-            content,
-            end
-        )),
-        (Some(start_index), Some(end_index)) if start_index < end_index => {
-            if body[start_index + start.len()..].matches(start).count() > 0
-                || body[end_index + end.len()..].contains(end)
-            {
-                return Err(invalid(format!("managed section {start} is duplicated")));
-            }
-            let tail = end_index + end.len();
-            Ok(format!(
-                "{}{}\n{}\n{}{}",
-                &body[..start_index],
-                start,
-                content,
-                end,
-                &body[tail..]
-            ))
-        }
-        _ => Err(invalid(format!("managed section {start} is malformed"))),
-    }
-}
-
-fn render_manifest_section(value: &Value) -> Result<String> {
-    Ok(format!(
-        "\n```json\n{}\n```\n",
-        serde_json::to_string_pretty(value)?
-    ))
-}
-
-fn render_worklist_section(tasks: &[ProjectTask], merged: &BTreeSet<String>) -> String {
-    let mut output = String::from("\n");
-    for task in tasks {
-        let state = if merged.contains(&task.id) { "x" } else { " " };
-        output.push_str(&format!(
-            "- [{state}] {TASK_MARKER_PREFIX}{} --> #{} — {}\n",
-            task.id,
-            task.issue.expect("projection assigns every issue"),
-            task.title
-        ));
-    }
-    output
-}
-
-fn validate_worklist_projection(body: &str, manifest: &CampaignManifest) -> Result<()> {
-    let section = extract_managed_section(body, WORKLIST_BEGIN, WORKLIST_END)?;
-    let references = manifest
-        .tasks
-        .iter()
-        .map(|task| (task.id.as_str(), task.issue))
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = BTreeSet::new();
-    for line in section.lines().filter(|line| !line.trim().is_empty()) {
-        let line = line.trim();
-        if !["- [ ] ", "- [x] ", "- [X] "]
-            .iter()
-            .any(|prefix| line.starts_with(prefix))
-        {
-            return Err(invalid(
-                "campaign worklist must contain only task checkbox lines",
-            ));
-        }
-        let id = extract_task_marker(line)
-            .ok_or_else(|| invalid("campaign worklist contains an invalid task marker"))?;
-        let issue = references
-            .get(id.as_str())
-            .ok_or_else(|| invalid(format!("campaign worklist names unknown task {id}")))?;
-        if !seen.insert(id.clone()) {
-            return Err(invalid(format!(
-                "campaign worklist repeats task marker {id}"
-            )));
-        }
-        if !line.contains(&format!("--> #{issue}")) {
-            return Err(invalid(format!(
-                "campaign worklist task {id} does not name issue #{issue}"
-            )));
-        }
-    }
-    let expected = references.keys().copied().collect::<BTreeSet<_>>();
-    let actual = seen.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    if actual != expected {
-        return Err(invalid(
-            "campaign worklist task markers differ from the manifest task set",
-        ));
-    }
-    Ok(())
-}
-
-fn render_master_body(
-    base: &str,
-    config: &Value,
-    tasks: &[ProjectTask],
-    merged: &BTreeSet<String>,
-) -> Result<String> {
-    let value = manifest_value(config, tasks)?;
-    let with_manifest = upsert_managed_section(
-        base,
-        CAMPAIGN_BEGIN,
-        CAMPAIGN_END,
-        &render_manifest_section(&value)?,
-    )?;
-    upsert_managed_section(
-        &with_manifest,
-        WORKLIST_BEGIN,
-        WORKLIST_END,
-        &render_worklist_section(tasks, merged),
-    )
-}
-
-fn extract_task_marker(body: &str) -> Option<String> {
-    let start = body.find(TASK_MARKER_PREFIX)? + TASK_MARKER_PREFIX.len();
-    let end = body[start..].find(" -->")? + start;
-    let id = &body[start..end];
-    safe_task_id(id).then(|| id.to_owned())
-}
-
-fn validate_issue_title(value: &str, context: &str) -> Result<()> {
-    if value.trim().is_empty() || value.chars().count() > 300 || value.chars().any(char::is_control)
-    {
-        return Err(invalid(format!(
-            "{context} must be a non-empty single-line title of at most 300 characters"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_label_name(label: &str) -> Result<()> {
-    if label.trim().is_empty() || label.chars().any(char::is_control) {
-        return Err(invalid(
-            "campaign labels must be non-empty single-line strings",
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_label(repository: &str, label: &str, color: &str, description: &str) -> Result<()> {
-    validate_label_name(label)?;
-    let labels: Vec<Value> = gh_json(&[
-        "label".into(),
-        "list".into(),
-        "--repo".into(),
-        repository.into(),
-        "--limit".into(),
-        "1000".into(),
-        "--json".into(),
-        "name".into(),
-    ])?;
-    if labels
-        .iter()
-        .any(|value| value.get("name").and_then(Value::as_str) == Some(label))
-    {
-        return Ok(());
-    }
-    run_gh(
-        &[
-            "label".into(),
-            "create".into(),
-            label.into(),
-            "--repo".into(),
-            repository.into(),
-            "--color".into(),
-            color.into(),
-            "--description".into(),
-            description.into(),
-        ],
-        None,
-    )?;
-    Ok(())
-}
-
-fn gh_issue_number(output: &str) -> Result<u64> {
-    output
-        .lines()
-        .rev()
-        .find_map(|line| parse_issue_url(line.trim()).ok())
-        .map(|locator| locator.number)
-        .ok_or_else(|| invalid("gh issue create returned no canonical issue URL"))
-}
-
-fn edit_master(
-    repository: &str,
-    number: u64,
-    title: Option<&str>,
-    label: &str,
-    body: &str,
-) -> Result<()> {
-    let mut arguments = vec![
-        "issue".into(),
-        "edit".into(),
-        number.to_string().into(),
-        "--repo".into(),
-        repository.into(),
-        "--body-file".into(),
-        "-".into(),
-        "--add-label".into(),
-        label.into(),
-    ];
-    if let Some(title) = title {
-        arguments.extend(["--title".into(), title.into()]);
-    }
-    run_gh(&arguments, Some(body))?;
-    Ok(())
-}
-
-fn merged_project_tasks(
-    repository: &str,
-    manifest: &CampaignManifest,
-    tasks: &[ProjectTask],
-    issue_number: u64,
-) -> Result<BTreeSet<String>> {
-    if manifest.repository.forge != "github" {
-        return Ok(BTreeSet::new());
-    }
-    let candidates: Vec<Value> = gh_json(&[
-        "pr".into(),
-        "list".into(),
-        "--repo".into(),
-        repository.into(),
-        "--state".into(),
-        "merged".into(),
-        "--limit".into(),
-        "1000".into(),
-        "--json".into(),
-        "body,baseRefName,headRefName,url".into(),
-    ])?;
-    let mut merged = BTreeSet::new();
-    let mut claimed_urls = BTreeSet::new();
-    let graph_digest = sha256_json(&json!({
-        "manifest": manifest,
-        "tasks": tasks.iter().map(|task| json!({
-            "number": task.issue.expect("projection assigns every issue"),
-            "title": task.title,
-            "body": format!("{TASK_MARKER_PREFIX}{} -->\n\n{}", task.id, task.body.trim()),
-        })).collect::<Vec<_>>(),
-    }))?;
-    for task in &manifest.tasks {
-        if task.kind == "checkpoint" {
-            let reference =
-                checkpoint_reference_prefix(&manifest.name, issue_number, &task.id, &graph_digest)?;
-            if projected_checkpoint_complete(manifest, &reference)? {
-                merged.insert(task.id.clone());
-            }
-            continue;
-        }
-        let projected = tasks
-            .iter()
-            .find(|projected| projected.id == task.id)
-            .expect("validated manifest and projected tasks have the same ids");
-        let content = CanonicalCampaignTaskV1 {
-            number: projected.issue.expect("projection assigns every issue"),
-            title: projected.title.clone(),
-            body: format!(
-                "{TASK_MARKER_PREFIX}{} -->\n\n{}",
-                projected.id,
-                projected.body.trim()
-            ),
-        };
-        let revision = task_completion_revision(manifest, task, &content)?;
-        let marker = format!(
-            "<!-- tally:spec-build:v2 campaign={} issue={} task={} revision={} -->",
-            manifest.name, issue_number, task.id, revision
-        );
-        let branch = stable_publish_branch(&manifest.name, issue_number, &task.id, &revision);
-        let mut matching = candidates
-            .iter()
-            .filter(|candidate| {
-                candidate
-                    .get("body")
-                    .and_then(Value::as_str)
-                    .is_some_and(|body| body.contains(&marker))
-            })
-            .collect::<Vec<_>>();
-        let branch_candidates;
-        if matching.is_empty() {
-            branch_candidates = gh_json::<Vec<Value>>(&[
-                "pr".into(),
-                "list".into(),
-                "--repo".into(),
-                repository.into(),
-                "--head".into(),
-                branch.clone().into(),
-                "--state".into(),
-                "merged".into(),
-                "--limit".into(),
-                "2".into(),
-                "--json".into(),
-                "body,baseRefName,headRefName,url".into(),
-            ])?;
-            matching = branch_candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate
-                        .get("body")
-                        .and_then(Value::as_str)
-                        .is_some_and(|body| body.contains(&marker))
-                })
-                .collect();
-        }
-        if matching.len() > 1 {
-            bail!(
-                "multiple merged pull requests claim campaign task {}",
-                task.id
-            );
-        }
-        let Some(candidate) = matching.first() else {
-            continue;
-        };
-        let url = candidate
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid(format!("merged pull request for {} has no URL", task.id)))?;
-        if !claimed_urls.insert(url.to_owned()) {
-            bail!("merged pull request {url} claims more than one campaign task");
-        }
-        if candidate.get("baseRefName").and_then(Value::as_str)
-            != Some(&manifest.repository.base_branch)
-        {
-            bail!(
-                "merged pull request {url} does not target campaign base {}",
-                manifest.repository.base_branch
-            );
-        }
-        if candidate.get("headRefName").and_then(Value::as_str) != Some(branch.as_str()) {
-            bail!("merged pull request {url} does not use stable task branch {branch}");
-        }
-        merged.insert(task.id.clone());
-    }
-    Ok(merged)
-}
-
-/// Has this checkpoint published a receipt the base branch already contains?
-///
-/// `prefix` names the task's receipt family, not one ref: the driver appends
-/// the tested base revision as a final path component, and this projection —
-/// which runs from a manifest, not from a reconcile pass — does not know which
-/// revision that was. Every receipt under the family is considered and one
-/// that the base branch contains is enough; the driver's own exact-revision
-/// check remains the completion oracle, and this is the checkbox the reader
-/// sees.
-fn projected_checkpoint_complete(manifest: &CampaignManifest, prefix: &str) -> Result<bool> {
-    let git = |arguments: &[&str]| -> Result<std::process::Output> {
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&manifest.repository.checkout)
-            .args(arguments)
-            .output()
-            .context("cannot query projected checkpoint completion")
-    };
-    let pattern = format!("{prefix}/*");
-    let listed = git(&["ls-remote", "--refs", &manifest.repository.remote, &pattern])?;
-    if !listed.status.success() {
-        bail!(
-            "cannot query checkpoint refs {pattern}: {}",
-            String::from_utf8_lossy(&listed.stderr).trim()
-        );
-    }
-    let stdout = String::from_utf8(listed.stdout).context("git ls-remote was not UTF-8")?;
-    let mut receipts = Vec::new();
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        let (target, name) = line.split_once('\t').ok_or_else(|| {
-            invalid(format!(
-                "checkpoint refs {pattern} returned malformed output"
-            ))
-        })?;
-        if !name.starts_with(&format!("{prefix}/")) {
-            bail!("checkpoint refs {pattern} returned unrelated ref {name}");
-        }
-        if !((40..=64).contains(&target.len())
-            && target.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        {
-            return Err(invalid(format!(
-                "checkpoint ref {name} returned malformed output"
-            )));
-        }
-        receipts.push((target.to_owned(), name.to_owned()));
-    }
-    if receipts.is_empty() {
-        return Ok(false);
-    }
-    let fetched_base = git(&["fetch", "--prune", "--no-tags", &manifest.repository.remote])?;
-    if !fetched_base.status.success() {
-        bail!("cannot refresh campaign base while projecting checkpoint state");
-    }
-    let base = format!(
-        "{}/{}",
-        manifest.repository.remote, manifest.repository.base_branch
-    );
-    for (target, name) in receipts {
-        let fetched = git(&["fetch", "--no-tags", &manifest.repository.remote, &name])?;
-        if !fetched.status.success() {
-            bail!("cannot fetch checkpoint ref {name}");
-        }
-        let object_type = git(&["cat-file", "-t", &target])?;
-        if !object_type.status.success()
-            || String::from_utf8_lossy(&object_type.stdout).trim() != "commit"
-        {
-            continue;
-        }
-        if git(&["merge-base", "--is-ancestor", &target, &base])?
-            .status
-            .success()
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn stable_publish_branch(
-    campaign: &str,
-    issue_number: u64,
-    task_id: &str,
-    revision: &str,
-) -> String {
-    let slug = campaign.trim_matches(['.', '-']);
-    let slug = &slug[..slug.len().min(32)];
-    let revision = revision.strip_prefix("sha256:").unwrap_or(revision);
-    let suffix = format!("-{}", &revision[..revision.len().min(16)]);
-    format!("tally/{slug}-issue-{issue_number}/{task_id}{suffix}")
-}
-
-/// The family of refs one checkpoint's receipts are published under.
-///
-/// The driver appends `/<baseRevision>` to this prefix for the revision it
-/// actually tested (`checkpoint_ref` in `spec_build_driver.py`); the shared
-/// vectors in `test/fixtures/spec-build/checkpoint-refs.json` pin the two
-/// layouts together from both languages.
-fn checkpoint_reference_prefix(
-    campaign: &str,
-    issue_number: u64,
-    task_id: &str,
-    source: &str,
-) -> Result<String> {
-    let digest = source
-        .strip_prefix("sha256:")
-        .filter(|value| value.len() == 64)
-        .ok_or_else(|| invalid("checkpoint source is not a SHA-256 identity"))?;
-    Ok(format!(
-        "{}/checkpoint/{task_id}-{digest}",
-        campaign_state_ref_prefix(campaign, issue_number),
-    ))
-}
-
-fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<CampaignManifest> {
+fn validate_worklist_shape(config: &Value, tasks: &[WorklistTask]) -> Result<CampaignManifest> {
     let mut projected = tasks.to_vec();
     let mut used = projected
         .iter()
@@ -5836,7 +3908,7 @@ fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<Campa
             while used.contains(&placeholder) {
                 placeholder = placeholder
                     .checked_add(1)
-                    .ok_or_else(|| invalid("campaign projection exhausted issue placeholders"))?;
+                    .ok_or_else(|| invalid("campaign task numbering is exhausted"))?;
             }
             task.issue = Some(placeholder);
             used.insert(placeholder);
@@ -5851,20 +3923,19 @@ fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<Campa
 }
 
 /// Parse one JSON worklist into the exact manifest and immutable task content
-/// admitted at the campaign boundary. Both forge projection and local arming
-/// call this function; rendering issues is never a second validator.
+/// admitted at the campaign boundary.
 fn validate_worklist_document(
     document: &Value,
     separate_config: Option<&Value>,
 ) -> Result<ValidatedWorklist> {
-    let raw_config = project_config(document, separate_config)?;
+    let raw_config = worklist_manifest_config(document, separate_config)?;
     let campaign_name = raw_config
         .get("name")
         .and_then(Value::as_str)
         .filter(|value| safe_component(value))
         .ok_or_else(|| invalid("campaign configuration name is missing or invalid"))?;
-    let tasks = project_tasks(document, campaign_name)?;
-    let manifest = validate_project_shape(&raw_config, &tasks)?;
+    let tasks = worklist_tasks(document, campaign_name)?;
+    let manifest = validate_worklist_shape(&raw_config, &tasks)?;
     Ok(ValidatedWorklist { manifest, tasks })
 }
 
@@ -5929,9 +4000,8 @@ fn local_string_list(value: &Value, context: &str, nonempty: bool) -> Result<Vec
         .collect()
 }
 
-/// The local file format is intentionally narrower than the compatibility
-/// input accepted by `campaign project`: declaration belongs to the host and
-/// the committed file contains only immutable task briefs.
+/// The local file format keeps declaration on the host; the committed file
+/// contains only immutable task briefs.
 fn validate_local_worklist_document(
     document: &Value,
     manifest_config: &Value,
@@ -6085,404 +4155,12 @@ fn validate_local_worklist_document(
     validate_worklist_document(document, Some(manifest_config))
 }
 
-fn reconcile_dependencies(repository: &str, tasks: &[ProjectTask]) -> Result<()> {
-    let campaign_numbers = tasks
-        .iter()
-        .filter_map(|task| task.issue)
-        .collect::<BTreeSet<_>>();
-    let by_id = tasks
-        .iter()
-        .map(|task| (&task.id, task.issue.unwrap()))
-        .collect::<BTreeMap<_, _>>();
-    for task in tasks {
-        let number = task.issue.unwrap();
-        let viewed: Value = gh_json(&[
-            "issue".into(),
-            "view".into(),
-            number.to_string().into(),
-            "--repo".into(),
-            repository.into(),
-            "--json".into(),
-            "blockedBy".into(),
-        ])?;
-        let current = viewed
-            .pointer("/blockedBy/nodes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.get("number").and_then(Value::as_u64))
-            .filter(|number| campaign_numbers.contains(number))
-            .collect::<BTreeSet<_>>();
-        let desired = task
-            .dependencies
-            .iter()
-            .map(|id| by_id[id])
-            .collect::<BTreeSet<_>>();
-        let additions = desired.difference(&current).copied().collect::<Vec<_>>();
-        let removals = current.difference(&desired).copied().collect::<Vec<_>>();
-        if additions.is_empty() && removals.is_empty() {
-            continue;
-        }
-        let mut arguments = vec![
-            "issue".into(),
-            "edit".into(),
-            number.to_string().into(),
-            "--repo".into(),
-            repository.into(),
-        ];
-        if !additions.is_empty() {
-            arguments.extend([
-                "--add-blocked-by".into(),
-                additions
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-                    .into(),
-            ]);
-        }
-        if !removals.is_empty() {
-            arguments.extend([
-                "--remove-blocked-by".into(),
-                removals
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-                    .into(),
-            ]);
-        }
-        run_gh(&arguments, None)?;
-    }
-    Ok(())
-}
-
-fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
-    let repository = parse_repository(&args.repo)?;
-    let state_dir = resolve_state_dir(args.state_dir.clone())?;
-    let document = read_json_document(&args.worklist, "campaign worklist")?;
-    let separate = args
-        .campaign_config
-        .as_deref()
-        .map(|path| read_json_document(path, "campaign configuration"))
-        .transpose()?;
-    let validated = validate_worklist_document(&document, separate.as_ref())?;
-    let canonical_preview = validated.manifest;
-    let mut tasks = validated.tasks;
-    let name = canonical_preview.name.clone();
-    let (worklist_pattern, source_revision, worklist_sha256) =
-        committed_worklist_coordinate(&args.worklist, &canonical_preview)?;
-    let mut config = serde_json::to_value(canonical_preview)?;
-    config
-        .as_object_mut()
-        .expect("CampaignManifest serializes as an object")
-        .remove("tasks");
-    let initial_title = args
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("{name}: tally campaign"));
-    validate_issue_title(&initial_title, "campaign master title")?;
-    validate_label_name(&args.label)?;
-    validate_label_name(&args.task_label)?;
-    let existing_master = args
-        .issue
-        .as_deref()
-        .map(|url| {
-            let locator = parse_issue_url(url)?;
-            if locator.repository != repository {
-                return Err(invalid(
-                    "--issue and --repo must identify the same repository",
-                ));
-            }
-            let master = fetch_issue(&locator)?;
-            if master.state != "open" {
-                return Err(invalid("campaign master issue must be open"));
-            }
-            let body = master.body.unwrap_or_default();
-            let preview = upsert_managed_section(
-                &body,
-                CAMPAIGN_BEGIN,
-                CAMPAIGN_END,
-                "\nprojection preview\n",
-            )?;
-            upsert_managed_section(
-                &preview,
-                WORKLIST_BEGIN,
-                WORKLIST_END,
-                "\nprojection preview\n",
-            )?;
-            Ok((locator, body))
-        })
-        .transpose()?;
-    ensure_label(
-        &repository,
-        &args.label,
-        "8250DF",
-        "Forge-native tally campaign",
-    )?;
-    ensure_label(
-        &repository,
-        &args.task_label,
-        "C5DEF5",
-        "Task in a forge-native tally campaign",
-    )?;
-
-    let (locator, mut master_body) = if let Some(existing) = existing_master {
-        existing
-    } else {
-        let partial = render_master_body(
-            "This issue is the durable container for a forge-native tally campaign.\n",
-            &config,
-            &[],
-            &BTreeSet::new(),
-        )?;
-        let output = run_gh(
-            &[
-                "issue".into(),
-                "create".into(),
-                "--repo".into(),
-                repository.clone().into(),
-                "--title".into(),
-                initial_title.clone().into(),
-                "--body-file".into(),
-                "-".into(),
-                "--label".into(),
-                args.label.clone().into(),
-            ],
-            Some(&partial),
-        )?;
-        let number = gh_issue_number(&output)?;
-        let url = format!("https://github.com/{repository}/issues/{number}");
-        (parse_issue_url(&url)?, partial)
-    };
-
-    let mut known = BTreeMap::<String, u64>::new();
-    if let Ok(section) = extract_managed_section(&master_body, CAMPAIGN_BEGIN, CAMPAIGN_END) {
-        if let Some(json) = section
-            .strip_prefix("```json")
-            .and_then(|value| value.strip_suffix("```"))
-        {
-            if let Ok(value) = serde_json::from_str::<Value>(json.trim()) {
-                if let Some(references) = value.get("tasks").and_then(Value::as_array) {
-                    for reference in references {
-                        if let (Some(id), Some(issue)) = (
-                            reference.get("id").and_then(Value::as_str),
-                            reference.get("issue").and_then(Value::as_u64),
-                        ) {
-                            if safe_task_id(id) && issue > 0 {
-                                known.insert(id.to_owned(), issue);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let desired_ids = tasks
-        .iter()
-        .map(|task| task.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let explicit_ids = tasks
-        .iter()
-        .filter_map(|task| task.issue.map(|issue| (issue, task.id.clone())))
-        .collect::<BTreeMap<_, _>>();
-    let mut native_numbers = BTreeSet::new();
-    for issue in fetch_subissues(&locator)? {
-        native_numbers.insert(issue.number);
-        let marker_id = extract_task_marker(issue.body.as_deref().unwrap_or_default());
-        let explicit_id = explicit_ids.get(&issue.number);
-        let id = match (marker_id, explicit_id) {
-            (Some(marker), Some(explicit)) if marker != *explicit => {
-                return Err(invalid(format!(
-                    "native sub-issue #{} is marked for task {marker} but explicitly assigned to {explicit}",
-                    issue.number
-                )));
-            }
-            (Some(marker), _) => marker,
-            (None, Some(explicit)) => explicit.clone(),
-            (None, None) => {
-                return Err(invalid(format!(
-                    "native sub-issue #{} is neither owned by this tally projection nor explicitly assigned in the worklist",
-                    issue.number
-                )));
-            }
-        };
-        if !desired_ids.contains(id.as_str()) {
-            run_gh(
-                &[
-                    "issue".into(),
-                    "edit".into(),
-                    issue.number.to_string().into(),
-                    "--repo".into(),
-                    repository.clone().into(),
-                    "--remove-parent".into(),
-                ],
-                None,
-            )?;
-            native_numbers.remove(&issue.number);
-            known.remove(&id);
-            continue;
-        }
-        if known
-            .insert(id.clone(), issue.number)
-            .is_some_and(|prior| prior != issue.number)
-        {
-            bail!("more than one native sub-issue claims campaign task {id}");
-        }
-    }
-    for index in 0..tasks.len() {
-        let task = &mut tasks[index];
-        match (task.issue, known.get(&task.id).copied()) {
-            (Some(explicit), Some(existing)) if explicit != existing => {
-                return Err(invalid(format!(
-                    "task {} issue {} conflicts with projected issue {}",
-                    task.id, explicit, existing
-                )));
-            }
-            (None, Some(existing)) => task.issue = Some(existing),
-            _ => {}
-        }
-        let projected_body = format!(
-            "{TASK_MARKER_PREFIX}{} -->\n\n{}",
-            task.id,
-            task.body.trim()
-        );
-        if let Some(number) = task.issue {
-            let mut arguments = vec![
-                "issue".into(),
-                "edit".into(),
-                number.to_string().into(),
-                "--repo".into(),
-                repository.clone().into(),
-                "--title".into(),
-                task.title.clone().into(),
-                "--body-file".into(),
-                "-".into(),
-                "--add-label".into(),
-                args.task_label.clone().into(),
-            ];
-            if !native_numbers.contains(&number) {
-                arguments.extend(["--parent".into(), locator.number.to_string().into()]);
-            }
-            run_gh(&arguments, Some(&projected_body))?;
-            native_numbers.insert(number);
-        } else {
-            let output = run_gh(
-                &[
-                    "issue".into(),
-                    "create".into(),
-                    "--repo".into(),
-                    repository.clone().into(),
-                    "--title".into(),
-                    task.title.clone().into(),
-                    "--body-file".into(),
-                    "-".into(),
-                    "--label".into(),
-                    args.task_label.clone().into(),
-                    "--parent".into(),
-                    locator.number.to_string().into(),
-                ],
-                Some(&projected_body),
-            )?;
-            task.issue = Some(gh_issue_number(&output)?);
-        }
-        let projected = tasks[..=index].to_vec();
-        master_body = render_master_body(&master_body, &config, &projected, &BTreeSet::new())?;
-        edit_master(&repository, locator.number, None, &args.label, &master_body)?;
-    }
-
-    let final_value = manifest_value(&config, &tasks)?;
-    let manifest = admit_manifest_value(final_value).map_err(|error| {
-        invalid(format!(
-            "projected campaign configuration is invalid: {error}"
-        ))
-    })?;
-    validate_manifest(&manifest)?;
-    reconcile_dependencies(&repository, &tasks)?;
-    let merged = merged_project_tasks(&repository, &manifest, &tasks, locator.number)?;
-    master_body = render_master_body(&master_body, &config, &tasks, &merged)?;
-    edit_master(
-        &repository,
-        locator.number,
-        args.title
-            .as_deref()
-            .or((args.issue.is_none()).then_some(initial_title.as_str())),
-        &args.label,
-        &master_body,
-    )?;
-    let projection = CampaignProjectionV1 {
-        schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
-        code_repository: repository.clone(),
-        worklist_pattern: worklist_pattern.clone(),
-        source_revision,
-        worklist_sha256,
-        issue: Some(ProjectedIssueV1 {
-            repository: locator.repository.clone(),
-            number: locator.number,
-            url: locator.url.clone(),
-        }),
-        sub_issue_walk: None,
-    };
-    write_campaign_projection(&state_dir, &projection)?;
-    outln!(
-        "{}",
-        serde_json::to_string(&json!({
-            "issue": locator.url,
-            "codeRepository": repository,
-            "worklistPattern": worklist_pattern,
-            "tasks": tasks.iter().map(|task| json!({"id": task.id, "issue": task.issue})).collect::<Vec<_>>(),
-            "merged": merged,
-        }))?
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tally_core::campaign_contract::{BRIEF_SENTINEL, DEFAULT_AGENT_SANDBOX_POLICY};
-
-    /// The one shared checkpoint-ref vector file, asserted from here and from
-    /// `test/spec_build_checkpoint_receipts_test.py`.
-    ///
-    /// Two languages computing the same ref name with nothing pinning them
-    /// together is how the projection came to read a namespace the driver has
-    /// never written: it built the receipt family and queried it as if it were
-    /// the ref. Neither side owns this file; both are checked against it.
-    #[test]
-    fn checkpoint_ref_layout_matches_the_shared_driver_vectors() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/fixtures/spec-build/checkpoint-refs.json");
-        let document: Value = serde_json::from_str(
-            &std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
-        )
-        .expect("checkpoint ref vectors must be JSON");
-        assert_eq!(document["schemaVersion"], json!(1));
-        let vectors = document["vectors"]
-            .as_array()
-            .expect("checkpoint ref vectors must be a list");
-        assert!(!vectors.is_empty());
-        for vector in vectors {
-            let campaign = vector["campaign"].as_str().unwrap();
-            let issue_number = vector["issueNumber"].as_u64().unwrap();
-            let task_id = vector["taskId"].as_str().unwrap();
-            let source = vector["source"].as_str().unwrap();
-            let base_revision = vector["baseRevision"].as_str().unwrap();
-
-            let prefix =
-                checkpoint_reference_prefix(campaign, issue_number, task_id, source).unwrap();
-            assert_eq!(prefix, vector["refPrefix"].as_str().unwrap());
-
-            // The prefix has to be exactly the driver's ref minus the tested
-            // revision, or the `<prefix>/*` query the projection runs matches
-            // nothing the driver ever published.
-            assert_eq!(
-                vector["ref"].as_str().unwrap(),
-                format!("{prefix}/{base_revision}")
-            );
-        }
-    }
+    use tally_core::campaign_contract::{
+        validate_manifest, BRIEF_SENTINEL, DEFAULT_AGENT_SANDBOX_POLICY,
+    };
 
     fn manifest_value_for_test(tasks: Value) -> Value {
         json!({
@@ -6492,7 +4170,7 @@ mod tests {
                 "checkout": "/tmp/example",
                 "baseBranch": "main",
                 "remote": "origin",
-                "forge": "github"
+                "forge": "local"
             },
             "maxTasks": 4,
             "maxParallel": 1,
@@ -6505,379 +4183,6 @@ mod tests {
             }],
             "tasks": tasks
         })
-    }
-
-    /// `TALLY_GH_PROGRAM` is process-global, so every test that swaps the
-    /// `gh` binary has to hold this. Without it a sibling test's fake `gh`
-    /// answers this one's calls, which is a flake, not a finding.
-    static GH_PROGRAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Restores whatever `TALLY_GH_PROGRAM` was on drop, panic or not.
-    struct GhProgramGuard {
-        previous: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl GhProgramGuard {
-        fn acquire() -> Self {
-            let lock = GH_PROGRAM_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Self {
-                previous: std::env::var_os("TALLY_GH_PROGRAM"),
-                _lock: lock,
-            }
-        }
-
-        fn use_program(&self, program: &Path) {
-            std::env::set_var("TALLY_GH_PROGRAM", program);
-        }
-    }
-
-    impl Drop for GhProgramGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("TALLY_GH_PROGRAM", value),
-                None => std::env::remove_var("TALLY_GH_PROGRAM"),
-            }
-        }
-    }
-
-    /// The immutable executable this tree installs instead of writing one
-    /// (#117). It reads its behaviour from a sibling script file, so the file
-    /// the kernel is asked to `execve` is a checked-in fixture that no test
-    /// ever opens for writing.
-    const SHELL_COMMAND_PROVIDER: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../test/fixtures/shell-command-provider"
-    );
-
-    fn shell_program_source(path: &Path) -> PathBuf {
-        let mut source = OsString::from(path.as_os_str());
-        source.push(".tally-test-script");
-        PathBuf::from(source)
-    }
-
-    /// Install a fake `gh` at `directory/name` that runs `body`.
-    ///
-    /// This used to write the script itself and then `chmod +x` it, which is a
-    /// load-dependent `ETXTBSY` race and red-gated an innocent sha (#396):
-    /// `fs::write` holds a write fd across its open/write/close, and a sibling
-    /// thread of a parallel test binary that `fork`s inside that window carries
-    /// the fd into its child until that child reaches `execve` (`O_CLOEXEC`
-    /// closes it there, not at `fork`). While any process holds a write fd on a
-    /// file, the kernel refuses to execute it — `Text file busy`.
-    ///
-    /// Publishing the behaviour through a non-executable sidecar removes the
-    /// race rather than retrying through it: the executed path is a symlink to
-    /// the checked-in provider, which is never written, so the window in which
-    /// the exec target is open for writing never opens at all. The script the
-    /// provider reads may be held open for writing by anyone — reading a file
-    /// is not an exec of it.
-    fn fake_gh(directory: &Path, name: &str, body: &str) -> PathBuf {
-        let path = directory.join(name);
-        fs::write(shell_program_source(&path), format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::os::unix::fs::symlink(SHELL_COMMAND_PROVIDER, &path).unwrap();
-        path
-    }
-
-    /// The race #396 filed, made deterministic, on both shapes.
-    ///
-    /// Under load the window is a fork landing between `fs::write`'s open and
-    /// close; here the write fd is simply held open, which is the same state
-    /// the kernel refuses on. The first half asserts the hazard is real rather
-    /// than theorised — a written-then-`chmod`ed program is refused with
-    /// `ETXTBSY` while a write fd is open on it. The second asserts the shape
-    /// `fake_gh` now uses is immune under exactly that condition, because what
-    /// gets executed is the checked-in provider and the file held open is only
-    /// ever *read*.
-    ///
-    /// This is deliberately not "the suite is still green": the suite was green
-    /// on the sha this race red-gated.
-    #[test]
-    fn a_written_program_is_unexecutable_while_open_for_writing_and_a_provided_one_is_not() {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let temporary = tempfile::tempdir().unwrap();
-
-        // The shape `fake_gh` used to have.
-        let written = temporary.path().join("gh-written");
-        let mut open_for_writing = fs::File::create(&written).unwrap();
-        open_for_writing.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
-        open_for_writing.flush().unwrap();
-        fs::set_permissions(&written, fs::Permissions::from_mode(0o755)).unwrap();
-        let refused = std::process::Command::new(&written)
-            .status()
-            .expect_err("a program still open for writing must not be executable");
-        assert_eq!(
-            refused.raw_os_error(),
-            Some(libc::ETXTBSY),
-            "expected Text file busy, got: {refused}"
-        );
-        drop(open_for_writing);
-        // Deliberately not asserted here: that the same program is executable
-        // once the fd is closed. It usually is, and that is exactly why the
-        // original failure only ever showed up under load — but this binary's
-        // other threads are forking the whole time, and any of those forks
-        // landing in the window above inherits a write fd on this file and
-        // makes the retry fail too. Asserting it would rebuild the flake.
-
-        // The shape it has now. Executing while the *script* is held open for
-        // writing is necessary but nowhere near sufficient — that also passes
-        // for a written-then-chmoded target that simply is not open right now,
-        // which is the whole race. So the property itself is asserted below.
-        let provided = fake_gh(temporary.path(), "gh-provided", "exit 0");
-        let source = shell_program_source(&provided);
-        let held_open = fs::OpenOptions::new().write(true).open(&source).unwrap();
-        let status = std::process::Command::new(&provided)
-            .status()
-            .expect("a provided program must execute while its script is open for writing");
-        assert!(status.success(), "{status}");
-        drop(held_open);
-
-        assert_exec_target_is_never_written(temporary.path(), &provided);
-    }
-
-    /// The property #396 actually rests on, asserted rather than approximated.
-    ///
-    /// `ETXTBSY` is raised for an exec target some process holds open for
-    /// writing. What makes the converted helpers immune is not that the window
-    /// is small — it is that the exec target is a file this process never opens
-    /// at all: a symlink to the checked-in provider, outside the directory the
-    /// test writes into. The only thing installed here that *is* written is the
-    /// sidecar, and `/bin/sh` merely reads it.
-    ///
-    /// Asserting the exec succeeds is not this property. A written-then-chmoded
-    /// program that happens not to be open at that instant also executes, which
-    /// is exactly how the race stayed invisible on a quiet host.
-    fn assert_exec_target_is_never_written(written_root: &Path, program: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let installed = fs::symlink_metadata(program).unwrap();
-        assert!(
-            installed.file_type().is_symlink(),
-            "the exec target must be a symlink to the checked-in provider, not a file \
-             this process wrote: {}",
-            program.display()
-        );
-        let target = fs::read_link(program).unwrap();
-        assert!(
-            target.ends_with("test/fixtures/shell-command-provider"),
-            "unexpected provider target {}",
-            target.display()
-        );
-        assert!(
-            !target.starts_with(written_root),
-            "the exec target resolves inside the directory this test writes into ({}), \
-             so it is a file this process can hold open for writing",
-            target.display()
-        );
-        assert!(target.exists(), "{} is not checked in", target.display());
-        let sidecar = shell_program_source(program);
-        assert_eq!(
-            fs::metadata(&sidecar).unwrap().permissions().mode() & 0o111,
-            0,
-            "the file the installer writes must never be executable, or it becomes an \
-             exec target this process wrote: {}",
-            sidecar.display()
-        );
-    }
-
-    const WALK_PAYLOAD: &str = r#"{"data":{"repository":{"issue":{"subIssues":{
-        "pageInfo":{"hasNextPage":false,"endCursor":null},
-        "nodes":[{"number":8,
-          "closedByPullRequestsReferences":{"nodes":[]},
-          "comments":{"pageInfo":{"hasPreviousPage":false},"nodes":[
-            {"databaseId":11,"url":"https://github.com/acme/widgets/issues/8#c11",
-             "body":"rerun the gate with the fixture regenerated",
-             "createdAt":"2026-08-01T10:00:00Z","updatedAt":"2026-08-01T10:00:00Z",
-             "author":{"login":"Operator"}},
-            {"databaseId":12,"url":"https://github.com/acme/widgets/issues/8#c12",
-             "body":"<!-- tally:spec-build:diagnosis:v1 -->\nmachine receipt",
-             "createdAt":"2026-08-01T10:01:00Z","updatedAt":"2026-08-01T10:01:00Z",
-             "author":{"login":"operator"}},
-            {"databaseId":13,"url":"https://github.com/acme/widgets/issues/8#c13",
-             "body":"drive-by opinion",
-             "createdAt":"2026-08-01T10:02:00Z","updatedAt":"2026-08-01T10:02:00Z",
-             "author":{"login":"stranger"}}
-          ]}}]}}}}}"#;
-
-    /// A walk the forge served in full, whose comment bodies happen to quote a
-    /// GraphQL schema error. Comment bodies are writable by any account on a
-    /// public repository — and by the campaign's own agents through the machine
-    /// receipts tally posts to task threads — so nothing in here may reach the
-    /// capability decision.
-    const HOSTILE_WALK_PAYLOAD: &str = r#"{"data":{"repository":{"issue":{"subIssues":{
-        "pageInfo":{"hasNextPage":false,"endCursor":null},
-        "nodes":[{"number":8,
-          "closedByPullRequestsReferences":{"nodes":[]},
-          "comments":{"pageInfo":{"hasPreviousPage":true},"nodes":[
-            {"databaseId":11,"url":"https://github.com/acme/widgets/issues/8#c11",
-             "body":"CI says: Field 'foo' doesn't exist on type 'Bar' -- please fix",
-             "createdAt":"2026-08-01T10:00:00Z","updatedAt":"2026-08-01T10:00:00Z",
-             "author":{"login":"operator"}},
-            {"databaseId":12,"url":"https://github.com/acme/widgets/issues/8#c12",
-             "body":"see issue #334, which quotes UNDEFINED_FIELD verbatim",
-             "createdAt":"2026-08-01T10:01:00Z","updatedAt":"2026-08-01T10:01:00Z",
-             "author":{"login":"stranger"}}
-          ]}}]}}}}}"#;
-
-    #[test]
-    fn the_arm_probe_answers_degraded_instead_of_failing_the_campaign() {
-        let temporary = tempfile::tempdir().unwrap();
-        let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
-        let gh_program = GhProgramGuard::acquire();
-
-        let refusing = fake_gh(
-            temporary.path(),
-            "gh-refusing",
-            "echo '{\"errors\":[{\"type\":\"UNDEFINED_FIELD\",\
-             \"message\":\"Field '\\''subIssues'\\'' doesn'\\''t exist on type '\\''Issue'\\''\"}]}'; \
-             echo \"gh: Field 'subIssues' doesn't exist on type 'Issue'\" >&2; exit 1",
-        );
-        gh_program.use_program(&refusing);
-        // A forge whose schema has no such field is a capability answer, not an
-        // error: the campaign still arms, in degraded mode.
-        assert!(!probe_sub_issue_walk(&locator).unwrap());
-
-        // A transport error, a rate limit, or a 502 says nothing about the
-        // schema. Reading one as "this forge has no sub-issues" armed the
-        // campaign degraded for the rest of its life over one bad minute, so
-        // the probe now fails the arm and says why.
-        let flaky = fake_gh(
-            temporary.path(),
-            "gh-flaky",
-            "echo 'gh: HTTP 502: Bad gateway (https://api.github.com/graphql)' >&2; exit 1",
-        );
-        gh_program.use_program(&flaky);
-        let failure = probe_sub_issue_walk(&locator).unwrap_err().to_string();
-        assert!(failure.contains("capability probe failed"), "{failure}");
-        assert!(failure.contains("502"), "{failure}");
-
-        let serving = fake_gh(
-            temporary.path(),
-            "gh-serving",
-            &format!("cat <<'TALLY_WALK'\n{WALK_PAYLOAD}\nTALLY_WALK"),
-        );
-        gh_program.use_program(&serving);
-        assert!(probe_sub_issue_walk(&locator).unwrap());
-        let walked = sub_issue_threads(&locator).unwrap();
-        assert_eq!(walked.threads.keys().copied().collect::<Vec<_>>(), vec![8]);
-        assert_eq!(walked.threads[&8].len(), 3);
-    }
-
-    /// A capability gate must not be answerable by an input a stranger writes.
-    ///
-    /// The first fix read the whole probe response for four phrases before it
-    /// checked whether the call had even failed, and the response carries every
-    /// comment body on every task thread. Quoting an ordinary CI error — or
-    /// quoting issue #334, which contains the literal `UNDEFINED_FIELD` — was
-    /// enough to answer "this forge has no sub-issue API", and the gate fails
-    /// open into degraded mode for the life of the arm.
-    #[test]
-    fn a_served_walk_is_never_a_capability_refusal_whatever_its_comments_say() {
-        let temporary = tempfile::tempdir().unwrap();
-        let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
-        let gh_program = GhProgramGuard::acquire();
-
-        let hostile = fake_gh(
-            temporary.path(),
-            "gh-hostile",
-            &format!("cat <<'TALLY_WALK'\n{HOSTILE_WALK_PAYLOAD}\nTALLY_WALK"),
-        );
-        gh_program.use_program(&hostile);
-        // The same payload walks successfully, which is the whole point: the
-        // forge served the field, so the answer is native.
-        let walked = sub_issue_threads(&locator).unwrap();
-        assert_eq!(walked.threads.keys().copied().collect::<Vec<_>>(), vec![8]);
-        assert!(
-            probe_sub_issue_walk(&locator).unwrap(),
-            "a served walk must arm native whatever its comment bodies quote"
-        );
-
-        // A genuine schema refusal still degrades even when GitHub types the
-        // error only in the message, with no `type` or `extensions.code`.
-        let untyped = fake_gh(
-            temporary.path(),
-            "gh-untyped-refusal",
-            "echo '{\"errors\":[{\"message\":\"Field '\\''subIssues'\\'' doesn'\\''t exist on type '\\''Issue'\\''\"}]}'; exit 1",
-        );
-        gh_program.use_program(&untyped);
-        assert!(!probe_sub_issue_walk(&locator).unwrap());
-
-        // And a failure whose *body* merely quotes the phrase, with no such
-        // message of its own, is a failure — not an answer.
-        let quoting_failure = fake_gh(
-            temporary.path(),
-            "gh-quoting-failure",
-            "echo '{\"data\":{\"note\":\"undefined_field\"}}';              echo 'gh: HTTP 502: Bad gateway' >&2; exit 1",
-        );
-        gh_program.use_program(&quoting_failure);
-        let failure = probe_sub_issue_walk(&locator).unwrap_err().to_string();
-        assert!(failure.contains("capability probe failed"), "{failure}");
-    }
-
-    #[test]
-    fn every_arm_path_says_which_projection_it_recorded() {
-        // The enqueueing path prints the daemon's admission result, and a
-        // campaign that armed degraded is otherwise indistinguishable from one
-        // that armed native until an operator's sub-issue comment silently
-        // fails to reach its agent.
-        let admitted = json!({"task_uuid": "0198f000-0000-7000-8000-000000000002"});
-        let native = armed_projection(&admitted, true);
-        assert_eq!(native["projection"], json!("native-sub-issues"));
-        assert_eq!(native["subIssueWalk"], json!(true));
-        assert_eq!(native["task_uuid"], admitted["task_uuid"]);
-        let degraded = armed_projection(&admitted, false);
-        assert_eq!(degraded["projection"], json!("degraded-checkboxes"));
-        assert_eq!(degraded["subIssueWalk"], json!(false));
-        // A non-object admission result keeps its own shape rather than being
-        // silently dropped to make room for the annotation.
-        let wrapped = armed_projection(&json!("queued"), true);
-        assert_eq!(wrapped["result"], json!("queued"));
-        assert_eq!(wrapped["projection"], json!("native-sub-issues"));
-    }
-
-    #[test]
-    fn resume_posts_one_auditable_counter_boundary() {
-        let temporary = tempfile::tempdir().unwrap();
-        let captured = temporary.path().join("resume-body");
-        let fake = fake_gh(
-            temporary.path(),
-            "gh-resume",
-            &format!(
-                "cat > '{}'; printf '%s\\n' 'https://github.com/acme/widgets/issues/42#issuecomment-99'",
-                captured.display()
-            ),
-        );
-        let gh_program = GhProgramGuard::acquire();
-        gh_program.use_program(&fake);
-
-        let receipt = post_campaign_resume(
-            &graph_for_forge_observation(),
-            "operator",
-            "  Corrected the unavailable external dependency.  ",
-        )
-        .unwrap();
-        assert_eq!(
-            receipt,
-            "https://github.com/acme/widgets/issues/42#issuecomment-99"
-        );
-        let body = fs::read_to_string(captured).unwrap();
-        assert!(
-            body.lines().next().unwrap().starts_with(
-                "<!-- tally:spec-build:resume:v1 campaign=night-build issue=42 nonce="
-            ),
-            "{body}"
-        );
-        assert!(body.contains("\n\n### Campaign resumed\n\n"), "{body}");
-        assert!(
-            body.contains("\n\nReason: Corrected the unavailable external dependency.\n\n"),
-            "{body}"
-        );
-        assert!(body.ends_with("Requested by `@operator`."), "{body}");
-        assert!(post_campaign_resume(&graph_for_forge_observation(), "operator", "   ").is_err());
     }
 
     #[test]
@@ -6901,12 +4206,10 @@ mod tests {
 
         let receipt = arm_receipt(
             &json!({"status": "armed"}),
-            true,
             &[AutoPardonReceipt {
                 task_id: pardons[0].task_id.clone(),
                 added_dependencies: pardons[0].added_dependencies.clone(),
-                resume_receipt: "https://github.com/acme/widgets/issues/42#issuecomment-100"
-                    .to_owned(),
+                resume_receipt: "local://campaign/night-build/attempt-receipts/7".to_owned(),
             }],
             &warnings,
         );
@@ -6917,130 +4220,9 @@ mod tests {
         );
         assert_eq!(
             receipt["autoPardons"][0]["resumeReceipt"],
-            json!("https://github.com/acme/widgets/issues/42#issuecomment-100")
+            json!("local://campaign/night-build/attempt-receipts/7")
         );
         assert_eq!(receipt["warnings"], json!(warnings));
-    }
-
-    #[test]
-    fn auto_pardon_uses_the_resume_audit_receipt_with_a_task_scope() {
-        let temporary = tempfile::tempdir().unwrap();
-        let captured = temporary.path().join("auto-pardon-body");
-        let fake = fake_gh(
-            temporary.path(),
-            "gh-auto-pardon",
-            &format!(
-                "cat > '{}'; printf '%s\\n' 'https://github.com/acme/widgets/issues/42#issuecomment-100'",
-                captured.display()
-            ),
-        );
-        let gh_program = GhProgramGuard::acquire();
-        gh_program.use_program(&fake);
-        let pardon = PlannedAutoPardon {
-            task_id: "foundation".to_owned(),
-            added_dependencies: vec!["prerequisite".to_owned()],
-        };
-
-        let receipt = post_campaign_auto_pardon(
-            temporary.path(),
-            &graph_for_forge_observation(),
-            "operator",
-            &pardon,
-        )
-        .unwrap();
-        assert!(receipt.ends_with("#issuecomment-100"));
-        let body = fs::read_to_string(captured).unwrap();
-        let marker = body.lines().next().unwrap();
-        assert!(
-            marker.starts_with(
-                "<!-- tally:spec-build:resume:v1 campaign=night-build issue=42 nonce="
-            ),
-            "{body}"
-        );
-        assert!(marker.ends_with(" tasks=foundation -->"), "{body}");
-        assert!(body.contains("\n\n### Campaign resumed\n\n"), "{body}");
-        assert!(
-            body.contains("receipts for `foundation` without deleting the audit trail."),
-            "{body}"
-        );
-        assert!(
-            body.contains("Reason: Re-armed graph added dependency `prerequisite`"),
-            "{body}"
-        );
-        assert!(body.ends_with("Requested by `@operator`."), "{body}");
-    }
-
-    #[test]
-    fn active_escalation_detection_honors_scoped_resume_boundaries() {
-        let temporary = tempfile::tempdir().unwrap();
-        let comments_path = temporary.path().join("comments.json");
-        let diagnosis = |id: u64, attempt: u8| {
-            json!({
-                "id": id,
-                "body": format!(
-                    "<!-- tally:spec-build:diagnosis:v1 campaign=night-build issue=42 task=foundation attempt={attempt} -->\n\nreceipt"
-                ),
-                "html_url": format!("https://github.com/acme/widgets/issues/42#issuecomment-{id}"),
-                "created_at": "2026-08-10T10:00:00Z",
-                "updated_at": "2026-08-10T10:00:00Z",
-                "user": {"login": "operator"},
-            })
-        };
-        let mut comments = vec![
-            diagnosis(10, 1),
-            diagnosis(11, 2),
-            json!({
-                "id": 12,
-                "body": "<!-- tally:spec-build:escalation:v1 campaign=night-build issue=42 -->\n\n### Spec-build escalation: frontier quiescent",
-                "html_url": "https://github.com/acme/widgets/issues/42#issuecomment-12",
-                "created_at": "2026-08-10T10:01:00Z",
-                "updated_at": "2026-08-10T10:01:00Z",
-                "user": {"login": "operator"},
-            }),
-        ];
-        fs::write(
-            &comments_path,
-            serde_json::to_vec(&json!([comments])).unwrap(),
-        )
-        .unwrap();
-        let fake = fake_gh(
-            temporary.path(),
-            "gh-active-escalation",
-            &format!(
-                r#"case "$*" in
-  "api --paginate --slurp repos/acme/widgets/issues/42/comments?per_page=100") cat '{}' ;;
-  *) echo "unexpected gh call: $*" >&2; exit 97 ;;
-esac"#,
-                comments_path.display()
-            ),
-        );
-        let gh_program = GhProgramGuard::acquire();
-        gh_program.use_program(&fake);
-        let graph = graph_for_forge_observation();
-        assert_eq!(
-            active_escalated_tasks(&graph, "operator", false).unwrap(),
-            BTreeSet::from(["foundation".to_owned()])
-        );
-
-        comments.push(json!({
-            "id": 13,
-            "body": "<!-- tally:spec-build:resume:v1 campaign=night-build issue=42 nonce=018f47a0-7b9d-7cc2-92d6-2f7f19f505fd tasks=foundation -->\n\n### Campaign resumed\n\nPardoned prior receipts.\n\nReason: The amendment added a dependency.",
-            "html_url": "https://github.com/acme/widgets/issues/42#issuecomment-13",
-            "created_at": "2026-08-10T10:02:00Z",
-            "updated_at": "2026-08-10T10:02:00Z",
-            "user": {"login": "operator"},
-        }));
-        fs::write(
-            &comments_path,
-            serde_json::to_vec(&json!([comments])).unwrap(),
-        )
-        .unwrap();
-        assert!(
-            active_escalated_tasks(&graph, "operator", false)
-                .unwrap()
-                .is_empty(),
-            "the task-scoped resume marker must pardon only that task's active generation"
-        );
     }
 
     #[test]
@@ -7102,9 +4284,7 @@ esac"#,
             BTreeSet::from(["finish".to_owned()])
         );
 
-        let mut graph = graph_for_forge_observation();
-        graph.locator.number = issue_number;
-        graph.canonical.manifest.repository.forge = "local".to_owned();
+        let graph = local_graph_for_test();
         let receipt = append_local_campaign_pardon(
             temporary.path(),
             &graph,
@@ -7147,170 +4327,17 @@ esac"#,
     }
 
     #[test]
-    fn a_projection_written_before_the_probe_has_no_capability_answer() {
-        let projection: CampaignProjectionV1 = serde_json::from_value(json!({
-            "schemaVersion": CAMPAIGN_PROJECTION_SCHEMA_VERSION,
-            "codeRepository": "acme/widgets",
-            "worklistPattern": "specs/night/tasks.json",
-            "sourceRevision": "a".repeat(40),
-            "worklistSha256": format!("sha256:{}", "b".repeat(64)),
-            "issue": {
-                "repository": "acme/widgets",
-                "number": 42,
-                "url": "https://github.com/acme/widgets/issues/42"
-            }
-        }))
-        .unwrap();
-        assert_eq!(projection.sub_issue_walk, None);
-    }
-
-    #[test]
-    fn a_local_projection_need_not_invent_a_forge_issue() {
-        let temporary = tempfile::tempdir().unwrap();
-        let projection = CampaignProjectionV1 {
-            schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
-            code_repository: "acme/widgets".to_owned(),
-            worklist_pattern: "specs/night/tasks.json".to_owned(),
-            source_revision: "a".repeat(40),
-            worklist_sha256: format!("sha256:{}", "b".repeat(64)),
-            issue: None,
-            sub_issue_walk: None,
-        };
-        write_campaign_projection(temporary.path(), &projection).unwrap();
-
-        let loaded = read_campaign_projection(
-            temporary.path(),
-            &projection.code_repository,
-            &projection.worklist_pattern,
-        )
-        .unwrap();
-        assert!(loaded.issue.is_none());
-        assert!(loaded.locator().is_err());
-    }
-
-    #[test]
-    fn a_task_thread_comment_moves_the_observation_revision() {
-        let graph = CampaignGraph {
-            locator: parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap(),
-            canonical: CanonicalCampaignGraphV1 {
-                manifest: serde_json::from_value(manifest_value_for_test(json!([{
-                    "id": "foundation",
-                    "kind": "implementation",
-                    "issue": 43,
-                    "dependencies": [],
-                    "conflictDomains": []
-                }])))
-                .unwrap(),
-                tasks: Vec::new(),
-                executable_digest: format!("sha256:{}", "a".repeat(64)),
-            },
-            master: GithubIssue {
-                number: 42,
-                title: "Campaign".to_owned(),
-                body: None,
-                state: "open".to_owned(),
-                html_url: "https://github.com/acme/widgets/issues/42".to_owned(),
-                updated_at: "2026-08-01T10:00:00Z".to_owned(),
-                user: GithubActor {
-                    login: "operator".to_owned(),
-                },
-                pull_request: None,
-            },
-            tasks: Vec::new(),
-        };
+    fn task_addressed_local_steering_moves_the_observation_revision() {
+        let graph = local_graph_for_test();
         let quiet = CampaignSteering::default();
         let steered = CampaignSteering {
             master: Vec::new(),
-            tasks: BTreeMap::from([("43".to_owned(), vec![json!({"body": "rerun it"})])]),
+            tasks: BTreeMap::from([("foundation".to_owned(), vec![json!({"body": "rerun it"})])]),
         };
         let repository_progress = json!({"base": "a"});
         assert_ne!(
             campaign_observation(&graph, &quiet, &repository_progress, 1).unwrap(),
             campaign_observation(&graph, &steered, &repository_progress, 1).unwrap()
-        );
-    }
-
-    #[test]
-    fn timestamp_only_machine_writes_wake_the_poll_without_moving_the_campaign() {
-        let base = graph_for_forge_observation();
-        let mut machine_touched = graph_for_forge_observation();
-        machine_touched.master.updated_at = "2026-08-01T11:00:00Z".to_owned();
-        machine_touched.tasks[0].updated_at = "2026-08-01T11:00:00Z".to_owned();
-        let repository_progress = json!({"base": "a", "campaignRefs": {}});
-        let steering = CampaignSteering::default();
-
-        assert_ne!(
-            forge_observation(&base, &repository_progress, 1).unwrap(),
-            forge_observation(&machine_touched, &repository_progress, 1).unwrap(),
-            "the cheap precondition must still notice that comments may need rereading"
-        );
-        assert_eq!(
-            campaign_observation(&base, &steering, &repository_progress, 1).unwrap(),
-            campaign_observation(&machine_touched, &steering, &repository_progress, 1).unwrap(),
-            "filtered machine writes must not enqueue a new reconcile pass"
-        );
-    }
-
-    #[test]
-    fn a_graph_mismatch_requires_the_same_complete_forge_snapshot_twice() {
-        let graph = graph_for_forge_observation();
-        let first = graph_mismatch_observation(&graph, 1).unwrap();
-        assert_eq!(graph_mismatch_observation(&graph, 1).unwrap(), first);
-
-        let mut moving = graph;
-        moving.tasks[0].updated_at = "2026-08-01T11:00:00Z".to_owned();
-        assert_ne!(graph_mismatch_observation(&moving, 1).unwrap(), first);
-    }
-
-    /// The poll skips the expensive sub-issue walk while this digest holds
-    /// still, so anything the walk could see has to move it.
-    #[test]
-    fn the_cheap_poll_precondition_moves_with_every_surface_the_walk_reads() {
-        let base = graph_for_forge_observation();
-        let unchanged = graph_for_forge_observation();
-        let repository_progress = json!({"base": "a", "campaignRefs": {}});
-        assert_eq!(
-            forge_observation(&base, &repository_progress, 1).unwrap(),
-            forge_observation(&unchanged, &repository_progress, 1).unwrap()
-        );
-        let quiet = forge_observation(&base, &repository_progress, 1).unwrap();
-
-        // A comment on the master thread bumps the master's updated_at.
-        let mut master_touched = graph_for_forge_observation();
-        master_touched.master.updated_at = "2026-08-01T11:00:00Z".to_owned();
-        assert_ne!(
-            forge_observation(&master_touched, &repository_progress, 1).unwrap(),
-            quiet
-        );
-
-        // A comment on a task's own sub-issue bumps that sub-issue's.
-        let mut task_touched = graph_for_forge_observation();
-        task_touched.tasks[0].updated_at = "2026-08-01T11:00:00Z".to_owned();
-        assert_ne!(
-            forge_observation(&task_touched, &repository_progress, 1).unwrap(),
-            quiet
-        );
-
-        // A merged pull request closing a sub-issue changes its state.
-        let mut task_closed = graph_for_forge_observation();
-        task_closed.tasks[0].state = "closed".to_owned();
-        assert_ne!(
-            forge_observation(&task_closed, &repository_progress, 1).unwrap(),
-            quiet
-        );
-
-        // A local merge or checkpoint moves durable Git state even when every
-        // issue and comment remains byte-for-byte unchanged.
-        let advanced_repository = json!({"base": "b", "campaignRefs": {}});
-        assert_ne!(
-            forge_observation(&base, &advanced_repository, 1).unwrap(),
-            quiet
-        );
-
-        // Re-arming always dispatches, so it must invalidate the precondition.
-        assert_ne!(
-            forge_observation(&base, &repository_progress, 2).unwrap(),
-            quiet
         );
     }
 
@@ -7355,7 +4382,7 @@ esac"#,
         git(&["remote", "add", "origin", remote.to_str().unwrap()]);
         git(&["push", "--quiet", "--set-upstream", "origin", "main"]);
 
-        let mut graph = graph_for_forge_observation();
+        let mut graph = local_graph_for_test();
         graph.canonical.manifest.repository.checkout = checkout.clone();
         graph.canonical.manifest.repository.forge = "local".to_owned();
         let initial = repository_progress_value(&graph).unwrap();
@@ -7373,7 +4400,7 @@ esac"#,
             .to_owned();
         let reference = format!(
             "{}/checkpoint/gate",
-            campaign_state_ref_prefix(&graph.canonical.manifest.name, graph.locator.number,)
+            campaign_state_ref_prefix(&graph.canonical.manifest.name, LOCAL_CAMPAIGN_ISSUE_NUMBER,)
         );
         let refspec = format!("{object}:{reference}");
         git(&["push", "--quiet", "origin", &refspec]);
@@ -7384,50 +4411,25 @@ esac"#,
         );
     }
 
-    fn graph_for_forge_observation() -> CampaignGraph {
-        let task = GithubIssue {
-            number: 43,
-            title: "Foundation".to_owned(),
-            body: None,
-            state: "open".to_owned(),
-            html_url: "https://github.com/acme/widgets/issues/43".to_owned(),
-            updated_at: "2026-08-01T10:00:00Z".to_owned(),
-            user: GithubActor {
-                login: "operator".to_owned(),
-            },
-            pull_request: None,
-        };
+    fn local_graph_for_test() -> CampaignGraph {
+        let manifest = serde_json::from_value(manifest_value_for_test(json!([{
+            "id": "foundation",
+            "kind": "implementation",
+            "issue": 43,
+            "dependencies": [],
+            "conflictDomains": []
+        }])))
+        .unwrap();
         CampaignGraph {
-            locator: parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap(),
-            canonical: CanonicalCampaignGraphV1 {
-                manifest: serde_json::from_value(manifest_value_for_test(json!([{
-                    "id": "foundation",
-                    "kind": "implementation",
-                    "issue": 43,
-                    "dependencies": [],
-                    "conflictDomains": []
-                }])))
-                .unwrap(),
-                tasks: vec![CanonicalCampaignTaskV1 {
-                    number: task.number,
-                    title: task.title.clone(),
-                    body: task.body.clone().unwrap_or_default(),
+            canonical: CanonicalCampaignGraphV1::new(
+                manifest,
+                vec![CanonicalCampaignTaskV1 {
+                    number: 43,
+                    title: "Foundation".to_owned(),
+                    body: "Build the foundation.".to_owned(),
                 }],
-                executable_digest: format!("sha256:{}", "a".repeat(64)),
-            },
-            master: GithubIssue {
-                number: 42,
-                title: "Campaign".to_owned(),
-                body: None,
-                state: "open".to_owned(),
-                html_url: "https://github.com/acme/widgets/issues/42".to_owned(),
-                updated_at: "2026-08-01T10:00:00Z".to_owned(),
-                user: GithubActor {
-                    login: "operator".to_owned(),
-                },
-                pull_request: None,
-            },
-            tasks: vec![task],
+            )
+            .unwrap(),
         }
     }
 
@@ -7480,97 +4482,6 @@ esac"#,
     }
 
     #[test]
-    fn issue_url_is_canonical_and_bounded() {
-        let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
-        assert_eq!(locator.repository, "acme/widgets");
-        assert_eq!(locator.number, 42);
-        assert!(parse_issue_url("http://github.com/acme/widgets/issues/42").is_err());
-        assert!(parse_issue_url("https://github.com/acme/widgets/pull/42").is_err());
-        assert!(parse_issue_url("https://github.com/acme/widgets/issues/42?x=1").is_err());
-    }
-
-    #[test]
-    fn arm_manifest_defaults_to_the_repository_campaign_namespace() {
-        let temporary = tempfile::tempdir().unwrap();
-        let checkout = temporary.path().join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        let status = ProcessCommand::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .current_dir(&checkout)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let mut value = manifest_value_for_test(json!([{
-            "id": "foundation",
-            "kind": "implementation",
-            "issue": 43,
-            "dependencies": [],
-            "conflictDomains": []
-        }]));
-        value["repository"]["checkout"] = json!(checkout);
-        value["repository"]["forge"] = json!("local");
-        let body = |manifest: &Value| {
-            format!(
-                "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
-                serde_json::to_string(manifest).unwrap()
-            )
-        };
-
-        let admitted = parse_manifest(&body(&value), "acme/widgets").unwrap();
-        assert_eq!(admitted.pool, "campaign/acme/widgets");
-
-        value["pool"] = json!("legacy-runner");
-        let explicit = parse_manifest(&body(&value), "acme/widgets").unwrap();
-        assert_eq!(explicit.pool, "legacy-runner");
-    }
-
-    #[test]
-    fn arm_manifest_validates_campaign_namespace_shape_and_repository() {
-        let temporary = tempfile::tempdir().unwrap();
-        let checkout = temporary.path().join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        let status = ProcessCommand::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .current_dir(&checkout)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let mut value = manifest_value_for_test(json!([{
-            "id": "foundation",
-            "kind": "implementation",
-            "issue": 43,
-            "dependencies": [],
-            "conflictDomains": []
-        }]));
-        value["repository"]["checkout"] = json!(checkout);
-        value["repository"]["forge"] = json!("local");
-        let parse = |value: &Value| {
-            let body = format!(
-                "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
-                serde_json::to_string(value).unwrap()
-            );
-            parse_manifest(&body, "acme/widgets")
-        };
-
-        value["pool"] = json!("campaign/acme/widgets");
-        assert_eq!(parse(&value).unwrap().pool, "campaign/acme/widgets");
-        for invalid in [
-            "campaign/acme",
-            "campaign//widgets",
-            "campaign/acme/widgets/extra",
-        ] {
-            value["pool"] = json!(invalid);
-            let error = parse(&value).unwrap_err().to_string();
-            assert!(error.contains("campaign/OWNER/REPO"), "{error}");
-        }
-        value["pool"] = json!("campaign/acme/other");
-        let error = parse(&value).unwrap_err().to_string();
-        assert!(error.contains("must match issue repository"), "{error}");
-    }
-
-    #[test]
     fn namespace_runner_bypasses_config_while_explicit_runner_keeps_mutex_validation() {
         let mut pools = BTreeMap::new();
         validate_campaign_runner_pool("campaign/acme/widgets", &pools).unwrap();
@@ -7596,38 +4507,7 @@ esac"#,
     }
 
     #[test]
-    fn managed_sections_preserve_operator_prose() {
-        let body = "Operator context.\n\n<!-- tally:campaign:v1 -->\nold\n<!-- tally:campaign:v1:end -->\n\nTail.\n";
-        let updated =
-            upsert_managed_section(body, CAMPAIGN_BEGIN, CAMPAIGN_END, "\nnew\n").unwrap();
-        assert!(updated.starts_with("Operator context."));
-        assert!(updated.ends_with("\n\nTail.\n"));
-        assert!(updated.contains("\nnew\n"));
-        assert!(!updated.contains("old"));
-        assert!(extract_managed_section(
-            "<!-- tally:campaign:v1 -->x<!-- tally:campaign:v1:end --><!-- tally:campaign:v1:end -->",
-            CAMPAIGN_BEGIN,
-            CAMPAIGN_END,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn project_worklist_accepts_exact_issue_briefs() {
-        let document = json!({
-            "schemaVersion": 1,
-            "tasks": [
-                {"id": "foundation", "kind": "implementation", "title": "Foundation", "body": "Do the first thing.", "dependencies": [], "conflictDomains": ["src"]},
-                {"id": "finish", "kind": "implementation", "title": "Finish", "body": "Do the next thing.", "dependencies": ["foundation"], "conflictDomains": ["tests"]}
-            ]
-        });
-        let tasks = project_tasks(&document, "night-build").unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[1].dependencies, ["foundation"]);
-    }
-
-    #[test]
-    fn local_arm_ingests_worklist_briefs_without_a_forge_projection() {
+    fn local_arm_ingests_committed_worklist_briefs() {
         let temporary = tempfile::tempdir().unwrap();
         let checkout = temporary.path().join("checkout");
         let remote = temporary.path().join("remote.git");
@@ -7791,296 +4671,15 @@ esac"#,
                 .collect::<Vec<_>>(),
             [1, 2]
         );
-        let projection = CampaignProjectionV1 {
-            schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
-            code_repository: "acme/widgets".to_owned(),
-            worklist_pattern: "specs/night/tasks.json".to_owned(),
-            source_revision: committed.source_revision,
-            worklist_sha256: committed.sha256,
-            issue: None,
-            sub_issue_walk: Some(false),
-        };
-        let graph = local_campaign_graph(validated, "acme/widgets", &projection).unwrap();
-        assert_eq!(graph.locator.url, "local://campaign/night-build");
+        let graph = local_campaign_graph(validated).unwrap();
         assert!(graph.canonical.tasks[0]
             .body
             .contains("Build the local foundation."));
         assert_eq!(graph.canonical.tasks[1].number, 2);
-        assert!(graph.tasks[1].html_url.ends_with("/task/finish"));
 
         let mut invalid = document;
         invalid["campaign"] = json!({});
         assert!(validate_local_worklist_document(&invalid, &declaration.manifest_config).is_err());
-    }
-
-    #[test]
-    fn project_synthesizes_checkpoint_brief_from_fixture_worklist() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/checkpoint-bare-worklist.json");
-        let document: Value = serde_json::from_str(
-            &fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
-        )
-        .expect("checkpoint worklist fixture must be JSON");
-        let mut config = project_config(&document, None).unwrap();
-        let campaign_name = config["name"].as_str().unwrap();
-        let tasks = project_tasks(&document, campaign_name).unwrap();
-        let checkpoint = tasks
-            .iter()
-            .find(|task| task.kind == "checkpoint")
-            .expect("fixture must contain a checkpoint");
-        assert_eq!(
-            checkpoint.body,
-            "## Checkpoint\n\nCampaign: `fixture-checkpoint-render`\n\n## Gate argv\n\n    [\"bash\",\"test/fleet-gate.sh\"]\n\n## Runtime limit\n\n7200 seconds\n\n## Dependencies\n\n    [\"prepare\"]\n"
-        );
-
-        let temporary = tempfile::tempdir().unwrap();
-        let checkout = temporary.path().join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        let status = ProcessCommand::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .current_dir(&checkout)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        config["repository"]["checkout"] = json!(fs::canonicalize(checkout).unwrap());
-        let manifest = validate_project_shape(&config, &tasks).unwrap();
-        assert_eq!(manifest.tasks.len(), 2);
-        assert_eq!(manifest.tasks[1].kind, "checkpoint");
-    }
-
-    #[test]
-    fn committed_silent_factory_worklists_render_checkpoint_briefs() {
-        let directory =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silent-factory-worklists");
-        let mut paths = fs::read_dir(&directory)
-            .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()))
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
-            .collect::<Vec<_>>();
-        paths.sort();
-        assert!(!paths.is_empty(), "silent-factory worklists must exist");
-
-        let temporary = tempfile::tempdir().unwrap();
-        let checkout = temporary.path().join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        let status = ProcessCommand::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .current_dir(&checkout)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let checkout = fs::canonicalize(checkout).unwrap();
-
-        for path in paths {
-            let document: Value = serde_json::from_str(
-                &fs::read_to_string(&path)
-                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
-            )
-            .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display()));
-            let stem = path.file_stem().and_then(|value| value.to_str()).unwrap();
-            let campaign_name = format!("silent-factory-{stem}");
-            let tasks = project_tasks(&document, &campaign_name)
-                .unwrap_or_else(|error| panic!("cannot render {}: {error}", path.display()));
-            let checkpoints = tasks
-                .iter()
-                .filter(|task| task.kind == "checkpoint")
-                .collect::<Vec<_>>();
-            assert_eq!(
-                checkpoints.len(),
-                1,
-                "{} must contain its chapter checkpoint",
-                path.display()
-            );
-            for checkpoint in checkpoints {
-                let argv = serde_json::to_string(checkpoint.argv.as_ref().unwrap()).unwrap();
-                let dependencies = serde_json::to_string(&checkpoint.dependencies).unwrap();
-                assert!(
-                    checkpoint
-                        .body
-                        .contains(&format!("Campaign: `{campaign_name}`")),
-                    "{} omits its campaign name",
-                    path.display()
-                );
-                assert!(
-                    checkpoint.body.contains(&format!("    {argv}")),
-                    "{} omits its checkpoint argv",
-                    path.display()
-                );
-                assert!(
-                    checkpoint
-                        .body
-                        .contains(&format!("{} seconds", checkpoint.runtime_max_sec.unwrap())),
-                    "{} omits its checkpoint runtime",
-                    path.display()
-                );
-                assert!(
-                    checkpoint.body.contains(&format!("    {dependencies}")),
-                    "{} omits its checkpoint dependencies",
-                    path.display()
-                );
-            }
-
-            let mut config = manifest_value_for_test(json!([]));
-            config["name"] = json!(campaign_name);
-            config["repository"]["checkout"] = json!(checkout);
-            config["repository"]["forge"] = json!("local");
-            config["maxTasks"] = json!(100);
-            config.as_object_mut().unwrap().remove("tasks");
-            validate_project_shape(&config, &tasks)
-                .unwrap_or_else(|error| panic!("cannot project {}: {error}", path.display()));
-        }
-    }
-
-    #[test]
-    fn project_and_admission_preserve_omitted_conflict_domains() {
-        let temporary = tempfile::tempdir().unwrap();
-        let checkout = temporary.path().join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        let status = ProcessCommand::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .current_dir(&checkout)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let document = json!({
-            "schemaVersion": 1,
-            "tasks": [{
-                "id": "serial",
-                "kind": "implementation",
-                "title": "Serial task",
-                "body": "Make the bounded change.",
-                "issue": 43,
-                "dependencies": []
-            }]
-        });
-        let tasks = project_tasks(&document, "night-build").unwrap();
-        assert_eq!(tasks[0].conflict_domains, None);
-        let references = task_references(&tasks).unwrap();
-        assert!(!references[0]
-            .as_object()
-            .unwrap()
-            .contains_key("conflictDomains"));
-
-        let mut config = manifest_value_for_test(json!([]));
-        config["repository"]["checkout"] = json!(checkout);
-        let admitted = admit_manifest_value(manifest_value(&config, &tasks).unwrap()).unwrap();
-        assert_eq!(admitted.tasks[0].conflict_domains, None);
-        let canonical = serde_json::to_value(&admitted).unwrap();
-        assert!(!canonical["tasks"][0]
-            .as_object()
-            .unwrap()
-            .contains_key("conflictDomains"));
-
-        let explicit = json!({
-            "schemaVersion": 1,
-            "tasks": [{
-                "id": "serial",
-                "kind": "implementation",
-                "title": "Serial task",
-                "body": "Make no change.",
-                "issue": 43,
-                "dependencies": [],
-                "conflictDomains": []
-            }]
-        });
-        let explicit_tasks = project_tasks(&explicit, "night-build").unwrap();
-        assert_eq!(explicit_tasks[0].conflict_domains, Some(Vec::new()));
-        assert_eq!(
-            task_references(&explicit_tasks).unwrap()[0]["conflictDomains"],
-            json!([])
-        );
-
-        config["maxParallel"] = json!(2);
-        let error = admit_manifest_value(manifest_value(&config, &tasks).unwrap())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("conflictDomains: must be non-empty when campaign maxParallel"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn project_rejects_an_oversized_issue_brief_before_projection() {
-        let document = json!({
-            "schemaVersion": 1,
-            "tasks": [{
-                "id": "foundation",
-                "kind": "implementation",
-                "title": "Foundation",
-                "body": "x".repeat(64_001),
-                "dependencies": [],
-                "conflictDomains": []
-            }]
-        });
-        assert!(project_tasks(&document, "night-build").is_err());
-    }
-
-    #[test]
-    fn worklist_projection_must_match_manifest_but_checkbox_state_is_not_truth() {
-        let value = manifest_value_for_test(json!([{
-            "id": "foundation",
-            "kind": "implementation",
-            "issue": 43,
-            "dependencies": [],
-            "conflictDomains": []
-        }]));
-        let manifest: CampaignManifest = serde_json::from_value(value.clone()).unwrap();
-        let body = format!(
-            "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}\n{WORKLIST_BEGIN}\n- [X] {TASK_MARKER_PREFIX}foundation --> #43 — Foundation\n{WORKLIST_END}\n",
-            serde_json::to_string_pretty(&value).unwrap()
-        );
-        validate_worklist_projection(&body, &manifest).unwrap();
-        assert!(validate_worklist_projection(&body.replace("#43", "#44"), &manifest).is_err());
-    }
-
-    #[test]
-    fn project_shape_reports_the_configured_max_tasks_overflow() {
-        let temporary = tempfile::tempdir().unwrap();
-        let checkout = temporary.path().join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        let status = ProcessCommand::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .current_dir(&checkout)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let document = json!({
-            "schemaVersion": 1,
-            "tasks": [
-                {"id": "one", "kind": "implementation", "title": "One", "body": "First.", "dependencies": [], "conflictDomains": []},
-                {"id": "two", "kind": "implementation", "title": "Two", "body": "Second.", "dependencies": ["one"], "conflictDomains": []}
-            ]
-        });
-        let mut config = manifest_value_for_test(json!([]));
-        config["repository"]["checkout"] = json!(fs::canonicalize(&checkout).unwrap());
-        config.as_object_mut().unwrap().remove("tasks");
-        config
-            .as_object_mut()
-            .unwrap()
-            .insert("maxTasks".into(), json!(1));
-        let error =
-            validate_project_shape(&config, &project_tasks(&document, "night-build").unwrap())
-                .unwrap_err()
-                .to_string();
-        assert_eq!(
-            error,
-            "campaign configuration cannot form a valid manifest: campaign contains 2 tasks but manifest maxTasks is 1 — raise \"maxTasks\" in the campaign manifest"
-        );
-    }
-
-    #[test]
-    fn explicit_missing_asset_never_falls_back() {
-        assert!(resolve_asset(
-            Some(PathBuf::from("/definitely/missing/tally-campaign-flow")),
-            "TALLY_TEST_UNUSED_ASSET",
-            "missing-installed",
-            "examples/flows/spec-build.js",
-        )
-        .is_err());
     }
 
     #[test]
@@ -8272,7 +4871,7 @@ esac"#,
     #[test]
     fn manifest_defaults_to_squash_with_no_steward_and_refuses_other_methods() {
         // The campaign default is squash on both sides of the seam: the Nix
-        // module renders it into the brief and a forge-native manifest that
+        // module renders it into the brief and a local manifest that
         // names nothing gets the same integration.
         let tasks = json!([{ "id": "task-1", "kind": "implementation", "issue": 8 }]);
         let manifest: CampaignManifest =
@@ -8366,7 +4965,7 @@ esac"#,
 
     #[test]
     fn manifest_git_ai_binding_is_off_by_default_and_refuses_unknown_postures() {
-        // The shipped state binds nothing. A forge-native manifest that names
+        // The shipped state binds nothing. A local manifest that names
         // no posture gets the same integration it always had.
         let tasks = json!([{ "id": "task-1", "kind": "implementation", "issue": 8 }]);
         let manifest: CampaignManifest =
@@ -8520,312 +5119,7 @@ esac"#,
     /// driver must consume those exact bytes even when the operator spelled a
     /// checkout through a symlink or `..`, and a minimal explicit steward must
     /// already contain every default before it crosses the boundary.
-    #[test]
-    fn graph_digest_is_byte_identical_between_the_cli_and_the_packaged_driver() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let driver = repo_root.join("drivers/spec_build_driver.py");
-        assert!(
-            driver.is_file(),
-            "packaged driver missing: {}",
-            driver.display()
-        );
 
-        let temporary = tempfile::tempdir().unwrap();
-        let checkout = temporary.path().join("actual-checkout");
-        fs::create_dir(&checkout).unwrap();
-        let run_git = |directory: &Path, arguments: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(arguments)
-                .current_dir(directory)
-                .output()
-                .expect("git must run for campaign parity");
-            assert!(
-                output.status.success(),
-                "git {arguments:?} failed:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
-        run_git(&checkout, &["config", "user.name", "Tally Test"]);
-        run_git(&checkout, &["config", "user.email", "tally-test@invalid"]);
-        fs::write(checkout.join("README.md"), "fixture\n").unwrap();
-        run_git(&checkout, &["add", "README.md"]);
-        run_git(&checkout, &["commit", "--quiet", "-m", "fixture"]);
-        let remote = temporary.path().join("remote.git");
-        fs::create_dir(&remote).unwrap();
-        run_git(
-            &remote,
-            &["init", "--bare", "--quiet", "--initial-branch=main"],
-        );
-        run_git(
-            &checkout,
-            &["remote", "add", "origin", remote.to_str().unwrap()],
-        );
-        run_git(&checkout, &["push", "--quiet", "-u", "origin", "main"]);
-
-        let symlink = temporary.path().join("checkout-link");
-        std::os::unix::fs::symlink(&checkout, &symlink).unwrap();
-        let dot_parent = temporary.path().join("spelling-parent");
-        fs::create_dir(&dot_parent).unwrap();
-        let dotdot = dot_parent.join("..").join("actual-checkout");
-        let canonical_checkout = fs::canonicalize(&checkout).unwrap();
-
-        let tasks = vec![CanonicalCampaignTaskV1 {
-            number: 101,
-            title: "Implement the thing".to_owned(),
-            body: "Brief for task-a.".to_owned(),
-        }];
-        for spelling in [&symlink, &dotdot] {
-            let raw_manifest = json!({
-                "schemaVersion": 1,
-                "name": "parity",
-                "repository": {"checkout": spelling, "forge": "local"},
-                "pool": "campaign",
-                "agent": {},
-                "steward": {"adapter": "narrator", "argv": ["narrate"]},
-                "gates": [{"kind": "forbidPaths", "id": "gate-forbid", "forbidPaths": ["*.db"]}],
-                "tasks": [{"id": "task-a", "kind": "implementation", "issue": 101}]
-            });
-            let body = format!(
-                "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
-                serde_json::to_string(&raw_manifest).unwrap()
-            );
-            let manifest =
-                parse_manifest(&body, "acme/widgets").expect("arm admission must succeed");
-            assert_eq!(manifest.repository.checkout, canonical_checkout);
-            let steward = manifest.steward.as_ref().unwrap();
-            assert!(steward.env.is_empty());
-            assert_eq!(steward.final_message_pattern, "^TALLY_FINAL_MESSAGE=(.*)$");
-            assert_eq!(steward.runtime_max_sec, Some(120));
-            let graph = CanonicalCampaignGraphV1::new(manifest, tasks.clone()).unwrap();
-            let rust_bytes = graph.canonical_json().unwrap();
-
-            let input_path = temporary.path().join(format!(
-                "parity-{}.json",
-                if spelling == &symlink {
-                    "symlink"
-                } else {
-                    "dotdot"
-                }
-            ));
-            fs::write(
-                &input_path,
-                serde_json::to_string(&json!({
-                    "graph": &graph,
-                    "master": {
-                        "number": 100,
-                        "state": "open",
-                        "html_url": "https://github.com/acme/spec/issues/100",
-                        "body": "mutable projection body"
-                    },
-                    "issues": [{
-                        "number": 101,
-                        "title": "mutable forge title",
-                        "body": "mutable forge body",
-                        "state": "open",
-                        "html_url": "https://github.com/acme/spec/issues/101"
-                    }],
-                    "admittedIssues": [{
-                        "number": 101,
-                        "title": "Implement the thing",
-                        "body": "Brief for task-a.",
-                        "state": "open",
-                        "html_url": "https://github.com/acme/spec/issues/101"
-                    }]
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            let script = r#"
-import importlib.util
-import json
-import sys
-
-spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-with open(sys.argv[2], encoding="utf-8") as handle:
-    data = json.load(handle)
-decoded = module.canonical_campaign_graph(data["graph"])
-responses = iter([data["master"], data["issues"]])
-module.github_json = lambda *args, **kwargs: next(responses)
-worklist = module.issue_graph_worklist({
-    "repository": "acme/spec",
-    "issue": {"number": "100", "url": "https://github.com/acme/spec/issues/100"},
-    "worklist": {"kind": "github-issue", "graphDigest": decoded["executableDigest"]},
-    "armedManifest": decoded["manifest"],
-    "campaignGraph": decoded,
-})
-responses = iter([data["master"], data["admittedIssues"]])
-module.github_json = lambda *args, **kwargs: next(responses)
-recovered = module.issue_graph_worklist({
-    "repository": "acme/spec",
-    "issue": {"number": "100", "url": "https://github.com/acme/spec/issues/100"},
-    "worklist": {"kind": "github-issue", "graphDigest": decoded["executableDigest"]},
-    "armedManifest": decoded["manifest"],
-})
-print(json.dumps({
-    "canonical": module.canonical_json(decoded),
-    "digest": decoded["executableDigest"],
-    "checkout": str(worklist["config"]["repositoryConfig"]["checkout"]),
-    "taskBody": worklist["tasks"][0]["brief"]["body"],
-    "taskRevision": worklist["tasks"][0]["revision"],
-    "recoveredCheckout": str(recovered["config"]["repositoryConfig"]["checkout"]),
-    "recoveredTaskBody": recovered["tasks"][0]["brief"]["body"],
-    "recoveredTaskRevision": recovered["tasks"][0]["revision"],
-}, sort_keys=True, separators=(",", ":")))
-"#;
-            let output = std::process::Command::new("python3")
-                .args(["-c", script])
-                .arg(&driver)
-                .arg(&input_path)
-                .output()
-                .expect("python3 must run the packaged driver for the schema-parity test");
-            assert!(
-                output.status.success(),
-                "packaged driver parity probe failed (status {:?}):\nstdout: {}\nstderr: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            let observed: Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(observed["canonical"], rust_bytes);
-            assert_eq!(observed["digest"], graph.executable_digest);
-            let expected_task_revision = task_completion_revision(
-                &graph.manifest,
-                &graph.manifest.tasks[0],
-                &graph.tasks[0],
-            )
-            .unwrap();
-            assert_eq!(
-                observed["checkout"],
-                canonical_checkout.to_str().expect("checkout must be UTF-8")
-            );
-            assert_eq!(observed["taskBody"], "Brief for task-a.");
-            assert_eq!(observed["taskRevision"], expected_task_revision);
-            assert_eq!(
-                observed["recoveredCheckout"],
-                canonical_checkout.to_str().expect("checkout must be UTF-8")
-            );
-            assert_eq!(observed["recoveredTaskBody"], "Brief for task-a.");
-            assert_eq!(observed["recoveredTaskRevision"], expected_task_revision);
-        }
-    }
-
-    #[tokio::test]
-    async fn invalid_manifest_leaves_arm_without_registration_or_enqueue() {
-        let temporary = tempfile::tempdir().unwrap();
-        let state_dir = temporary.path().join("state");
-        let calls = temporary.path().join("gh-calls");
-        let master = temporary.path().join("master.json");
-        let invalid_manifest = json!({
-            "schemaVersion": 1,
-            "name": "invalid-arm",
-            "repository": {"checkout": "/does/not/matter", "forge": "local"},
-            "agent": {},
-            "gates": [{
-                "kind": "command",
-                "id": "test",
-                "preflightArgv": ["true"],
-                "argv": ["true"],
-                "typo": true
-            }],
-            "tasks": [{"id": "task-a", "kind": "implementation", "issue": 101}]
-        });
-        let body = format!(
-            "{CAMPAIGN_BEGIN}\n```json\n{}\n```\n{CAMPAIGN_END}",
-            serde_json::to_string(&invalid_manifest).unwrap()
-        );
-        fs::write(
-            &master,
-            serde_json::to_vec(&json!({
-                "number": 42,
-                "title": "Invalid campaign",
-                "body": body,
-                "state": "open",
-                "html_url": "https://github.com/acme/widgets/issues/42",
-                "updated_at": "2026-08-08T00:00:00Z",
-                "user": {"login": "operator"}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let gh = fake_gh(
-            temporary.path(),
-            "gh-invalid-arm",
-            &format!(
-                r#"printf '%s\n' "$*" >> '{}'
-case "$*" in
-  "api user") printf '%s\n' '{{"login":"operator"}}' ;;
-  "api repos/acme/widgets/issues/42") cat '{}' ;;
-  *) echo "unexpected gh call: $*" >&2; exit 97 ;;
-esac"#,
-                calls.display(),
-                master.display(),
-            ),
-        );
-        let gh_program = GhProgramGuard::acquire();
-        gh_program.use_program(&gh);
-        write_campaign_projection(
-            &state_dir,
-            &CampaignProjectionV1 {
-                schema_version: CAMPAIGN_PROJECTION_SCHEMA_VERSION,
-                code_repository: "acme/widgets".to_owned(),
-                worklist_pattern: "specs/night/tasks.json".to_owned(),
-                source_revision: "a".repeat(40),
-                worklist_sha256: format!("sha256:{}", "b".repeat(64)),
-                issue: Some(ProjectedIssueV1 {
-                    repository: "acme/widgets".to_owned(),
-                    number: 42,
-                    url: "https://github.com/acme/widgets/issues/42".to_owned(),
-                }),
-                sub_issue_walk: None,
-            },
-        )
-        .unwrap();
-
-        let error = run_campaign_arm(
-            &temporary.path().join("missing-tally.sock"),
-            None,
-            Duration::from_secs(1),
-            CampaignArmArgs {
-                code_repository: "acme/widgets".to_owned(),
-                worklist_pattern: "specs/night/tasks.json".to_owned(),
-                no_enqueue: false,
-                wait: false,
-                allowed_actors: Vec::new(),
-                allow_test_local_forge: true,
-                flow: Some(temporary.path().join("missing-flow.js")),
-                driver: Some(temporary.path().join("missing-driver")),
-                state_dir: Some(state_dir.clone()),
-                workspace_root: None,
-                projection_wait_ms: None,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("unknown field `typo`"),
-            "{error}"
-        );
-        let registration_count = CampaignRegistry::open(&state_dir)
-            .unwrap()
-            .registrations()
-            .unwrap()
-            .len();
-        assert_eq!(registration_count, 0);
-        assert_eq!(
-            fs::read_to_string(calls).unwrap().lines().collect::<Vec<_>>(),
-            ["api user", "api repos/acme/widgets/issues/42"],
-            "invalid admission must stop before sub-issue reads, registration, asset resolution, or queue RPC"
-        );
-    }
-
-    /// #433: the reconcile digest-mismatch receipt must stop starving the
-    /// operator. Two manifests differing in exactly one nested key must yield a
-    /// receipt that prints BOTH digests and names that exact canonical path —
-    /// presence/shape only, never the value. Removing the path computation from
-    /// the driver makes this red, which is the mutation this test pins.
     #[test]
     fn digest_mismatch_receipt_names_both_digests_and_the_first_divergent_path() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

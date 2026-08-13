@@ -192,8 +192,6 @@ pub(super) enum CampaignCommand {
     Steer(CampaignSteerArgs),
     /// Pardon an escalated campaign's counters, record why, and re-arm it.
     Resume(CampaignResumeArgs),
-    /// Project a worklist into one master issue and native task sub-issues.
-    Project(CampaignProjectArgs),
     /// Reconcile changed armed campaigns into fresh bounded flow passes.
     Poll(CampaignPollArgs),
     /// Show the current or latest durable pass for one campaign, plus usage
@@ -203,7 +201,7 @@ pub(super) enum CampaignCommand {
     List(CampaignListArgs),
     /// Exit successfully only when the local campaign registry is empty.
     Quiescent(CampaignQuiescentArgs),
-    /// Remove a local campaign registration without changing any forge projection.
+    /// Remove a local campaign registration.
     Disarm(CampaignDisarmArgs),
 }
 
@@ -301,34 +299,6 @@ pub(super) struct CampaignArmArgs {
     /// `campaign poll` dispatches later. Defaults to the flow host's 10 s.
     #[arg(long, value_name = "MILLISECONDS")]
     pub(super) projection_wait_ms: Option<u64>,
-}
-
-#[derive(Debug, Args)]
-pub(super) struct CampaignProjectArgs {
-    /// JSON worklist, optionally carrying a top-level `campaign` object.
-    #[arg(value_name = "WORKLIST")]
-    pub(super) worklist: PathBuf,
-    /// Separate JSON campaign configuration when WORKLIST has none.
-    #[arg(long, value_name = "PATH")]
-    pub(super) campaign_config: Option<PathBuf>,
-    /// GitHub repository receiving the issue graph.
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub(super) repo: String,
-    /// Durable projection root used by a later identity-based arm.
-    #[arg(long, value_name = "PATH")]
-    pub(super) state_dir: Option<PathBuf>,
-    /// Existing master issue URL to maintain instead of creating one.
-    #[arg(long, value_name = "URL")]
-    pub(super) issue: Option<String>,
-    /// Master issue title; required only on initial creation when no campaign name exists.
-    #[arg(long)]
-    pub(super) title: Option<String>,
-    /// Label applied to the master issue (created when absent).
-    #[arg(long, default_value = "tally-campaign")]
-    pub(super) label: String,
-    /// Label applied to projected task issues (created when absent).
-    #[arg(long, default_value = "tally-campaign-task")]
-    pub(super) task_label: String,
 }
 
 #[derive(Debug, Args)]
