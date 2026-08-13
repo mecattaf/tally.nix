@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tally_client::{RequestFrame, WireError};
 use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV3, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
@@ -12,7 +11,7 @@ use tally_core::wire::{serve_connection, RpcHandler};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
-const ISSUE_URL: &str = "https://github.com/acme/widgets/issues/42";
+const ISSUE_URL: &str = "local://acme/widgets/specs/night/tasks.json";
 const CODE_REPOSITORY: &str = "acme/widgets";
 const WORKLIST: &str = "specs/night/tasks.json";
 const REGISTRATION_ID: &str = "0198a62b-41ee-7000-8000-000000000542";
@@ -46,31 +45,6 @@ fn write_registration(state_dir: &Path, fixture_dir: &Path) {
         .unwrap()
         .write(&mut CampaignRegistration::new(authority, None))
         .unwrap();
-
-    let mut identity = Sha256::new();
-    identity.update(CODE_REPOSITORY.as_bytes());
-    identity.update([0]);
-    identity.update(WORKLIST.as_bytes());
-    let directory = state_dir.join("campaigns/projections");
-    std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(
-        directory.join(format!("{:x}.projection-v1.json", identity.finalize())),
-        serde_json::to_vec(&json!({
-            "schemaVersion": 1,
-            "codeRepository": CODE_REPOSITORY,
-            "worklistPattern": WORKLIST,
-            "sourceRevision": "a".repeat(40),
-            "worklistSha256": format!("sha256:{}", "b".repeat(64)),
-            "issue": {
-                "repository": CODE_REPOSITORY,
-                "number": 42,
-                "url": ISSUE_URL,
-            },
-            "subIssueWalk": true,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
 }
 
 fn usage() -> Value {
