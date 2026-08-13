@@ -43,8 +43,7 @@ let
   forge = cfg.campaignForge;
   # The whole campaign execution surface is one switch. A NixOS host that does
   # not want campaigns renders exactly what it rendered before this option
-  # existed: no campaign pools, no driver adapter, no continuation entry, and
-  # no poll units.
+  # existed: no campaign pools, no driver adapter, and no poll units.
   campaignSurface = forge.enable;
   # `""` is reachable only when the login assertion below has already failed.
   # Keeping these expressions total means an operator who enables the surface
@@ -183,23 +182,14 @@ let
     '';
   };
 
-  # The campaign layer seeds one events-dir registry entry that renders no unit
-  # on either module: `tally-drain.timer` already drains that directory. It is
-  # the one producer a NixOS host may carry, because carrying it costs no unit
-  # and the continuation payload is written against it by name.
-  seededProducers = lib.optionals campaignSurface [ "campaign-continuation" ];
   unsupportedConfigAssertions = [
     {
-      assertion = builtins.attrNames (builtins.removeAttrs cfg.producers seededProducers) == [ ];
+      assertion = cfg.producers == { };
       message = "services.tally.producers must be empty in the NixOS module; configure producers with the Home Manager module (tally.homeManagerModules.tally)";
     }
     {
       assertion = cfg.flows == { };
       message = "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)";
-    }
-    {
-      assertion = cfg.campaigns == { };
-      message = "services.tally.campaigns must be empty in the NixOS module: a declared campaign is driven by a managed GitHub producer unit and only the Home Manager module renders producer units. Set services.tally.campaignForge.enable = true and arm forge-native campaigns with `tally campaign arm`, or configure declared campaigns with the Home Manager module (tally.homeManagerModules.tally)";
     }
     {
       assertion = lib.all (pool: pool.usageMeter == null) (builtins.attrValues cfg.pools);
@@ -247,13 +237,11 @@ in
           Campaign execution surface for the system service, and the forge
           identity it acts as. Enabling this renders the host-wide campaign
           resource pools (`campaign-agent`, `campaign-control`, `flow`), the
-          packaged spec-build driver adapter, and the continuation registry
-          entry, then installs `tally-campaign-poll` when
+          packaged spec-build driver adapter, then installs
+          `tally-campaign-poll` when
           `services.tally.campaignPoll.enable` is also on, so that a
           forge-native campaign armed with `tally campaign arm` has somewhere to
-          dispatch into. Declared `services.tally.campaigns` stay Home Manager
-          only either way: those are driven by a managed GitHub producer unit,
-          and the NixOS module renders no producer units.
+          dispatch into. The NixOS module renders no producer units.
 
           The identity is the substantive part. A Home Manager campaign runs as
           the operator and inherits the operator's own `gh` and `git`
@@ -338,12 +326,11 @@ in
       services.tally.adapters = common.adapterDefaults;
       assertions = unsupportedConfigAssertions;
     }
-    # The generic campaign surface, rendered by the same builder the Home
-    # Manager module uses. With `campaigns` empty it contributes exactly the
-    # generic half: the campaign resource pools, the driver adapter, the fanout
-    # floor, and the continuation registry entry -- which is what `tally
-    # campaign arm` validates a host against before it spends agent time.
-    (lib.mkIf campaignSurface { services.tally = common.mkCampaignConfig cfg; })
+    # The generic runtime contract shared with Home Manager: resource pools,
+    # driver adapter, and fanout floor. `tally campaign arm` validates this host
+    # surface before it spends agent time; campaign policy comes from the
+    # committed worklist rather than from module declarations.
+    (lib.mkIf campaignSurface { services.tally = common.mkForgeNativeRuntimeConfig cfg; })
     (lib.mkIf campaignSurface {
       # The driver's forge identity lives in the service account's home, and
       # `gh` rewrites its own configuration file the first time it runs against
@@ -585,20 +572,6 @@ in
       };
     })
     (lib.mkIf (cfg.enable && campaignSurface) {
-      assertions = [
-        {
-          # Every campaign class continues itself through this one drain, and on
-          # this module `tally-drain.timer` is the only drainer there can be:
-          # nothing here renders producer units, so a self-draining entry would
-          # describe a timer that does not exist.
-          assertion =
-            builtins.hasAttr "campaign-continuation" cfg.producers
-            && cfg.producers.campaign-continuation.kind == "events-dir"
-            && !cfg.producers.campaign-continuation.selfDrain;
-          message = "tally requires the generic events-dir producer campaign-continuation with selfDrain = false; the NixOS module renders no producer units and tally-drain.timer is its only drainer";
-        }
-      ];
-
       # A real home for the service account, because that is where `gh`, `git`,
       # and the campaign CLI's own XDG fallbacks look. Campaign jobs are
       # transient units in this account's own user manager, so they inherit it.
