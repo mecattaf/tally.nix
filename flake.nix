@@ -30,15 +30,6 @@
         inherit self;
       };
       priorityRanks = import ./nix/lib/priority-ranks.nix;
-      ghLoginLibrary = import ./nix/lib/gh-login.nix;
-      # The corpus `crates/tally-core/src/producers/validate.rs` runs from the
-      # same path. Evaluating it here is what keeps the module assertion and the
-      # daemon's config-load check from drifting apart: a login one side accepts
-      # and the other rejects is a green deploy with a dead daemon.
-      ghLoginVectors = builtins.fromJSON (builtins.readFile ./test/fixtures/gh-login/vectors.json);
-      ghLoginVectorFailures = builtins.filter (
-        case: ghLoginLibrary.isValid case.login != case.valid
-      ) ghLoginVectors.cases;
     in
     {
       lib.adapters = adapterLibrary;
@@ -96,7 +87,6 @@
             ./examples/flows/worklist-fanout.js
             ./drivers/spec_build_driver.py
             ./test/fixtures/flows
-            ./test/fixtures/gh-login
             ./test/fixtures/ledger
             ./test/fixtures/pools
             ./test/fixtures/redaction
@@ -151,91 +141,6 @@
                 };
               };
               drop.kind = "events-dir";
-              github = {
-                kind = "gh";
-                enable = true;
-                sources = [
-                  {
-                    search = {
-                      repo = "agency-agency/spec";
-                      labels = [ "agency:codex-ready" ];
-                      state = "open";
-                    };
-                  }
-                ];
-                triggers.commandComments = [ "/tally run" ];
-                allowSelfTriggered = true;
-                allowedActors = [ "tally-bot" ];
-                postEvidence = true;
-                closeOnPass = true;
-                enqueue = {
-                  argv = [ "gh-job" ];
-                  pool = "slot";
-                  noEnqueue = true;
-                };
-              };
-              github-flow = {
-                kind = "gh";
-                enable = true;
-                sources = [
-                  {
-                    search = {
-                      repo = "agency-agency/spec";
-                      labels = [ "agency:codex-ready" ];
-                      state = "open";
-                    };
-                  }
-                ];
-                triggers.commandComments = [ "/pooled-review" ];
-                allowSelfTriggered = true;
-                allowedActors = [ "tally-bot" ];
-                enqueue = {
-                  argv = [
-                    "tally"
-                    "flow"
-                    "run"
-                    "${./examples/flows/pooled-review.js}"
-                    "--args-from-brief"
-                    "--max-nodes"
-                    "1000"
-                    "--catalog"
-                    "${catalogFixture}"
-                  ];
-                  brief = {
-                    subject = "\${gh.url}";
-                    minimumValid = 2;
-                  };
-                  pool = "slot";
-                  noEnqueue = false;
-                };
-              };
-              effects = {
-                kind = "build-effect";
-                watch = "jsonl";
-                path = "/var/empty/tally-effects.jsonl";
-                onKey = {
-                  argv = [ "effect-job" ];
-                  pool = "slot";
-                };
-              };
-              health = {
-                kind = "pool-reachability";
-                probePool = "slot";
-                hysteresis = 3;
-                onLost = {
-                  argv = [ "pool-lost" ];
-                  pool = "slot";
-                };
-                onReturn = {
-                  argv = [ "pool-return" ];
-                  pool = "slot";
-                };
-                onReturnAttest = {
-                  argv = [ "assess-return" ];
-                  pool = "slot";
-                  noEnqueue = true;
-                };
-              };
             };
           }
         );
@@ -264,7 +169,6 @@
             wrapProgram "$out/bin/tally" \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
-                  pkgs.gh
                   pkgs.git
                 ]
               }
@@ -491,12 +395,12 @@
             builtins.removeAttrs (
               transformed
               // {
-                type = "one of \"calendar\", \"events-dir\", \"gh\", \"build-effect\", or \"pool-reachability\"";
+                type = "one of \"calendar\" or \"events-dir\"";
                 example = pkgs.lib.literalExpression ''"calendar"'';
                 description = ''
                   Required discriminator selecting this producer's field set.
                   There is no producer-level default: every registry entry must
-                  name one of the five supported kinds explicitly.
+                  name one of the two supported kinds explicitly.
                 '';
               }
             ) [ "default" ]
@@ -504,17 +408,15 @@
             transformed
             // {
               description = ''
-                Polling interval in seconds. This controls GitHub intake for a
-                "gh" producer and the event-directory timer for an
-                "events-dir" producer.
+                Polling interval in seconds for an "events-dir" producer's
+                event-directory timer.
               '';
             }
           else if option.name == "services.tally.producers.<name>.enqueue" then
             transformed
             // {
               description = ''
-                Job payload emitted by a "calendar" producer at each firing or
-                by a "gh" producer for each accepted trigger.
+                Job payload emitted by a "calendar" producer at each firing.
               '';
             }
           else
@@ -670,29 +572,16 @@
             cmp core-option-keys.json home-option-keys.json
             jq -S '
               keys - [
-                "services.tally.campaignForge",
-                "services.tally.campaignForge.enable",
-                "services.tally.campaignForge.gitUserEmail",
-                "services.tally.campaignForge.gitUserName",
-                "services.tally.campaignForge.homeDir",
-                "services.tally.campaignForge.login",
-                "services.tally.campaignForge.tokenFile",
                 "services.tally.group",
                 "services.tally.user"
               ]
             ' "$nixos_json" > nixos-common-option-keys.json
             cmp core-option-keys.json nixos-common-option-keys.json
-            # The three options the NixOS module owns alone: the account the
-            # system service runs as, and the forge identity it acts as when it
-            # executes campaigns. Home Manager needs neither -- it runs as the
-            # operator and inherits the operator's own gh and git identity.
+            # The NixOS module alone owns the account the system service runs
+            # as. Home Manager runs directly as the operator.
             jq -e '
               has("services.tally.group")
               and has("services.tally.user")
-              and has("services.tally.campaignForge.enable")
-              and has("services.tally.campaignForge.login")
-              and has("services.tally.campaignForge.tokenFile")
-              and has("services.tally.campaignForge.homeDir")
             ' "$nixos_json" >/dev/null
             jq -e '
               all(to_entries[];
@@ -1214,68 +1103,6 @@
                       credentials.JOB_TOKEN = "/run/credentials/tally-job";
                     };
                   };
-                  effects = {
-                    kind = "build-effect";
-                    watch = "jsonl";
-                    path = "/var/empty/tally-effects.jsonl";
-                    onKey = {
-                      argv = [ "effect-job" ];
-                      pool = "stock";
-                    };
-                  };
-                  health = {
-                    kind = "pool-reachability";
-                    probePool = "stock";
-                    onReturnAttest = {
-                      argv = [ "assess-return" ];
-                      pool = "stock";
-                      noEnqueue = true;
-                    };
-                  };
-                  github = {
-                    kind = "gh";
-                    enable = true;
-                    sources = [
-                      {
-                        search = {
-                          repo = "agency-agency/spec";
-                          labels = [ "agency:codex-ready" ];
-                          state = "open";
-                        };
-                      }
-                    ];
-                    triggers.commandComments = [ "/tally run" ];
-                    postGateSummary = true;
-                    requestReview = true;
-                    reviewers = [ "tally-reviewer" ];
-                    closeOnAcceptance = true;
-                    enqueue = {
-                      argv = [ "Review \${gh.url}" ];
-                      adapter = "project-codex";
-                      cwd = "/worktrees/\${gh.repoName}";
-                      workspace = {
-                        repo = "agency-agency/spec";
-                        baseRev = "origin/main";
-                        branch = "tally-intake";
-                        worktreePath = "/worktrees/spec";
-                      };
-                      adapterOptions = {
-                        prePromptArgv = [ "--dangerously-bypass-approvals-and-sandbox" ];
-                        environment.NO_COLOR = "1";
-                        model = "gpt-5-codex";
-                        effort = "high";
-                      };
-                      gateManifest = {
-                        path = "/worktrees/spec/.tally/gates.json";
-                        requiredGateIds = [
-                          "tests"
-                          "clippy"
-                        ];
-                        acceptancePolicy = "execution-and-gates";
-                      };
-                      pool = "stock";
-                    };
-                  };
                   drop.kind = "events-dir";
                 };
                 flows = {
@@ -1377,23 +1204,6 @@
                 producers = {
                   missing = { };
                   misspelled.kind = "event-directory";
-                  bad-close = {
-                    kind = "gh";
-                    postEvidence = false;
-                    closeOnPass = true;
-                    enqueue = {
-                      argv = [ "gh-job" ];
-                      pool = "slot";
-                    };
-                  };
-                  bad-failure-stderr = {
-                    kind = "gh";
-                    postFailureStderr = true;
-                    enqueue = {
-                      argv = [ "gh-job" ];
-                      pool = "slot";
-                    };
-                  };
                 };
               };
             }
@@ -1759,52 +1569,6 @@
               config.services.tally.producers = {
                 missing = { };
                 misspelled.kind = "event-directory";
-                bad-close = {
-                  kind = "gh";
-                  postEvidence = false;
-                  closeOnPass = true;
-                  enqueue = {
-                    argv = [ "gh-job" ];
-                    pool = "slot";
-                  };
-                };
-                bad-failure-stderr = {
-                  kind = "gh";
-                  postFailureStderr = true;
-                  enqueue = {
-                    argv = [ "gh-job" ];
-                    pool = "slot";
-                  };
-                };
-                bad-review = {
-                  kind = "gh";
-                  requestReview = true;
-                  enqueue = {
-                    argv = [ "gh-job" ];
-                    pool = "slot";
-                  };
-                };
-                bad-reviewer-login = {
-                  kind = "gh";
-                  requestReview = true;
-                  reviewers = [ "not a login" ];
-                  enqueue = {
-                    argv = [ "gh-job" ];
-                    pool = "slot";
-                  };
-                };
-                # 40 characters: grammatical, one past GitHub's own bound. The
-                # module used to accept this and the daemon then refused to
-                # load the config it was deployed with.
-                bad-reviewer-length = {
-                  kind = "gh";
-                  requestReview = true;
-                  reviewers = [ "abcdefghijklmnopqrstuvwxyz0123456789abcd" ];
-                  enqueue = {
-                    argv = [ "gh-job" ];
-                    pool = "slot";
-                  };
-                };
               };
             }
           ];
@@ -1840,8 +1604,7 @@
             }
           ];
         };
-        # A NixOS host that executes forge-native campaigns. The token path is a
-        # path, never a secret: activation reads it, the module never does.
+        # A NixOS host with an overridden local campaign poll cadence.
         campaignNixos = nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
@@ -1850,11 +1613,6 @@
             {
               services.tally = {
                 enable = true;
-                campaignForge = {
-                  enable = true;
-                  login = "tally-fixture";
-                  tokenFile = "/run/secrets/tally-campaign-forge-token";
-                };
                 campaignPoll.interval = "4min";
                 campaignPoll.timeout = "2min";
               };
@@ -1869,51 +1627,11 @@
             {
               services.tally = {
                 enable = true;
-                campaignForge = {
-                  enable = true;
-                  login = "tally-fixture";
-                  tokenFile = "/run/secrets/tally-campaign-forge-token";
-                };
                 campaignPoll.enable = false;
               };
             }
           ];
         };
-        # The identity is not optional on this module, so an operator who turns
-        # the surface on without declaring one is refused at evaluation rather
-        # than by a timer that fails every tick.
-        anonymousCampaignNixos = nixpkgs.lib.nixosSystem {
-          inherit system;
-          modules = [
-            self.nixosModules.tally
-            nixosBase
-            { services.tally.campaignForge.enable = true; }
-          ];
-        };
-        badLoginCampaignNixos = nixpkgs.lib.nixosSystem {
-          inherit system;
-          modules = [
-            self.nixosModules.tally
-            nixosBase
-            {
-              services.tally = {
-                enable = true;
-                campaignForge = {
-                  enable = true;
-                  login = "not a login";
-                  tokenFile = "/run/secrets/tally-campaign-forge-token";
-                };
-              };
-            }
-          ];
-        };
-        failedAssertionMessages =
-          evaluated:
-          builtins.map (entry: entry.message) (
-            builtins.filter (entry: !entry.assertion) evaluated.config.assertions
-          );
-        anonymousCampaignMessages = failedAssertionMessages anonymousCampaignNixos;
-        badLoginCampaignMessages = failedAssertionMessages badLoginCampaignNixos;
         unsupportedSystemNixos = nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
@@ -3063,11 +2781,9 @@
         checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
         systemServices = stockNixos.config.systemd.services;
         systemTimers = stockNixos.config.systemd.timers;
-        forgeSystemConfig = campaignNixos.config.services.tally;
+        campaignSystemConfig = campaignNixos.config.services.tally;
         campaignSystemServices = campaignNixos.config.systemd.services;
         campaignSystemTimers = campaignNixos.config.systemd.timers;
-        campaignSystemActivation =
-          campaignNixos.config.system.activationScripts.tallyCampaignForgeIdentity.text;
         systemServiceExec = name: systemServices.${name}.serviceConfig.ExecStart;
         systemDaemon = systemServices.tally-daemon;
         systemWitnessEmitter = systemServices."tally-witness-emit@";
@@ -3081,7 +2797,6 @@
               eventsDoneHorizon = "180d";
               eventsRejectedHorizon = "30d";
               eventsRejectedMaxCount = 10000;
-              producerMarkerHorizon = "180d";
               lifecycleHorizon = "30d";
               lifecycleMaxBytes = 268435456;
             };
@@ -3107,7 +2822,7 @@
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
           assert pkgs.lib.hasInfix "gc --horizon 30d --collect" (homeServiceExec "tally-retention");
           assert pkgs.lib.hasInfix
-            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000 --producer-marker-horizon 180d"
+            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000"
             (homeServiceExec "tally-retention");
           # The poll timer is the recovery heartbeat for locally armed
           # campaigns; it survives the retired declaration renderer.
@@ -3151,7 +2866,7 @@
             "gc --horizon 30d --collect --data-dir /var/lib/tally/data --state-dir /var/lib/tally/state"
             (systemServiceExec "tally-retention");
           assert pkgs.lib.hasInfix
-            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000 --producer-marker-horizon 180d"
+            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000"
             (systemServiceExec "tally-retention");
           assert
             systemServices.tally-retention.serviceConfig.ReadWritePaths == [
@@ -3165,46 +2880,39 @@
           assert builtins.elem
             "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)"
             unsupportedSystemMessages;
-          # The campaign execution surface on NixOS. A stock host renders none
-          # of it: the switch is off, so the module deploys the daemon exactly
-          # as it did before the option existed.
-          assert stockNixos.config.services.tally.campaignForge.enable == false;
+          assert builtins.elem
+            "services.tally.pools.<name>.usageMeter must be null in the NixOS module; configure usage meters with the Home Manager module (tally.homeManagerModules.tally)"
+            unsupportedSystemMessages;
+          # NixOS now renders the same local campaign runtime contract as Home
+          # Manager whenever Tally is enabled. There is no forge identity or
+          # separate campaign switch: the committed worklist is the authority.
+          assert !(stockNixos.options.services.tally ? campaignForge);
           assert stockNixos.config.services.tally.producers == { };
           assert !(stockNixos.config.services.tally.pools ? campaign);
-          assert !(stockNixos.config.services.tally.pools ? campaign-agent);
-          assert !(stockNixos.config.services.tally.pools ? campaign-control);
-          assert !(stockNixos.config.services.tally.pools ? flow);
-          assert !(stockNixos.config.services.tally.adapters ? spec-build-driver);
-          assert !(systemServices ? tally-campaign-poll);
-          assert !(systemTimers ? tally-campaign-poll);
+          assert stockNixos.config.services.tally.pools.campaign-agent.resource == "slot";
+          assert stockNixos.config.services.tally.pools.campaign-control.resource == "cpu-slot";
+          assert stockNixos.config.services.tally.pools.flow.resource == "cpu-slot";
+          assert stockNixos.config.services.tally.enqueue.fanoutCap == 64;
+          assert stockNixos.config.services.tally.adapters ? spec-build-driver;
+          assert systemServices ? tally-campaign-poll;
+          assert systemTimers ? tally-campaign-poll;
           assert stockNixos.config.users.users.tally.home == "/var/empty";
-          # With the switch on, the host renders exactly what `tally campaign
-          # arm` validates a host against: the three resource pools, the driver
-          # adapter, and a fanout cap that admits a worst-case pass. Repository
-          # campaign/<owner>/<repo> mutexes are minted on demand from the name
-          # alone, so no generic host-wide campaign pool is configured.
-          assert !(forgeSystemConfig.pools ? campaign);
-          assert forgeSystemConfig.pools.campaign-agent.resource == "slot";
-          assert forgeSystemConfig.pools.campaign-control.resource == "cpu-slot";
-          assert forgeSystemConfig.pools.flow.resource == "cpu-slot";
-          assert forgeSystemConfig.enqueue.fanoutCap == 64;
-          # The events directory the continuation payload is written into, plus
-          # the home the driver's own forge identity lives in: a hardened
-          # driver adapter has to keep both writable on a system host, because
-          # `gh` rewrites its own configuration file on first use.
+          assert !(campaignSystemConfig.pools ? campaign);
+          assert campaignSystemConfig.pools.campaign-agent.resource == "slot";
+          assert campaignSystemConfig.pools.campaign-control.resource == "cpu-slot";
+          assert campaignSystemConfig.pools.flow.resource == "cpu-slot";
+          assert campaignSystemConfig.enqueue.fanoutCap == 64;
           assert
-            forgeSystemConfig.adapters.spec-build-driver.extraWritablePaths == [
-              "/var/lib/tally/forge"
+            campaignSystemConfig.adapters.spec-build-driver.extraWritablePaths == [
               "/var/lib/tally/state/events"
               "/var/lib/tally/state/capture/archive"
             ];
           assert
-            forgeSystemConfig.adapters.spec-build-driver.scrape.finalMessage.pattern
+            campaignSystemConfig.adapters.spec-build-driver.scrape.finalMessage.pattern
             == "^TALLY_FINAL_MESSAGE=(.*)$";
-          assert forgeSystemConfig.producers == { };
+          assert campaignSystemConfig.producers == { };
           assert campaignSystemTimers.tally-drain.timerConfig.OnUnitActiveSec == "5s";
-          # The continuation payload's directory exists before the first job
-          # that names it starts, on this module too.
+          # The continuation payload's directories exist before the first job.
           assert pkgs.lib.hasInfix "/var/lib/tally/state/events" systemDaemon.serviceConfig.ExecStartPre;
           assert pkgs.lib.hasInfix "/var/lib/tally/state/capture/archive"
             systemDaemon.serviceConfig.ExecStartPre;
@@ -3212,81 +2920,35 @@
             stockNixos.config.system.activationScripts.tallyRuntimeDirectories.text;
           assert pkgs.lib.hasInfix "/var/lib/tally/state/capture/archive"
             stockNixos.config.system.activationScripts.tallyRuntimeDirectories.text;
-          # The poll units, with system-service paths.
+          # Both system fixtures render a local-only poll service; the second
+          # pins override propagation while the first pins the defaults.
+          assert systemServices.tally-campaign-poll.serviceConfig.TimeoutStartSec == "90s";
           assert campaignSystemServices.tally-campaign-poll.serviceConfig.User == "tally";
           assert campaignSystemServices.tally-campaign-poll.serviceConfig.TimeoutStartSec == "2min";
           assert
             campaignSystemServices.tally-campaign-poll.serviceConfig.ReadWritePaths == [
               "/var/lib/tally/state"
-              "/var/lib/tally/forge"
             ];
           assert
-            campaignSystemServices.tally-campaign-poll.serviceConfig.Environment == [
-              "HOME=/var/lib/tally/forge"
+            campaignSystemServices.tally-campaign-poll.serviceConfig.RestrictAddressFamilies == [
+              "AF_UNIX"
+              "AF_INET"
+              "AF_INET6"
             ];
-          assert campaignSystemTimers.tally-campaign-poll.timerConfig.OnUnitActiveSec == "4min";
-          assert campaignSystemTimers.tally-campaign-poll.timerConfig.Unit == "tally-campaign-poll.service";
-          assert !(campaignPollDisabledNixos.config.systemd.services ? tally-campaign-poll);
-          assert !(campaignPollDisabledNixos.config.systemd.timers ? tally-campaign-poll);
-          # An `After=` on a target nothing pulls in orders against nothing, and
-          # the scan's first act is an authenticated forge read 15s after boot.
           assert
             campaignSystemServices.tally-campaign-poll.after == [
               "network-online.target"
               "tally-daemon.service"
             ];
           assert campaignSystemServices.tally-campaign-poll.wants == [ "network-online.target" ];
-          # A host whose secret is not provisioned yet skips the scan instead of
-          # failing a unit every tick.
           assert
             campaignSystemServices.tally-campaign-poll.unitConfig.ConditionPathExists == [
               "/etc/tally/config.json"
-              "/var/lib/tally/forge/.config/gh/hosts.yml"
             ];
-          # The identity. The account gets a real home because campaign jobs are
-          # transient units in its own user manager and read gh and git
-          # configuration from HOME; the token is piped in from its declared
-          # path and appears nowhere in the store.
-          assert campaignNixos.config.users.users.tally.home == "/var/lib/tally/forge";
-          assert campaignNixos.config.users.users.tally.createHome;
-          assert pkgs.lib.hasInfix "--login tally-fixture" campaignSystemActivation;
-          assert pkgs.lib.hasInfix "--git-name tally-fixture" campaignSystemActivation;
-          assert pkgs.lib.hasInfix "--git-email tally-fixture@users.noreply.github.com"
-            campaignSystemActivation;
-          assert pkgs.lib.hasInfix "< /run/secrets/tally-campaign-forge-token" campaignSystemActivation;
-          # A missing secret is named by the option it comes from, rather than
-          # arriving as a bare shell redirection error.
-          assert pkgs.lib.hasInfix "if [ ! -r /run/secrets/tally-campaign-forge-token ]"
-            campaignSystemActivation;
-          assert pkgs.lib.hasInfix "services.tally.campaignForge.tokenFile is unreadable"
-            campaignSystemActivation;
-          # No estate here runs sops-nix or agenix, so the ordering list is the
-          # account record alone; naming a snippet that does not exist is an
-          # evaluation error, which is why the dependency is conditional.
-          assert
-            campaignNixos.config.system.activationScripts.tallyCampaignForgeIdentity.deps == [
-              "users"
-            ];
-          # Turning the surface off removes the token this writer left behind,
-          # and a host that never enabled it still runs the same no-op snippet.
-          assert !(campaignNixos.config.system.activationScripts ? tallyCampaignForgeTeardown);
-          assert !(stockNixos.config.system.activationScripts ? tallyCampaignForgeIdentity);
-          assert pkgs.lib.hasInfix "--remove --home /var/lib/tally/forge"
-            stockNixos.config.system.activationScripts.tallyCampaignForgeTeardown.text;
-          assert builtins.elem
-            "services.tally.campaignForge.login must name the GitHub account the tally system service acts as; unlike the Home Manager module there is no ambient operator identity to inherit"
-            anonymousCampaignMessages;
-          assert builtins.elem
-            "services.tally.campaignForge.tokenFile must be the absolute path of a file holding that account's GitHub token; it is read at activation and never enters the Nix store"
-            anonymousCampaignMessages;
-          assert builtins.elem "services.tally.campaignForge.enable requires services.tally.enable"
-            anonymousCampaignMessages;
-          assert builtins.elem
-            "services.tally.campaignForge.login must be a GitHub login: alphanumerics and interior hyphens, at most 39 characters"
-            badLoginCampaignMessages;
-          assert builtins.elem
-            "services.tally.pools.<name>.usageMeter must be null in the NixOS module; configure usage meters with the Home Manager module (tally.homeManagerModules.tally)"
-            unsupportedSystemMessages;
+          assert campaignSystemTimers.tally-campaign-poll.timerConfig.OnUnitActiveSec == "4min";
+          assert campaignSystemTimers.tally-campaign-poll.timerConfig.Unit == "tally-campaign-poll.service";
+          assert !(campaignPollDisabledNixos.config.systemd.services ? tally-campaign-poll);
+          assert !(campaignPollDisabledNixos.config.systemd.timers ? tally-campaign-poll);
           assert homeTimers ? tally-producer-daily;
           assert homeTimers.tally-producer-daily.Timer.OnCalendar == "daily";
           assert homeTimers ? tally-producer-flow-fixture;
@@ -3313,12 +2975,6 @@
             invalidFlowMessages;
           assert builtins.elem "tally flow wide-mutex workloadMutex must reference a capacity-1 pool"
             invalidFlowMessages;
-          assert homeServices.tally-producer-health.Service.Restart == "always";
-          assert homeServices.tally-producer-health.Unit.StartLimitIntervalSec == 0;
-          assert homeServices.tally-producer-effects.Service.Restart == "always";
-          assert homeServices.tally-producer-effects.Unit.StartLimitIntervalSec == 0;
-          assert homeServices.tally-producer-github.Service.Restart == "always";
-          assert homeServices.tally-producer-github.Unit.StartLimitIntervalSec == 0;
           assert homeTimers ? tally-producer-drop;
           assert homeTimers.tally-producer-drop.Timer.OnActiveSec == "1s";
           assert homeTimers.tally-producer-drop.Timer.OnUnitActiveSec == "60s";
@@ -3428,8 +3084,6 @@
               echo 'producer script contains an unexpanded systemd specifier' >&2
               exit 1
             fi
-            grep -F -- '__producer-dispatch' ${homeServiceExec "tally-producer-health"}
-            grep -F -- 'pool-reachability' ${homeServiceExec "tally-producer-health"}
             grep -F -- 'systemctl --user stop "$unit"' ${homeServiceExec "tally-clean-removed-producers"}
             grep -F -- 'witness append --ledger "$ledger" --payload "$payload"' \
               ${tallyWitnessEmit}/bin/tally-witness-emit
@@ -3439,7 +3093,7 @@
               .enqueue.depthCap == 3 and
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
-              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"producerMarkerHorizon":"180d","lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
+              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
               .storage == {"pollIntervalSec":60,"dataDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592},"stateDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592}} and
               .attestations == {"exec":{"enable":true}} and
               .pools.build.resource == "build-slot" and
@@ -3483,32 +3137,7 @@
               .producers.daily.enqueue.pool == ["programmatic", "stock"] and
               .producers.daily.enqueue.executor == "worker" and
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
-              .producers.effects.onKey.pool == "stock" and
-              .producers.health.onReturnAttest.noEnqueue == true and
-              .producers.github.sources[0].search.repo == "agency-agency/spec" and
-              .producers.github.sources[0].search.labels == ["agency:codex-ready"] and
-              .producers.github.sources[0].search.state == "open" and
-              .producers.github.triggers.commandComments == ["/tally run"] and
-              .producers.github.allowSelfTriggered == false and
-              .producers.github.allowedActors == [] and
-              .producers.github.postReceipt == true and
-              .producers.github.postEvidence == false and
-              .producers.github.postFailureEvidence == false and
-              .producers.github.postFailureStderr == false and
-              .producers.github.postGateSummary == true and
-              .producers.github.requestReview == true and
-              .producers.github.reviewers == ["tally-reviewer"] and
-              .producers.github.closeOnAcceptance == true and
-              .producers.github.neverMutate == false and
-              .producers.github.closeOnPass == false and
-              .producers.github.enqueue.argv == ["Review ''${gh.url}"] and
-              .producers.github.enqueue.cwd == "/worktrees/''${gh.repoName}" and
-              .producers.github.enqueue.workspace.repo == "agency-agency/spec" and
-              .producers.github.enqueue.workspace.worktreePath == "/worktrees/spec" and
-              .producers.github.enqueue.adapterOptions.prePromptArgv == ["--dangerously-bypass-approvals-and-sandbox"] and
-              .producers.github.enqueue.adapterOptions.environment.NO_COLOR == "1" and
-              .producers.github.enqueue.gateManifest.requiredGateIds == ["tests", "clippy"] and
-              .producers.github.enqueue.gateManifest.acceptancePolicy == "execution-and-gates" and
+              ([.producers | keys[]] | sort) == ["daily", "drop", "flow-fixture", "flow-monthly-dedup"] and
               .executors.worker.kind == "ssh" and
               .executors.worker.host == "worker.example" and
               .executors.worker.user == "tally-worker" and
@@ -3625,6 +3254,10 @@
                   grep -Fq -- "${pkgs.nix}/bin" "$script"
                   if grep -Fq -- "--wait" "$script"; then
                     echo "campaign-runtime: poll timer must not pass --wait: $script" >&2
+                    exit 1
+                  fi
+                  if grep -Fq -- "/bin/gh" "$script"; then
+                    echo "campaign-runtime: local poll timer must not call or expose gh: $script" >&2
                     exit 1
                   fi
                 done
@@ -4333,37 +3966,15 @@
             '';
           producer-kind-required =
             assert builtins.elem
-              "tally producer missing requires an explicit kind; expected one of calendar, build-effect, pool-reachability, gh, events-dir"
+              "tally producer missing requires an explicit kind; expected one of calendar, events-dir"
               invalidProducerMessages;
             assert builtins.elem
-              ''tally producer misspelled has unknown kind "event-directory"; expected one of calendar, build-effect, pool-reachability, gh, events-dir''
-              invalidProducerMessages;
-            assert builtins.elem "gh producer bad-close closeOnPass=true requires postEvidence=true"
-              invalidProducerMessages;
-            assert builtins.elem
-              "gh producer bad-failure-stderr postFailureStderr=true requires postFailureEvidence=true"
-              invalidProducerMessages;
-            assert builtins.elem "gh producer bad-review requestReview=true requires a non-empty reviewers list"
-              invalidProducerMessages;
-            assert builtins.elem "gh producer bad-reviewer-login reviewers must be unique GitHub logins"
-              invalidProducerMessages;
-            assert builtins.elem "gh producer bad-reviewer-length reviewers must be unique GitHub logins"
+              ''tally producer misspelled has unknown kind "event-directory"; expected one of calendar, events-dir''
               invalidProducerMessages;
             assert !invalidProducerAttempt.success;
             pkgs.runCommand "tally-producer-kind-required" { } ''
               touch "$out"
             '';
-          gh-login-grammar =
-            assert ghLoginVectors.maxLength == ghLoginLibrary.maxLength;
-            assert builtins.length ghLoginVectors.cases >= 20;
-            if ghLoginVectorFailures == [ ] then
-              pkgs.runCommand "tally-gh-login-grammar" { } ''
-                touch "$out"
-              ''
-            else
-              throw "nix/lib/gh-login.nix disagrees with test/fixtures/gh-login/vectors.json on: ${
-                nixpkgs.lib.concatMapStringsSep ", " (case: case.name) ghLoginVectorFailures
-              }";
           forbidden-options-absent =
             assert builtins.all (attempt: !attempt.success) forbiddenAttempts;
             pkgs.runCommand "tally-forbidden-options-absent" { } ''
@@ -4646,71 +4257,13 @@
             pkgs.runCommand "tally-producer-registry" { nativeBuildInputs = [ pkgs.jq ]; }
               ''
                 ${tally}/bin/tally --mode check-config --config ${producerConfig}
-                test "$(jq -r '.producers | keys | join(",")' ${producerConfig})" = 'daily,drop,effects,github,github-flow,health'
+                test "$(jq -r '.producers | keys | join(",")' ${producerConfig})" = 'daily,drop'
                 test "$(jq -r '[.producers[] | select(has("pool") or has("priority") or has("adapter"))] | length' ${producerConfig})" = 0
                 producer_state="$PWD/state"
                 producer_data="$PWD/data"
                 mkdir -p "$producer_data"
                 daily="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch daily --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"calendar"}')"
                 test "$(printf '%s' "$daily" | jq -r 'keys[0]')" = emitted
-                own_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-42","commentId":"comment-42","triggerTimestamp":"2026-07-20T12:30:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted $(must-not-run)","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-42","author":"tally-bot","body":"/tally run"}}}'
-                own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --data-dir "$producer_data" --event "$own_event")"
-                test "$(printf '%s' "$own" | jq -r 'keys[0]')" = emitted
-                own_path="$(printf '%s' "$own" | jq -r '.emitted')"
-                jq -e '.argv == ["gh-job"] and .noEnqueue == true' "$own_path" >/dev/null
-                flow_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":61,"htmlUrl":"https://github.com/agency-agency/spec/issues/61","itemType":"issue","nodeId":"I-flow-61","itemAuthor":"flow-author","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"notification-61","commentId":"comment-61","triggerTimestamp":"2026-07-26T12:30:00Z","context":{"schemaVersion":2,"title":"Pooled review","body":"untrusted $(must-not-run)","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-61","author":"tally-bot","body":"/pooled-review"}}}'
-                flow="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --data-dir "$producer_data" --event "$flow_event")"
-                test "$(printf '%s' "$flow" | jq -r 'keys[0]')" = emitted
-                flow_path="$(printf '%s' "$flow" | jq -r '.emitted')"
-                flow_args="$(jq -r '.briefPath' "$flow_path")"
-                test -f "$flow_args"
-                jq -e \
-                  --arg script ${./examples/flows/pooled-review.js} \
-                  --arg catalog ${catalogFixture} \
-                  --arg args "$flow_args" '
-                    .source == "gh" and
-                    .noEnqueue == false and
-                    .argv[0:3] == ["tally", "flow", "run"] and
-                    .argv[3] == $script and
-                    .argv[4:7] == ["--args-from-brief", "--max-nodes", "1000"] and
-                    .briefPath == $args and
-                    (has("brief") | not) and
-                    .argv[7] == "--catalog" and
-                    .argv[8] == $catalog and
-                    ([.argv[] | contains("must-not-run")] | any | not)
-                  ' "$flow_path" >/dev/null
-                jq -e '. == {
-                  "subject": "https://github.com/agency-agency/spec/issues/61",
-                  "minimumValid": 2
-                }' "$flow_args" >/dev/null
-                test "$(dirname "$(dirname "$flow_args")")" = "$producer_data"
-                test ! -e "$producer_state/briefs"
-                flow_duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --data-dir "$producer_data" --event "$flow_event")"
-                test "$(printf '%s' "$flow_duplicate" | jq -r '.')" = duplicate
-                rejected_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-43","commentId":"comment-43","triggerTimestamp":"2026-07-20T12:31:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"/tally run"}}}'
-                rejected="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --data-dir "$producer_data" --event "$rejected_event")"
-                test "$(printf '%s' "$rejected" | jq -r '.filtered.reason')" = trigger-actor-not-allowed
-                effect="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
-                test "$(printf '%s' "$effect" | jq -r '.[0] | keys[0]')" = emitted
-                duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
-                test "$(printf '%s' "$duplicate" | jq -r '.[0]')" = duplicate
-                for probe in 1 2; do
-                  lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":false}')"
-                  test "$(printf '%s' "$lost" | jq -r '.transition')" = null
-                done
-                lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":false}')"
-                test "$(printf '%s' "$lost" | jq -r '.transition')" = lost
-                test "$(printf '%s' "$lost" | jq -r '.emitted | length')" = 1
-                for probe in 1 2; do
-                  returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":true}')"
-                  test "$(printf '%s' "$returned" | jq -r '.transition')" = null
-                done
-                returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":true}')"
-                test "$(printf '%s' "$returned" | jq -r '.transition')" = returned
-                test "$(printf '%s' "$returned" | jq -r '.emitted | length')" = 2
-                find "$producer_state/events" -maxdepth 1 -name '*.producer.json' -print0 \
-                  | xargs -0 jq -s 'map(select(.noEnqueue == true)) | length == 2' \
-                  | grep -Fx true >/dev/null
                 touch $out
               '';
         }

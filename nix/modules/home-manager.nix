@@ -62,29 +62,6 @@ let
       '';
     };
 
-  mkReachabilityProgram =
-    producer: pool:
-    pkgs.writeShellApplication {
-      name = "tally-producer-${producer}-probe";
-      runtimeInputs = [ pkgs.jq ];
-      text = ''
-        socket="''${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}/tally/tally.sock"
-        reachable=false
-        if pools="$(${
-          lib.escapeShellArgs [
-            "${cfg.package}/bin/tally"
-          ]
-        } --socket "$socket" query pools)"; then
-          if jq -e --arg pool ${lib.escapeShellArg pool} 'any(.pools[]; .pool == $pool)' \
-            <<<"$pools" >/dev/null; then
-            reachable=true
-          fi
-        fi
-        event="$(jq -cn --argjson reachable "$reachable" '{kind: "pool-reachability", reachable: $reachable}')"
-        exec ${lib.escapeShellArgs dispatchPrefix} --socket "$socket" ${lib.escapeShellArgs (dispatchSuffix producer)} --event "$event"
-      '';
-    };
-
   credentialServiceConfig =
     credentials:
     lib.optionalAttrs (credentials != { }) {
@@ -144,60 +121,6 @@ let
               "${unit}.service"
               "${unit}.timer"
             ];
-          }
-        else if producer.kind == "pool-reachability" then
-          let
-            program = mkReachabilityProgram name producer.probePool;
-          in
-          {
-            services = acc.services // {
-              ${unit} = commonUnit program // {
-                Service = commonService program // {
-                  Type = "simple";
-                  Restart = "always";
-                  RestartSec = "${toString producer.intervalSec}s";
-                };
-                Install.WantedBy = [ "default.target" ];
-              };
-            };
-            timers = acc.timers;
-            desired = acc.desired ++ [ "${unit}.service" ];
-          }
-        else if producer.kind == "build-effect" then
-          let
-            program = mkDispatchProgram name { kind = "build-effect"; };
-          in
-          {
-            services = acc.services // {
-              ${unit} = commonUnit program // {
-                Service = commonService program // {
-                  Type = "simple";
-                  Restart = "always";
-                  RestartSec = "5s";
-                };
-                Install.WantedBy = [ "default.target" ];
-              };
-            };
-            timers = acc.timers;
-            desired = acc.desired ++ [ "${unit}.service" ];
-          }
-        else if producer.kind == "gh" && producer.enable then
-          let
-            program = mkDispatchProgram name { kind = "gh"; };
-          in
-          {
-            services = acc.services // {
-              ${unit} = commonUnit program // {
-                Service = commonService program // {
-                  Type = "simple";
-                  Restart = "always";
-                  RestartSec = "${toString producer.pollIntervalSec}s";
-                };
-                Install.WantedBy = [ "default.target" ];
-              };
-            };
-            timers = acc.timers;
-            desired = acc.desired ++ [ "${unit}.service" ];
           }
         else if producer.kind == "events-dir" && !producer.selfDrain then
           # A registry entry that declares the contract without adding a second
@@ -346,7 +269,6 @@ let
   campaignPollProgram = pkgs.writeShellApplication {
     name = "tally-campaign-poll";
     runtimeInputs = [
-      pkgs.gh
       pkgs.git
       pkgs.nix
     ];
@@ -388,7 +310,7 @@ in
         ${cleanupProgram}/bin/tally-clean-removed-producers
       '';
     }
-    { services.tally = common.mkForgeNativeRuntimeConfig cfg; }
+    { services.tally = common.mkCampaignRuntimeConfig cfg; }
     (lib.mkIf (cfg.flows != { }) {
       services.tally.pools.build = common.buildPoolDefaults;
       services.tally.pools.flow = common.flowPoolDefaults;
@@ -579,7 +501,7 @@ in
 
         tally-campaign-poll = lib.mkIf cfg.campaignPoll.enable {
           Unit = {
-            Description = "reconcile armed forge-native tally campaigns";
+            Description = "reconcile locally armed tally campaigns";
             After = [
               "network-online.target"
               "tally-daemon.service"
@@ -589,9 +511,9 @@ in
           };
           Service = {
             Type = "oneshot";
-            # The scan holds the registry lock exclusively across its forge
-            # round-trips, so a wedged call would block interactive arm,
-            # disarm, and list until this fires.
+            # The scan holds the registry lock while reconciling durable Git
+            # state, so a wedged call would block interactive arm, disarm, and
+            # list until this fires.
             TimeoutStartSec = cfg.campaignPoll.timeout;
             ExecStart = "${campaignPollProgram}/bin/tally-campaign-poll";
             UMask = "0077";
@@ -630,7 +552,7 @@ in
           Install.WantedBy = [ "timers.target" ];
         };
         tally-campaign-poll = lib.mkIf cfg.campaignPoll.enable {
-          Unit.Description = "poll armed forge-native tally campaigns";
+          Unit.Description = "poll locally armed tally campaigns";
           Timer = {
             OnActiveSec = "15s";
             OnUnitActiveSec = cfg.campaignPoll.interval;

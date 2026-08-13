@@ -22,8 +22,6 @@ let
 
   priorityRanks = import ../lib/priority-ranks.nix;
 
-  ghLogin = import ../lib/gh-login.nix;
-
   internalAssertionsOption = mkOption {
     type = types.listOf types.raw;
     default = [ ];
@@ -691,8 +689,8 @@ let
         cwd = mkOption {
           type = types.nullOr types.str;
           default = null;
-          example = "/worktrees/\${gh.repoName}";
-          description = "Absolute job cwd; gh enqueue values may use documented origin placeholders.";
+          example = "/worktrees/project";
+          description = "Optional absolute working directory for the job.";
         };
         workspace = mkOption {
           type = types.nullOr mkWorkspaceMetadataType;
@@ -716,13 +714,12 @@ let
           type = types.raw;
           default = null;
           example = {
-            subject = "\${gh.url}";
+            subject = "local campaign task";
           };
           description = ''
             Optional structured JSON input. The producer materializes it in the
             daemon's content-addressed store outside argv; jobs receive its path
-            and identity as TALLY_BRIEF and TALLY_BRIEF_HASH. GitHub enqueue
-            values may use documented origin placeholders.
+            and identity as TALLY_BRIEF and TALLY_BRIEF_HASH.
           '';
         };
         pool = mkOption {
@@ -1049,479 +1046,8 @@ let
     } (_: _: [ ])
   );
 
-  ghSourceConstraintsType = types.submodule (
-    { config, name, ... }:
-    {
-      options = {
-        repo = mkOption {
-          type = types.nullOr types.str;
-          default = null;
-          example = "agency-agency/spec";
-          description = "Optional single owner/repository identity constraint.";
-        };
-        repositories = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "agency-agency/spec" ];
-          description = "Additional owner/repository identity constraints.";
-        };
-        owners = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "agency-agency" ];
-          description = "Repository-owner identity constraints.";
-        };
-        labels = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "agency:codex-ready" ];
-          description = "Labels all selected items must carry.";
-        };
-        state = mkOption {
-          type = types.nullOr (
-            types.enum [
-              "open"
-              "closed"
-            ]
-          );
-          default = null;
-          example = "open";
-          description = "Optional exact item state.";
-        };
-        assignee = mkOption {
-          type = types.nullOr types.str;
-          default = null;
-          example = "tally-bot";
-          description = "Optional required assignee.";
-        };
-        kinds = mkOption {
-          type = types.listOf (
-            types.enum [
-              "issue"
-              "pull-request"
-            ]
-          );
-          default = [ ];
-          example = [ "pull-request" ];
-          description = "Optional issue/pull-request kind filter.";
-        };
-        notificationReasons = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "mention" ];
-          description = "Allowed notification reasons for a notifications source.";
-        };
-        query = mkOption {
-          type = types.nullOr types.str;
-          default = null;
-          example = "draft:false";
-          description = "Optional additional GitHub search query fragment.";
-        };
-        itemAllowlist = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "https://github.com/agency-agency/spec/issues/21" ];
-          description = "Optional exact GitHub item URL allowlist for one-shot operation.";
-        };
-        _tallyAssertions = internalAssertionsOption;
-      };
-
-      config._tallyAssertions =
-        map
-          (field: {
-            assertion =
-              builtins.length config.${field} == builtins.length (unique config.${field})
-              && lib.all (value: value != "") config.${field};
-            message = "GitHub source ${name} ${field} must contain unique non-empty values";
-          })
-          [
-            "repositories"
-            "owners"
-            "labels"
-            "kinds"
-            "notificationReasons"
-            "itemAllowlist"
-          ];
-    }
-  );
-
-  ghSourceType = types.submodule (
-    { config, name, ... }:
-    {
-      options = {
-        notifications = mkOption {
-          type = types.nullOr ghSourceConstraintsType;
-          default = null;
-          example.repo = "agency-agency/spec";
-          description = "Scoped GitHub notifications intake.";
-        };
-        search = mkOption {
-          type = types.nullOr ghSourceConstraintsType;
-          default = null;
-          example = {
-            repo = "agency-agency/spec";
-            labels = [ "agency:codex-ready" ];
-            state = "open";
-          };
-          description = "Scoped GitHub issue-search intake.";
-        };
-        _tallyAssertions = internalAssertionsOption;
-      };
-
-      config._tallyAssertions = flatten [
-        {
-          assertion = (config.notifications == null) != (config.search == null);
-          message = "GitHub source ${name} requires exactly one of notifications or search";
-        }
-        {
-          assertion = config.notifications == null || config.notifications.query == null;
-          message = "GitHub notifications source ${name} cannot carry a search query";
-        }
-        {
-          assertion = config.search == null || config.search.notificationReasons == [ ];
-          message = "GitHub search source ${name} cannot carry notificationReasons";
-        }
-        (if config.notifications == null then [ ] else config.notifications._tallyAssertions)
-        (if config.search == null then [ ] else config.search._tallyAssertions)
-      ];
-    }
-  );
-
-  ghTriggersType = types.submodule (
-    { config, ... }:
-    {
-      options = {
-        commandComments = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "/tally run" ];
-          description = "Exact explicit slash-command comment grammar.";
-        };
-        mentions = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "@your-login run" ];
-          description = ''
-            Exact explicit mention-command grammar. Matched literally, but the
-            comment that carries it at-mentions whoever it names on GitHub, so
-            name an account that belongs to this deployment.
-          '';
-        };
-        assignments = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "tally-bot" ];
-          description = "Assignee values that trigger intake.";
-        };
-        labels = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "tally:run" ];
-          description = "Label values that trigger intake.";
-        };
-        _tallyAssertions = internalAssertionsOption;
-      };
-
-      config._tallyAssertions =
-        map
-          (field: {
-            assertion =
-              builtins.length config.${field} == builtins.length (unique config.${field})
-              && lib.all (value: value != "") config.${field};
-            message = "GitHub triggers.${field} must contain unique non-empty values";
-          })
-          [
-            "commandComments"
-            "mentions"
-            "assignments"
-            "labels"
-          ];
-    }
-  );
-
-  ghProducerType = types.submodule (
-    mkProducerModule "gh"
-      {
-        enable = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Generate and run the GitHub polling producer.";
-        };
-        sources = mkOption {
-          type = types.listOf ghSourceType;
-          default = [ ];
-          example = [
-            {
-              search = {
-                repo = "agency-agency/spec";
-                labels = [ "agency:codex-ready" ];
-                state = "open";
-              };
-            }
-          ];
-          description = "Explicit, identity-scoped GitHub intake sources.";
-        };
-        triggers = mkOption {
-          type = ghTriggersType;
-          default = { };
-          example.commandComments = [ "/tally run" ];
-          description = "Explicit GitHub comment, mention, assignment, and label triggers.";
-        };
-        actorExclude = mkOption {
-          type = types.str;
-          default = "self";
-          example = "tally-bot";
-          description = "Literal trigger actor refused by the GitHub intake narrower.";
-        };
-        allowSelfTriggered = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Explicitly allow a trigger whose actor is the authenticated GitHub identity.";
-        };
-        allowedActors = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "trusted-maintainer" ];
-          description = "Optional external trigger-actor allowlist; authenticated self triggers are governed separately by allowSelfTriggered.";
-        };
-        pollIntervalSec = mkOption {
-          type = types.ints.positive;
-          default = 60;
-          example = 120;
-          description = "GitHub polling cadence.";
-        };
-        postReceipt = mkOption {
-          type = types.bool;
-          default = true;
-          example = false;
-          description = "Post one sticky acknowledgement for an accepted or filtered trigger; re-observing a recorded trigger stays producer-internal and is never published.";
-        };
-        postEvidence = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Post an idempotent evidence comment after a passing or reused verdict.";
-        };
-        postFailureEvidence = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Explicitly post one idempotent evidence comment for each failed attempt; disabled by default because failure metadata originates in private execution state.";
-        };
-        postFailureStderr = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Include a conservatively redacted, bounded stderr tail in explicitly enabled failure evidence; requires postFailureEvidence.";
-        };
-        postGateSummary = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Post the declared gate summary and derived acceptance fact.";
-        };
-        requestReview = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Request human review while semantic acceptance remains pending or rejected. Requires a non-empty reviewers list.";
-        };
-        reviewers = mkOption {
-          type = types.listOf types.str;
-          default = [ ];
-          example = [ "octocat" ];
-          description = "GitHub logins to request review from. A pull request receives a real review request; an issue receives one fresh comment mentioning them.";
-        };
-        closeOnAcceptance = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Close only after the explicit acceptance policy derives accepted.";
-        };
-        neverMutate = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Absolute policy override that disables every GitHub acknowledgement, comment, review request, and close.";
-        };
-        closeOnPass = mkOption {
-          type = types.bool;
-          default = false;
-          example = true;
-          description = "Close the GitHub item after posting evidence for a passing or reused verdict.";
-        };
-        enqueue = mkOption {
-          type = mkEnqueueType;
-          default = { };
-          example = {
-            argv = [ "handle-gh-item" ];
-            pool = "worker-build";
-          };
-          description = "GitHub item enqueue payload.";
-        };
-      }
-      (
-        config: name: [
-          {
-            assertion = !config.enable || config.sources != [ ];
-            message = "enabled gh producer ${name} requires at least one source";
-          }
-          {
-            assertion =
-              builtins.length (map builtins.toJSON config.sources)
-              == builtins.length (unique (map builtins.toJSON config.sources));
-            message = "gh producer ${name} sources must not repeat an identical constraint set";
-          }
-          {
-            assertion = config.actorExclude != "";
-            message = "gh producer ${name} actorExclude must be non-empty";
-          }
-          {
-            assertion =
-              builtins.length config.allowedActors == builtins.length (unique config.allowedActors)
-              && lib.all (actor: actor != "") config.allowedActors;
-            message = "gh producer ${name} allowedActors must contain unique non-empty actors";
-          }
-          {
-            assertion = !config.closeOnPass || config.postEvidence;
-            message = "gh producer ${name} closeOnPass=true requires postEvidence=true";
-          }
-          {
-            assertion = !config.requestReview || config.reviewers != [ ];
-            message = "gh producer ${name} requestReview=true requires a non-empty reviewers list";
-          }
-          {
-            # The same grammar the daemon enforces at config load, length bound
-            # included. A login this accepted but the daemon rejected deployed
-            # green and then killed the daemon it was deployed for.
-            assertion =
-              builtins.length config.reviewers == builtins.length (unique config.reviewers)
-              && lib.all ghLogin.isValid config.reviewers;
-            message = "gh producer ${name} reviewers must be unique GitHub logins";
-          }
-          {
-            assertion = !config.postFailureStderr || config.postFailureEvidence;
-            message = "gh producer ${name} postFailureStderr=true requires postFailureEvidence=true";
-          }
-          {
-            assertion =
-              !(config.postGateSummary || config.closeOnAcceptance) || config.enqueue.gateManifest != null;
-            message = "gh producer ${name} postGateSummary/closeOnAcceptance requires enqueue.gateManifest";
-          }
-          (map (source: source._tallyAssertions) config.sources)
-          config.triggers._tallyAssertions
-          config.enqueue._tallyAssertions
-        ]
-      )
-  );
-
-  buildEffectProducerType = types.submodule (
-    mkProducerModule "build-effect" {
-      watch = mkOption {
-        type = types.enum [
-          "gc-roots-dir"
-          "jsonl"
-          "post-build-hook"
-        ];
-        default = "gc-roots-dir";
-        example = "jsonl";
-        description = "Bounded store-path observation surface.";
-      };
-      path = mkOption {
-        type = types.externalPath;
-        default = "/var/empty/tally-build-effects";
-        example = "/var/lib/tally/build-effects.jsonl";
-        description = "Absolute observation path; tally never invokes nix build.";
-      };
-      onKey = mkOption {
-        type = mkEnqueueType;
-        default = { };
-        example = {
-          argv = [ "consume-store-path" ];
-          pool = "worker-build";
-        };
-        description = "Payload emitted once per distinct observed store path.";
-      };
-    } (config: _: [ config.onKey._tallyAssertions ])
-  );
-
-  poolReachabilityProducerType = types.submodule (
-    mkProducerModule "pool-reachability"
-      {
-        probePool = mkOption {
-          type = types.str;
-          default = "";
-          example = "worker-gpu";
-          description = "Configured pool whose local availability is probed.";
-        };
-        intervalSec = mkOption {
-          type = types.ints.positive;
-          default = 30;
-          example = 15;
-          description = "Reachability probe cadence.";
-        };
-        hysteresis = mkOption {
-          type = types.ints.positive;
-          default = 3;
-          example = 5;
-          description = "Consecutive observations required before a transition.";
-        };
-        onLost = mkOption {
-          type = types.nullOr mkEnqueueType;
-          default = null;
-          example = {
-            argv = [ "record-pool-loss" ];
-            pool = "controller";
-          };
-          description = "Optional fresh enqueue on confirmed loss.";
-        };
-        onReturn = mkOption {
-          type = types.nullOr mkEnqueueType;
-          default = null;
-          example = {
-            argv = [ "record-pool-return" ];
-            pool = "controller";
-          };
-          description = "Optional fresh enqueue on confirmed return.";
-        };
-        onReturnAttest = mkOption {
-          type = types.nullOr mkEnqueueType;
-          default = null;
-          example = {
-            argv = [ "assess-return" ];
-            pool = "controller";
-            noEnqueue = true;
-          };
-          description = "Optional advisory return assessor; noEnqueue must be true.";
-        };
-      }
-      (
-        config: name:
-        flatten [
-          {
-            assertion = config.probePool != "";
-            message = "pool-reachability producer ${name} requires probePool";
-          }
-          {
-            assertion = config.onReturnAttest == null || config.onReturnAttest.noEnqueue;
-            message = "pool-reachability producer ${name} onReturnAttest requires noEnqueue = true";
-          }
-          (map (field: if config.${field} == null then [ ] else config.${field}._tallyAssertions) [
-            "onLost"
-            "onReturn"
-            "onReturnAttest"
-          ])
-        ]
-      )
-  );
-
   producerKinds = [
     "calendar"
-    "build-effect"
-    "pool-reachability"
-    "gh"
     "events-dir"
   ];
 
@@ -1561,9 +1087,6 @@ let
 
   mkProducerType = types.oneOf [
     (producerTypeFor "calendar" calendarProducerType)
-    (producerTypeFor "build-effect" buildEffectProducerType)
-    (producerTypeFor "pool-reachability" poolReachabilityProducerType)
-    (producerTypeFor "gh" ghProducerType)
     (producerTypeFor "events-dir" eventsDirProducerType)
     invalidProducerType
   ];
@@ -1574,9 +1097,6 @@ let
   # present in the generated reference.
   producerTypesForDocumentation = {
     calendar = calendarProducerType;
-    "build-effect" = buildEffectProducerType;
-    "pool-reachability" = poolReachabilityProducerType;
-    gh = ghProducerType;
     "events-dir" = eventsDirProducerType;
   };
 
@@ -2149,27 +1669,6 @@ let
                 file first.
               '';
             };
-            producerMarkerHorizon = mkOption {
-              type = types.str;
-              default = "180d";
-              example = "90d";
-              description = ''
-                Systemd timespan after which the per-dispatch marker files under
-                producers/gh-triggers, producers/gh-completed,
-                producers/gh-comments, producers/gh-storage-warnings, and
-                producers/gh-orphaned expire. Each of the first four makes one
-                forge mutation idempotent; collecting one costs at most a
-                re-publication that the marker scan on the thread already
-                collapses, so the envelope matches the ingress audit trail
-                rather than the shorter archive one. A gh-orphaned record
-                guards nothing — it is the durable statement that one
-                projection can never be applied, read only by the startup
-                report and by "tally producer orphaned" — and it retires with
-                the acknowledged event it describes, so keep this at or above
-                eventsDoneHorizon unless a shorter report is worth losing the
-                first-seen date.
-              '';
-            };
             lifecycleHorizon = mkOption {
               type = types.str;
               default = "30d";
@@ -2334,8 +1833,8 @@ let
           };
         };
         description = ''
-          Registry of calendar, events-directory, GitHub, build-effect, and
-          pool-reachability producers. Every entry requires an explicit kind.
+          Registry of calendar and events-directory producers. Every entry
+          requires an explicit kind.
           Only the Home Manager module renders their managed user units.
         '';
       };
@@ -2346,13 +1845,12 @@ let
               type = types.bool;
               default = true;
               description = ''
-                Install the timer that reconciles locally armed forge-native
-                campaigns. A pass that advanced admits its own successor
-                through the events directory, so this timer is the recovery
-                path for a lost continuation event and the way an outside
-                change to the issue graph is noticed — not the ordinary way a
-                campaign reaches its next pass. Disabling it leaves a campaign
-                that dropped its continuation with no automatic way back.
+                Install the timer that reconciles locally armed campaigns. A
+                pass that advanced admits its own successor through the events
+                directory, so this timer is the recovery path for a lost
+                continuation event rather than the ordinary way a campaign
+                reaches its next pass. Disabling it leaves a campaign that
+                dropped its continuation with no automatic way back.
               '';
             };
             interval = mkOption {
@@ -2360,14 +1858,8 @@ let
               default = "60s";
               example = "5min";
               description = ''
-                Systemd timespan between poll scans. A scan that finds nothing
-                moved costs three REST reads per armed campaign — the
-                authenticated actor, the master issue, and its sub-issue list —
-                and no GraphQL at all: it compares the master and sub-issue
-                timestamps that fetch already returned before deciding whether
-                to run the bounded steering walk or the paginated master-comment
-                read. Short intervals are affordable on that budget; raise it to
-                reduce forge API traffic further.
+                Systemd timespan between local registry scans. A scan that finds
+                no dispatchable work returns without admitting a successor.
               '';
             };
             timeout = mkOption {
@@ -2375,18 +1867,17 @@ let
               default = "90s";
               example = "5min";
               description = ''
-                Hard bound on one scan. The scan holds the registry lock
-                exclusively across its forge round-trips, which blocks
-                interactive `tally campaign arm`, `disarm`, and `list`; this
-                timeout caps how long a wedged forge call can hold it.
+                Hard bound on one scan. The scan holds the registry lock while
+                reading durable Git state, which blocks interactive `tally
+                campaign arm`, `disarm`, and `list` until it returns.
               '';
             };
           };
         };
         default = { };
         description = ''
-          Scheduling for the forge-native campaign poll. Only the Home Manager
-          module renders the unit.
+          Scheduling for the local campaign recovery poll rendered by both
+          service modules.
         '';
       };
       flows = mkOption {
@@ -2504,37 +1995,6 @@ let
       credentials = mapAttrs (_: toString) enqueue.credentials;
     };
 
-  renderGhSourceConstraints = constraints: {
-    inherit (constraints)
-      repo
-      repositories
-      owners
-      labels
-      state
-      assignee
-      kinds
-      notificationReasons
-      query
-      itemAllowlist
-      ;
-  };
-
-  renderGhSource =
-    source:
-    if source.search != null then
-      { search = renderGhSourceConstraints source.search; }
-    else
-      { notifications = renderGhSourceConstraints source.notifications; };
-
-  renderGhTriggers = triggers: {
-    inherit (triggers)
-      commandComments
-      mentions
-      assignments
-      labels
-      ;
-  };
-
   renderProducer =
     _: producer:
     (
@@ -2554,43 +2014,8 @@ let
           {
             inherit (producer) pollIntervalSec;
           }
-        else if producer.kind == "gh" then
-          {
-            inherit (producer)
-              enable
-              actorExclude
-              allowSelfTriggered
-              allowedActors
-              pollIntervalSec
-              postReceipt
-              postEvidence
-              postFailureEvidence
-              postFailureStderr
-              postGateSummary
-              requestReview
-              reviewers
-              closeOnAcceptance
-              neverMutate
-              closeOnPass
-              ;
-            sources = map renderGhSource producer.sources;
-            triggers = renderGhTriggers producer.triggers;
-            enqueue = renderEnqueue producer.enqueue;
-          }
-        else if producer.kind == "build-effect" then
-          {
-            inherit (producer) watch;
-            path = toString producer.path;
-            onKey = renderEnqueue producer.onKey;
-          }
         else
-          {
-            inherit (producer) probePool intervalSec hysteresis;
-            onLost = if producer.onLost == null then null else renderEnqueue producer.onLost;
-            onReturn = if producer.onReturn == null then null else renderEnqueue producer.onReturn;
-            onReturnAttest =
-              if producer.onReturnAttest == null then null else renderEnqueue producer.onReturnAttest;
-          }
+          { }
       )
     );
 
@@ -2724,7 +2149,6 @@ let
         eventsDoneHorizon
         eventsRejectedHorizon
         eventsRejectedMaxCount
-        producerMarkerHorizon
         lifecycleHorizon
         lifecycleMaxBytes
         ;
@@ -2815,7 +2239,7 @@ let
   # `tally campaign arm` reads policy from the committed worklist, but still
   # validates that the host has enough generic execution capacity. Keep these
   # defaults independent of the retired per-campaign module declarations.
-  mkForgeNativeRuntimeConfig = cfg: {
+  mkCampaignRuntimeConfig = cfg: {
     enqueue.fanoutCap = lib.mkDefault 64;
     pools = {
       flow = flowPoolDefaults;
@@ -2848,20 +2272,7 @@ let
     };
   };
 
-  producerEnqueues =
-    producer:
-    if producer.kind == "calendar" || producer.kind == "gh" then
-      [ producer.enqueue ]
-    else if producer.kind == "build-effect" then
-      [ producer.onKey ]
-    else if producer.kind == "pool-reachability" then
-      builtins.filter (value: value != null) [
-        producer.onLost
-        producer.onReturn
-        producer.onReturnAttest
-      ]
-    else
-      [ ];
+  producerEnqueues = producer: if producer.kind == "calendar" then [ producer.enqueue ] else [ ];
 
   # One sweep entry point, so both module layers must spell the same argv.
   mkRetentionArgv = cfg: [
@@ -2882,8 +2293,6 @@ let
     cfg.retention.eventsRejectedHorizon
     "--events-rejected-max-count"
     (toString cfg.retention.eventsRejectedMaxCount)
-    "--producer-marker-horizon"
-    cfg.retention.producerMarkerHorizon
   ];
 
   mkAssertions =
@@ -2908,10 +2317,6 @@ let
       {
         assertion = cfg.retention.eventsRejectedHorizon != "";
         message = "tally retention eventsRejectedHorizon must be non-empty";
-      }
-      {
-        assertion = cfg.retention.producerMarkerHorizon != "";
-        message = "tally retention producerMarkerHorizon must be non-empty";
       }
       {
         assertion = cfg.retention.lifecycleHorizon != "";
@@ -2952,15 +2357,6 @@ let
           message = "tally producer name ${name} is not a safe unit/file component";
         }
         producer._tallyAssertions
-        (
-          if producer.kind == "pool-reachability" then
-            {
-              assertion = builtins.hasAttr producer.probePool cfg.pools;
-              message = "tally producer ${name} references unknown probePool ${producer.probePool}";
-            }
-          else
-            [ ]
-        )
         (map (
           enqueue:
           (map (pool: {
@@ -3025,25 +2421,6 @@ let
           }
         ]
       ) cfg.flows)
-      (
-        let
-          owners = mapAttrsToList (
-            name: producer:
-            if producer.kind == "pool-reachability" then
-              {
-                inherit name;
-                pool = producer.probePool;
-              }
-            else
-              null
-          ) cfg.producers;
-          activeOwners = builtins.filter (owner: owner != null) owners;
-        in
-        map (pool: {
-          assertion = builtins.length (builtins.filter (owner: owner.pool == pool) activeOwners) <= 1;
-          message = "more than one pool-reachability producer owns pool ${pool}";
-        }) (unique (map (owner: owner.pool) activeOwners))
-      )
     ];
 
   mkCheckedConfig =
@@ -3165,7 +2542,7 @@ in
     meterEventPath
     flowPoolDefaults
     mkAssertions
-    mkForgeNativeRuntimeConfig
+    mkCampaignRuntimeConfig
     mkCheckedConfig
     mkFlowProducers
     mkInstalledPackage
