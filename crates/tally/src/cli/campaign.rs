@@ -52,11 +52,18 @@ struct WorklistTask {
     kind: String,
     title: String,
     body: String,
+    ownership_lint_inputs: Vec<OwnershipLintInput>,
     issue: Option<u64>,
     dependencies: Vec<String>,
     conflict_domains: Option<Vec<String>>,
     argv: Option<Vec<String>>,
     runtime_max_sec: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct OwnershipLintInput {
+    context: String,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +115,7 @@ struct CheckpointBrief<'a> {
 #[derive(Debug, Clone)]
 struct CampaignGraph {
     canonical: CanonicalCampaignGraphV1,
+    ownership_preflight_warnings: Vec<String>,
 }
 
 const fn default_worklist_max_tasks() -> usize {
@@ -2169,6 +2177,7 @@ fn local_campaign_graph(validated: ValidatedWorklist) -> Result<CampaignGraph> {
             "validated worklist task content does not match its manifest references",
         ));
     }
+    let ownership_preflight_warnings = ownership_preflight_warnings(&validated.tasks);
     let task_content = validated
         .tasks
         .iter()
@@ -2180,7 +2189,10 @@ fn local_campaign_graph(validated: ValidatedWorklist) -> Result<CampaignGraph> {
         })
         .collect::<Vec<_>>();
     let canonical = CanonicalCampaignGraphV1::new(validated.manifest, task_content)?;
-    Ok(CampaignGraph { canonical })
+    Ok(CampaignGraph {
+        canonical,
+        ownership_preflight_warnings,
+    })
 }
 
 fn approved_graph_directory(state_dir: &Path, registration_id: &str) -> PathBuf {
@@ -2400,6 +2412,162 @@ fn worker_findings_warning(agent: &CampaignAgent, adapter: &AdapterConfig) -> Op
             agent.adapter
         )
     })
+}
+
+fn trim_path_location_suffix(mut token: &str) -> &str {
+    loop {
+        let Some((path, suffix)) = token.rsplit_once(':') else {
+            return token;
+        };
+        if suffix.is_empty()
+            || !suffix
+                .chars()
+                .all(|character| character.is_ascii_digit() || matches!(character, '-' | '~' | '–'))
+        {
+            return token;
+        }
+        token = path;
+    }
+}
+
+fn normalized_path_shaped_token(token: &str) -> Option<String> {
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '`' | '\''
+                | '"'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | '!'
+                | '?'
+                | ':'
+        )
+    });
+    let token = token.trim_end_matches(['.', '—']);
+    let token = trim_path_location_suffix(token);
+    let token = token.rfind("#L").map_or(token, |index| {
+        let suffix = &token[index + 2..];
+        if !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|character| character.is_ascii_digit() || matches!(character, '-' | 'L'))
+        {
+            &token[..index]
+        } else {
+            token
+        }
+    });
+    let token = token.trim_start_matches("./");
+
+    if token.is_empty()
+        || token.contains("://")
+        || token.contains("//")
+        || token == "."
+        || token.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let path = Path::new(token);
+    let has_slash = token.contains('/');
+    let has_extension = path.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy();
+        name.rsplit_once('.').is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                && extension
+                    .chars()
+                    .any(|character| character.is_ascii_alphabetic())
+        })
+    });
+    (has_slash || has_extension).then(|| token.to_owned())
+}
+
+fn path_shaped_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '`' | '\''
+                    | '"'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | '|'
+                    | '&'
+                    | '='
+            )
+    })
+    .filter_map(normalized_path_shaped_token)
+    .collect()
+}
+
+fn path_is_inside_conflict_domain(path: &str, domain: &str) -> bool {
+    !Path::new(path).is_absolute()
+        && !Path::new(path).components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        && (path == domain
+            || path
+                .strip_prefix(domain)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+fn ownership_preflight_warnings(tasks: &[WorklistTask]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for task in tasks {
+        if task.kind != "implementation" {
+            continue;
+        }
+        let Some(domains) = task.conflict_domains.as_deref() else {
+            // An omitted serial-task boundary is inferred after execution. It
+            // gives this textual preflight no declared allowlist to compare.
+            continue;
+        };
+        let mut outside = BTreeMap::<String, BTreeSet<String>>::new();
+        for input in &task.ownership_lint_inputs {
+            for path in path_shaped_tokens(&input.text) {
+                if !domains
+                    .iter()
+                    .any(|domain| path_is_inside_conflict_domain(&path, domain))
+                {
+                    outside
+                        .entry(path)
+                        .or_default()
+                        .insert(input.context.clone());
+                }
+            }
+        }
+        for (path, contexts) in outside {
+            warnings.push(format!(
+                "implementation task {:?} names path-shaped token {path:?} in {} outside declared conflictDomains {:?}; arming continues",
+                task.id,
+                contexts.into_iter().collect::<Vec<_>>().join(" and "),
+                domains,
+            ));
+        }
+    }
+    warnings
 }
 
 const CACHE_USING_TOOLS: [&str; 6] = ["nix", "go", "cargo", "npm", "pip", "uv"];
@@ -3213,6 +3381,9 @@ async fn run_campaign_arm(
     };
     let (pardon_plan, mut arm_warnings) =
         amendment_pardon_plan(prior_graph.as_ref(), &graph.canonical, &escalated);
+    // Arm-time conflictDomains warnings are advisory: they share the receipt
+    // surface with host warnings but never participate in graph admission.
+    arm_warnings.extend(graph.ownership_preflight_warnings.iter().cloned());
     let workspace_root = args.workspace_root.unwrap_or_else(|| {
         state_dir
             .join("campaigns")
@@ -3947,6 +4118,28 @@ fn worklist_tasks(document: &Value, campaign_name: &str) -> Result<Vec<WorklistT
             runtime_max_sec: runtime_max_sec.expect("checkpoint runtime was validated above"),
             dependencies: &dependencies,
         });
+        let mut ownership_lint_inputs = Vec::new();
+        if kind == "implementation" {
+            if let Some(goal) = item.get("goal").and_then(Value::as_str) {
+                ownership_lint_inputs.push(OwnershipLintInput {
+                    context: "goal".to_owned(),
+                    text: goal.to_owned(),
+                });
+            }
+            if let Some(criteria) = item.get("acceptanceCriteria").and_then(Value::as_array) {
+                for (criterion_index, criterion) in criteria.iter().enumerate() {
+                    let Some(arguments) = criterion.get("argv").and_then(Value::as_array) else {
+                        continue;
+                    };
+                    for argument in arguments.iter().filter_map(Value::as_str) {
+                        ownership_lint_inputs.push(OwnershipLintInput {
+                            context: format!("acceptanceCriteria[{criterion_index}].argv"),
+                            text: argument.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
         let body = render_worklist_task_body(item, &context, checkpoint)?;
         if body.chars().count() > 64_000 {
             return Err(invalid(format!(
@@ -3958,6 +4151,7 @@ fn worklist_tasks(document: &Value, campaign_name: &str) -> Result<Vec<WorklistT
             kind,
             title,
             body,
+            ownership_lint_inputs,
             issue,
             dependencies,
             conflict_domains,
@@ -4558,6 +4752,7 @@ mod tests {
                 }],
             )
             .unwrap(),
+            ownership_preflight_warnings: Vec::new(),
         }
     }
 
@@ -4802,13 +4997,13 @@ mod tests {
                     "id": "foundation",
                     "kind": "implementation",
                     "title": "Foundation",
-                    "goal": "Build the local foundation.",
+                    "goal": "Build the local foundation in src/lib.rs.",
                     "deliveredBehaviors": ["The local foundation exists"],
                     "readFirst": {"specSections": ["Foundation"], "styleReferences": []},
                     "acceptanceCriteria": [{
                         "id": "foundation-green",
                         "description": "The foundation test passes.",
-                        "argv": ["true"]
+                        "argv": ["test", "-f", "src/lib.rs"]
                     }],
                     "dependencies": [],
                     "conflictDomains": ["src"]
@@ -4817,13 +5012,13 @@ mod tests {
                     "id": "finish",
                     "kind": "implementation",
                     "title": "Finish",
-                    "goal": "Finish from the admitted local brief.",
+                    "goal": "Finish tests/finish.rs while changing src/lib.rs:12.",
                     "deliveredBehaviors": ["The campaign is finished"],
                     "readFirst": {"specSections": ["Finish"], "styleReferences": []},
                     "acceptanceCriteria": [{
                         "id": "finish-green",
                         "description": "The finish test passes.",
-                        "argv": ["true"]
+                        "argv": ["bash", "-lc", "test -f tests/finish.rs && test -f crates/tally/src/main.rs"]
                     }],
                     "dependencies": ["foundation"],
                     "conflictDomains": ["tests"]
@@ -4873,8 +5068,30 @@ mod tests {
         let graph = local_campaign_graph(validated).unwrap();
         assert!(graph.canonical.tasks[0]
             .body
-            .contains("Build the local foundation."));
+            .contains("Build the local foundation in src/lib.rs."));
         assert_eq!(graph.canonical.tasks[1].number, 2);
+        assert_eq!(graph.ownership_preflight_warnings.len(), 2);
+        assert!(graph.ownership_preflight_warnings.iter().any(|warning| {
+            warning.contains("task \"finish\"")
+                && warning.contains("\"src/lib.rs\"")
+                && warning.contains("in goal")
+                && warning.contains("conflictDomains [\"tests\"]")
+        }));
+        assert!(graph.ownership_preflight_warnings.iter().any(|warning| {
+            warning.contains("task \"finish\"")
+                && warning.contains("\"crates/tally/src/main.rs\"")
+                && warning.contains("acceptanceCriteria[0].argv")
+                && warning.contains("arming continues")
+        }));
+        let receipt = arm_receipt(
+            &json!({"status": "armed"}),
+            &[],
+            &graph.ownership_preflight_warnings,
+        );
+        assert_eq!(
+            receipt["warnings"],
+            json!(graph.ownership_preflight_warnings)
+        );
 
         let mut forge_field = document.clone();
         forge_field["campaign"]["label"] = json!("must-not-be-accepted");
