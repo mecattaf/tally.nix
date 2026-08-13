@@ -220,8 +220,6 @@ fn remote_completion(request: &ExecutionRequest, stdout: &[u8]) -> RemoteComplet
         })),
         semantic_completion: None,
         result_revision: None,
-        authorship: None,
-        authorship_sessions: None,
         host_id: Some("worker.example".to_owned()),
     }
 }

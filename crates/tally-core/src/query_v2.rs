@@ -26,8 +26,8 @@ use crate::usage_rollup::{
     roll_up, AttestationEvidence, ExpectedUsageRoster, ExpectedUsageTask, UsageRollup,
 };
 use crate::witness::{
-    counts_toward_canonical_gpu_seconds, AttestationRecord, AuthorshipSession, AuthorshipStatus,
-    Charge, LaborClass, TerminalError, Verdict, VerifyReport, WitnessRecord,
+    counts_toward_canonical_gpu_seconds, AttestationRecord, Charge, LaborClass, TerminalError,
+    Verdict, VerifyReport, WitnessRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,28 +248,6 @@ pub struct TerminationProjection {
     pub provenance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AuthorshipProjection {
-    pub status: AuthorshipStatus,
-    pub provider: String,
-    pub provider_version: String,
-    pub result_revision: String,
-    pub note_ref: String,
-    pub notes_ref_target: Option<String>,
-    pub note_content_sha256: Option<String>,
-    pub reason: Option<String>,
-    pub identity_mismatch: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<SourcedValue<WorkspaceMetadata>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tally_session: Option<SourcedValue<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tally_model: Option<SourcedValue<String>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub git_ai_sessions: Vec<SourcedValue<AuthorshipSession>>,
-}
-
 /// How a durable row came to exist, in the daemon's own enqueue vocabulary.
 ///
 /// A flow node's replay is only verifiable if the operator can read the answer
@@ -375,8 +353,6 @@ pub struct JobSummary {
     pub artifact_content_hash: Option<String>,
     pub exit_code: Option<i32>,
     pub termination: Option<TerminationProjection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorship: Option<AuthorshipProjection>,
     pub gpu_seconds: Option<f64>,
     pub charge: Option<Charge>,
     pub canonical_gpu_seconds: Option<f64>,
@@ -2755,8 +2731,6 @@ pub struct ProofView {
     pub status: ProofStatus,
     pub witness_expected: bool,
     pub witness_record: Option<WitnessRecord>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub authorship: Option<AuthorshipProjection>,
     pub evidence: ProofEvidence,
     pub advisory_attestations: Vec<AttestationReference>,
     pub ledger: ProofLedgerStatus,
@@ -2871,7 +2845,6 @@ pub fn query_proof(
             provenance: "attestation-ledger".to_owned(),
         })
         .collect();
-    let authorship = authorship_projection(selected_witness.as_ref(), detail);
     Ok(ProofView {
         schema_version: QUERY_SCHEMA_VERSION,
         protocol_version: QUERY_PROTOCOL_VERSION,
@@ -2881,7 +2854,6 @@ pub fn query_proof(
         status,
         witness_expected,
         witness_record: selected_witness,
-        authorship,
         evidence: ProofEvidence {
             specs: detail.map_or_else(Vec::new, |detail| detail.evidence_specs.clone()),
             observations,
@@ -3238,7 +3210,6 @@ fn build_summary(
             authority: FactAuthority::CanonicalWitnessFact,
             provenance: "witness-ledger".to_owned(),
         }),
-        authorship: authorship_projection(latest_witness, detail),
         gpu_seconds: latest_witness.and_then(|record| record.gpu_seconds),
         charge: latest_witness.and_then(|record| record.charge.clone()),
         canonical_gpu_seconds: latest_witness.and_then(|record| {
@@ -3273,85 +3244,6 @@ fn context_window_sourced_value(window: ContextWindow) -> SourcedValue<u64> {
             "adapter-config",
         ),
     }
-}
-
-fn authorship_projection(
-    witness: Option<&WitnessRecord>,
-    detail: Option<&RowDetailFact>,
-) -> Option<AuthorshipProjection> {
-    let witness = witness?;
-    let authorship = witness.authorship.as_ref()?;
-    let result_revision = witness.result_revision.clone()?;
-    let matching_detail = detail.filter(|detail| {
-        detail.attempt == witness.attempt && detail.lease_epoch == witness.lease_epoch
-    });
-    let workspace = matching_detail
-        .and_then(|detail| detail.workspace.clone())
-        .map(|value| {
-            SourcedValue::new(
-                value,
-                FactAuthority::DurableAdmissionFact,
-                "durable-task-admission",
-            )
-        });
-    let tally_session = matching_detail
-        .and_then(|detail| detail.session_ref.clone())
-        .map(|value| {
-            SourcedValue::new(
-                value,
-                FactAuthority::AdvisoryProviderCapture,
-                "adapter-scrape",
-            )
-        });
-    let tally_model = matching_detail.and_then(|detail| {
-        detail
-            .requested_model
-            .clone()
-            .map(|value| {
-                SourcedValue::new(
-                    value,
-                    FactAuthority::DurableAdmissionFact,
-                    "adapter-options",
-                )
-            })
-            .or_else(|| {
-                detail.observed_model.clone().map(|value| {
-                    SourcedValue::new(
-                        value,
-                        FactAuthority::AdvisoryProviderCapture,
-                        "adapter-scrape",
-                    )
-                })
-            })
-    });
-    let git_ai_sessions = witness
-        .authorship_sessions
-        .iter()
-        .flatten()
-        .cloned()
-        .map(|value| {
-            SourcedValue::new(
-                value,
-                FactAuthority::CanonicalWitnessFact,
-                "witness-ledger:git-ai-note",
-            )
-        })
-        .collect();
-    Some(AuthorshipProjection {
-        status: authorship.status,
-        provider: authorship.provider.clone(),
-        provider_version: authorship.provider_version.clone(),
-        result_revision,
-        note_ref: authorship.note_ref.clone(),
-        notes_ref_target: authorship.notes_ref_target.clone(),
-        note_content_sha256: authorship.note_content_sha256.clone(),
-        reason: authorship.reason.clone(),
-        identity_mismatch: authorship.status == AuthorshipStatus::Mismatch,
-        workspace,
-        tally_session,
-        tally_model,
-        git_ai_sessions,
-    })
 }
 
 fn child_index(details: &[RowDetailFact]) -> BTreeMap<String, Vec<String>> {
@@ -3950,7 +3842,7 @@ mod tests {
         UsageAccountingBasis, UsageAccountingState, UsageBreakdown, UsageEvidence, UsageShape,
     };
     use crate::usage_rollup::UsageRollupCaveat;
-    use crate::witness::{build_record, Authorship, ChainHead, WitnessBody};
+    use crate::witness::{build_record, ChainHead, WitnessBody};
 
     const FORGE_REGISTRATION_ID: &str = "0198f000-0000-7000-8000-000000000042";
     const FORGE_TASK_T01: &str = "0198f000-0000-7000-8000-000000000042/t01";
@@ -4048,8 +3940,8 @@ mod tests {
             workspace: Some(WorkspaceMetadata {
                 repo: "mecattaf/tally.nix".to_owned(),
                 base_rev: "a".repeat(40),
-                branch: "query-authorship".to_owned(),
-                worktree_path: "/var/lib/tally/worktrees/query-authorship".into(),
+                branch: "query-fixture".to_owned(),
+                worktree_path: "/var/lib/tally/worktrees/query-fixture".into(),
             }),
             attempt: 1,
             lease_epoch: 7,
@@ -4319,60 +4211,6 @@ mod tests {
             last_seq: None,
             problems: Vec::new(),
         }
-    }
-
-    fn authorship_witness(status: AuthorshipStatus) -> WitnessRecord {
-        build_record(
-            WitnessBody {
-                task_uuid: Some("00000000-0000-4000-8000-000000000024".to_owned()),
-                transition_timestamp: "2026-07-26T20:00:00.000Z".to_owned(),
-                verdict: Verdict::Pass,
-                exit_code: 0,
-                artifact_content_hash: None,
-                store_paths: None,
-                drv: None,
-                gpu_seconds: None,
-                wall_clock: 1.0,
-                attempt: 1,
-                lease_epoch: 7,
-                dedup_key: None,
-                payload_hash: None,
-                brief_hash: None,
-                origin: AdmissionOrigin::direct(EnqueueSource::Manual),
-                orchestration: None,
-                labor_class: LaborClass::Fresh,
-                trace_ref: None,
-                pools: vec!["slot".to_owned()],
-                executor: None,
-                host_id: None,
-                charge: None,
-                model: Some("requested-model".to_owned()),
-                evidence_class: None,
-                manifest_hash: None,
-                completion: None,
-                error: None,
-                result_revision: Some("b".repeat(40)),
-                authorship: Some(Authorship {
-                    provider: "git-ai".to_owned(),
-                    provider_version: "1.6.17".to_owned(),
-                    note_ref: "refs/notes/ai".to_owned(),
-                    status,
-                    notes_ref_target: Some("c".repeat(40)),
-                    note_content_sha256: Some(format!("sha256:{}", "d".repeat(64))),
-                    reason: (status == AuthorshipStatus::Mismatch).then(|| {
-                        "git-ai-mismatch: Tally session/model differs from Git AI's correlated attribution"
-                            .to_owned()
-                    }),
-                }),
-                authorship_sessions: Some(vec![AuthorshipSession {
-                    tool: "codex".to_owned(),
-                    id: "git-ai-session".to_owned(),
-                    model: "git-ai-model".to_owned(),
-                }]),
-            },
-            &ChainHead::default(),
-        )
-        .unwrap()
     }
 
     #[test]
@@ -5534,76 +5372,6 @@ mod tests {
         );
         let encoded = serde_json::to_string(job).unwrap();
         assert!(!encoded.contains("/run/credentials"));
-    }
-
-    #[test]
-    fn job_and_proof_project_authorship_as_separately_sourced_observations() {
-        let detail = detail(RowStatus::Completed);
-        let witness = authorship_witness(AuthorshipStatus::Mismatch);
-        let jobs = query_jobs(
-            std::slice::from_ref(&detail),
-            &[],
-            &history(),
-            std::slice::from_ref(&witness),
-            &BTreeMap::new(),
-            &JobsFilter::default(),
-            &FlowMembership::default(),
-        )
-        .unwrap();
-        let projected = jobs.items[0].authorship.as_ref().unwrap();
-        assert_eq!(jobs.protocol_version, 5);
-        assert_eq!(projected.status, AuthorshipStatus::Mismatch);
-        assert!(projected.identity_mismatch);
-        assert_eq!(projected.result_revision, "b".repeat(40));
-        assert_eq!(
-            projected.workspace.as_ref().unwrap().authority,
-            FactAuthority::DurableAdmissionFact
-        );
-        assert_eq!(
-            projected.tally_session.as_ref().unwrap(),
-            &SourcedValue::new(
-                "scraped-session".to_owned(),
-                FactAuthority::AdvisoryProviderCapture,
-                "adapter-scrape",
-            )
-        );
-        assert_eq!(
-            projected.tally_model.as_ref().unwrap().authority,
-            FactAuthority::DurableAdmissionFact
-        );
-        assert_eq!(
-            projected.git_ai_sessions[0].value,
-            AuthorshipSession {
-                tool: "codex".to_owned(),
-                id: "git-ai-session".to_owned(),
-                model: "git-ai-model".to_owned(),
-            }
-        );
-        assert_eq!(
-            projected.git_ai_sessions[0].authority,
-            FactAuthority::CanonicalWitnessFact
-        );
-
-        let proof = query_proof(
-            &detail.task_uuid,
-            Some(1),
-            std::slice::from_ref(&detail),
-            &history(),
-            &VerifyReport {
-                ok: true,
-                records: 1,
-                first_seq: Some(1),
-                last_seq: Some(1),
-                problems: Vec::new(),
-            },
-            std::slice::from_ref(&witness),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(proof.authorship, jobs.items[0].authorship);
-        let encoded = serde_json::to_string(&proof).unwrap();
-        assert!(!encoded.contains("\"prompts\""));
-        assert!(!encoded.contains("\"ranges\""));
     }
 
     #[test]

@@ -29,7 +29,6 @@ use tally_client::{
     await_job_with_rearm, default_config_path, resolve_max_frame_bytes, RpcClient, WireErrorCode,
     WireIoError,
 };
-use tally_core::authorship::{verify_authorship, verify_revision_authorship};
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
 use tally_core::config::{ExecutionTargetConfig, Priority};
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings, DEFAULT_MAX_CONNECTIONS};
@@ -965,74 +964,6 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                         report.summary.unattested,
                         report.summary.orphans
                     );
-                }
-            }
-            if report.ok {
-                Ok(())
-            } else {
-                Err(exit_failure(1, String::new()))
-            }
-        }
-        WitnessCommand::VerifyAuthorship {
-            ledger,
-            repository,
-            task,
-            attempt,
-            lease_epoch,
-            revision,
-            note_sha256,
-            note_ref,
-            format,
-        } => {
-            let report = if let Some(revision) = revision {
-                let digest = note_sha256.expect("clap requires a digest with a revision");
-                verify_revision_authorship(&repository, &note_ref, &revision, &digest)
-            } else {
-                let ledger = ledger.unwrap_or(default_data_dir()?.join("witness.jsonl"));
-                let task = task.expect("clap requires a task without a revision");
-                verify_authorship(&ledger, &repository, task.as_str(), attempt, lease_epoch)?
-            };
-            match format {
-                WitnessVerifyFormat::Json => {
-                    outln!("{}", serde_json::to_string(&report)?);
-                }
-                WitnessVerifyFormat::Text => {
-                    outln!(
-                        "authorship binding: {}",
-                        serde_json::to_value(report.status)?
-                            .as_str()
-                            .expect("status serializes as a string")
-                    );
-                    if let Some(ledger) = &report.ledger {
-                        outln!(
-                            "verdict chain: {} ({} records)",
-                            if ledger.ok { "ok" } else { "invalid" },
-                            ledger.records
-                        );
-                    } else {
-                        outln!("verdict chain: not consulted (revision mode)");
-                    }
-                    if let Some(note_ref) = &report.note_ref {
-                        outln!("note ref: {note_ref}");
-                    }
-                    if let Some(revision) = &report.result_revision {
-                        outln!("result revision: {revision}");
-                    }
-                    if let Some(expected) = &report.expected_note_content_sha256 {
-                        outln!("expected note digest: {expected}");
-                    }
-                    if let Some(observed) = &report.observed_note_content_sha256 {
-                        outln!("observed note digest: {observed}");
-                    }
-                    if let Some(expected) = &report.expected_notes_ref_target {
-                        outln!("expected notes-ref target: {expected}");
-                    }
-                    if let Some(observed) = &report.observed_notes_ref_target {
-                        outln!("observed notes-ref target: {observed}");
-                    }
-                    if let Some(reason) = &report.reason {
-                        outln!("reason: {reason}");
-                    }
                 }
             }
             if report.ok {

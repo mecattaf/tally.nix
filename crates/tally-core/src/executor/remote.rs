@@ -67,10 +67,6 @@ pub struct RemoteCompletion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorship: Option<Authorship>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorship_sessions: Option<Vec<AuthorshipSession>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_id: Option<String>,
 }
 
@@ -535,8 +531,6 @@ impl Executor {
             evidence_gate: completion.evidence_gate,
             semantic_completion: completion.semantic_completion,
             result_revision: completion.result_revision,
-            authorship: completion.authorship,
-            authorship_sessions: completion.authorship_sessions,
             host_id: completion.host_id,
             captures_available,
         })
@@ -845,8 +839,6 @@ pub(super) fn remote_completion(
         evidence_gate: gate,
         semantic_completion: outcome.semantic_completion,
         result_revision: outcome.result_revision,
-        authorship: outcome.authorship,
-        authorship_sessions: outcome.authorship_sessions,
         host_id: outcome.host_id,
     })
 }

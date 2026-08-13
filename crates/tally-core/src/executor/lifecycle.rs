@@ -317,8 +317,6 @@ impl Executor {
                         evidence_gate: None,
                         semantic_completion: None,
                         result_revision: None,
-                        authorship: None,
-                        authorship_sessions: None,
                         host_id: self.host_id.clone(),
                         captures_available: true,
                     });
@@ -440,8 +438,6 @@ impl Executor {
             evidence_gate: None,
             semantic_completion: None,
             result_revision: None,
-            authorship: None,
-            authorship_sessions: None,
             host_id: self.host_id.clone(),
             captures_available: true,
         })
@@ -537,8 +533,6 @@ impl Executor {
                         evidence_gate: None,
                         semantic_completion: None,
                         result_revision: None,
-                        authorship: None,
-                        authorship_sessions: None,
                         host_id: self.host_id.clone(),
                         captures_available: true,
                     });
@@ -1038,8 +1032,6 @@ impl Executor {
             evidence_gate: None,
             semantic_completion: None,
             result_revision: None,
-            authorship: None,
-            authorship_sessions: None,
             host_id: self.host_id.clone(),
             captures_available: true,
         })

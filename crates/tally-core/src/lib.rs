@@ -2,7 +2,6 @@
 
 pub mod adapters;
 pub mod assisted_by;
-pub mod authorship;
 pub mod brief;
 pub mod campaign_contract;
 pub mod campaign_poll;

@@ -34,7 +34,6 @@ use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOu
 use crate::exec_attestation::{ExecAttestationContext, EXEC_ATTESTATION_LEDGER};
 use crate::provenance::TaskRef;
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
-use crate::witness::{Authorship, AuthorshipSession};
 
 mod captures;
 mod launch;
