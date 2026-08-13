@@ -1,152 +1,66 @@
 ---
 name: assign-tally
-description: Hand an entire multi-task buildout to tally as one autonomous campaign — prepare the frozen work graph, verify every executable claim live, ring the doorbell once, then observe forge ground truth without steering. Use when the user says assign to tally, tally campaign, overnight buildout, spec-build run, or wants a repo built from a frozen spec while they sleep. Derived from steer-codex: tally is that contract with a witnessed backend. WIP — lives in tally.nix until stable, then graduates to dotfiles.
+description: Prepare and arm a local tally campaign from a committed JSON worklist. Use when assigning a multi-task buildout to tally, turning a project document into a dependency graph, or starting an autonomous campaign from a repository worklist.
 ---
 
-# Assign to tally without becoming its supervisor
+# Assign a buildout to tally
 
-## Operating contract
+Turn the requested outcome into one committed worklist, arm it locally, and let
+tally own execution. Do not create per-campaign orchestration or supervise task
+work through a public forge. Use `campaign-operator` after arming.
 
-Tally owns the campaign from first mention to closed master issue. Claude is the
-control plane before and after, never during: prepare the ground, prove it live,
-ring the doorbell once, observe, and intervene only through the failure protocol.
+## Write the worklist
 
-Claude never writes product code, never merges, never re-reviews what witnessed
-gates already merged, and never hand-patches tally mid-campaign — a mechanism bug
-gets a tally.nix issue and (if blocking) a dispatched worker, then the campaign
-resumes. The frozen spec is read-only for Claude and for the agents.
+Create one repository JSON file containing exactly `schemaVersion: 1` and a
+non-empty `tasks` array.
 
-The prime directive inherited from the estate's verified-live doctrine: **nothing
-is proven until its exact argv has executed on the exact host.** Every campaign
-failure to date came from an executable claim (gate command, adapter policy,
-trigger identity) that fixtures and flake checks could not see.
+Populate `tasks` in topological order. Give every implementation task:
 
-## Rule of residue
+- a stable lowercase `id`, `kind: "implementation"`, and concise `title`;
+- one bounded `goal` and explicit `deliveredBehaviors`;
+- `readFirst.specSections` that exist at the authority revision, plus only
+  genuinely useful `styleReferences`;
+- non-empty `acceptanceCriteria`, each with the exact executable `argv` that
+  proves its claim;
+- dependencies naming only earlier tasks; and
+- normalized repository-relative `conflictDomains` that cover every path the
+  task may change. Require them whenever `maxParallel` is greater than one.
 
-Code first. This skill may only contain rules the mechanism cannot yet enforce.
-Every such rule below carries a `DEBT:` marker naming the mechanism change that
-should absorb it. When that change ships, delete the rule here. A growing skill
-is a failing mechanism; the ideal version of this file is the operating contract
-above and nothing else.
+Give a checkpoint only `id`, `kind: "checkpoint"`, `title`, executable `argv`,
+`runtimeMaxSec`, and earlier `dependencies`. Let tally render its brief.
 
-## Prepare (the freeze ritual)
+Encode ordering as dependencies, invariants as executable gates, and ownership
+as path domains. Do not put an operational requirement only in prose. For a
+campaign of consequence, end with an adversarial test-and-fix task whose checks
+enumerate the affected surface structurally.
 
-The campaign artifact is **data, not code**: a worklist of tasks with stable ids,
-per-task briefs (goal, behaviors, read-first pointers, acceptance, dependencies),
-and the gate argvs. Never author per-campaign orchestration scripts; the generic
-spec-build flow is the only executor.
+## Rehearse admission
 
-- Dependencies are a DAG, not a sequence. Encode real edges; do not linearize.
-  Ordering constraints (e.g. "import runs last") must be dependency edges, never
-  prose in a prompt. DEBT: frontier scheduling — until it ships, execution is
-  serial in worklist order, so the topological order must also be a valid plan.
-- Declare which files each task owns when tasks could run concurrently.
-  DEBT: conflict-domain field in the worklist schema, required when parallel.
-- Standing invariants ("no .db/-wal/-shm in any PR") must be gates — a file-glob
-  gate costs five lines. Never leave an invariant as a post-merge human audit.
-- Before arming, execute on the target host, in a real checkout: `tally adapter
-  smoke` for every adapter on the critical path, **and every gate argv
-  verbatim**, including with a representative dirty tree. A gate that has never
-  run is a gate that fails at 2am. DEBT: campaign preflight verb (#248).
-- The mention token is the operator's own GitHub handle, never a third-party
-  name. DEBT: default + validation (#246).
+Make gate preflights test only the environment and tracked inputs. Never make a
+preflight depend on state produced by another gate. Print a useful diagnostic to
+stderr before failing.
 
-## Launch
+Run every declared preflight argv verbatim in a pristine worktree on the target
+host. Fix the worklist or host until admission is clean.
 
-One master issue carries the campaign: the mention is posted there once, exactly
-as configured. Per-task issues are public anchors that PRs close — never
-triggers. One comment starts everything; a second comment mints a second run,
-so never stack mentions.
+## Establish authority
 
-Ad-hoc campaigns must not require a fleet deploy to tune: config changes that
-force redeploy-plus-fresh-run are a weight-class error for one-shot buildouts.
-DEBT: forge-native campaign container (config + DAG readable from the master
-issue; briefs as sub-issue bodies) and forge-state re-entrancy, after which a
-re-mention is always safe and always cheap.
+Declare the campaign in the host module with `forge = "local"`, its repository
+checkout, worklist pattern, task and parallelism bounds, agent, gates, and merge
+policy.
 
-## Observe
+Commit the worklist, merge it to the configured base branch, and push that base
+branch. Arming fetches the configured remote and admits the single matching file
+from that revision; working-tree bytes are not authority.
 
-Start an operator check with `tally query run <runner-task-uuid>`; it projects
-the reconciled task table, current-node elapsed/budget state, and failure
-pointers. For persistent monitoring, still corroborate ground truth: merged
-PRs, capture `.err` files, and runner-unit liveness.
+## Arm
 
-`tally query log --flow-run` no longer hides truncation: the human view walks
-the whole window rather than the first (permanently stale) page, and says on
-stderr when it cannot show all of it. For an unattended monitor, hold the
-`position` a response reports and poll with `--after <position>`; empty `items`
-means nothing after that position matched your filter. Read `items`, not
-`position` — the position is the head of the whole lifecycle stream, so it
-advances whenever anything else on the daemon does.
+Run:
 
-**An empty `--flow-run` window is not automatically a fact about the run.**
-Membership is a durable admission fact: every admission under a `flowRunId`
-records `(run, task)` before it is acknowledged, for all five dispositions,
-including the row-less ones — `attached`, and full-mode `reused` and `terminal`
-— that used to leave a run holding a task UUID that was not one of its members.
-A re-triggered campaign attaching to nodes still in flight used to get a window
-showing the same items forever with `nextCursor: null` while the work executed;
-that is the original #247 shape and it is **fixed**. Every run-scoped response
-still reports `flowRunTasks`, and `flowRunTasks: 0` means the daemon holds no
-membership for that run ID — usually a mistyped or stale ID, but also a
-repaired or deleted ledger, a compacted-out idle run, or an admission that
-reported `membershipDegraded`, so it is not proof the run is quiet. A
-count below the node count the runner reports is a real discrepancy: corroborate
-against `tally query run <id>`, runner-unit liveness, merged PRs, and capture
-`.err` files.
+```text
+tally campaign arm OWNER/REPO PATH/TO/WORKLIST.json
+```
 
-The contract is in Operating → Observability, "Poll a flow run correctly".
-Silence is still not success: any watcher must fire on every terminal state,
-including "runner gone with work remaining."
-
-Known adapter noise such as "Reading additional input from stdin..." is retained
-in `.adapter.err`. The conventional `.err` path is an atomic, bounded
-diagnostic projection materialized only after a failed terminal verdict, so
-its presence is a valid current-generation failure signal.
-
-A healthy campaign gets zero intervention. Do not comment, do not steer, do not
-"check in" on the agents. Wall-clock alone is never a reason to interfere.
-
-## Failure protocol
-
-The campaign must keep working unless it is genuinely blocked or done. There are
-no approval pauses, no "phase done, awaiting operator" states, and Claude must
-never introduce one.
-
-1. On any failed node, read the bounded stderr tail in `tally query run` first;
-   use `tally query log --task <uuid> --json` when the exact `stderrTail` field
-   or transition provenance is needed. A `capture: <not retained>` line means
-   no capture exists to read — do not go looking for the file.
-   A campaign failure receipt contains a conservatively redacted copy only when
-   its GitHub producer explicitly enables both failure-publication switches. Read
-   `~/.local/state/tally/capture/<task-uuid>.err` only when the tail is
-   truncated or insufficient; `.adapter.err` is the raw adapter stream.
-2. Transient (network, quota, wall-clock budget) → re-trigger. Until forge-state
-   re-entrancy ships, know the replay rules: config or tally changes void the
-   witnessed prefix (args/script hash) and require a fresh mention; never retry
-   a dead runner.
-3. Agent fell short → one precise, evidence-based steering comment on the master
-   issue, then re-trigger. State the missing outcome, not an implementation.
-4. Two failures on the same task with good steering, a spec contradiction, or a
-   mechanism smell → stop, write the diagnosis, file the tally.nix issue, hand
-   to the operator. This is the only escalation in the protocol.
-5. Escalate only at quiescence: a blocked task blocks its dependents, nothing
-   else. DEBT: frontier scheduling makes this structural; until then a failed
-   node kills the serial run and step 2/3 applies.
-
-## Do not inject
-
-Unless the frozen spec itself requires them, never impose: human checkpoints or
-approval gates; a supervisor in the merge path; per-campaign orchestration code;
-extra validation ceremonies beyond the declared gates; commit/PR rituals; token,
-turn, or wall-clock budgets beyond the configured ones; or any constraint on how
-the coding agent implements its brief. Tally's witnessed gates are the entire
-acceptance contract.
-
-## After
-
-Close the loop from forge facts, not agent prose: all tasks merged, per-task
-issues closed by their PRs, master issue closed with a summary comment (counts,
-wall-clock, failures, steering, mechanism lessons). File every mechanism
-observation as an atomic tally.nix issue the same day. Write the campaign
-post-mortem where the estate keeps lineage; local commit suffices.
+Add `--wait` only when waiting for the newly admitted reconcile pass is useful;
+that pass is not the whole campaign. Keep the JSON receipt, then hand observation
+to `campaign-operator` using the same repository/worklist identity.
