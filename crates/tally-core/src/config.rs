@@ -1005,6 +1005,24 @@ mod tests {
     }
 
     #[test]
+    fn retired_authorship_config_key_fails_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        // Exercise the retired wire spelling without restoring it as a source symbol.
+        let removed_key = ["git", "Ai"].concat();
+        let config = format!(r#"{{"pools":{{}},"{removed_key}":{{"enable":true}}}}"#);
+        std::fs::write(&config_path, config).unwrap();
+
+        let error = Config::from_path(&config_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unknown field `{removed_key}`")),
+            "stale config failed without identifying the removed key: {error}"
+        );
+    }
+
+    #[test]
     fn journald_native_is_an_explicit_default_off_toggle() {
         let default: Config = serde_json::from_str(r#"{"pools":{}}"#).unwrap();
         assert!(!default.journald.native);
