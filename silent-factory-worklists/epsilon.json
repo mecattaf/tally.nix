@@ -58,118 +58,364 @@
   },
   "tasks": [
     {
-      "id": "final-bar-local-forge-repair",
+      "id": "campaign-nix-surface-retire",
       "kind": "implementation",
-      "title": "Repair the final conformance bar for the post-chapter-2 local-only CLI",
-      "goal": "Chapter 2's drop-local-forge-escape-hatches deleted --allow-test-local-forge from crates/tally, but the final conformance bar still passes it in four call sites: test/final-bar/cases/manifest.py line 286, cases/pipeline.py lines 149 and 253, and cases/registry.py line 59. The bar is therefore broken on main and nothing noticed: its only flake attribute (final-conformance-bar-harness) runs --list without executing a case, and test/fleet-gate.sh has no final-bar step. Remove the dead flag from the four spawn argvs and bring the whole bar back to exit 0 by running it against your worktree (test/final-bar/run <absolute path to the worktree>; tri-state exit per test/final-bar/README.md). The bar has not executed since before the chapter 2 deletions, so any further staleness the run reveals inside test/final-bar is in scope for this task. Do not touch test/fleet-gate.sh (owned by gate-keep-going in this campaign); the epsilon chapter checkpoint runs the bar directly.",
+      "title": "Retire the vestigial module campaign rendering",
+      "goal": "Decision D77 made arm self-contained; nothing reads the module's campaign surface any more. Delete it whole: mkCampaignProducer, mkCampaignFlow, mkCampaignArgs, mkCampaignType with its forge-native-only option set (label, mention, pollIntervalSec, allowSelfTriggered, allowedActors, issueRepository, postReceipt/postEvidence projection literals and the forgeNativeOnlyOptions assertion), mkCampaignGateType and mkCampaignRepositoryType if they have no other consumer, mkCampaignConfig and its call in nix/modules/home-manager.nix, campaignMaxNodes, renderCampaignSteward/renderCampaignGates/renderCampaignRepositories, and the services.tally.campaigns option itself. The flake's module-layer contract checks assert this rendering (campaignHome / campaignSystemConfig fixtures around flake.nix:3592-3670 and the spec-build fixture assertions around :4100-4160) \u2014 those assertions are made false by this deletion and you own updating them; keep the module-layer check itself alive for what remains (adapters, pools, flows, producers). The spec-build-driver adapter auto-declaration: verify whether it is declared by the campaign surface or independently, and preserve the independent path if it exists (the deployed estate uses it). Do NOT touch the campaignPoll option or its units (they are the local heartbeat and survive; the sibling task delete-gh-nix-tree owns their runtimeInputs). Behavior oracle per F19/F20: the D77 test suite in crates/tally is untouched and stays green \u2014 arm/resume/poll never read this surface.",
       "deliveredBehaviors": [
-        "test/final-bar/run <tree> exits 0 against the post-chapter-2 local-only CLI",
-        "No final-bar case passes --allow-test-local-forge"
+        "services.tally.campaigns no longer exists as a module option",
+        "Module-layer flake checks pass without campaign rendering assertions",
+        "Arm/resume/poll behavior is byte-identical (D77 suite green)"
       ],
       "readFirst": {
         "specSections": [
-          "SILENT-FACTORY-PLAN.md Part 7 sections 7.1 and 7.3"
-        ],
-        "styleReferences": [
-          "test/final-bar/README.md"
-        ]
-      },
-      "acceptanceCriteria": [
-        {
-          "id": "no-dead-flag",
-          "description": "The deleted flag is gone from every final-bar case.",
-          "argv": [
-            "bash",
-            "-lc",
-            "! grep -rn 'allow-test-local-forge' test/final-bar"
-          ]
-        },
-        {
-          "id": "bar-green",
-          "description": "The full final conformance bar passes against this worktree.",
-          "argv": [
-            "bash",
-            "-lc",
-            "exec test/final-bar/run \"$PWD\""
-          ]
-        }
-      ],
-      "dependencies": [],
-      "conflictDomains": [
-        "test/final-bar"
-      ]
-    },
-    {
-      "id": "gate-keep-going",
-      "kind": "implementation",
-      "title": "Make the fleet gate enumerate every failing flake attribute",
-      "goal": "test/fleet-gate.sh runs 'nix flake check -L', which stops at the first failing attribute. Chapter 2's gate repair found two additional stale suites hiding behind the first failure only when re-run with --keep-going (findings F14/F21; three campaigns for three, each gate failure cost a full cycle per hidden attribute). Change that step to 'nix flake check -L --keep-going' so a single gate failure enumerates every failing attribute in one transcript. Keep the stage order (cheap failures first) and the invocation contract intact: the script must still print its 'usage: ... <full-commit-sha>' line when invoked without a commit argument (finding F13b regression pin).",
-      "deliveredBehaviors": [
-        "One fleet-gate failure lists every failing flake attribute instead of the first",
-        "The usage contract for the commit-sha argument is unchanged"
-      ],
-      "readFirst": {
-        "specSections": [
-          "SILENT-FACTORY-PLAN.md Part 7 section 7.3"
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
         ],
         "styleReferences": []
       },
       "acceptanceCriteria": [
         {
-          "id": "keep-going-flag",
-          "description": "The script parses and the flake-check step carries --keep-going.",
+          "id": "surface-gone",
+          "description": "The campaign renderers are gone from the module tree.",
           "argv": [
             "bash",
             "-lc",
-            "bash -n test/fleet-gate.sh && grep -q -- '--keep-going' test/fleet-gate.sh"
+            "! grep -rn 'mkCampaignProducer\\|mkCampaignConfig\\|mkCampaignArgs' nix/modules"
           ]
         },
         {
-          "id": "usage-pin",
-          "description": "Argument-less invocation still prints the usage contract.",
+          "id": "flake-eval-green",
+          "description": "The flake still evaluates with the module-layer contract.",
           "argv": [
-            "bash",
-            "-lc",
-            "test/fleet-gate.sh 2>&1 | grep -qi 'usage: .* <full-commit-sha>'"
+            "nix",
+            "flake",
+            "check",
+            "--no-build"
           ]
         }
       ],
       "dependencies": [],
       "conflictDomains": [
-        "test/fleet-gate.sh"
+        "nix/modules",
+        "flake.nix"
       ]
     },
     {
-      "id": "steering-grammar-negation",
+      "id": "delete-gh-inbound-core",
       "kind": "implementation",
-      "title": "Let machine diagnoses state a negation without being gagged",
-      "goal": "Finding F15, the sharpest of chapter 2: the managed-agents content contract in drivers/spec_build_driver.py (lines 176-186) rejects any text containing an exclamation mark, and the rejection redaction path (line 3779) replaces '!' with '.'. A machine diagnosis therefore cannot state a shell or Nix negation such as '! grep -n pattern file' without being rejected or mangled; it was silenced twice in chapter 2 while diagnosing correctly. Change the contract to permit exclamation marks inside inline code spans and argv reproductions (backtick-delimited text, or an equivalent explicit encoding you choose and document in the predicate's docstring) while keeping the bang-free rule for ordinary prose, and update the redaction at line 3779 so code spans are preserved rather than mangled. Implement the rule as one named predicate so the future Rust port of this driver carries it verbatim. Out of scope: crates/tally-core/src/evidence.rs lines 1451-1478 and journal.rs line 1190 are test assertions on tally's own narration text, not this validator; leave them alone. Update test/spec_build_driver_test.py to cover the new grammar, including a negative case proving bare '!' in prose is still refused.",
+      "title": "Delete the gh-inbound producers stack and the daemon's outbound gh subsystem",
+      "goal": "The gh-inbound intake is dead machinery post-chapter-2 (D56): delete crates/tally-core/src/producers/gh_intake.rs (~2,100 lines), gh_decision.rs (~740), orphan.rs (~340) whole, and the gh arms of producers/engine.rs, validate.rs, config.rs, ingress.rs and mod.rs. Delete the build-effect and pool-reachability producer kinds in the same sweep \u2014 the D57 grep was executed on both estates (dotfiles AND sodimo-os: zero matches for build-effect, pool-reachability, or services.tally with those kinds); record that census in your commit body. Delete the daemon's outbound gh subsystem (~250 lines): GhCliMutationSink and impl GhMutationSink in gh_intake.rs, the completion-loop projection writes in daemon/completion.rs (the GhCompletionProjection/GhProjectionOutcome paths, historically around :75-110 and :186-240), read_orphaned_projections, the daemon/mod.rs re-exports, and the gh_program wiring (daemon/startup.rs:535 and its daemon/mod.rs plumbing) \u2014 the behavior change to state plainly in the commit: the daemon stops writing to GitHub for producer completions at all. Also delete producer_query.rs gh arms, the ProducerCommand gh arms in crates/tally (producer test's gh arm, producer orphaned), CliSource::Gh in args.rs, and the gh test bodies in producers/tests.rs, daemon/tests.rs, executor tests, crates/tally/tests/producer_cli.rs, and the source!=gh gate in crates/tally/src/flow_live.rs (~:1109). Calendar and events-dir producer kinds survive and their suites keep passing \u2014 the events-dir continuation drain is live machinery this campaign itself runs on. Keep every deletion honest against F26: for each deleted symbol, sweep the tree for tests and fixtures asserting it.",
       "deliveredBehaviors": [
-        "A diagnosis containing a backtick-quoted shell negation passes the content contract",
-        "Bare exclamation marks in ordinary prose are still refused",
-        "The redaction path preserves code spans instead of rewriting '!' to '.'"
+        "No gh-inbound producer kind, decision surface, or orphan machinery remains in crates",
+        "The daemon performs zero GitHub writes for producer completions",
+        "Calendar and events-dir producers keep passing their full suites"
       ],
       "readFirst": {
         "specSections": [
-          "SILENT-FACTORY-PLAN.md Part 7 section 7.3"
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
         ],
-        "styleReferences": [
-          "drivers/spec_build_driver.py lines 160-200"
-        ]
+        "styleReferences": []
       },
       "acceptanceCriteria": [
         {
-          "id": "negation-survives",
-          "description": "The content contract accepts a diagnosis whose code span carries a shell negation.",
+          "id": "intake-gone",
+          "description": "The three gh modules are gone and no gh producer symbol survives.",
           "argv": [
             "bash",
             "-lc",
-            "python3 -c \"import importlib.util; spec = importlib.util.spec_from_file_location('d', 'drivers/spec_build_driver.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); assert m.validate_outcome_first('Recorded a failing check. Reproduce with \\`! grep -n stale test/x.py\\`.', max_chars=4000, context='diagnosis') is None\""
+            "! test -f crates/tally-core/src/producers/gh_intake.rs && ! grep -rn 'gh_decision\\|CliSource::Gh\\|GhMutationSink' crates"
           ]
         },
         {
-          "id": "suite-green",
-          "description": "The driver test suite passes with the new grammar cases.",
+          "id": "kinds-gone",
+          "description": "The build-effect and pool-reachability kinds are gone.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'build-effect\\|pool-reachability' crates/tally-core/src/producers"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "The workspace passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "delete-gh-origin-durable",
+      "kind": "implementation",
+      "title": "Delete the GhOrigin durable surface, keeping the ledger decode arm",
+      "goal": "Delete the GhOrigin/GhContextSnapshot durable write-and-projection surface: wire.rs ghTriggerActor/ghActor aliases and legacy arms (historically :520/:525/:851-905 and the :2077 test), GhOriginWire in taskdb.rs, the GhOrigin fields in executor/types.rs and executor/mod.rs, the daemon completion plumb-through, the query projections (query.rs historically :560/:1596/:1746-1765, query_v2.rs :3828, daemon/rpc/query.rs :1449), and the test/fixtures/ledger/events/legacy-gh-origin.enqueue.json fixture with its include in taskdb.rs. KEEP the EnqueueSource::Gh string-decode arm (taskdb.rs) \u2014 Decision D33: old ledger bytes must keep decoding; the measured census is 0 gh-sourced events of 3,859 and 0 of 1,775 rows carrying ghOrigin, so the decode arm is cheap insurance while the payload-acceptance path dies. The D42 fence is untouchable: witness float normalization, OldFormat refusals, and flow-membership tolerance stay byte-identical. Grants include crates/tally-flow because its model carries gh-origin kernel fields (model.rs historically :622/:628/:634) whose deletion this task owns, including the goldens they appear in.",
+      "deliveredBehaviors": [
+        "No GhOrigin or GhContextSnapshot symbol survives outside the EnqueueSource::Gh decode arm",
+        "Old ledger bytes with source gh still decode (D33)",
+        "D42 fence untouched: float normalization, OldFormat refusals, flow-membership tolerance"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "origin-gone",
+          "description": "GhOrigin and GhContextSnapshot are gone from crates.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'GhOrigin\\|GhContextSnapshot' crates"
+          ]
+        },
+        {
+          "id": "decode-arm-stays",
+          "description": "The EnqueueSource gh decode arm survives.",
+          "argv": [
+            "bash",
+            "-lc",
+            "grep -rn 'Gh' crates/tally-core/src/taskdb.rs | grep -qi 'EnqueueSource'"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "The workspace passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [
+        "delete-gh-inbound-core"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally",
+        "crates/tally-flow",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "delete-gh-nix-tree",
+      "kind": "implementation",
+      "title": "Collapse the nix tree to local-only campaign operation",
+      "goal": "The nix half of the gh deletion. The campaignPoll units SURVIVE (nixos.nix and home-manager.nix render them; they are the local recovery heartbeat \u2014 Part 3's delete-campaignPoll prose was wrong). Remove pkgs.gh from campaignPollProgram's runtimeInputs (home-manager.nix:346-349) \u2014 the poll of local campaigns performs no gh calls post-chapter-2; verify the program body agrees and update it if it still shells gh. Collapse any remaining forge option surface to local-only, and delete the reviewers validation surface (requestReview and its assertions \u2014 D75 default: delete). Sweep the flake's VM tests and module checks for assertions this makes false and update them; you own flake.nix for exactly that class. Coordinate with campaign-nix-surface-retire (your dependency): its deletions land first, so enumerate your targets from the tree as it exists when your lane cuts, not from this goal's line numbers.",
+      "deliveredBehaviors": [
+        "campaignPoll units render and pass their VM assertions without gh in runtimeInputs",
+        "No reviewers/requestReview surface remains",
+        "No forge choice other than local remains in the nix tree"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "gh-out-of-poll",
+          "description": "pkgs.gh is out of the poll program's runtimeInputs.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -n 'pkgs.gh' nix/modules/home-manager.nix"
+          ]
+        },
+        {
+          "id": "flake-eval-green",
+          "description": "The flake evaluates.",
+          "argv": [
+            "nix",
+            "flake",
+            "check",
+            "--no-build"
+          ]
+        }
+      ],
+      "dependencies": [
+        "campaign-nix-surface-retire"
+      ],
+      "conflictDomains": [
+        "nix/modules",
+        "flake.nix"
+      ]
+    },
+    {
+      "id": "squash-migration-modules",
+      "kind": "implementation",
+      "title": "Delete the capture and unit-exit migration modules and the migrate verb",
+      "goal": "capture_migration.rs (~474 lines) and unit_exit_migration.rs (~627) sit at crates/tally-core/src top level; their migration windows closed before chapter 2. First relocate the unit_exit_migration::fixtures helpers that recovery.rs identity tests use (historically :1489-1658) into recovery's own test module, then delete both modules, MigrateCommand (args.rs :90 and :158-186 era, cli/mod.rs dispatch), and crates/tally/tests/migrate_cli.rs whole (its subject verb is gone; this also retires the known F25 config-leaking test). Rewrite strict-read error strings that name 'tally migrate' as the remedy \u2014 the verb will not exist. The pre-arm operator step (tally migrate --plan on the deployed pin reporting isClean before this campaign armed) is recorded in the run record; your lane does not need to run it.",
+      "deliveredBehaviors": [
+        "No migration module, migrate verb, or migrate_cli test remains",
+        "Strict-read error strings name a real remedy",
+        "Recovery identity tests keep their fixtures locally"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "migrate-gone",
+          "description": "The modules, verb, and test file are gone.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'MigrateCommand\\|capture_migration\\|unit_exit_migration' crates && ! test -f crates/tally/tests/migrate_cli.rs"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "The workspace passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ]
+        }
+      ],
+      "dependencies": [
+        "delete-gh-origin-durable"
+      ],
+      "conflictDomains": [
+        "crates/tally-core",
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "squash-err-fallbacks",
+      "kind": "implementation",
+      "title": "Delete the legacy stderr-capture dual-read arms",
+      "goal": "executor/captures.rs keeps dual-read arms for legacy capture layouts (~:143-205, including the .adapter.err compatibility read near :205) and normalize_legacy_stderr_capture (:335), called from executor/lifecycle.rs (historically :310 and :526). Every capture written since the chapter-0 pin uses the current layout; delete the legacy arms, the normalizer, its call sites, and sweep executor tests for assertions on legacy .err naming (F26: assertions the deletion makes false are yours).",
+      "deliveredBehaviors": [
+        "Only the current capture layout is read",
+        "No executor test asserts legacy stderr naming"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "normalizer-gone",
+          "description": "The legacy normalizer is gone.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'normalize_legacy_stderr_capture' crates"
+          ]
+        },
+        {
+          "id": "executor-green",
+          "description": "Executor suites pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core",
+            "executor"
+          ]
+        }
+      ],
+      "dependencies": [
+        "delete-gh-inbound-core"
+      ],
+      "conflictDomains": [
+        "crates/tally-core/src/executor"
+      ]
+    },
+    {
+      "id": "squash-rowversion-ladder",
+      "kind": "implementation",
+      "title": "Replace the row-migration ladder with a floor refusal",
+      "goal": "crates/tally-core/src/taskdb/migrations.rs carries the ROW_MIGRATIONS ladder (currently 5 entries at :17-38 era) upgrading pre-current row versions. Replace the ladder with a floor: rows below the current version are refused with a message naming the last pin that could upgrade them (the deployed estate is clean \u2014 the pre-arm migrate --plan reported isClean). Keep the migration frame (:40-70 era) per D42. Delete the remaining legacy row fixtures and their includes in taskdb.rs (the legacy-gh-origin fixture is your dependency's; the include list is why you serialize behind it), and the N_MINUS_1 usage fixture (usage.rs :1183 and :1999) with test/fixtures/usage/n-minus-1-records.json. Count entries, not braces: the acceptance grep counts ROW_MIGRATIONS entries remaining.",
+      "deliveredBehaviors": [
+        "Rows below the current version are refused with a named remedy",
+        "No legacy row fixture or include survives",
+        "The migration frame itself survives (D42)"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "ladder-emptied",
+          "description": "The ladder holds zero upgrade entries.",
+          "argv": [
+            "bash",
+            "-lc",
+            "test \"$(grep -c 'RowMigration {' crates/tally-core/src/taskdb/migrations.rs)\" -eq 0"
+          ]
+        },
+        {
+          "id": "taskdb-green",
+          "description": "taskdb suites pass.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally-core",
+            "taskdb"
+          ]
+        }
+      ],
+      "dependencies": [
+        "delete-gh-origin-durable"
+      ],
+      "conflictDomains": [
+        "crates/tally-core/src/taskdb.rs",
+        "crates/tally-core/src/taskdb",
+        "crates/tally-core/src/usage.rs",
+        "test/fixtures"
+      ]
+    },
+    {
+      "id": "brief-carries-conflict-domains",
+      "kind": "implementation",
+      "title": "Render conflictDomains into the projected task brief",
+      "goal": "F22's cheapest structural fix: a worker that cannot see its own ownership boundary cannot respect it. Render each task's conflictDomains into the projected implementation and diagnosis briefs at prep, stated as the binding write-boundary ('files your change makes false must be inside these prefixes; anything else is the operator's to grant'). The prep result passes the flow's closed schemas (F24's own precedent): you own examples/flows/spec-build.js for the schema fields and crates/tally-flow for goldens the brief shape appears in. Update the driver-suite assertions on brief shape.",
+      "deliveredBehaviors": [
+        "Every projected brief names its lane's conflictDomains as the write boundary",
+        "Flow schemas and goldens accept the extended brief shape"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "brief-carries",
+          "description": "Prep renders conflictDomains into the brief.",
+          "argv": [
+            "bash",
+            "-lc",
+            "grep -n 'conflictDomains' drivers/spec_build_driver.py | grep -qi 'brief'"
+          ]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver suite passes.",
           "argv": [
             "python3",
             "test/spec_build_driver_test.py"
@@ -179,58 +425,196 @@
       "dependencies": [],
       "conflictDomains": [
         "drivers",
-        "test/spec_build_driver_test.py"
+        "test/spec_build_driver_test.py",
+        "examples/flows/spec-build.js",
+        "crates/tally-flow"
       ]
     },
     {
-      "id": "gate-local-audit",
+      "id": "dead-cuts",
       "kind": "implementation",
-      "title": "Teach the fleet gate to audit a local campaign head",
-      "goal": "test/fleet-gate.sh cannot audit a commit that exists only locally, which every local-first campaign integration head does. Two forge-native assumptions falsify it: resolve_pull_request_metadata (around line 132) runs 'gh api repos/<repo>/commits/<sha>/pulls' and calls fail('cannot list pull requests ... is the commit pushed?') when the SHA is absent from the remote (HTTP 422), aborting the whole gate before any stage runs; and run_changelog_stage (lines 168-193) fails any head that is neither an open pull-request head nor the tip of main. Add a third classified audit subject: when the SHA has no remote presence or no open pull request and is not the tip of main, classify it as a local audit (changelog-subject names it honestly, e.g. 'local head; no pull request'), let every substantive stage run exactly as today, and have the changelog stage report itself not-run for a local audit ('the changelog policy is a pull-request policy; no pull request exists for a local head') instead of failing. Pull-request and tip-of-main behavior must stay byte-identical, including the no-changelog label path and the pinned-at-script-start decision. Keep the usage contract intact. Your change is independent of the merged --keep-going edit (line ~231); the hunks do not overlap.",
+      "title": "Sweep the dead operational surfaces",
+      "goal": "Five dead cuts, each with its consumers: (1) campaign poll --continuation-token (args.rs :321 era) and its discard site in cli/campaign.rs \u2014 the rollback window closed at the post-chapter-2 deploy; (2) legacy_state_markers/reclaim_legacy_markers in drivers/spec_build_driver.py (currently ~:5287-5330; line numbers drifted +340 since the epsilon stage 0 merges \u2014 re-locate by symbol) and their driver-suite assertions; (3) the --mode daemon spelling (args.rs head, cli/mod.rs dispatch \u2014 keep --mode check-config) and the duplicate top-level enqueue dispatch arm; (4) the superseded CONTRIBUTING.md paste-transcript clause (the Merge verification section instructing worker-pasted transcripts, superseded in-file by Merge control) \u2014 CONTRIBUTING.md is yours for exactly that clause; do not rewrite unrelated sections (D53); (5) delete the orphaned test/eval_manifest_check_test.py (reached by nothing; eval_manifest_check.py itself stays, live via the final bar) and tighten the driver's repositoryConfig forge validation (currently :549 era) to local-only \u2014 dead arm post-chapter-2, and the stage-2 port must not carry it.",
       "deliveredBehaviors": [
-        "The fleet gate runs its full ladder against a commit that exists only in the local repository",
-        "The changelog stage reports not-run with an honest subject for a local audit instead of failing",
-        "Pull-request and tip-of-main audits behave exactly as before"
+        "No continuation-token, legacy marker, or daemon-mode spelling survives",
+        "CONTRIBUTING no longer instructs pasted transcripts",
+        "The driver admits only forge local"
       ],
       "readFirst": {
         "specSections": [
-          "SILENT-FACTORY-PLAN.md Part 7 sections 7.1 and 7.3"
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
         ],
-        "styleReferences": [
-          "test/fleet-gate.sh"
-        ]
+        "styleReferences": []
       },
       "acceptanceCriteria": [
         {
-          "id": "script-parses",
-          "description": "The script parses and still pins the usage contract.",
+          "id": "cuts-made",
+          "description": "The dead symbols are gone.",
           "argv": [
             "bash",
             "-lc",
-            "bash -n test/fleet-gate.sh && test/fleet-gate.sh 2>&1 | grep -qi 'usage: .* <full-commit-sha>'"
+            "! grep -rn 'continuation_token\\|legacy_state_markers' crates drivers && ! test -f test/eval_manifest_check_test.py"
           ]
         },
         {
-          "id": "local-audit-classified",
-          "description": "A local-only commit is classified as a local audit at metadata resolution instead of aborting the gate.",
+          "id": "driver-suite-green",
+          "description": "The driver suite passes.",
           "argv": [
-            "bash",
-            "-lc",
-            "grep -qi 'local' test/fleet-gate.sh && grep -q 'gate_changelog_subject' test/fleet-gate.sh"
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        },
+        {
+          "id": "workspace-green",
+          "description": "The workspace passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
           ]
         }
       ],
       "dependencies": [
-        "gate-keep-going"
+        "squash-migration-modules",
+        "brief-carries-conflict-domains"
       ],
       "conflictDomains": [
-        "test/fleet-gate.sh"
+        "crates/tally",
+        "drivers",
+        "CONTRIBUTING.md",
+        "test/eval_manifest_check_test.py",
+        "test/spec_build_driver_test.py"
+      ]
+    },
+    {
+      "id": "ownership-preflight-warn",
+      "kind": "implementation",
+      "title": "Warn at arm time when task text names paths outside its domains",
+      "goal": "Arm-time textual lint: for each implementation task, tokenize goal and acceptance argvs for path-shaped tokens and warn \u2014 never gate \u2014 when one falls outside the task's declared conflictDomains (it provably cannot see semantic coupling, F24-F26, so warning is its honest ceiling). Render the warnings in the arm receipt's warnings array (the surface already exists). Cover it in the D77 worklist-policy tests.",
+      "deliveredBehaviors": [
+        "Arm reports path-shaped goal/criteria tokens outside declared domains as warnings",
+        "Warnings never block arming"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "warn-wired",
+          "description": "The lint exists and feeds arm warnings.",
+          "argv": [
+            "bash",
+            "-lc",
+            "grep -rn 'conflictDomains' crates/tally/src/cli/campaign.rs | grep -qi 'warn'"
+          ]
+        },
+        {
+          "id": "tally-green",
+          "description": "The tally crate passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally"
+      ]
+    },
+    {
+      "id": "poll-liveness-arm",
+      "kind": "implementation",
+      "title": "Poll dispatches when work is dispatchable and nothing runs",
+      "goal": "F23: a campaign can rest with dispatchable work because poll compares observation digests and declines to wake an unchanged world. Add the liveness arm: if the registration has dispatchable work (an unblocked, un-escalated task) and zero live nodes, poll admits a reconcile pass regardless of the observation digest. Cover both the unit surface and the VM poll assertions in flake.nix \u2014 the VM checks are exactly where this class of change historically broke eval (F21), so you own flake.nix up front.",
+      "deliveredBehaviors": [
+        "A resting campaign with dispatchable work is woken by the next poll",
+        "An armed campaign with nothing dispatchable still rests (no busy-loop)"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "liveness-armed",
+          "description": "The dispatchable-work liveness path exists in poll.",
+          "argv": [
+            "bash",
+            "-lc",
+            "grep -rn 'dispatchable' crates/tally/src/cli/campaign.rs | head -1"
+          ]
+        },
+        {
+          "id": "tally-green",
+          "description": "The tally crate passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally",
+        "flake.nix"
+      ]
+    },
+    {
+      "id": "status-renders-reconciled-truth",
+      "kind": "implementation",
+      "title": "Status renders the last reconciled truth, never a placeholder",
+      "goal": "Shakedown finding: campaign status renders the LATEST pass \u2014 after a steer or re-arm that is a queued, un-reconciled pass, so the operator sees an empty task table, zero counts, and the placeholder name 'Campaign campaign' while real work runs under the previous pass. Fix: when the latest pass has not reconciled a task table, status falls back to the most recent reconciled pass (or the registration's durable task state) and labels the queued pass as queued; the campaign name always comes from the registration/worklist, never a placeholder. This deletes the operator rule 'do not trust status, use query run' (D58: fixes delete rules).",
+      "deliveredBehaviors": [
+        "Status never renders an empty table while a previous pass has reconciled truth",
+        "The campaign name is never a placeholder",
+        "A queued un-reconciled pass is labeled as such"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-placeholder",
+          "description": "The placeholder name cannot render.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn '\"Campaign campaign\"' crates"
+          ]
+        },
+        {
+          "id": "tally-green",
+          "description": "The tally crate passes.",
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "tally"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "crates/tally"
       ]
     },
     {
       "id": "chapter-gate",
       "kind": "checkpoint",
-      "title": "Epsilon stage 0 gate: full gate ladder plus the final conformance bar",
+      "title": "Epsilon stage 1 gate: full gate ladder plus the final conformance bar",
       "argv": [
         "bash",
         "-lc",
@@ -238,10 +622,18 @@
       ],
       "runtimeMaxSec": 10800,
       "dependencies": [
-        "final-bar-local-forge-repair",
-        "gate-keep-going",
-        "steering-grammar-negation",
-        "gate-local-audit"
+        "campaign-nix-surface-retire",
+        "delete-gh-inbound-core",
+        "delete-gh-origin-durable",
+        "delete-gh-nix-tree",
+        "squash-migration-modules",
+        "squash-err-fallbacks",
+        "squash-rowversion-ladder",
+        "dead-cuts",
+        "brief-carries-conflict-domains",
+        "ownership-preflight-warn",
+        "poll-liveness-arm",
+        "status-renders-reconciled-truth"
       ]
     }
   ]
