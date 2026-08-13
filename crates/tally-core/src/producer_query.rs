@@ -280,7 +280,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let registry = BTreeMap::from([(
             "nightly".to_owned(),
-            ProducerConfig::Calendar(CalendarProducer {
+            ProducerConfig::Calendar(Box::new(CalendarProducer {
                 credentials: BTreeMap::from([(
                     "token".to_owned(),
                     "/run/secrets/never-project-this".into(),
@@ -294,7 +294,7 @@ mod tests {
                     }))
                     .unwrap()
                 },
-            }),
+            })),
         )]);
         record_producer_runtime(
             temp.path(),

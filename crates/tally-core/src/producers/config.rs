@@ -254,7 +254,7 @@ pub enum ProducerObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProducerConfig {
-    Calendar(CalendarProducer),
+    Calendar(Box<CalendarProducer>),
     EventsDir(EventsDirProducer),
 }
 
