@@ -144,10 +144,10 @@ NARRATION_MENTION = re.compile(r"(?<![0-9A-Za-z._-])@[0-9A-Za-z][0-9A-Za-z-]*")
 
 # #385: the managed-agents content guidelines the chips-and-log rendering
 # assumes -- an outcome-first leading sentence, a past-tense opening verb, no
-# exclamation, a bounded length -- made machine-checkable and applied to every
-# prose surface that crosses the publish boundary: PR prose (the narrate
-# slot's proposal body), the closing summary, and steering notes. One
-# validator, three callers, so the contract lives in exactly one place.
+# bare prose exclamation, a bounded length -- made machine-checkable and
+# applied to every prose surface that crosses the publish boundary: PR prose
+# (the narrate slot's proposal body), the closing summary, and steering notes.
+# One validator, three callers, so the contract lives in exactly one place.
 OUTCOME_FIRST_LIST_MARKER = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)")
 # Regular past-tense verbs end in "ed"; the irregulars below are the ones this
 # driver's own templates and a steward's plausible vocabulary actually use.
@@ -171,23 +171,86 @@ OUTCOME_FIRST_VERB = re.compile(
 OUTCOME_FIRST_LEAD_MAX = 240
 
 
+def _closed_inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Return half-open ranges fenced by equal-length backtick runs."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        opening = text.find("`", cursor)
+        if opening < 0:
+            break
+        opening_end = opening
+        while opening_end < len(text) and text[opening_end] == "`":
+            opening_end += 1
+        fence_width = opening_end - opening
+        search = opening_end
+        closing_end = -1
+        while search < len(text):
+            closing = text.find("`", search)
+            if closing < 0:
+                break
+            candidate_end = closing
+            while candidate_end < len(text) and text[candidate_end] == "`":
+                candidate_end += 1
+            if candidate_end - closing == fence_width:
+                closing_end = candidate_end
+                break
+            search = candidate_end
+        if closing_end < 0:
+            cursor = opening_end
+            continue
+        spans.append((opening, closing_end))
+        cursor = closing_end
+    return spans
+
+
+def contains_bare_exclamation_mark(text: str) -> bool:
+    """Return whether `text` has `!` outside a closed inline-code span.
+
+    A reproduction is explicitly encoded as text between matching non-empty
+    runs of backticks, such as `! grep -n stale test/x.py`. The opener and
+    closer must have equal lengths; an unmatched or mismatched run grants no
+    exception. Exclamation marks in those spans are code, while every other
+    exclamation mark is ordinary prose and therefore refused.
+    """
+    plain_start = 0
+    for code_start, code_end in _closed_inline_code_spans(text):
+        if "!" in text[plain_start:code_start]:
+            return True
+        plain_start = code_end
+    return "!" in text[plain_start:]
+
+
+def _replace_bare_exclamation_marks(text: str, replacement: str) -> str:
+    """Replace prose bangs while copying closed inline-code spans verbatim."""
+    output: list[str] = []
+    plain_start = 0
+    for code_start, code_end in _closed_inline_code_spans(text):
+        output.append(text[plain_start:code_start].replace("!", replacement))
+        output.append(text[code_start:code_end])
+        plain_start = code_end
+    output.append(text[plain_start:].replace("!", replacement))
+    return "".join(output)
+
+
 def validate_outcome_first(text: Any, *, max_chars: int, context: str) -> str | None:
     """The machine-checkable half of the managed-agents content contract.
 
     Returns `None` when `text` satisfies it, or the one reason it does not.
     The four checks are independent and each names itself: a leading sentence
     (ending `.` or `:`) precedes any list rather than a list opening the text,
-    that sentence opens with a past-tense verb, nothing in the text carries an
-    exclamation mark, and the whole text stays under `max_chars`. Applied
-    uniformly whether the text is steward-proposed or driver-rendered, so a
-    template that drifts from its own contract fails loudly instead of
+    that sentence opens with a past-tense verb, ordinary prose carries no
+    exclamation mark, and the whole text stays under `max_chars`. Inline code
+    uses the explicit encoding documented by `contains_bare_exclamation_mark`.
+    Applied uniformly whether the text is steward-proposed or driver-rendered,
+    so a template that drifts from its own contract fails loudly instead of
     shipping unchecked.
     """
     if not isinstance(text, str) or not text.strip():
         return f"{context} must be non-empty text"
     if len(text) > max_chars:
         return f"{context} is over the {max_chars} character cap"
-    if "!" in text:
+    if contains_bare_exclamation_mark(text):
         return f"{context} contains an exclamation mark"
     first_line = text.strip().split("\n", 1)[0].strip()
     if OUTCOME_FIRST_LIST_MARKER.match(first_line):
@@ -4052,8 +4115,11 @@ def diagnosis_fallback_note(
     if path:
         note += f" Required literal offending path: {path!r}."
     if rejected:
-        excerpt = re.sub(r"\s+", " ", rejected).strip().replace("!", ".")
+        excerpt = re.sub(r"\s+", " ", rejected).strip()
         excerpt = excerpt[:2000].rstrip(" .:;?")
+        # Truncation can remove a code span's closing fence. Sanitize after the
+        # bound so only spans that remain complete retain their code bangs.
+        excerpt = _replace_bare_exclamation_marks(excerpt, ".")
         if excerpt:
             note += f" Redacted proposal excerpt: {excerpt}."
     if len(note) > MAX_DIAGNOSIS_CHARS:
