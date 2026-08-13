@@ -41,10 +41,7 @@ use tally_core::exec_attestation::{
 use tally_core::executor::{
     persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, Executor, UnitLimits,
 };
-use tally_core::producers::{
-    read_orphaned_projections, record_producer_runtime, GhCliAcknowledgementSink, GhCliIntake,
-    GhObservation, ProducerEngine, ProducerObservation,
-};
+use tally_core::producers::{record_producer_runtime, ProducerEngine, ProducerObservation};
 use tally_core::provenance::Orchestration;
 use tally_core::query_v2::ObservabilityError;
 use tally_core::recovery::RecoveryPolicy;
@@ -308,7 +305,6 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         Some(Command::Queue { command }) => {
             run_queue(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
-        Some(Command::Producer { command }) => run_producer(opts.config, command),
         Some(Command::Adapter { command }) => {
             run_adapter(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
@@ -396,161 +392,6 @@ fn migration_executors(
     Ok(BTreeMap::new())
 }
 
-fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Result<()> {
-    // An orphaned projection is exactly the case where the configuration no
-    // longer mentions the producer, so requiring a readable configuration to
-    // read the record would refuse the one question it answers.
-    if let ProducerCommand::Orphaned { state_dir } = command {
-        let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-        let scan = read_orphaned_projections(&state_dir)?;
-        // One unusable file must not hide the usable ones. It is named on
-        // stderr and counted in the envelope, and the listing an operator was
-        // told to run still answers.
-        for unreadable in &scan.unreadable {
-            errln!(
-                "tally: orphaned-projection record {} could not be read: {}",
-                unreadable.path.display(),
-                unreadable.detail
-            );
-        }
-        outln!(
-            "{}",
-            serde_json::to_string(&json!({
-                "stateDir": state_dir,
-                "count": scan.records.len(),
-                "projections": scan.records,
-                "unreadable": scan.unreadable,
-            }))?
-        );
-        return Ok(());
-    }
-    let config_path = config_path.map_or_else(default_config_path, Ok)?;
-    let config = Config::from_path(&config_path)?;
-    let intake = GhCliIntake::default();
-    let now = Utc::now();
-    let result = match command {
-        ProducerCommand::Preview {
-            name,
-            state_dir,
-            data_dir,
-        } => {
-            let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-            let data_dir = data_dir.map_or_else(default_data_dir, Ok)?;
-            let engine = ProducerEngine::new(
-                &config.producers,
-                state_dir.join("events"),
-                &state_dir,
-                &data_dir,
-            );
-            serde_json::to_value(engine.preview_gh(&name, &intake, now)?)?
-        }
-        ProducerCommand::Poll {
-            name,
-            once,
-            no_enqueue,
-            state_dir,
-            data_dir,
-        } => {
-            if !once {
-                return Err(invalid("producer poll currently requires --once"));
-            }
-            let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-            let data_dir = data_dir.map_or_else(default_data_dir, Ok)?;
-            let engine = ProducerEngine::new(
-                &config.producers,
-                state_dir.join("events"),
-                &state_dir,
-                &data_dir,
-            );
-            if no_enqueue {
-                serde_json::to_value(engine.preview_gh(&name, &intake, now)?)?
-            } else {
-                let mut acknowledgements =
-                    GhCliAcknowledgementSink::default().with_state_dir(&state_dir);
-                serde_json::to_value(engine.poll_gh_with_acknowledgements(
-                    &name,
-                    &intake,
-                    now,
-                    &mut acknowledgements,
-                )?)?
-            }
-        }
-        ProducerCommand::Explain {
-            name,
-            item,
-            state_dir,
-            data_dir,
-        } => {
-            let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-            let data_dir = data_dir.map_or_else(default_data_dir, Ok)?;
-            let engine = ProducerEngine::new(
-                &config.producers,
-                state_dir.join("events"),
-                &state_dir,
-                &data_dir,
-            );
-            serde_json::to_value(engine.explain_gh(&name, &intake, &item, now)?)?
-        }
-        ProducerCommand::Test {
-            name,
-            item,
-            event,
-            actor,
-            no_enqueue,
-            promote,
-            state_dir,
-            data_dir,
-        } => {
-            let dry_run = no_enqueue || !promote;
-            let state_dir = if promote {
-                state_dir.map_or_else(default_state_dir, Ok)?
-            } else {
-                state_dir.unwrap_or_else(|| {
-                    std::env::temp_dir().join(format!("tally-producer-test-{}", std::process::id()))
-                })
-            };
-            let data_dir = if promote {
-                data_dir.map_or_else(default_data_dir, Ok)?
-            } else {
-                data_dir.unwrap_or_else(|| state_dir.join("diagnostic-data"))
-            };
-            std::fs::create_dir_all(&data_dir).with_context(|| {
-                format!("cannot create producer brief root {}", data_dir.display())
-            })?;
-            let engine = ProducerEngine::new(
-                &config.producers,
-                state_dir.join("events"),
-                &state_dir,
-                &data_dir,
-            );
-            let observation = engine.diagnostic_gh_observation(
-                &name,
-                &intake,
-                &item,
-                event.as_str(),
-                &actor,
-                now,
-            )?;
-            if dry_run {
-                serde_json::to_value(engine.preview_gh_observation(&name, &observation, now)?)?
-            } else {
-                let mut acknowledgements =
-                    GhCliAcknowledgementSink::default().with_state_dir(&state_dir);
-                serde_json::to_value(engine.admit_gh_observation(
-                    &name,
-                    &observation,
-                    now,
-                    &mut acknowledgements,
-                )?)?
-            }
-        }
-        // Answered above, before the configuration is required.
-        ProducerCommand::Orphaned { .. } => unreachable!("orphaned listing returns early"),
-    };
-    outln!("{}", serde_json::to_string(&result)?);
-    Ok(())
-}
-
 async fn run_producer_dispatch(
     config_path: Option<PathBuf>,
     socket: &Path,
@@ -568,13 +409,10 @@ async fn run_producer_dispatch(
     // name it too.
     let data_dir = args.data_dir;
     let events_dir = state_dir.join("events");
-    let engine = ProducerEngine::new(&config.producers, &events_dir, &state_dir, &data_dir);
+    let engine = ProducerEngine::new(&config.producers, &events_dir, &data_dir);
     let expected_kind = match &event {
         ProducerObservation::Calendar => "calendar",
         ProducerObservation::EventsDir => "events-dir",
-        ProducerObservation::Gh(_) => "gh",
-        ProducerObservation::BuildEffect { .. } => "build-effect",
-        ProducerObservation::PoolReachability { .. } => "pool-reachability",
     };
     let actual_kind = engine.producer_kind(&args.producer)?;
     if actual_kind != expected_kind {
@@ -589,158 +427,19 @@ async fn run_producer_dispatch(
     let producer_name = args.producer.clone();
     let dispatched: Result<Value> = async {
         let result = match event {
-        ProducerObservation::Calendar => {
-            serde_json::to_value(engine.emit_calendar(&args.producer, now)?)?
-        }
-        ProducerObservation::EventsDir => {
-            let client =
-                RpcClient::connect_with_max_frame_bytes(socket, max_frame_bytes).await?;
-            client
-                .call(
-                    "queue.drain",
-                    Some(json!({"producer": args.producer.clone()})),
-                )
-                .await?
-        }
-        ProducerObservation::Gh(observation) => {
-            let tally_core::producers::GhObservationInput {
-                source,
-                repo,
-                number,
-                html_url,
-                item_type,
-                head_sha,
-                node_id,
-                item_author,
-                trigger_actor,
-                self_actor,
-                notification_reason,
-                trigger_kind,
-                event_id,
-                comment_id,
-                trigger_timestamp,
-                trigger_value,
-                context,
-            } = *observation;
-            let is_poll = source.is_none()
-                && repo.is_none()
-                && number.is_none()
-                && html_url.is_none()
-                && item_type.is_none()
-                && head_sha.is_none()
-                && node_id.is_none()
-                && item_author.is_none()
-                && trigger_actor.is_none()
-                && self_actor.is_none()
-                && notification_reason.is_none()
-                && trigger_kind.is_none()
-                && event_id.is_none()
-                && comment_id.is_none()
-                && trigger_timestamp.is_none()
-                && trigger_value.is_none()
-                && context.is_none();
-            if is_poll {
-                let mut acknowledgements =
-                    GhCliAcknowledgementSink::default().with_state_dir(&state_dir);
-                serde_json::to_value(engine.poll_gh_with_acknowledgements(
-                    &args.producer,
-                    &GhCliIntake::default(),
-                    now,
-                    &mut acknowledgements,
-                )?)?
-            } else if let (
-                Some(source),
-                Some(repo),
-                Some(number),
-                Some(html_url),
-                Some(item_type),
-                Some(node_id),
-                Some(item_author),
-                Some(trigger_actor),
-                Some(self_actor),
-                Some(trigger_kind),
-                Some(trigger_timestamp),
-                Some(context),
-            ) = (
-                source,
-                repo,
-                number,
-                html_url,
-                item_type,
-                node_id,
-                item_author,
-                trigger_actor,
-                self_actor,
-                trigger_kind,
-                trigger_timestamp,
-                context,
-            ) {
-                serde_json::to_value(engine.emit_gh(
-                    &args.producer,
-                    &GhObservation {
-                        source,
-                        repo,
-                        number,
-                        html_url,
-                        item_type,
-                        head_sha,
-                        node_id,
-                        item_author,
-                        trigger_actor,
-                        self_actor,
-                        notification_reason,
-                        trigger_kind,
-                        event_id,
-                        comment_id,
-                        trigger_timestamp,
-                        trigger_value,
-                        context,
-                    },
-                    now,
-                )?)?
-            } else {
-                bail!(
-                    "gh observation requires either no fields for a configured poll or complete origin identity and context fields"
-                )
+            ProducerObservation::Calendar => {
+                serde_json::to_value(engine.emit_calendar(&args.producer, now)?)?
             }
-        }
-        ProducerObservation::BuildEffect { store_path } => {
-            let store_paths = if let Some(store_path) = store_path {
-                vec![store_path]
-            } else {
-                engine.scan_build_effect(&args.producer)?
-            };
-            let outcomes = store_paths
-                .iter()
-                .map(|store_path| engine.emit_build_effect(&args.producer, store_path, now))
-                .collect::<Result<Vec<_>, _>>()?;
-            serde_json::to_value(outcomes)?
-        }
-        ProducerObservation::PoolReachability { reachable } => {
-            let outcome = engine.observe_reachability(&args.producer, reachable, now)?;
-            if let Some(transition) = outcome.transition {
-                if args.engine_only {
-                    engine
-                        .acknowledge_reachability_transition(&args.producer, outcome.generation)?;
-                } else {
-                    let client =
-                        RpcClient::connect_with_max_frame_bytes(socket, max_frame_bytes).await?;
-                    client
-                        .call(
-                            "__producer.pool-transition",
-                            Some(json!({
-                                "producer": args.producer.clone(),
-                                "transition": transition,
-                                "generation": outcome.generation,
-                            })),
-                        )
-                        .await?;
-                    engine
-                        .acknowledge_reachability_transition(&args.producer, outcome.generation)?;
-                }
+            ProducerObservation::EventsDir => {
+                let client =
+                    RpcClient::connect_with_max_frame_bytes(socket, max_frame_bytes).await?;
+                client
+                    .call(
+                        "queue.drain",
+                        Some(json!({"producer": args.producer.clone()})),
+                    )
+                    .await?
             }
-            serde_json::to_value(outcome)?
-        }
         };
         Ok(result)
     }
@@ -1021,7 +720,6 @@ fn run_gc(args: GcArgs) -> Result<()> {
         &args.events_done_horizon,
         &args.events_rejected_horizon,
         args.events_rejected_max_count,
-        &args.producer_marker_horizon,
     )?;
     let report = tally_core::retention::run_gc(
         tally_core::retention::GcRequest {

@@ -43,8 +43,6 @@ pub enum EnqueueSource {
     Calendar,
     EventsDir,
     Gh,
-    BuildEffect,
-    PoolReachability,
 }
 
 impl EnqueueSource {
@@ -55,20 +53,11 @@ impl EnqueueSource {
             Self::Calendar => "calendar",
             Self::EventsDir => "events-dir",
             Self::Gh => "gh",
-            Self::BuildEffect => "build-effect",
-            Self::PoolReachability => "pool-reachability",
         }
     }
 
     pub const fn is_producer(self) -> bool {
-        matches!(
-            self,
-            Self::Calendar
-                | Self::EventsDir
-                | Self::Gh
-                | Self::BuildEffect
-                | Self::PoolReachability
-        )
+        matches!(self, Self::Calendar | Self::EventsDir | Self::Gh)
     }
 }
 
@@ -1896,13 +1885,11 @@ mod tests {
     }
 
     fn property_source(selector: u8) -> EnqueueSource {
-        match selector % 6 {
+        match selector % 4 {
             0 => EnqueueSource::Manual,
             1 => EnqueueSource::Orchestrator,
             2 => EnqueueSource::Calendar,
             3 => EnqueueSource::EventsDir,
-            4 => EnqueueSource::BuildEffect,
-            5 => EnqueueSource::PoolReachability,
             _ => unreachable!(),
         }
     }

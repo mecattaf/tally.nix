@@ -116,16 +116,6 @@ impl Daemon {
         if let Some(timeline) = self.startup.as_mut() {
             timeline.phase("initial-recovery");
         }
-        let mut startup_error = None;
-        for pool in std::mem::take(&mut self.initial_lost_pools) {
-            if let Err(error) = self.handler.apply_pool_loss(&pool).await {
-                startup_error = Some(DaemonError::Invalid(format!(
-                    "cannot apply confirmed startup pool loss for {pool:?}: {}",
-                    error.message
-                )));
-                break;
-            }
-        }
         for job in std::mem::take(&mut self.initial_jobs) {
             let running = self
                 .handler
@@ -138,10 +128,6 @@ impl Daemon {
             if running {
                 self.handler.spawn_execution(job);
             }
-        }
-        for completion in std::mem::take(&mut self.initial_gh_completions) {
-            self.handler
-                .complete_gh_post_ack(completion.row, completion.result);
         }
         let mut lease_tick = tokio::time::interval(LEASE_TICK);
         lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -172,138 +158,134 @@ impl Daemon {
             }
             eprintln!("tally: {report}");
         }
-        let mut result = if let Some(error) = startup_error {
-            Err(error)
-        } else {
-            match self.notifier.ready() {
-                Err(error) => Err(error),
-                Ok(()) => {
-                    // READY=1 is what arms the service watchdog, so this is the
-                    // first instant a keepalive is owed and the last instant it
-                    // can be started from. Everything before it — the whole of
-                    // `Daemon::open`, including unit-fact collection and the
-                    // startup projection sweep — is covered by TimeoutStartSec
-                    // instead, and cannot miss a watchdog deadline.
-                    //
-                    // The keepalive lives on its own OS thread from here. It is
-                    // deliberately not a `select!` arm any more: an arm is only
-                    // polled when the loop comes back around to poll it, so any
-                    // one slow arm body used to hold the ping until systemd gave
-                    // up. What the loop still owes is proof that it came back
-                    // around, stamped below.
-                    keepalive = self.notifier.keepalive(self.handler.fatal.clone());
-                    let progress = keepalive.as_ref().map(WatchdogKeepalive::progress);
-                    loop {
-                        if let Some(progress) = &progress {
-                            progress.stamp();
-                        }
-                        tokio::select! {
-                            accepted = self.listener.accept(), if connections.len() < max_connections => {
-                                match accepted {
-                                    Ok((stream, _)) => {
-                                        let handler = self.handler.clone();
-                                        let max_frame_bytes = self.max_frame_bytes;
-                                        connections.spawn_local(async move {
-                                            if let Err(error) = serve_connection_with_limits(
-                                                stream,
-                                                handler,
-                                                max_frame_bytes,
-                                                Some(RPC_IDLE_TIMEOUT),
-                                            )
-                                            .await
-                                            {
-                                                eprintln!("tally: RPC connection failed: {error}");
-                                            }
-                                        });
-                                        #[cfg(test)]
-                                        if let Some(hook) = &connection_count_hook {
-                                            let _ = hook.send(connections.len());
-                                        }
-                                    }
-                                    Err(source) if retryable_accept_error(&source) => {
-                                        eprintln!(
-                                            "tally: RPC accept failed, retrying after {} ms: {source}",
-                                            ACCEPT_ERROR_BACKOFF.as_millis()
-                                        );
-                                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                                    }
-                                    Err(source) => break Err(io_error(&socket_path, source)),
-                                }
-                            }
-                            Some(joined) = connections.join_next(), if !connections.is_empty() => {
-                                if let Err(error) = joined {
-                                    eprintln!("tally: RPC connection task failed: {error}");
-                                }
-                                #[cfg(test)]
-                                if let Some(hook) = &connection_count_hook {
-                                    let _ = hook.send(connections.len());
-                                }
-                            }
-                            Some(finished) = self.completion_rx.recv() => {
-                                if let Err(error) = self.finish_job(finished).await {
-                                    break Err(error);
-                                }
-                            }
-                            Some(error) = self.fatal_rx.recv() => break Err(error),
-                            _ = lease_tick.tick() => {
-                                #[cfg(test)]
-                                if let Some(hook) = &dispatch_stall_hook {
-                                    hook.stall().await;
-                                }
-                                if lease_ticks.is_empty() {
+        let mut result = match self.notifier.ready() {
+            Err(error) => Err(error),
+            Ok(()) => {
+                // READY=1 is what arms the service watchdog, so this is the
+                // first instant a keepalive is owed and the last instant it
+                // can be started from. Everything before it — the whole of
+                // `Daemon::open`, including unit-fact collection and the
+                // startup projection sweep — is covered by TimeoutStartSec
+                // instead, and cannot miss a watchdog deadline.
+                //
+                // The keepalive lives on its own OS thread from here. It is
+                // deliberately not a `select!` arm any more: an arm is only
+                // polled when the loop comes back around to poll it, so any
+                // one slow arm body used to hold the ping until systemd gave
+                // up. What the loop still owes is proof that it came back
+                // around, stamped below.
+                keepalive = self.notifier.keepalive(self.handler.fatal.clone());
+                let progress = keepalive.as_ref().map(WatchdogKeepalive::progress);
+                loop {
+                    if let Some(progress) = &progress {
+                        progress.stamp();
+                    }
+                    tokio::select! {
+                        accepted = self.listener.accept(), if connections.len() < max_connections => {
+                            match accepted {
+                                Ok((stream, _)) => {
                                     let handler = self.handler.clone();
+                                    let max_frame_bytes = self.max_frame_bytes;
+                                    connections.spawn_local(async move {
+                                        if let Err(error) = serve_connection_with_limits(
+                                            stream,
+                                            handler,
+                                            max_frame_bytes,
+                                            Some(RPC_IDLE_TIMEOUT),
+                                        )
+                                        .await
+                                        {
+                                            eprintln!("tally: RPC connection failed: {error}");
+                                        }
+                                    });
                                     #[cfg(test)]
-                                    let hook = self.lease_tick_hook.clone();
-                                    lease_ticks.spawn_local(async move {
-                                        #[cfg(test)]
-                                        if let Some(mut hook) = hook {
-                                            let _ = hook.started.send(());
-                                            while !*hook.release.borrow() {
-                                                if hook.release.changed().await.is_err() {
-                                                    break;
-                                                }
+                                    if let Some(hook) = &connection_count_hook {
+                                        let _ = hook.send(connections.len());
+                                    }
+                                }
+                                Err(source) if retryable_accept_error(&source) => {
+                                    eprintln!(
+                                        "tally: RPC accept failed, retrying after {} ms: {source}",
+                                        ACCEPT_ERROR_BACKOFF.as_millis()
+                                    );
+                                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                                }
+                                Err(source) => break Err(io_error(&socket_path, source)),
+                            }
+                        }
+                        Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                            if let Err(error) = joined {
+                                eprintln!("tally: RPC connection task failed: {error}");
+                            }
+                            #[cfg(test)]
+                            if let Some(hook) = &connection_count_hook {
+                                let _ = hook.send(connections.len());
+                            }
+                        }
+                        Some(finished) = self.completion_rx.recv() => {
+                            if let Err(error) = self.finish_job(finished).await {
+                                break Err(error);
+                            }
+                        }
+                        Some(error) = self.fatal_rx.recv() => break Err(error),
+                        _ = lease_tick.tick() => {
+                            #[cfg(test)]
+                            if let Some(hook) = &dispatch_stall_hook {
+                                hook.stall().await;
+                            }
+                            if lease_ticks.is_empty() {
+                                let handler = self.handler.clone();
+                                #[cfg(test)]
+                                let hook = self.lease_tick_hook.clone();
+                                lease_ticks.spawn_local(async move {
+                                    #[cfg(test)]
+                                    if let Some(mut hook) = hook {
+                                        let _ = hook.started.send(());
+                                        while !*hook.release.borrow() {
+                                            if hook.release.changed().await.is_err() {
+                                                break;
                                             }
                                         }
-                                        Self::tick_leases(handler).await
-                                    });
-                                }
+                                    }
+                                    Self::tick_leases(handler).await
+                                });
                             }
-                            _ = storage_tick.tick() => {
-                                self.handler.compact_lifecycle_if_needed().await;
-                                if storage_samples.is_empty() {
-                                    let handler = self.handler.clone();
-                                    storage_samples.spawn_local(async move {
-                                        handler.refresh_storage_now().await
-                                    });
-                                }
-                            }
-                            Some(sampled) = storage_samples.join_next(), if !storage_samples.is_empty() => {
-                                if let Err(error) = sampled {
-                                    eprintln!("tally: storage sampling task failed: {error}");
-                                }
-                            }
-                            Some(tick_result) = lease_ticks.join_next(), if !lease_ticks.is_empty() => {
-                                match tick_result {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(error)) => break Err(error),
-                                    Err(error) => break Err(DaemonError::Invalid(format!(
-                                        "lease tick task failed: {error}"
-                                    ))),
-                                }
-                            }
-                            changed = shutdown.changed() => {
-                                if changed.is_err() || *shutdown.borrow() {
-                                    break Ok(());
-                                }
-                            }
-                            signal = tokio::signal::ctrl_c() => {
-                                match signal {
-                                    Ok(()) => break Ok(()),
-                                    Err(error) => break Err(DaemonError::Notify(error.to_string())),
-                                }
-                            }
-                            _ = terminate.recv() => break Ok(()),
                         }
+                        _ = storage_tick.tick() => {
+                            self.handler.compact_lifecycle_if_needed().await;
+                            if storage_samples.is_empty() {
+                                let handler = self.handler.clone();
+                                storage_samples.spawn_local(async move {
+                                    handler.refresh_storage_now().await
+                                });
+                            }
+                        }
+                        Some(sampled) = storage_samples.join_next(), if !storage_samples.is_empty() => {
+                            if let Err(error) = sampled {
+                                eprintln!("tally: storage sampling task failed: {error}");
+                            }
+                        }
+                        Some(tick_result) = lease_ticks.join_next(), if !lease_ticks.is_empty() => {
+                            match tick_result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => break Err(error),
+                                Err(error) => break Err(DaemonError::Invalid(format!(
+                                    "lease tick task failed: {error}"
+                                ))),
+                            }
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break Ok(());
+                            }
+                        }
+                        signal = tokio::signal::ctrl_c() => {
+                            match signal {
+                                Ok(()) => break Ok(()),
+                                Err(error) => break Err(DaemonError::Notify(error.to_string())),
+                            }
+                        }
+                        _ = terminate.recv() => break Ok(()),
                     }
                 }
             }
@@ -341,14 +323,6 @@ impl Daemon {
             }
         }
         connections.shutdown().await;
-        // Pool-loss application crosses physical reclaim and canonical witness
-        // writes. RPC connection cancellation must not detach or abort that
-        // transaction; join it under the daemon's exclusive state lock.
-        if let Err(error) = self.handler.drain_pool_transition_tasks().await {
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
         let _ = self.execution_shutdown.send(true);
         // Advisory scrape attestations are outside the terminal fsync barrier,
         // but they still belong to this daemon lifetime. Join them while the
@@ -895,9 +869,11 @@ fn retry_unleased_jobs(context: &mut Context, executor: &Executor) -> Vec<Job> {
         .filter(|job| {
             job.state == JobState::Queued
                 && job.lease_id.is_none()
-                && !job.row.pools.iter().any(|pool| {
-                    context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
-                })
+                && !job
+                    .row
+                    .pools
+                    .iter()
+                    .any(|pool| context.paused_pools.contains(pool))
         })
         .map(|job| job.job_id)
         .collect::<Vec<_>>();
@@ -939,9 +915,11 @@ pub(super) fn resume_paused_jobs_locked(
             continue;
         };
         if job.state != JobState::Paused
-            || job.row.pools.iter().any(|pool| {
-                context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
-            })
+            || job
+                .row
+                .pools
+                .iter()
+                .any(|pool| context.paused_pools.contains(pool))
         {
             continue;
         }
@@ -972,154 +950,6 @@ pub(super) fn resume_paused_jobs_locked(
         }
     }
     launches
-}
-
-pub(super) fn pool_representations(
-    mut plan: crate::recovery::RecoveryPlan,
-    pool: &str,
-    renderable: &BTreeSet<Uuid>,
-) -> crate::recovery::RecoveryPlan {
-    let selected = plan
-        .actions
-        .iter()
-        .filter_map(|action| match action {
-            RecoveryAction::RePresent { row, .. }
-                if row.pools.iter().any(|name| name == pool) && renderable.contains(&row.uuid) =>
-            {
-                Some(row.uuid)
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    plan.actions.retain(|action| {
-        matches!(action, RecoveryAction::RePresent { row, .. } if selected.contains(&row.uuid))
-    });
-    plan.rows.retain(|row| selected.contains(&row.row.uuid));
-    plan.lease_epoch_fences
-        .retain(|fence| match fence.identity {
-            RecoveryIdentity::Task(uuid) => selected.contains(&uuid),
-            RecoveryIdentity::Job(_) => false,
-        });
-    plan.advisory_return_attestations.clear();
-    plan
-}
-
-pub(super) fn renderable_pool_return_rows(
-    plan: &crate::recovery::RecoveryPlan,
-    config: &Config,
-    executor: &Executor,
-    attestations: &mut SharedAttestations,
-) -> BTreeSet<Uuid> {
-    let mut selected = BTreeSet::new();
-    for action in &plan.actions {
-        let RecoveryAction::RePresent {
-            row,
-            trigger: RetryTrigger::PoolReturn,
-            ..
-        } = action
-        else {
-            continue;
-        };
-        if config
-            .adapters
-            .get(&row.adapter)
-            .is_none_or(|adapter| adapter.resume.is_none())
-        {
-            eprintln!(
-                "tally: leaving pool-return row {} terminal because adapter {:?} has no resume template",
-                row.uuid, row.adapter
-            );
-            continue;
-        }
-        match recovery_adapter_invocation(config, action, row, executor, attestations) {
-            Ok(_) => {
-                selected.insert(row.uuid);
-            }
-            Err(error) => eprintln!(
-                "tally: leaving pool-return row {} terminal because its resume checkpoint is unavailable: {error}",
-                row.uuid
-            ),
-        }
-    }
-    selected
-}
-
-pub(super) fn merge_selected_pool_returns(
-    mut base: crate::recovery::RecoveryPlan,
-    triggered: crate::recovery::RecoveryPlan,
-    selected: &BTreeSet<Uuid>,
-) -> crate::recovery::RecoveryPlan {
-    if selected.is_empty() {
-        return base;
-    }
-    base.rows.retain(|row| !selected.contains(&row.row.uuid));
-    base.rows.extend(
-        triggered
-            .rows
-            .iter()
-            .filter(|row| selected.contains(&row.row.uuid))
-            .cloned(),
-    );
-    base.actions.retain(|action| {
-        recovery_action_task_uuid(action).is_none_or(|uuid| !selected.contains(&uuid))
-    });
-    base.actions.extend(
-        triggered
-            .actions
-            .iter()
-            .filter(|action| {
-                recovery_action_task_uuid(action).is_some_and(|uuid| selected.contains(&uuid))
-            })
-            .cloned(),
-    );
-    base.lease_epoch_fences
-        .retain(|fence| match fence.identity {
-            RecoveryIdentity::Task(uuid) => !selected.contains(&uuid),
-            RecoveryIdentity::Job(_) => true,
-        });
-    base.lease_epoch_fences.extend(
-        triggered
-            .lease_epoch_fences
-            .iter()
-            .filter(|fence| {
-                matches!(fence.identity, RecoveryIdentity::Task(uuid) if selected.contains(&uuid))
-            })
-            .cloned(),
-    );
-    base
-}
-
-fn recovery_action_task_uuid(action: &RecoveryAction) -> Option<Uuid> {
-    match action {
-        RecoveryAction::QueueExisting { task_uuid, .. }
-        | RecoveryAction::AwaitRetry { task_uuid, .. }
-        | RecoveryAction::RetryExhausted { task_uuid, .. } => Some(*task_uuid),
-        RecoveryAction::AdoptRunning {
-            identity: RecoveryIdentity::Task(uuid),
-            ..
-        }
-        | RecoveryAction::ReconcileExit {
-            identity: RecoveryIdentity::Task(uuid),
-            ..
-        } => Some(*uuid),
-        RecoveryAction::RePresent { row, .. } => Some(row.uuid),
-        RecoveryAction::AwaitUnitCollection {
-            identity: RecoveryIdentity::Task(uuid),
-            ..
-        } => Some(*uuid),
-        RecoveryAction::AdoptRunning {
-            identity: RecoveryIdentity::Job(_),
-            ..
-        }
-        | RecoveryAction::ReconcileExit {
-            identity: RecoveryIdentity::Job(_),
-            ..
-        }
-        | RecoveryAction::AwaitUnitCollection {
-            identity: RecoveryIdentity::Job(_),
-            ..
-        } => None,
-    }
 }
 
 /// Did the executor fail before the job could start?

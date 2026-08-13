@@ -45,10 +45,6 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: QueueCommand,
     },
-    Producer {
-        #[command(subcommand)]
-        command: ProducerCommand,
-    },
     Adapter {
         #[command(subcommand)]
         command: AdapterCommand,
@@ -682,9 +678,6 @@ pub(super) enum CliSource {
     Orchestrator,
     Calendar,
     EventsDir,
-    Gh,
-    BuildEffect,
-    PoolReachability,
 }
 
 impl From<CliSource> for EnqueueSource {
@@ -694,9 +687,6 @@ impl From<CliSource> for EnqueueSource {
             CliSource::Orchestrator => Self::Orchestrator,
             CliSource::Calendar => Self::Calendar,
             CliSource::EventsDir => Self::EventsDir,
-            CliSource::Gh => Self::Gh,
-            CliSource::BuildEffect => Self::BuildEffect,
-            CliSource::PoolReachability => Self::PoolReachability,
         }
     }
 }
@@ -825,12 +815,6 @@ pub(super) struct GcArgs {
         default_value_t = tally_core::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
     )]
     pub(super) events_rejected_max_count: usize,
-    #[arg(
-        long,
-        value_name = "DURATION",
-        default_value = tally_core::retention::DEFAULT_PRODUCER_MARKER_MAX_AGE
-    )]
-    pub(super) producer_marker_horizon: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -919,82 +903,6 @@ pub(super) enum QueueCommand {
     },
     AwaitBarrier {
         barrier: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(super) enum GhDiagnosticEvent {
-    CommandComment,
-    Mention,
-    Assignment,
-    Label,
-}
-
-impl GhDiagnosticEvent {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::CommandComment => "command-comment",
-            Self::Mention => "mention",
-            Self::Assignment => "assignment",
-            Self::Label => "label",
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-pub(super) enum ProducerCommand {
-    Preview {
-        name: String,
-        #[arg(long, value_name = "PATH")]
-        state_dir: Option<PathBuf>,
-        #[arg(long, value_name = "PATH")]
-        data_dir: Option<PathBuf>,
-    },
-    Poll {
-        name: String,
-        #[arg(long)]
-        once: bool,
-        #[arg(long)]
-        no_enqueue: bool,
-        #[arg(long, value_name = "PATH")]
-        state_dir: Option<PathBuf>,
-        #[arg(long, value_name = "PATH")]
-        data_dir: Option<PathBuf>,
-    },
-    Explain {
-        name: String,
-        #[arg(long)]
-        item: String,
-        #[arg(long, value_name = "PATH")]
-        state_dir: Option<PathBuf>,
-        #[arg(long, value_name = "PATH")]
-        data_dir: Option<PathBuf>,
-    },
-    /// List every forge projection whose producer is no longer configured.
-    ///
-    /// These are terminal: the task completions are settled and witnessed, and
-    /// only the forge-side projection was lost. Reading them needs the state
-    /// directory alone — the configuration no longer names the producer.
-    Orphaned {
-        #[arg(long, value_name = "PATH")]
-        state_dir: Option<PathBuf>,
-    },
-    Test {
-        name: String,
-        #[arg(long)]
-        item: String,
-        #[arg(long, value_enum)]
-        event: GhDiagnosticEvent,
-        #[arg(long)]
-        actor: String,
-        #[arg(long, conflicts_with = "promote")]
-        no_enqueue: bool,
-        #[arg(long)]
-        promote: bool,
-        #[arg(long, value_name = "PATH")]
-        state_dir: Option<PathBuf>,
-        #[arg(long, value_name = "PATH")]
-        data_dir: Option<PathBuf>,
     },
 }
 

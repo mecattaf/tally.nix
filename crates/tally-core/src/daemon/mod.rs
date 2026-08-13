@@ -28,11 +28,9 @@ use completion::hash_job_token;
 use completion::{
     accounting_witness_fields, append_context_witness, append_daemon_witness, canonical_job_model,
     canonical_verdict, completed_event, effective_gate_manifest, enqueued_event,
-    execution_fact_for_termination, finalize_forced_locked, forced_witness,
-    lock_gcroot_registration, release_child_charge, substituted_witness, GhTerminalWork,
-    TerminalWork,
+    execution_fact_for_termination, finalize_forced_locked, lock_gcroot_registration,
+    release_child_charge, substituted_witness, TerminalWork,
 };
-use completion::{append_orphan_attestation, append_orphan_retraction, gh_completion_id};
 pub(crate) use notify::WatchdogKeepalive;
 #[cfg(test)]
 use notify::{
@@ -40,31 +38,24 @@ use notify::{
     KeepaliveVerdict,
 };
 use rpc::control::{find_job, lease_request, lease_wire, state_name};
-#[cfg(test)]
-use rpc::producer::{pool_loss_intent_directory, read_pool_loss_intent, write_pool_loss_intent};
-use rpc::producer::{reconcile_pool_loss_intents, PoolTransitionTask};
 use rpc::query::{feed_scraped_usage, query_row};
 #[cfg(test)]
 use rpc::query::{
     overlay_live_states, read_usage_meter, usage_meter_event_path, write_usage_meter,
     UsageMeterObservation,
 };
-use run::{
-    merge_selected_pool_returns, pool_representations, promoted_jobs, renderable_pool_return_rows,
-    resume_paused_jobs_locked,
-};
+use run::{promoted_jobs, resume_paused_jobs_locked};
 #[cfg(test)]
 use run::{DispatchStallHook, FinishJobHook, LeaseTickHook};
+use startup::DaemonLockGuard;
 #[cfg(test)]
 use startup::{
     acquire_daemon_lock, hydrate_adopted_adapter_metadata, hydrate_completed_adapter_metadata,
     prepare_paths, reconcile_reuse_witnesses, recovered_model_is_advisory,
     verified_adapter_attestation_captures,
 };
-use startup::{
-    hydrate_represent_adapter_metadata, install_recovery_jobs, recovery_adapter_invocation,
-    DaemonLockGuard,
-};
+#[cfg(test)]
+use startup::{hydrate_represent_adapter_metadata, recovery_adapter_invocation};
 use witness_view::WitnessView;
 
 use std::cell::RefCell;
@@ -103,7 +94,7 @@ use crate::completion::{
 use crate::config::{Config, PoolPredicate, Priority, ResourceKind};
 use crate::evidence::{
     parse_evidence_specs, probe_dedup, probe_full_pass, run_evidence_gate, CheckOutcome,
-    DedupMissReason, RetryTrigger, RunOutcome,
+    DedupMissReason, RunOutcome,
 };
 use crate::exec_attestation::ExecAttestationContext;
 use crate::executor::{
@@ -130,9 +121,7 @@ use crate::pagination::{PageCache, PaginationError};
 use crate::producer_query::query_producers;
 use crate::producers::{
     acknowledged_ingress_ids, archive_ingress_claim, claim_ingress_files, read_ingress_payload,
-    read_orphaned_projections, GhCliMutationSink, GhCompletionProjection, GhProjectionOutcome,
-    IngressOutcome, OrphanedProjection, OrphanedProjectionKind, OrphanedProjections,
-    ProducerEngine, ProducerError, ReachabilityTransition, ORPHANED_PROJECTION_SCHEMA_VERSION,
+    IngressOutcome,
 };
 use crate::provenance::{Orchestration, TaskRef, DEFAULT_FLOW_MAX_NODES};
 use crate::query::{
@@ -173,10 +162,12 @@ use crate::wire::{
     GuardrailState, ParentInfo, ProducerDefaults, RequestFrame, RpcHandler, SubmissionMode,
     WireError, WireErrorCode, WireIoError,
 };
+#[cfg(test)]
+use crate::witness::read_verified_records;
 use crate::witness::{
-    current_host_id, read_verified_attestations, read_verified_records, AttestationLedger,
-    AttestationRecord, AttestationVerifyReport, Charge, Derivation, LaborClass, TerminalError,
-    Verdict, WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
+    current_host_id, read_verified_attestations, AttestationLedger, AttestationRecord,
+    AttestationVerifyReport, Charge, Derivation, LaborClass, TerminalError, Verdict, WitnessBody,
+    WitnessError, WitnessLedger, WitnessRecord,
 };
 
 /// The daemon's one cached handle per advisory attestation chain.
@@ -627,9 +618,6 @@ pub struct Context {
     aliases: HashMap<String, Uuid>,
     lease_jobs: HashMap<String, Uuid>,
     paused_pools: HashSet<String>,
-    unreachable_pools: HashSet<String>,
-    unreachable_paused_jobs: HashSet<Uuid>,
-    applied_pool_transitions: HashSet<(String, u64)>,
     barriers: BarrierTracker,
     rows: BTreeMap<Uuid, RowSeed>,
     guardrail_depths: BTreeMap<Uuid, u32>,
@@ -660,17 +648,13 @@ struct DaemonHandler {
     changes: Rc<RefCell<ChangeStore>>,
     storage: Rc<RefCell<StorageRuntime>>,
     storage_refresh: Rc<Mutex<()>>,
-    storage_receipts: Rc<RefCell<HashSet<StorageReceiptKey>>>,
     trace_adapters: Rc<BTreeSet<String>>,
     pages: Rc<RefCell<PageCache>>,
     execution_shutdown: watch::Receiver<bool>,
     execution_cancel: broadcast::Sender<Uuid>,
     fatal: mpsc::UnboundedSender<DaemonError>,
     post_ack_tasks: Rc<RefCell<Vec<JoinHandle<()>>>>,
-    pool_transition_tasks: Rc<RefCell<Vec<PoolTransitionTask>>>,
     ingress_sweep: Rc<Mutex<()>>,
-    pool_transition_sweep: Rc<Mutex<()>>,
-    gh_program: PathBuf,
     tally_socket: String,
     brief_root: PathBuf,
     exec_attestations: bool,
@@ -704,14 +688,6 @@ pub(crate) struct CachedFlowMembership {
     membership: Arc<FlowMembership>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct StorageReceiptKey {
-    producer: String,
-    source: String,
-    item_id: String,
-    warning_sequence: u64,
-}
-
 struct StorageRuntime {
     monitor: StorageMonitor,
     snapshot: StorageMetrics,
@@ -740,7 +716,6 @@ enum DispatchMethod {
     Resume,
     Cancel,
     Supersede,
-    PoolTransition,
     ProducerRuntimeObserved,
     Acquire,
     Release,
@@ -759,7 +734,6 @@ const DISPATCHER_METHODS: &[(&str, DispatchMethod)] = &[
     ("queue.resume", DispatchMethod::Resume),
     ("queue.cancel", DispatchMethod::Cancel),
     ("flow.supersede", DispatchMethod::Supersede),
-    ("__producer.pool-transition", DispatchMethod::PoolTransition),
     (
         "__producer.runtime-observed",
         DispatchMethod::ProducerRuntimeObserved,
@@ -808,7 +782,6 @@ impl RpcHandler for DaemonHandler {
                 Some(DispatchMethod::Resume) => self.resume(request.params).await,
                 Some(DispatchMethod::Cancel) => self.cancel(request.params).await,
                 Some(DispatchMethod::Supersede) => self.supersede_flow(request.params).await,
-                Some(DispatchMethod::PoolTransition) => self.pool_transition(request.params).await,
                 Some(DispatchMethod::ProducerRuntimeObserved) => {
                     self.producer_runtime_observed(request.params).await
                 }
@@ -1068,8 +1041,6 @@ pub struct Daemon {
     /// `run_loop`, which owns the last pre-`READY` phase.
     startup: Option<startup::StartupTimeline>,
     initial_jobs: Vec<Job>,
-    initial_gh_completions: Vec<GhTerminalWork>,
-    initial_lost_pools: Vec<String>,
     execution_shutdown: watch::Sender<bool>,
     max_frame_bytes: u64,
     #[cfg(test)]

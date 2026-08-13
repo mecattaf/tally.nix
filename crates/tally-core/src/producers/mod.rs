@@ -4,12 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
 
 use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Utc};
@@ -21,35 +16,20 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::adapters::AdapterJobOptions;
-use crate::completion::{
-    AcceptanceFact, AcceptanceStatus, GateManifestSpec, GateSummary, GateSummaryStatus,
-    SemanticCompletion,
-};
+use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
-use crate::taskdb::{
-    gh_trigger_dedup_key, gh_trigger_receipt_id, gh_trigger_task_uuid, read_acknowledged_events,
-    AdmissionOrigin, EnqueueSource, GhContextSnapshot, GhItemState, GhItemType, GhOrigin,
-    GhTriggeringComment, WorkspaceMetadata, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
-    MAX_GH_ORIGIN_FIELD_BYTES,
-};
+use crate::taskdb::{read_acknowledged_events, AdmissionOrigin, EnqueueSource, WorkspaceMetadata};
 use crate::wire::EnqueuePayload;
-use crate::witness::Verdict;
 
 mod config;
 mod engine;
-mod gh_decision;
-mod gh_intake;
 mod ingress;
-mod orphan;
 mod validate;
 
 pub use config::*;
 pub use engine::*;
-pub use gh_decision::*;
-pub use gh_intake::*;
 pub use ingress::*;
-pub use orphan::*;
 pub use validate::*;
 
 #[derive(Debug, Error)]
@@ -75,12 +55,6 @@ pub enum ProducerError {
     Json(#[from] serde_json::Error),
     #[error("durable event error: {0}")]
     DurableEvent(#[from] crate::taskdb::TaskDbError),
-    #[error("GitHub COMPLETED mutation failed: {0}")]
-    Mutation(String),
-    #[error("GitHub trigger acknowledgement failed: {0}")]
-    Acknowledgement(String),
-    #[error("GitHub intake failed: {0}")]
-    GitHub(String),
 }
 
 #[cfg(test)]

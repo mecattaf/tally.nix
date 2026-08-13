@@ -1447,7 +1447,5 @@ fn source_name(source: EnqueueSource) -> &'static str {
         EnqueueSource::Calendar => "calendar",
         EnqueueSource::EventsDir => "events-dir",
         EnqueueSource::Gh => "gh",
-        EnqueueSource::BuildEffect => "build-effect",
-        EnqueueSource::PoolReachability => "pool-reachability",
     }
 }

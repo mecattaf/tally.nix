@@ -233,7 +233,6 @@ impl Daemon {
         let host_id = current_host_id()?;
         let epoch = bump_epoch(&paths.state_dir)?;
         timeline.phase("durable-facts");
-        reconcile_pool_loss_intents(&paths, &executor, &mut witness_ledger, &host_id).await?;
         let mut durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
         if reconcile_reuse_witnesses(&paths, &durable, &mut witness_ledger)? {
             durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
@@ -268,51 +267,23 @@ impl Daemon {
         let units =
             collect_local_unit_facts(&executor, &durable, || extension.row_visited()).await?;
         timeline.phase("recovery-plan");
-        let producer_engine = ProducerEngine::new(
-            &config.producers,
-            paths.events_dir(),
-            &paths.state_dir,
-            &paths.data_dir,
-        );
-        let confirmed_pool_returns = producer_engine
-            .confirmed_pool_returns()
-            .map_err(|error| DaemonError::Invalid(error.to_string()))?
-            .into_iter()
-            .filter(|pool| {
-                config
-                    .pools
-                    .get(pool)
-                    .is_some_and(crate::config::PoolConfig::auto_resume_enabled)
-            })
-            .collect();
         let facts = RecoveryFacts {
             durable,
             current_lease_epoch: epoch,
             units,
             rowless_units: BTreeMap::new(),
             triggers: RecoveryTriggers {
-                confirmed_pool_returns,
+                confirmed_pool_returns: BTreeSet::new(),
                 resource_returns: BTreeSet::new(),
                 bounded_requeues: BTreeSet::new(),
             },
             advisory_return_attestations: Vec::new(),
         };
-        let mut startup_policy = settings.recovery_policy;
-        startup_policy.retry.auto_pool_return = true;
         let mut attestations = SharedAttestations::new(paths.attestations_path());
         if let Err(error) = attestations.ledger() {
             eprintln!("tally: advisory attestation ledger could not be opened: {error}");
         }
-        let triggered_plan = recover(&facts, startup_policy)?;
-        let selected =
-            renderable_pool_return_rows(&triggered_plan, &config, &executor, &mut attestations);
-        let mut facts_without_pool_returns = facts.clone();
-        facts_without_pool_returns
-            .triggers
-            .confirmed_pool_returns
-            .clear();
-        let base_plan = recover(&facts_without_pool_returns, startup_policy)?;
-        let mut plan = merge_selected_pool_returns(base_plan, triggered_plan, &selected);
+        let mut plan = recover(&facts, settings.recovery_policy)?;
         reconcile_retained_adapter_attestations(
             &plan,
             facts.durable.witness(),
@@ -393,23 +364,6 @@ impl Daemon {
         )?;
         timeline.phase("failure-stderr");
         reconcile_failure_stderr(&completed_witness, &executor, &paths.state_dir)?;
-        timeline.phase("gh-orphan-sweep");
-        let initial_gh_completions = sweep_orphaned_gh_completions(
-            recovery_gh_completions(&plan, &completed_witness, &executor)?,
-            &config,
-            &paths,
-            &mut attestations,
-        );
-        let initial_lost_pools = ProducerEngine::new(
-            &config.producers,
-            paths.events_dir(),
-            &paths.state_dir,
-            &paths.data_dir,
-        )
-        .confirmed_pool_losses()
-        .map_err(|error| DaemonError::Invalid(error.to_string()))?
-        .into_iter()
-        .collect::<Vec<_>>();
         timeline.phase("install-jobs");
         let query_rows = recovery_query_rows(&plan);
         let query_details = recovery_query_details(&plan);
@@ -445,9 +399,6 @@ impl Daemon {
             aliases: HashMap::new(),
             lease_jobs: HashMap::new(),
             paused_pools: HashSet::new(),
-            unreachable_pools: initial_lost_pools.iter().cloned().collect(),
-            unreachable_paused_jobs: HashSet::new(),
-            applied_pool_transitions: HashSet::new(),
             barriers: BarrierTracker::with_namespace(epoch),
             rows,
             guardrail_depths,
@@ -471,7 +422,6 @@ impl Daemon {
         let (execution_shutdown, execution_shutdown_rx) = watch::channel(false);
         let (execution_cancel, _) = broadcast::channel(64);
         let post_ack_tasks = Rc::new(RefCell::new(Vec::new()));
-        let pool_transition_tasks = Rc::new(RefCell::new(Vec::new()));
         let tally_socket = paths
             .socket
             .to_str()
@@ -522,17 +472,13 @@ impl Daemon {
             changes: Rc::new(RefCell::new(changes)),
             storage: Rc::new(RefCell::new(StorageRuntime::new(storage))),
             storage_refresh: Rc::new(Mutex::new(())),
-            storage_receipts: Rc::new(RefCell::new(HashSet::new())),
             trace_adapters: Rc::new(trace_adapters),
             pages: Rc::new(RefCell::new(PageCache::default())),
             execution_shutdown: execution_shutdown_rx,
             execution_cancel,
             fatal: fatal_tx,
             post_ack_tasks,
-            pool_transition_tasks,
             ingress_sweep: Rc::new(Mutex::new(())),
-            pool_transition_sweep: Rc::new(Mutex::new(())),
-            gh_program: PathBuf::from("gh"),
             tally_socket,
             brief_root: paths.data_dir.clone(),
             exec_attestations: config.attestations.exec.enable,
@@ -549,8 +495,6 @@ impl Daemon {
             notifier,
             startup: Some(timeline),
             initial_jobs,
-            initial_gh_completions,
-            initial_lost_pools,
             execution_shutdown,
             max_frame_bytes: config.max_frame_bytes,
             #[cfg(test)]
@@ -666,237 +610,6 @@ pub(super) fn acquire_daemon_lock(state_dir: &Path) -> Result<File, DaemonError>
         }
     })?;
     Ok(file)
-}
-
-/// Give every terminal projection that can no longer be applied a terminal
-/// outcome, before a single retry worker is spawned for it.
-///
-/// Two questions decide each projection, in this order:
-///
-/// 1. Did it already reach the forge? The `producers/gh-completed/` marker is
-///    the durable proof, and it is asked first for the same reason
-///    `complete_gh_once_with_completion` asks it first: a delivered projection
-///    is settled whatever the configuration says about its producer now.
-///    Saying otherwise would report a loss that did not happen — wrong in the
-///    reassuring direction, on the strongest claim surface in the tree.
-/// 2. Does its producer still resolve? Only if the answer to (1) is no does
-///    the absence of the producer make the projection terminal.
-///
-/// The population is decided from the effective configuration and the markers
-/// on every start, never from the records this writes. A producer block
-/// restored after a mistaken removal therefore projects its completions on the
-/// next start, and each stale record clears itself when its projection
-/// settles — including a record written before this ordering was in place,
-/// which retires on the first start after the upgrade and is retracted on the
-/// attestation chain by the worker that settles it.
-///
-/// The whole set is reported in one pass. A projection that can never be
-/// applied is a permanent condition, and an operator deserves to read it as a
-/// list rather than discover it one log line per minute.
-pub(super) fn sweep_orphaned_gh_completions(
-    completions: Vec<GhTerminalWork>,
-    config: &Config,
-    paths: &DaemonPaths,
-    attestations: &mut SharedAttestations,
-) -> Vec<GhTerminalWork> {
-    let engine = ProducerEngine::new(
-        &config.producers,
-        paths.events_dir(),
-        &paths.state_dir,
-        &paths.data_dir,
-    );
-    let mut retained = Vec::with_capacity(completions.len());
-    for work in completions {
-        let Some(origin) = work.row.gh_origin.as_ref() else {
-            retained.push(work);
-            continue;
-        };
-        let record = OrphanedProjection {
-            schema_version: ORPHANED_PROJECTION_SCHEMA_VERSION,
-            kind: OrphanedProjectionKind::Completion,
-            producer: origin.producer.clone(),
-            source: origin.source.clone(),
-            item_id: origin.node_id.clone(),
-            completion_id: gh_completion_id(
-                work.row.uuid,
-                work.result.attempt,
-                work.result.witness_seq,
-            ),
-            task_uuid: Some(work.row.uuid.to_string()),
-            verdict: Some(work.result.verdict),
-            observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            detail: ProducerError::UnknownProducer(origin.producer.clone()).to_string(),
-        };
-        match engine.gh_projection_settled(
-            OrphanedProjectionKind::Completion,
-            origin,
-            &record.completion_id,
-        ) {
-            Ok(true) => {
-                // Delivered. Retain it so the ordinary post-ack worker takes
-                // the no-op path it has always taken, and retract any record
-                // that claimed otherwise.
-                retract_settled_projection(&engine, attestations, &record, &work);
-                retained.push(work);
-                continue;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                // A marker that does not describe this projection is a
-                // corruption, and corruption is not evidence of loss. Hand it
-                // to the ordinary worker, which refuses it loudly and by name,
-                // rather than inventing a terminal claim from an unreadable
-                // file.
-                eprintln!(
-                    "tally: cannot tell whether the GitHub projection for {} was delivered; \
-                     leaving it to the post-ack worker: {error}",
-                    work.row.uuid
-                );
-                retained.push(work);
-                continue;
-            }
-        }
-        if config.producers.contains_key(&origin.producer) {
-            retained.push(work);
-            continue;
-        }
-        if let Err(error) = engine.record_orphaned_projection(&record) {
-            eprintln!(
-                "tally: recording the orphaned GitHub projection for {} failed: {error}",
-                work.row.uuid
-            );
-            continue;
-        }
-        if let Err(error) = append_orphan_attestation(
-            attestations,
-            &record,
-            Some(work.result.attempt),
-            Some(work.result.lease_epoch),
-        ) {
-            eprintln!("tally: orphaned-projection attestation failed: {error}");
-        }
-    }
-    match read_orphaned_projections(&paths.state_dir) {
-        Ok(scan) if !scan.is_empty() => eprintln!(
-            "tally: {}",
-            OrphanedProjections {
-                scan,
-                state_dir: paths.state_dir.clone(),
-            }
-        ),
-        Ok(_) => {}
-        Err(error) => eprintln!("tally: orphaned GitHub projection sweep failed: {error}"),
-    }
-    retained
-}
-
-/// Withdraw a record, and the claim it stood on, for a projection the marker
-/// proves was delivered.
-fn retract_settled_projection(
-    engine: &ProducerEngine<'_>,
-    attestations: &mut SharedAttestations,
-    record: &OrphanedProjection,
-    work: &GhTerminalWork,
-) {
-    let retracted = match engine.retract_orphaned_projection(record) {
-        Ok(Some(retracted)) => retracted,
-        Ok(None) => return,
-        Err(error) => {
-            eprintln!(
-                "tally: retracting the orphaned-projection record for {} failed: {error}",
-                work.row.uuid
-            );
-            return;
-        }
-    };
-    eprintln!(
-        "tally: the GitHub projection for {} was recorded as orphaned but its completion marker \
-         proves it reached the forge; the record is withdrawn and the claim retracted",
-        work.row.uuid
-    );
-    if let Err(error) = append_orphan_retraction(
-        attestations,
-        &retracted,
-        Some(work.result.attempt),
-        Some(work.result.lease_epoch),
-    ) {
-        eprintln!("tally: orphaned-projection retraction failed: {error}");
-    }
-}
-
-pub(super) fn recovery_gh_completions(
-    plan: &crate::recovery::RecoveryPlan,
-    records: &[crate::witness::WitnessRecord],
-    executor: &Executor,
-) -> Result<Vec<GhTerminalWork>, DaemonError> {
-    let rows = plan
-        .rows
-        .iter()
-        .filter(|row| {
-            row.row.gh_origin.is_some()
-                && matches!(
-                    row.state,
-                    RecoveryRowState::Completed | RecoveryRowState::Deleted
-                )
-        })
-        .map(|row| (row.row.uuid, row.row.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut latest = BTreeMap::<Uuid, &crate::witness::WitnessRecord>::new();
-    for record in records {
-        if !matches!(
-            record.verdict,
-            Verdict::Pass
-                | Verdict::Reused
-                | Verdict::CleanExitNoArtifact
-                | Verdict::Failed
-                | Verdict::Cancelled
-                | Verdict::PoolVanished
-                | Verdict::RuntimeExceeded
-        ) {
-            continue;
-        }
-        let Some(task_uuid) = record.task_uuid.as_deref() else {
-            continue;
-        };
-        let task_uuid = Uuid::parse_str(task_uuid).map_err(|_| {
-            DaemonError::Invalid(format!(
-                "terminal GitHub witness {} has invalid task UUID {task_uuid:?}",
-                record.seq
-            ))
-        })?;
-        if rows.contains_key(&task_uuid)
-            && latest
-                .get(&task_uuid)
-                .is_none_or(|selected| record.seq > selected.seq)
-        {
-            latest.insert(task_uuid, record);
-        }
-    }
-    Ok(latest
-        .into_iter()
-        .map(|(task_uuid, record)| GhTerminalWork {
-            row: rows[&task_uuid].clone(),
-            result: JobResult {
-                gpu_seconds: None,
-                task_uuid: Some(task_uuid.to_string()),
-                task_ref: record
-                    .orchestration
-                    .as_ref()
-                    .and_then(Orchestration::task_ref),
-                job_id: task_uuid.to_string(),
-                verdict: record.verdict,
-                exit_code: record.exit_code,
-                artifact_content_hash: record.artifact_content_hash.clone(),
-                attempt: record.attempt,
-                lease_epoch: record.lease_epoch,
-                witness_seq: record.seq,
-                model: record.model.clone(),
-                completion: record.completion.clone(),
-                error: record.error.clone(),
-                stderr_excerpt: retained_failure_stderr_excerpt(record, executor),
-            },
-        })
-        .collect())
 }
 
 /// Where the failure-stderr recovery pass records how far it has got.
@@ -2111,19 +1824,13 @@ pub(super) fn install_recovery_jobs(
         };
         if needs_lease
             && !adopted
-            && job.row.pools.iter().any(|pool| {
-                context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
-            })
-        {
-            job.state = JobState::Paused;
-            if job
+            && job
                 .row
                 .pools
                 .iter()
-                .any(|pool| context.unreachable_pools.contains(pool))
-            {
-                context.unreachable_paused_jobs.insert(job_id);
-            }
+                .any(|pool| context.paused_pools.contains(pool))
+        {
+            job.state = JobState::Paused;
         } else if needs_lease {
             let unit = executor.unit_name(&job.identity());
             match context.lease.admit(lease_request(&job, unit), Utc::now()) {

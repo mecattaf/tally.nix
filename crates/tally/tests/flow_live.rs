@@ -24,13 +24,8 @@ use tally_core::executor::{
     read_exit_record, ExecutionPaths, Executor, ExecutorError, LocalUnitFact, LocalUnitProbe,
     LocalUnitState, UnitLimits,
 };
-use tally_core::producers::{EmitOutcome, GhObservation, ProducerConfig, ProducerEngine};
 use tally_core::recovery::RecoveryPolicy;
-use tally_core::taskdb::{
-    read_acknowledged_events, related_trigger_from_gh_origin, EnqueueSource, GhContextSnapshot,
-    GhItemState, GhItemType, GhTriggeringComment, GH_CONTEXT_SCHEMA_VERSION,
-};
-use tally_core::wire::EnqueuePayload;
+use tally_core::taskdb::{read_acknowledged_events, EnqueueSource};
 use tally_core::witness::{read_verified_attestations, read_verified_records};
 use tally_flow::{BRIEF_SENTINEL, SUPERSESSION_DETAIL_FIELDS};
 use tokio::process::{Child, Command};
@@ -191,54 +186,6 @@ fn config() -> Config {
     }
 }
 
-fn install_github_flow_producer(config: &mut Config, argv: Vec<String>) {
-    let producer: ProducerConfig = serde_json::from_value(json!({
-        "kind": "gh",
-        "enable": true,
-        "sources": [{"search": {"repo": "acme/widgets"}}],
-        "triggers": {"commandComments": ["/pooled-review"]},
-        "allowedActors": ["maintainer"],
-        "postReceipt": false,
-        "postEvidence": true,
-        "closeOnPass": false,
-        "neverMutate": false,
-        "enqueue": {
-            "argv": argv,
-            "pool": "flow",
-            "evidence": ["exit:0"],
-            "noEnqueue": false
-        }
-    }))
-    .unwrap();
-    config.producers.insert("github-flow".to_owned(), producer);
-}
-
-fn install_fake_gh(root: &Path) -> (std::path::PathBuf, PathGuard) {
-    let bin = root.join("fake-bin");
-    fs::create_dir_all(&bin).unwrap();
-    let requests = root.join("gh-requests.jsonl");
-    let gh = bin.join("gh");
-    shell_program::install(
-        &gh,
-        format!(
-            concat!(
-                "#!/bin/sh\n",
-                "[ \"$1 $2 $3 $4\" = 'api graphql --input -' ] || exit 91\n",
-                "request=$(cat)\n",
-                "printf '%s\\n' \"$request\" >> '{}'\n",
-                "case \"$request\" in\n",
-                "  *TallyCompletionState*) printf '{{\"data\":{{\"node\":{{\"__typename\":\"Issue\",\"state\":\"OPEN\",\"comments\":{{\"nodes\":[],\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}' ;;\n",
-                "  *TallyCompletionComment*) printf '{{\"data\":{{\"addComment\":{{}}}}}}' ;;\n",
-                "  *) exit 92 ;;\n",
-                "esac\n"
-            ),
-            requests.display(),
-        ),
-    );
-    let path_guard = PathGuard::prepend(&bin);
-    (requests, path_guard)
-}
-
 fn install_fake_nix(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, PathGuard) {
     let bin = root.join("fake-nix-bin");
     fs::create_dir_all(&bin).unwrap();
@@ -326,41 +273,6 @@ fn install_fake_systemd_run(root: &Path, state_dir: &Path) -> std::path::PathBuf
         ),
     );
     program
-}
-
-fn github_flow_observation() -> GhObservation {
-    GhObservation {
-        source: "search".to_owned(),
-        repo: "acme/widgets".to_owned(),
-        number: 61,
-        html_url: "https://github.com/acme/widgets/issues/61".to_owned(),
-        item_type: GhItemType::Issue,
-        head_sha: None,
-        node_id: "I_flow_61".to_owned(),
-        item_author: "flow-author".to_owned(),
-        trigger_actor: "maintainer".to_owned(),
-        self_actor: "tally-bot".to_owned(),
-        notification_reason: None,
-        trigger_kind: "command-comment".to_owned(),
-        event_id: Some("notification-61".to_owned()),
-        comment_id: Some("comment-61".to_owned()),
-        trigger_timestamp: "2026-07-26T12:30:00Z".to_owned(),
-        trigger_value: None,
-        context: GhContextSnapshot {
-            schema_version: GH_CONTEXT_SCHEMA_VERSION,
-            title: "Run pooled review".to_owned(),
-            body: "Untrusted issue body never becomes flow code".to_owned(),
-            state: Some(GhItemState::Open),
-            head_sha: None,
-            labels: vec!["ready".to_owned()],
-            assignees: vec!["tally-bot".to_owned()],
-            triggering_comment: Some(GhTriggeringComment {
-                id: "comment-61".to_owned(),
-                author: "maintainer".to_owned(),
-                body: "/pooled-review".to_owned(),
-            }),
-        },
-    }
 }
 
 fn settings() -> DaemonSettings {
@@ -467,23 +379,6 @@ export const meta = {
     pools: ["beta"], priority: "medium", evidence: ["exit:0"], label: "beta-shell"
   })
 ]))()
-"#
-}
-
-fn one_node_source() -> &'static str {
-    r#"
-export const meta = {
-  name: "github-flow",
-  description: "GitHub provenance integration",
-  pools: ["alpha"],
-  argsSchema: { type: "object", additionalProperties: false },
-  selectors: [],
-  maxNodes: 1
-};
-
-(async () => sh(["/bin/sh", "-c", "exit 0"], {
-  pools: ["alpha"], evidence: ["exit:0"], label: "github-child"
-}))()
 "#
 }
 
@@ -1067,33 +962,13 @@ async fn fs5_live_acceptance_matrix() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let temp = tempfile::tempdir().unwrap();
-            let (gh_requests, _path_guard) = install_fake_gh(temp.path());
             let paths = paths(temp.path());
-            let mut config = config();
+            let config = config();
             let config_path = temp.path().join("config.json");
             let six_node_script = temp.path().join("six-node.js");
             fs::write(&six_node_script, six_node_source()).unwrap();
-            let github_script = temp.path().join("github-flow.js");
-            fs::write(&github_script, one_node_source()).unwrap();
             let divergent_script = temp.path().join("divergent.js");
             fs::write(&divergent_script, divergent_source()).unwrap();
-            install_github_flow_producer(
-                &mut config,
-                vec![
-                    env!("CARGO_BIN_EXE_tally").to_owned(),
-                    "--config".to_owned(),
-                    config_path.display().to_string(),
-                    "--socket".to_owned(),
-                    paths.socket.display().to_string(),
-                    "flow".to_owned(),
-                    "run".to_owned(),
-                    github_script.display().to_string(),
-                    "--args".to_owned(),
-                    "{}".to_owned(),
-                    "--max-nodes".to_owned(),
-                    "1".to_owned(),
-                ],
-            );
             config.validate().unwrap();
             fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
 
@@ -1152,186 +1027,6 @@ async fn fs5_live_acceptance_matrix() {
                 assert!(child.get("relatedTrigger").is_none());
             }
             assert_six_unique_rows(&paths, &parent_uuid);
-
-            // A command-comment producer emits the flow parent once. At runner
-            // startup the parent receipt is resolved through query.job and copied
-            // onto every child without turning that child into a GitHub job.
-            let producer_events = temp.path().join("producer-events");
-            let producer_state = temp.path().join("producer-state");
-            let producer = ProducerEngine::new(
-                &config.producers,
-                producer_events.clone(),
-                &producer_state,
-                &paths.data_dir,
-            );
-            let observation = github_flow_observation();
-            let emitted = match producer
-                .emit_gh("github-flow", &observation, chrono::Utc::now())
-                .unwrap()
-            {
-                EmitOutcome::Emitted(path) => path,
-                other => panic!("GitHub flow producer did not emit: {other:?}"),
-            };
-            assert_eq!(
-                producer
-                    .emit_gh("github-flow", &observation, chrono::Utc::now())
-                    .unwrap(),
-                EmitOutcome::Duplicate,
-                "redelivery of one comment must not launch a second flow parent"
-            );
-            assert_eq!(
-                fs::read_dir(&producer_events)
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry
-                        .file_name()
-                        .to_string_lossy()
-                        .ends_with(".producer.json"))
-                    .count(),
-                1
-            );
-            let payload: EnqueuePayload =
-                serde_json::from_slice(&fs::read(emitted).unwrap()).unwrap();
-            assert_eq!(payload.source, Some(EnqueueSource::Gh));
-            assert!(!payload.no_enqueue);
-            let origin = payload.gh_origin.as_ref().unwrap();
-            let expected_related = related_trigger_from_gh_origin(origin).unwrap();
-            assert_eq!(expected_related.event_id, "comment-61");
-            let expected_parent_uuid = payload.task_uuid.clone().unwrap();
-            let github_parent = client
-                .call(
-                    "queue.enqueue",
-                    Some(serde_json::to_value(payload).unwrap()),
-                )
-                .await
-                .unwrap();
-            assert_eq!(github_parent["task_uuid"], expected_parent_uuid);
-            let github_parent_terminal = tokio::time::timeout(
-                scaled(Duration::from_secs(30)),
-                client.call(
-                    "queue.await_job",
-                    Some(json!({"task_uuid": expected_parent_uuid})),
-                ),
-            )
-            .await
-            .expect("GitHub flow parent timed out")
-            .unwrap();
-            assert_eq!(
-                github_parent_terminal["verdict"],
-                "pass",
-                "{}",
-                capture(&paths, &expected_parent_uuid)
-            );
-
-            let github_children = wait_for_flow_items(&client, &expected_parent_uuid, 1).await;
-            let github_child = &github_children[0];
-            assert_eq!(github_child["source"], "orchestrator");
-            assert_eq!(github_child["parentTaskUuid"], expected_parent_uuid);
-            assert_eq!(github_child["noEnqueue"], true);
-            assert_eq!(
-                github_child["relatedTrigger"],
-                serde_json::to_value(&expected_related).unwrap()
-            );
-            assert!(github_child["origin"]["value"]["github"].is_null());
-
-            let projected_parent = client
-                .call(
-                    "query.job",
-                    Some(json!({"id": expected_parent_uuid.clone()})),
-                )
-                .await
-                .unwrap();
-            assert_eq!(projected_parent["job"]["source"], "gh");
-            assert!(projected_parent["job"]["origin"]["value"]["github"].is_object());
-            assert_eq!(
-                projected_parent["job"]["relatedTrigger"],
-                serde_json::to_value(&expected_related).unwrap()
-            );
-
-            let events = read_acknowledged_events(&paths.events_dir()).unwrap();
-            let durable_parent = events
-                .iter()
-                .find(|event| event.row.uuid.to_string() == expected_parent_uuid)
-                .unwrap();
-            assert!(durable_parent.row.gh_origin.is_some());
-            let durable_children = events
-                .iter()
-                .filter(|event| {
-                    event
-                        .row
-                        .orchestration
-                        .as_ref()
-                        .is_some_and(|orchestration| {
-                            orchestration.flow_run_id() == expected_parent_uuid
-                        })
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(durable_children.len(), 1);
-            assert_eq!(
-                durable_children[0].row.related_trigger.as_ref(),
-                Some(&expected_related)
-            );
-            assert_eq!(durable_children[0].row.source, EnqueueSource::Orchestrator);
-            assert!(durable_children[0].row.gh_origin.is_none());
-
-            let completed_dir = paths.state_dir.join("producers/gh-completed");
-            let (completed_deadline, completed_budget) = poll_deadline();
-            loop {
-                let completed = fs::read_dir(&completed_dir)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-                    .count();
-                if completed == 1 || tokio::time::Instant::now() >= completed_deadline {
-                    break;
-                }
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            let gh_requests = fs::read_to_string(&gh_requests)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str::<Value>(line).unwrap())
-                .collect::<Vec<_>>();
-            // The wait above ends either on the completion marker or on its
-            // scaled deadline, so this is where an expired budget surfaces —
-            // and it names the knob that would widen it, like every other wait
-            // in this suite.
-            assert_eq!(
-                gh_requests.len(),
-                2,
-                "the gh completion mutation did not land {completed_budget}: {gh_requests:?}"
-            );
-            let completion = gh_requests
-                .iter()
-                .find(|request| {
-                    request["query"]
-                        .as_str()
-                        .is_some_and(|query| query.contains("TallyCompletionComment"))
-                })
-                .unwrap();
-            assert_eq!(completion["variables"]["itemId"], "I_flow_61");
-            let completion_body = completion["variables"]["body"].as_str().unwrap();
-            assert!(completion_body.contains(&expected_parent_uuid));
-            assert!(!completion_body.contains(github_child["taskUuid"].as_str().unwrap()));
-
-            // The only GitHub culmination names the parent; the child's receipt
-            // link is query provenance and does not alter witness bytes.
-            let (report, witnesses) = read_verified_records(&paths.witness_path()).unwrap();
-            assert!(report.ok);
-            let child_witness = witnesses
-                .iter()
-                .find(|record| {
-                    record.orchestration.as_ref().is_some_and(|orchestration| {
-                        orchestration.flow_run_id() == expected_parent_uuid
-                    })
-                })
-                .unwrap();
-            assert!(serde_json::to_value(child_witness)
-                .unwrap()
-                .get("relatedTrigger")
-                .is_none());
 
             // Two concurrent runners race every ordinal while work is paused. The
             // kernel creates one row and returns attach to the other runner.

@@ -4,9 +4,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::taskdb::{
-    GhContextSnapshot, GhItemState, GhItemType, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
-};
 
 fn uuid(value: &str) -> Uuid {
     Uuid::parse_str(value).unwrap()
@@ -60,48 +57,6 @@ fn request() -> ExecutionRequest {
             memory_max_bytes: 1_073_741_824,
         },
         runtime_max_sec: Some(30),
-    }
-}
-
-fn gh_origin(item_type: GhItemType) -> GhOrigin {
-    GhOrigin {
-        schema_version: GH_ORIGIN_SCHEMA_VERSION,
-        producer: "github".to_owned(),
-        source: "notifications".to_owned(),
-        repo: "acme/widgets".to_owned(),
-        number: 77,
-        html_url: match item_type {
-            GhItemType::Issue => "https://github.com/acme/widgets/issues/77",
-            GhItemType::PullRequest => "https://github.com/acme/widgets/pull/77",
-        }
-        .to_owned(),
-        item_type: Some(item_type),
-        head_sha: (item_type == GhItemType::PullRequest)
-            .then(|| "7777777777777777777777777777777777777777".to_owned()),
-        node_id: "I_kwDO_origin".to_owned(),
-        item_author: "issue-author".to_owned(),
-        trigger_actor: "trusted-maintainer".to_owned(),
-        self_actor: "tally-bot".to_owned(),
-        notification_reason: Some("mention".to_owned()),
-        trigger_kind: "assignment".to_owned(),
-        event_id: Some("notification-77".to_owned()),
-        comment_id: None,
-        trigger_timestamp: Some("2026-07-20T12:30:00Z".to_owned()),
-        trigger_value: Some("tally-bot".to_owned()),
-        context: Some(GhContextSnapshot {
-            schema_version: GH_CONTEXT_SCHEMA_VERSION,
-            title: "Untrusted title".to_owned(),
-            body: "$(touch /tmp/must-not-run); ${SECRET}".to_owned(),
-            state: Some(GhItemState::Open),
-            head_sha: (item_type == GhItemType::PullRequest)
-                .then(|| "7777777777777777777777777777777777777777".to_owned()),
-            labels: vec!["build".to_owned()],
-            assignees: vec!["tally-bot".to_owned()],
-            triggering_comment: None,
-        }),
-        actor_exclude: "self".to_owned(),
-        allow_self_triggered: false,
-        allowed_actors: vec!["trusted-maintainer".to_owned()],
     }
 }
 
@@ -748,7 +703,6 @@ fn strict_writes_are_scoped_to_declared_execution_paths() {
         brief_hash: None,
         evidence: vec!["exit:0".to_owned()],
     });
-    strict.gh_origin = Some(gh_origin(GhItemType::Issue));
     strict.gate_manifest = Some(GateManifestSpec {
         path: PathBuf::from("/state tree/capture/gates.json"),
         required_gate_ids: vec!["tests".to_owned()],
@@ -766,7 +720,7 @@ fn strict_writes_are_scoped_to_declared_execution_paths() {
         .clone();
     assert_eq!(
         writable,
-        "ReadWritePaths=\"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.adapter.err\" \"/state tree/exec-attestations.jsonl\" \"/state tree/github-context/00000000-0000-4000-8000-000000000002.json\" \"/state tree/capture/gates.json\" \"/home/agent/.codex\""
+        "ReadWritePaths=\"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.adapter.err\" \"/state tree/exec-attestations.jsonl\" \"/state tree/capture/gates.json\" \"/home/agent/.codex\""
     );
 
     strict.extra_writable_paths = vec![PathBuf::from("relative/path")];
@@ -874,85 +828,6 @@ fn transported_brief_materializes_privately_and_provisions_exact_path() {
     assert!(environment
         .iter()
         .any(|(name, value)| name == "TALLY_BRIEF_HASH" && value == prepared.hash()));
-}
-
-#[test]
-fn github_origin_materializes_private_context_and_exact_identity_environment() {
-    let temp = tempfile::tempdir().unwrap();
-    let state_dir = temp.path().join("state");
-    let executor = executor(&state_dir);
-    let mut request = request();
-    request.gh_origin = Some(gh_origin(GhItemType::Issue));
-    let original_argv = request.argv.clone();
-
-    let context_path = executor.materialize_gh_context(&request).unwrap().unwrap();
-    let environment = execution_environment(&request, Some(&context_path)).unwrap();
-    let github = environment
-        .iter()
-        .filter(|(name, _)| name.starts_with("TALLY_GH_"))
-        .cloned()
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(github.len(), GH_TALLY_ENVIRONMENT.len());
-    assert_eq!(github["TALLY_GH_REPO"], "acme/widgets");
-    assert_eq!(github["TALLY_GH_NUMBER"], "77");
-    assert_eq!(
-        github["TALLY_GH_URL"],
-        "https://github.com/acme/widgets/issues/77"
-    );
-    assert_eq!(github["TALLY_GH_TYPE"], "issue");
-    assert_eq!(github["TALLY_GH_HEAD_SHA"], "");
-    assert_eq!(github["TALLY_GH_NODE_ID"], "I_kwDO_origin");
-    assert_eq!(github["TALLY_GH_TRIGGER_KIND"], "assignment");
-    assert_eq!(github["TALLY_GH_TRIGGER_ACTOR"], "trusted-maintainer");
-    assert_eq!(github["TALLY_GH_EVENT_ID"], "notification-77");
-    assert_eq!(github["TALLY_GH_COMMENT_ID"], "");
-    assert_eq!(github["TALLY_GH_CONTEXT"], context_path.to_string_lossy());
-    assert_eq!(request.argv, original_argv);
-    assert!(github
-        .values()
-        .all(|value| !value.contains("touch /tmp/must-not-run")));
-
-    let context: GhContextSnapshot =
-        serde_json::from_slice(&std::fs::read(&context_path).unwrap()).unwrap();
-    assert_eq!(context.schema_version, GH_CONTEXT_SCHEMA_VERSION);
-    assert_eq!(context.body, "$(touch /tmp/must-not-run); ${SECRET}");
-    assert_eq!(
-        std::fs::metadata(&context_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(context_path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-
-    let mut pull_request = request;
-    pull_request.gh_origin = Some(gh_origin(GhItemType::PullRequest));
-    let pull_path = executor.gh_context_path(&pull_request.identity);
-    let environment = execution_environment(&pull_request, Some(&pull_path)).unwrap();
-    assert!(environment.iter().any(|(name, value)| {
-        name == "TALLY_GH_HEAD_SHA" && value == "7777777777777777777777777777777777777777"
-    }));
-}
-
-#[test]
-fn jobs_without_github_origin_unset_every_github_identity_variable() {
-    let request = request();
-    let environment = execution_environment(&request, None).unwrap();
-    assert!(environment
-        .iter()
-        .all(|(name, _)| !name.starts_with("TALLY_GH_")));
-    let unset = environment_to_unset(&request);
-    for name in GH_TALLY_ENVIRONMENT {
-        assert!(unset.contains(&name), "missing unset for {name}");
-    }
 }
 
 #[test]
