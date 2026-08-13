@@ -2387,68 +2387,6 @@ let
             makes an ancestor of the base branch.
           '';
         };
-        gitAiBinding = mkOption {
-          type = types.enum [
-            "off"
-            "advisory"
-            "required"
-          ];
-          default = "off";
-          example = "advisory";
-          description = ''
-            Whether the merge node binds Git AI authorship on the commit it
-            just integrated. A squash mints a commit the forge authored, and
-            authorship notes are minted where a commit is made, so a
-            forge-side squash arrives with no note at all. Under `advisory`
-            and `required` the merge node reconstructs that squash in the
-            campaign checkout -- the one place that still holds the task
-            branch's checkpoints -- proves the reconstruction is the same tree
-            on the same parent, copies the minted note onto the integrated
-            commit, and publishes refs/notes/ai to the campaign remote.
-
-            Only the integrated commit's note is published. The campaign
-            checkout's own refs/notes/ai accumulates a note for every commit
-            the shared checkout ever made, so the node assembles a scratch ref
-            from the remote's tip plus that one entry and pushes that. A
-            remote already carrying a *different* note for the same commit is
-            reported as a typed `conflict` and nothing is written: two git-ai
-            authorship records cannot be merged without destroying both.
-
-            `off` is the shipped state and binds nothing. `advisory` records
-            every outcome as a merge receipt and never fails the node -- not
-            as a promise but as an enforced property, because the merge has
-            already landed irreversibly by the time the binding runs. It is
-            the posture to arm first: an unprovisioned host and a squash that
-            lost its attribution produce identical evidence, so only real
-            squash merges can show that the binding works. `required` turns
-            any outcome other than a published bound note into a failed merge
-            node and couples every campaign merge to the externally
-            provisioned binary's version, which tally.nix does not ship.
-
-            This is the merge node's own posture and is independent of
-            services.tally.gitAi, which governs the daemon's settlement
-            barrier at code-result completion.
-          '';
-        };
-        gitAiAwaitSec = mkOption {
-          type = types.ints.positive;
-          default = 60;
-          example = 120;
-          description = ''
-            How long the merge node may wait on git-ai's settlement barrier
-            before reporting the binding unsettled. The barrier runs inside
-            the merge node, so this budget and driverRuntimeMaxSec are not
-            independent: a campaign whose node deadline does not comfortably
-            exceed this one is killed mid-wait on every task and reports a
-            node timeout instead of a binding receipt. Whenever gitAiBinding
-            is not `off`, evaluation refuses driverRuntimeMaxSec below twice
-            this value.
-
-            The measurement in doc/src/flows/git-ai-squash-fidelity.md is the
-            scale to size it against: `git-ai await` costs roughly 18 seconds
-            on a repository with nothing outstanding.
-          '';
-        };
         agent = mkOption {
           type = types.str;
           default = "codex";
@@ -2669,16 +2607,6 @@ let
         {
           assertion = config.agentArgv != [ ] && builtins.head config.agentArgv != "";
           message = "tally campaign ${name} agentArgv must start with a non-empty value";
-        }
-        {
-          # The settlement barrier runs inside the merge node. Two numbers that
-          # nothing relates produce a node killed mid-await on every task,
-          # presenting as a timeout rather than as the binding receipt the
-          # advisory posture exists to produce.
-          assertion = config.gitAiBinding == "off" || config.driverRuntimeMaxSec >= 2 * config.gitAiAwaitSec;
-          message = "tally campaign ${name} driverRuntimeMaxSec must be at least twice gitAiAwaitSec (${
-            toString (2 * config.gitAiAwaitSec)
-          }) while gitAiBinding is not off";
         }
         {
           assertion = config.steward == null || validComponent config.steward;
@@ -3080,37 +3008,6 @@ let
         };
         default = { };
         description = "Advisory attestation policy.";
-      };
-      gitAi = mkOption {
-        type = types.submodule {
-          options = {
-            enable = mkOption {
-              type = types.bool;
-              default = false;
-              description = "Bind code-result revisions to externally provisioned Git AI notes.";
-            };
-            mode = mkOption {
-              type = types.enum [
-                "advisory"
-                "required"
-              ];
-              default = "advisory";
-              description = "Whether a missing or invalid Git AI binding is advisory or fails the result.";
-            };
-            awaitTimeoutSec = mkOption {
-              type = types.ints.positive;
-              default = 60;
-              description = "Maximum Git AI settlement-barrier duration in seconds.";
-            };
-            globalAwaitOk = mkOption {
-              type = types.bool;
-              default = false;
-              description = "Permit git-ai's process-global await barrier on an isolated execution host.";
-            };
-          };
-        };
-        default = { };
-        description = "External Git AI authorship binding policy; tally.nix does not provide the binary.";
       };
       pools = mkOption {
         type = types.attrsOf mkPoolType;
@@ -3605,14 +3502,6 @@ let
     attestations.exec = {
       inherit (cfg.attestations.exec) enable;
     };
-    gitAi = {
-      inherit (cfg.gitAi)
-        enable
-        mode
-        awaitTimeoutSec
-        globalAwaitOk
-        ;
-    };
     pools = mapAttrs renderPool cfg.pools;
     flows = mapAttrs renderFlow cfg.flows;
     executors = mapAttrs renderExecutor cfg.executors;
@@ -3780,8 +3669,6 @@ let
       inherit (campaign) driverRuntimeMaxSec;
       inherit (campaign) postFailureEvidence postFailureStderr;
       inherit (campaign) mergeMethod;
-      inherit (campaign) gitAiBinding;
-      inherit (campaign) gitAiAwaitSec;
       agent = {
         adapter = campaign.agent;
         argv = campaign.agentArgv;

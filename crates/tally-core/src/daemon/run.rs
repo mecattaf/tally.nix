@@ -421,14 +421,6 @@ impl Daemon {
             Some(Ok(outcome)) if outcome.captures_available
         );
         let effective_gate_manifest = effective_gate_manifest(&self.handler.executor, &job)?;
-        let (result_revision, authorship, authorship_sessions) = match &finished.outcome {
-            Some(Ok(outcome)) => (
-                outcome.result_revision.clone(),
-                outcome.authorship.clone(),
-                outcome.authorship_sessions.clone(),
-            ),
-            _ => (None, None, None),
-        };
         let execution_host_id = match &finished.outcome {
             Some(Ok(outcome)) => outcome.host_id.clone(),
             _ => None,
@@ -489,10 +481,7 @@ impl Daemon {
             // never started.
             (Some(_), Some(Err(error))) if undispatched_execution(error) => None,
             (Some(spec), Some(Err(error))) => {
-                let reason = match error {
-                    ExecutorError::GitAiRequired(reason) => reason.clone(),
-                    _ => format!("executor failed: {error}"),
-                };
+                let reason = format!("executor failed: {error}");
                 let execution = ExecutionFact::failed(reason);
                 let spec = spec.clone();
                 Some(
@@ -675,9 +664,9 @@ impl Daemon {
                     manifest_hash: job.row.manifest_hash.clone(),
                     completion: semantic_completion.clone(),
                     error: terminal_error.clone(),
-                    result_revision: result_revision.clone(),
-                    authorship: authorship.clone(),
-                    authorship_sessions: authorship_sessions.clone(),
+                    result_revision: None,
+                    authorship: None,
+                    authorship_sessions: None,
                 },
             )?;
             let result = JobResult {

@@ -550,7 +550,6 @@ impl DaemonHandler {
         let limits = self.settings.unit_limits;
         let tally_socket = self.tally_socket.clone();
         let brief_root = self.brief_root.clone();
-        let git_ai = self.git_ai.clone();
         let exec_attestations = self.exec_attestations;
         let execution_target = job.row.executor.clone();
         let evidence = job.row.evidence.clone();
@@ -573,7 +572,6 @@ impl DaemonHandler {
                 limits,
                 (&tally_socket, prepared.job_token.as_deref()),
                 &brief_root,
-                &git_ai,
                 exec_attestations,
             );
             let started = Instant::now();
@@ -982,7 +980,6 @@ pub(super) fn execution_request(
     limits: UnitLimits,
     local_environment: (&str, Option<&str>),
     brief_root: &Path,
-    git_ai_config: &GitAiConfig,
     exec_attestations: bool,
 ) -> Result<ExecutionRequest, ExecutorError> {
     let (tally_socket, job_token) = local_environment;
@@ -991,36 +988,6 @@ pub(super) fn execution_request(
             .expect("validated durable briefHash always derives a content path")
     });
     let gate_manifest = effective_gate_manifest(executor, job)?;
-    let git_ai = git_ai_config.enable.then(|| {
-        let mut attributes = BTreeMap::from([
-            ("taskUuid".to_owned(), job.stable_key()),
-            ("attempt".to_owned(), job.row.attempt.to_string()),
-            ("leaseEpoch".to_owned(), job.row.lease_epoch.to_string()),
-            ("adapter".to_owned(), job.row.adapter.clone()),
-        ]);
-        if let Some(orchestration) = &job.row.orchestration {
-            attributes.insert(
-                "flowRunId".to_owned(),
-                orchestration.flow_run_id().to_owned(),
-            );
-            if let Some(node_ordinal) = orchestration
-                .as_value()
-                .get("nodeOrdinal")
-                .and_then(Value::as_u64)
-            {
-                attributes.insert("nodeOrdinal".to_owned(), node_ordinal.to_string());
-            }
-            if let Some(task_ref) = orchestration.task_ref() {
-                attributes.insert("taskRef".to_owned(), task_ref.to_string());
-            }
-        }
-        GitAiExecution {
-            config: git_ai_config.clone(),
-            attributes,
-            expected_session: job.row.session_ref.clone(),
-            expected_model: canonical_job_model(job),
-        }
-    });
     Ok(ExecutionRequest {
         identity: job.identity(),
         parent: job.row.parent_uuid,
@@ -1049,7 +1016,7 @@ pub(super) fn execution_request(
         cwd: job.row.effective_cwd().map(Path::to_path_buf),
         workspace: job.row.workspace.clone(),
         gate_manifest,
-        git_ai,
+        git_ai: None,
         exec_attestation: exec_attestations.then(|| ExecAttestationContext {
             adapter: job.row.adapter.clone(),
             executor: job.row.executor.clone(),

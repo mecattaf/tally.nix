@@ -32,7 +32,6 @@ use crate::completion::{
 use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
 use crate::exec_attestation::{ExecAttestationContext, EXEC_ATTESTATION_LEDGER};
-use crate::git_ai::{self, GitAiExecution};
 use crate::provenance::TaskRef;
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
 use crate::witness::{Authorship, AuthorshipSession};
@@ -100,8 +99,6 @@ pub enum ExecutorError {
     RemoteExecution { executor: String, detail: String },
     #[error("remote executor protocol error for {executor:?}: {detail}")]
     RemoteProtocol { executor: String, detail: String },
-    #[error("{0}")]
-    GitAiRequired(String),
     #[error("local execution unit {unit} already exists in state {state:?}")]
     ExistingUnit { unit: String, state: LocalUnitState },
     #[error(
@@ -392,28 +389,4 @@ impl Executor {
     ) -> Result<(), ExecutorError> {
         self.reclaim_identity_exact(identity, None).await
     }
-}
-
-fn git_repository_write_paths(worktree: &Path) -> Vec<PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ])
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .collect()
 }

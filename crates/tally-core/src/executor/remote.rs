@@ -366,9 +366,6 @@ impl Executor {
                             ),
                         });
                     }
-                    if message.starts_with("git-ai-") {
-                        return Err(ExecutorError::GitAiRequired(message));
-                    }
                     return Err(ExecutorError::RemoteExecution {
                         executor: name.to_owned(),
                         detail: message,

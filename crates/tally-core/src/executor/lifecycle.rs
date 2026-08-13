@@ -282,24 +282,13 @@ impl Executor {
         &self,
         request: ExecutionRequest,
     ) -> Result<ExecutionOutcome, ExecutorError> {
-        let (preflight, runtime) = self.prepare_git_ai(&request).await?;
-        let result = match self.execute_raw(request.clone(), runtime.as_ref()).await {
-            Ok(outcome) => {
-                self.finalize_outcome(outcome, &request, preflight.as_ref(), runtime.as_ref())
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        if let Some(runtime) = runtime {
-            runtime.shutdown().await;
-        }
-        result
+        let outcome = self.execute_raw(request.clone()).await?;
+        self.finalize_outcome(outcome, &request)
     }
 
     pub(super) async fn execute_raw(
         &self,
         mut request: ExecutionRequest,
-        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         self.validate_request(&request)?;
         self.materialize_brief(&mut request)?;
@@ -405,7 +394,7 @@ impl Executor {
         )?;
         self.materialize_gh_context(&request)?;
         self.prepare_hardening_files(&request)?;
-        let args = self.build_systemd_argv_with_git_ai(&request, git_ai_runtime)?;
+        let args = self.build_systemd_argv(&request)?;
         let output = match Command::new(&self.systemd_run).args(&args).output().await {
             Ok(output) => {
                 launching.mark_complete();
@@ -414,7 +403,7 @@ impl Executor {
             Err(source)
                 if source.kind() == std::io::ErrorKind::NotFound && self.allow_direct_fallback =>
             {
-                return self.execute_direct(request, paths, git_ai_runtime).await;
+                return self.execute_direct(request, paths).await;
             }
             Err(source) => {
                 return Err(ExecutorError::Spawn {
@@ -466,69 +455,10 @@ impl Executor {
         request: ExecutionRequest,
         expected_invocation_id: &str,
     ) -> Result<ExecutionOutcome, ExecutorError> {
-        let (preflight, runtime) = self.prepare_git_ai(&request).await?;
-        let result = match self
+        let outcome = self
             .adopt_raw(request.clone(), expected_invocation_id)
-            .await
-        {
-            Ok(outcome) => {
-                self.finalize_outcome(outcome, &request, preflight.as_ref(), runtime.as_ref())
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        if let Some(runtime) = runtime {
-            runtime.shutdown().await;
-        }
-        result
-    }
-
-    pub(super) async fn prepare_git_ai(
-        &self,
-        request: &ExecutionRequest,
-    ) -> Result<(Option<git_ai::Preflight>, Option<git_ai::PrivateDaemon>), ExecutorError> {
-        let Some(execution) = &request.git_ai else {
-            return Ok((None, None));
-        };
-        let mut preflight = git_ai::preflight(execution)
-            .await
-            .map_err(ExecutorError::GitAiRequired)?;
-        let Some(workspace) = &request.workspace else {
-            return Ok((Some(preflight), None));
-        };
-        if matches!(preflight, git_ai::Preflight::Failed { .. }) {
-            return Ok((Some(preflight), None));
-        }
-        let runtime_key = format!(
-            "{}:{}:{}",
-            request.identity.unit_uuid(),
-            request.attempt,
-            request.lease_epoch
-        );
-        let mut repository_write_paths = git_repository_write_paths(&workspace.worktree_path);
-        repository_write_paths.push(workspace.worktree_path.clone());
-        match git_ai::start_private_daemon(
-            execution,
-            &preflight,
-            git_ai::PrivateDaemonLaunch {
-                state_dir: &self.state_dir,
-                runtime_key: &runtime_key,
-                worktree: &workspace.worktree_path,
-                repository_write_paths: &repository_write_paths,
-                systemd_run: &self.systemd_run,
-                systemctl: &self.systemctl,
-                allow_direct_fallback: self.allow_direct_fallback,
-            },
-        )
-        .await
-        {
-            Ok(runtime) => Ok((Some(preflight), Some(runtime))),
-            Err(reason) => {
-                preflight = git_ai::runtime_failure(execution, &preflight, reason)
-                    .map_err(ExecutorError::GitAiRequired)?;
-                Ok((Some(preflight), None))
-            }
-        }
+            .await?;
+        self.finalize_outcome(outcome, &request)
     }
 
     pub(super) async fn adopt_raw(
@@ -617,33 +547,16 @@ impl Executor {
         }
     }
 
-    pub(super) async fn finalize_outcome(
+    pub(super) fn finalize_outcome(
         &self,
         mut outcome: ExecutionOutcome,
         request: &ExecutionRequest,
-        preflight: Option<&git_ai::Preflight>,
-        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         let Some(spec) = &request.gate_manifest else {
             return Ok(outcome);
         };
         let execution = execution_fact(&outcome.termination);
-        let mut completion = evaluate_completion(execution, spec);
-        if let (Some(git_ai), Some(preflight)) = (&request.git_ai, preflight) {
-            let worktree = request
-                .workspace
-                .as_ref()
-                .map(|workspace| workspace.worktree_path.as_path());
-            let binding =
-                git_ai::bind(git_ai, preflight, &completion, worktree, git_ai_runtime).await;
-            outcome.result_revision = binding.result_revision;
-            outcome.authorship = binding.authorship;
-            outcome.authorship_sessions = binding.authorship_sessions;
-            if let Some(reason) = binding.required_failure {
-                completion = evaluate_completion(ExecutionFact::failed(reason), spec);
-            }
-        }
-        outcome.semantic_completion = Some(completion);
+        outcome.semantic_completion = Some(evaluate_completion(execution, spec));
         Ok(outcome)
     }
 
@@ -677,9 +590,6 @@ impl Executor {
             return Err(ExecutorError::InvalidRequest(
                 "attempt must be positive".to_owned(),
             ));
-        }
-        if let Some(git_ai) = &request.git_ai {
-            git_ai.validate().map_err(ExecutorError::InvalidRequest)?;
         }
         if let Some(attestation) = &request.exec_attestation {
             attestation
@@ -991,7 +901,6 @@ impl Executor {
         &self,
         request: ExecutionRequest,
         paths: ExecutionPaths,
-        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         if !request.credentials.is_empty() {
             return Err(ExecutorError::CredentialedFallback);
@@ -1023,10 +932,7 @@ impl Executor {
             .as_ref()
             .filter(|origin| origin.is_current())
             .map(|_| self.gh_context_path(&request.identity));
-        let mut environment = execution_environment(&request, gh_context_path.as_deref())?;
-        if let Some(runtime) = git_ai_runtime {
-            environment.extend(runtime.child_environment());
-        }
+        let environment = execution_environment(&request, gh_context_path.as_deref())?;
         for (name, value) in environment {
             command.env(name, value);
         }

@@ -11,7 +11,6 @@ use crate::producers::{validate_registry, ProducerConfig, ProducerError};
 pub const DEFAULT_AGING_THRESHOLD_SEC: u64 = 3_600;
 pub const DEFAULT_RETENTION_HORIZON: &str = "30d";
 pub const DEFAULT_RETENTION_CALENDAR: &str = "daily";
-pub const DEFAULT_GIT_AI_AWAIT_TIMEOUT_SEC: u64 = 60;
 
 fn default_ssh_port() -> u16 {
     22
@@ -39,42 +38,6 @@ fn default_server_alive_count_max() -> u32 {
 
 fn default_retry_interval_ms() -> u64 {
     1_000
-}
-
-const fn default_git_ai_await_timeout_sec() -> u64 {
-    DEFAULT_GIT_AI_AWAIT_TIMEOUT_SEC
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GitAiMode {
-    #[default]
-    Advisory,
-    Required,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GitAiConfig {
-    #[serde(default)]
-    pub enable: bool,
-    #[serde(default)]
-    pub mode: GitAiMode,
-    #[serde(default = "default_git_ai_await_timeout_sec")]
-    pub await_timeout_sec: u64,
-    #[serde(default)]
-    pub global_await_ok: bool,
-}
-
-impl Default for GitAiConfig {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            mode: GitAiMode::Advisory,
-            await_timeout_sec: DEFAULT_GIT_AI_AWAIT_TIMEOUT_SEC,
-            global_await_ok: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,8 +502,6 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
-    pub git_ai: GitAiConfig,
-    #[serde(default)]
     pub attestations: AttestationsConfig,
     #[serde(default)]
     pub pools: BTreeMap<String, PoolConfig>,
@@ -565,7 +526,6 @@ impl Default for Config {
             lease: LeaseConfig::default(),
             retention: RetentionConfig::default(),
             storage: StorageConfig::default(),
-            git_ai: GitAiConfig::default(),
             attestations: AttestationsConfig::default(),
             pools: BTreeMap::new(),
             flows: BTreeMap::new(),
@@ -622,8 +582,6 @@ pub enum ConfigError {
         "storage {store} budget requires 0 < warningBytes < hardBytes and 0 < minimumFreeBytes < warningFreeBytes"
     )]
     InvalidStorageBudget { store: &'static str },
-    #[error("gitAi awaitTimeoutSec must be positive")]
-    InvalidGitAiAwaitTimeout,
     #[error("maxFrameBytes and agingThresholdSec must both be positive")]
     InvalidFlowRuntimeLimit,
     #[error("executor {executor:?} is invalid: {detail}")]
@@ -691,9 +649,6 @@ impl Config {
             {
                 return Err(ConfigError::InvalidStorageBudget { store });
             }
-        }
-        if self.git_ai.await_timeout_sec == 0 {
-            return Err(ConfigError::InvalidGitAiAwaitTimeout);
         }
         for (name, pool) in &self.pools {
             if name.trim().is_empty() {
@@ -951,42 +906,6 @@ mod tests {
         assert!(!configured.attestations.exec.enable);
         assert!(serde_json::from_str::<Config>(
             r#"{"pools":{},"attestations":{"exec":{"enable":true,"ledger":"elsewhere"}}}"#
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn git_ai_policy_is_strict_defaulted_and_positive() {
-        let legacy: Config = serde_json::from_str(r#"{"pools":{}}"#).unwrap();
-        assert_eq!(legacy.git_ai, GitAiConfig::default());
-
-        let configured: Config = serde_json::from_str(
-            r#"{
-                "pools": {},
-                "gitAi": {
-                    "enable": true,
-                    "mode": "required",
-                    "awaitTimeoutSec": 12,
-                    "globalAwaitOk": true
-                }
-            }"#,
-        )
-        .unwrap();
-        assert!(configured.git_ai.enable);
-        assert_eq!(configured.git_ai.mode, GitAiMode::Required);
-        assert_eq!(configured.git_ai.await_timeout_sec, 12);
-        assert!(configured.git_ai.global_await_ok);
-        configured.validate().unwrap();
-
-        let zero: Config =
-            serde_json::from_str(r#"{"pools":{},"gitAi":{"enable":true,"awaitTimeoutSec":0}}"#)
-                .unwrap();
-        assert!(matches!(
-            zero.validate(),
-            Err(ConfigError::InvalidGitAiAwaitTimeout)
-        ));
-        assert!(serde_json::from_str::<Config>(
-            r#"{"pools":{},"gitAi":{"enable":true,"package":"git-ai"}}"#
         )
         .is_err());
     }
