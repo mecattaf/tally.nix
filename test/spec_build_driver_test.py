@@ -1202,6 +1202,41 @@ class LaneLifecycleTests(unittest.TestCase):
                 DRIVER.action_prep(malformed)
             self.assertIn("full Git object ID", str(raised.exception))
 
+    def test_prep_projects_domains_without_collapsing_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            base_fields = {
+                "taskId",
+                "baseRev",
+                "branch",
+                "publishBranch",
+                "worktreePath",
+            }
+
+            for name, present, domains in (
+                ("declared", True, ["drivers", "test/spec_build_driver_test.py"]),
+                ("declared-empty", True, []),
+                ("omitted", False, None),
+            ):
+                with self.subTest(case=name):
+                    brief = prep_brief(checkout, workspace_root, f"prep-domains-{name}")
+                    if present:
+                        brief["task"]["conflictDomains"] = domains
+                    else:
+                        del brief["task"]["conflictDomains"]
+
+                    prepared = DRIVER.action_prep(brief)
+                    expected_fields = base_fields | (
+                        {"conflictDomains"} if present else set()
+                    )
+                    self.assertEqual(set(prepared), expected_fields)
+                    if present:
+                        self.assertEqual(prepared["conflictDomains"], domains)
+                    else:
+                        self.assertNotIn("conflictDomains", prepared)
+
     def test_a_killed_lane_resumes_the_same_branch_and_worktree(self) -> None:
         """The resume invariant both managers promised, now proven once.
 

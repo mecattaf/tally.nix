@@ -285,6 +285,7 @@ fn reconcile_result(task: Value) -> Value {
 /// Every node of a pass whose agent fails, with `tree_delta` scripted by the
 /// caller. Nothing here is ordinal-sensitive: the client answers by label.
 fn replies(task: Value, tree_delta: Reply) -> BTreeMap<String, Reply> {
+    let conflict_domains = task.get("conflictDomains").cloned();
     let mut replies = BTreeMap::new();
     replies.insert(
         "spec-build-sweep".to_owned(),
@@ -300,16 +301,17 @@ fn replies(task: Value, tree_delta: Reply) -> BTreeMap<String, Reply> {
         "spec-build-reconcile".to_owned(),
         Reply::passed(reconcile_result(task)),
     );
-    replies.insert(
-        format!("prep-{TASK_ID}"),
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "baseRev": REV,
-            "branch": "tally-work/fixture/build",
-            "publishBranch": "tally/spec-build/v1/fixture/build",
-            "worktreePath": "/srv/spec/worktrees/build"
-        })),
-    );
+    let mut prepared = json!({
+        "taskId": TASK_ID,
+        "baseRev": REV,
+        "branch": "tally-work/fixture/build",
+        "publishBranch": "tally/spec-build/v1/fixture/build",
+        "worktreePath": "/srv/spec/worktrees/build"
+    });
+    if let Some(domains) = conflict_domains {
+        prepared["conflictDomains"] = domains;
+    }
+    replies.insert(format!("prep-{TASK_ID}"), Reply::passed(prepared));
     replies.insert(
         format!("steering-recheck-{TASK_ID}"),
         Reply::passed(json!({
@@ -448,6 +450,20 @@ fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate_case() {
         .expect("the gate ran");
     assert!(agent < gate, "{labels:?}");
 
+    let agent_brief = client.brief(&format!("agent-{TASK_ID}"));
+    assert_eq!(
+        agent_brief["workspace"]["conflictDomains"],
+        json!(["README.md"]),
+        "the prep projection must reach the worker brief: {agent_brief}"
+    );
+    assert!(
+        agent_brief["mission"]
+            .as_str()
+            .unwrap()
+            .contains("conflictDomains [\"README.md\"] are the binding write boundary: files your change makes false must be inside these prefixes; anything else is the operator's to grant"),
+        "the worker mission must render the concrete boundary: {agent_brief}"
+    );
+
     let brief = client.brief(&format!("tree-delta-{TASK_ID}"));
     assert_eq!(
         brief["ownershipRan"],
@@ -459,6 +475,14 @@ fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate_case() {
     assert_eq!(
         brief["workspace"]["worktreePath"],
         json!("/srv/spec/worktrees/build")
+    );
+    let diagnosis = client.brief(&format!("diagnose-{TASK_ID}"));
+    assert!(
+        diagnosis["mission"]
+            .as_str()
+            .unwrap()
+            .contains("conflictDomains [\"README.md\"] are the binding write boundary: files your change makes false must be inside these prefixes; anything else is the operator's to grant"),
+        "the diagnosis mission must render the same concrete boundary: {diagnosis}"
     );
     assert!(
         brief.get("ownedPaths").is_none(),
@@ -476,14 +500,14 @@ fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate_case() {
 /// agent failure it always reported. The new node must not swallow the failure
 /// that caused it to run.
 fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure_case() {
-    let task = implementation_task(Some(json!(["README.md"])));
+    let task = implementation_task(Some(json!([])));
     let client = TestClient::new(replies(
         task,
         Reply::passed(json!({
             "taskId": TASK_ID,
             "checkedPaths": 0,
-            "allowlistBasis": "declared",
-            "allowlist": ["README.md"],
+            "allowlistBasis": "declared-empty",
+            "allowlist": [],
             "ownershipRan": false
         })),
     ));
@@ -496,6 +520,21 @@ fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure_case() 
         "a clean gate must leave the agent failure priced as work: {steer}"
     );
     assert_eq!(steer["attempt"], json!(1), "{steer}");
+    let agent = client.brief(&format!("agent-{TASK_ID}"));
+    assert!(
+        agent["mission"]
+            .as_str()
+            .unwrap()
+            .contains("conflictDomains [] are the binding write boundary"),
+        "the explicit empty boundary must survive prep: {agent}"
+    );
+    assert!(
+        agent["mission"]
+            .as_str()
+            .unwrap()
+            .contains("this task may change no path"),
+        "the empty boundary must not look permissive: {agent}"
+    );
 }
 
 /// One arm of the pin below: a serial frontier carrying `task` must preserve
@@ -521,6 +560,17 @@ fn assert_keyless_task_reaches_ungated_gate(arm: &str, task: Value) {
     assert!(
         agent["task"].get("conflictDomains").is_none(),
         "{arm} arm: the implementation brief must preserve omission: {agent}"
+    );
+    assert!(
+        agent["workspace"].get("conflictDomains").is_none(),
+        "{arm} arm: prep must preserve omission in the workspace projection: {agent}"
+    );
+    assert!(
+        agent["mission"]
+            .as_str()
+            .unwrap()
+            .contains("This serial task omits conflictDomains"),
+        "{arm} arm: the worker mission must name the omitted boundary: {agent}"
     );
     let gate = client.brief(&format!("tree-delta-{TASK_ID}"));
     assert!(

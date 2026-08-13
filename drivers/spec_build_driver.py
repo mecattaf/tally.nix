@@ -904,6 +904,21 @@ def normalize_conflict_domains(
     return normalized
 
 
+def prepared_workspace(
+    value: Any, context: str, *, publish_branch: bool = True
+) -> dict[str, Any]:
+    """Admit the lane coordinates returned by prep, including its prompt boundary."""
+    fields = {"taskId", "baseRev", "branch", "worktreePath", "conflictDomains"}
+    if publish_branch:
+        fields.add("publishBranch")
+    workspace = object_exact(value, fields, context)
+    if "conflictDomains" in workspace:
+        workspace["conflictDomains"] = normalize_conflict_domains(
+            workspace["conflictDomains"], f"{context}.conflictDomains", required=False
+        )
+    return workspace
+
+
 def normalize_dependencies(value: Any, context: str, prior_ids: set[str]) -> list[str]:
     dependencies = string_list(value, f"{context}.dependencies")
     if len(dependencies) != len(set(dependencies)):
@@ -3641,11 +3656,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
 def action_diff(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(brief, {"repositoryConfig", "workspace"}, "diff brief")
     repo_config(data.get("repositoryConfig"))
-    workspace = object_exact(
-        data.get("workspace"),
-        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
-        "workspace",
-    )
+    workspace = prepared_workspace(data.get("workspace"), "workspace")
     task_id = required_string(workspace.get("taskId"), "workspace.taskId")
     if not TASK_ID.fullmatch(task_id):
         fail("workspace.taskId is not safe")
@@ -5019,7 +5030,34 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
         "workspaceRoot": workspace_root,
         "sourceRevision": source_revision,
     }
+    if task_kind == "implementation" and "conflictDomains" in task:
+        identity["conflictDomains"] = normalize_conflict_domains(
+            task["conflictDomains"], "prep brief task.conflictDomains", required=False
+        )
     return data, config, identity
+
+
+def prepared_lane_result(
+    identity: dict[str, Any],
+    base_rev: str,
+    branch: str,
+    publish_branch: str,
+    worktree: Path,
+) -> dict[str, Any]:
+    """Project one task's declared write boundary beside its lane coordinates."""
+    result = {
+        "taskId": identity["taskId"],
+        "baseRev": base_rev,
+        "branch": branch,
+        "publishBranch": publish_branch,
+        "worktreePath": str(worktree),
+    }
+    # Absence and an explicitly empty declaration have different campaign
+    # semantics. Preserve that distinction in the prep result handed to the
+    # task brief instead of silently widening or narrowing the worker's grant.
+    if "conflictDomains" in identity:
+        result["conflictDomains"] = identity["conflictDomains"]
+    return result
 
 
 def pass_record_path(workspace_root: Path, run_hash: str) -> Path:
@@ -5811,13 +5849,9 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
             fail("resumed lane base does not descend from the witnessed worklist revision")
         if identity["taskKind"] == "implementation":
             snapshot_before_agent(worktree)
-        return {
-            "taskId": identity["taskId"],
-            "baseRev": resumed_base,
-            "branch": branch,
-            "publishBranch": publish_branch,
-            "worktreePath": str(worktree),
-        }
+        return prepared_lane_result(
+            identity, resumed_base, branch, publish_branch, worktree
+        )
     if resumed is not None:
         # A lane git registered whose identity is short a field: a lane cut by
         # a tally from before identity moved into git, or a runner killed
@@ -5855,13 +5889,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     worktree_call(worktrees.write_identity, worktree, {**expected, "baserev": base_rev})
     if identity["taskKind"] == "implementation":
         snapshot_before_agent(worktree)
-    return {
-        "taskId": identity["taskId"],
-        "baseRev": base_rev,
-        "branch": branch,
-        "publishBranch": publish_branch,
-        "worktreePath": str(worktree),
-    }
+    return prepared_lane_result(identity, base_rev, branch, publish_branch, worktree)
 
 
 def action_preflight(brief: dict[str, Any]) -> dict[str, Any]:
@@ -6217,11 +6245,7 @@ def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
         "ownership brief",
     )
     config = repo_config(data.get("repositoryConfig"))
-    workspace = object_exact(
-        data.get("workspace"),
-        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
-        "workspace",
-    )
+    workspace = prepared_workspace(data.get("workspace"), "workspace")
     task_id = required_string(workspace.get("taskId"), "workspace.taskId")
     if not TASK_ID.fullmatch(task_id):
         fail("workspace.taskId is not safe")
@@ -6312,11 +6336,7 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     task_id = required_string(task.get("id"), "task.id")
     if not TASK_ID.fullmatch(task_id):
         fail("task.id is not safe")
-    workspace = object_exact(
-        data.get("workspace"),
-        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
-        "workspace",
-    )
+    workspace = prepared_workspace(data.get("workspace"), "workspace")
     if workspace.get("taskId") != task_id:
         fail("workspace.taskId does not match task.id")
     worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
@@ -6425,9 +6445,7 @@ def action_constraint(brief: dict[str, Any]) -> dict[str, Any]:
     patterns = gate["forbidPaths"]
     config = repo_config(data.get("repositoryConfig"))
 
-    workspace = object_exact(
-        data.get("workspace"), {"taskId", "baseRev", "branch", "worktreePath"}, "workspace"
-    )
+    workspace = prepared_workspace(data.get("workspace"), "workspace", publish_branch=False)
     task_id = required_string(workspace.get("taskId"), "workspace.taskId")
     if not TASK_ID.fullmatch(task_id):
         fail("workspace.taskId is not safe")
@@ -6643,11 +6661,7 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
         )
     data = object_exact(brief, seam_fields(brief, allowed), f"{action} brief")
     config = repo_config(data.get("repositoryConfig"))
-    workspace = object_exact(
-        data.get("workspace"),
-        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
-        "workspace",
-    )
+    workspace = prepared_workspace(data.get("workspace"), "workspace")
     full_git_oid(workspace.get("baseRev"), "workspace.baseRev")
     worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
     if not worktree.is_absolute():
@@ -7013,11 +7027,7 @@ def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
         worktree = expected_worktree
         branch = expected_branch
     else:
-        workspace = object_exact(
-            workspace_value,
-            {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
-            "workspace",
-        )
+        workspace = prepared_workspace(workspace_value, "workspace")
         if required_string(workspace.get("taskId"), "workspace.taskId") != task_id:
             fail("cleanup workspace.taskId does not match taskId")
         branch = required_string(workspace.get("branch"), "workspace.branch")
@@ -7303,11 +7313,7 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         code_revision = required_string(data.get("baseRevision"), "baseRevision")
         if not re.fullmatch(r"[0-9a-f]{40,64}", code_revision):
             fail("baseRevision must be a full Git object ID")
-    workspace = object_exact(
-        data.get("workspace"),
-        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
-        "workspace",
-    )
+    workspace = prepared_workspace(data.get("workspace"), "workspace")
     if workspace.get("taskId") != task_id:
         fail("checkpoint task.id does not match workspace.taskId")
     base_rev = required_string(workspace.get("baseRev"), "workspace.baseRev")
