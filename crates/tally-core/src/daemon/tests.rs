@@ -2004,53 +2004,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn non_empty_current_state_migrates_before_recovery_and_is_restart_stable() {
-        let temp = tempdir().unwrap();
-        let paths = fs1_paths(temp.path());
-
-        let initialized = fs1_daemon(&paths).await;
-        assert!(paths.witness_path().is_file());
-        drop(initialized);
-
-        let legacy = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../test/fixtures/ledger/events/legacy-no-origin.enqueue.json"
-        ))
-        .replace("\"pool\": \"worker-gpu\"", "\"pool\": \"slot\"")
-        .replace("\"leaseEpoch\": 7", "\"leaseEpoch\": 1");
-        assert!(!legacy.contains("\"rowVersion\""));
-        assert!(!legacy.contains("\"origin\""));
-        fs::create_dir_all(paths.events_dir()).unwrap();
-        let event_path = paths
-            .events_dir()
-            .join("00000000-0000-4000-8000-000000000301.enqueue.json");
-        fs::write(&event_path, legacy).unwrap();
-
-        let restarted = fs1_daemon(&paths).await;
-        let row_uuid = Uuid::parse_str("00000000-0000-4000-8000-000000000311").unwrap();
-        assert!(restarted
-            .initial_jobs
-            .iter()
-            .any(|job| job.task_uuid == Some(row_uuid)));
-        let migrated = fs::read(&event_path).unwrap();
-        let event = read_acknowledged_events(&paths.events_dir()).unwrap();
-        assert_eq!(event.len(), 1);
-        assert_eq!(event[0].row.row_version, crate::taskdb::CURRENT_ROW_VERSION);
-        assert_eq!(
-            event[0].row.origin,
-            Some(AdmissionOrigin::direct(EnqueueSource::Calendar))
-        );
-        drop(restarted);
-
-        let second_restart = fs1_daemon(&paths).await;
-        assert!(second_restart
-            .initial_jobs
-            .iter()
-            .any(|job| job.task_uuid == Some(row_uuid)));
-        assert_eq!(fs::read(event_path).unwrap(), migrated);
-    }
-
     fn fs1_full_payload(
         dedup_key: &str,
         argv: &[&str],

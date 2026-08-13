@@ -22,7 +22,6 @@ than reproduced.
 | `codex-resume-cumulative.jsonl` | reduced from `/home/tom/mecattaf/tally-codex-runs/probe-403/resumed-20260808T092702.jsonl`, captured 2026-08-08 | the first resumed reading rehydrates the thread counters: 32,834 / 26,112 / 0 / 11 / 0; the exact attempt delta is 16,630 input-as-reported, 1,526 uncached input, 15,104 cache-read, 0 cache-write, 6 output, total 16,636. Fresh plus delta is 32,845; the forbidden raw-reading sum is 49,054 |
 | `claude-code.jsonl` | one real `claude --print --output-format stream-json` run: `system/init`, assistant turns with `message.usage`, a `rate_limit_event`, a `user` tool-result turn with none, `result` | which `usage` object `$..usage` selects, the `iterations` array nested inside `result.usage`, and `total_cost_usd` beside a per-model `modelUsage.*.costUSD` that must not be read instead |
 | `claude-code-no-usage.jsonl` | the same real claude run truncated before its first usage-bearing event | what the capture file holds when a job is preempted during its first turn |
-| `n-minus-1-records.json` | hand-written durable records in the pre-#381 shapes | that a row and an `adapter-scrape` attestation written before the usage record existed read back unchanged |
 
 Real codex emits exactly one `turn.completed` per `exec`, so each fixture is
 one invocation. The paired resume fixtures share one redacted thread identity;

@@ -1180,7 +1180,6 @@ mod tests {
     const CLAUDE_STREAM: &str = include_str!("../../../test/fixtures/usage/claude-code.jsonl");
     const CLAUDE_QUIET_STREAM: &str =
         include_str!("../../../test/fixtures/usage/claude-code-no-usage.jsonl");
-    const N_MINUS_1: &str = include_str!("../../../test/fixtures/usage/n-minus-1-records.json");
 
     /// The `fields` maps these tests exercise are the ones the presets in
     /// `nix/lib/adapters.nix` declare. The evaluated-configuration check in
@@ -1992,76 +1991,5 @@ mod tests {
             },
         );
         assert_eq!(fallback.breakdown().unwrap().output_tokens, Some(8));
-    }
-
-    #[test]
-    fn records_written_before_this_field_existed_read_back_unchanged() {
-        let fixture: Value = serde_json::from_str(N_MINUS_1).unwrap();
-
-        // The durable row gains an optional field, so an N-1 row still parses
-        // and re-serializes to exactly the bytes it arrived as.
-        // Two arms: the rowVersion current main writes, which is the true N-1
-        // shape, and the older one a pinned-behind estate may still hold.
-        for arm in ["row", "rowVersion3"] {
-            let row_json = fixture[arm].clone();
-            let row: crate::taskdb::RowSeed = serde_json::from_value(row_json.clone()).unwrap();
-            assert_eq!(
-                row.usage, None,
-                "{arm}: no attempt was ever scraped for this row"
-            );
-            assert_eq!(
-                row.usage_accounting, None,
-                "{arm}: no accounting projection existed for this row"
-            );
-            assert_eq!(
-                row.usage_predecessor, None,
-                "{arm}: no accounting predecessor existed for this row"
-            );
-            assert_eq!(row.context_tokens, None, "{arm}: occupancy is N-1 too");
-            assert_eq!(row.context_window, None, "{arm}: occupancy is N-1 too");
-            let reserialized = serde_json::to_value(&row).unwrap();
-            assert!(
-                reserialized.get("usage").is_none(),
-                "{arm}: an absent usage record adds no key to a row that never had one"
-            );
-            assert!(
-                reserialized.get("contextTokens").is_none()
-                    && reserialized.get("contextWindow").is_none(),
-                "{arm}: absent occupancy adds no keys to a row that never had them"
-            );
-            for (key, value) in row_json.as_object().unwrap() {
-                assert_eq!(
-                    reserialized.get(key),
-                    Some(value),
-                    "{arm}: field {key} did not read back unchanged"
-                );
-            }
-        }
-        assert_eq!(
-            fixture["row"]["rowVersion"],
-            json!(crate::taskdb::CURRENT_ROW_VERSION - 1),
-            "the N-1 arm must remain one row version behind main"
-        );
-
-        // The attestation payload gains a sibling key, so an N-1 payload keeps
-        // producing the captures the daemon reads out of it.
-        let payload = &fixture["attestationPayload"];
-        assert!(
-            payload.get("usage").is_none(),
-            "N-1 payloads carry no usage"
-        );
-        let captures: BTreeMap<String, Value> =
-            serde_json::from_value(payload["captures"].clone()).unwrap();
-        let captures = ScrapeResult { captures };
-        assert_eq!(captures.session_ref().unwrap(), Some("codex-usage-thread"));
-        assert_eq!(captures.usage().unwrap()["input_tokens"], json!(7060166));
-
-        // And normalizing that retained capture reproduces the record a fresh
-        // scrape of the same stream produces, so a restart does not change a
-        // completed attempt's answer.
-        assert_eq!(
-            observe(&codex_adapter(), &captures),
-            scraped(&codex_adapter(), "codex", CODEX_STREAM)
-        );
     }
 }
