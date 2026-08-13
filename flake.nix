@@ -1310,14 +1310,14 @@
             }
           ];
         };
-        campaignHome = home-manager.lib.homeManagerConfiguration {
+        campaignPollHome = home-manager.lib.homeManagerConfiguration {
           inherit pkgs;
           modules = [
             self.homeManagerModules.tally
             {
               home = {
-                username = "tally-campaign";
-                homeDirectory = "/tmp/tally-campaign-home";
+                username = "tally-campaign-poll";
+                homeDirectory = "/tmp/tally-campaign-poll-home";
                 stateVersion = "26.11";
               };
               services.tally = {
@@ -1325,184 +1325,6 @@
                 campaignPoll = {
                   interval = "4min";
                   timeout = "2min";
-                };
-                adapters.narrator = {
-                  argv = [
-                    "/bin/sh"
-                    "/srv/campaign-fixtures/narrate"
-                  ];
-                  # The adapter entry is what supplies the narrator's endpoint
-                  # and credentials, so the seam must carry env into the brief;
-                  # a narrator that got only argv would fail twice and narrate
-                  # from the template for ever without saying so.
-                  env.NARRATOR_ENDPOINT = "https://narrator.invalid/v1";
-                  # And the proposal is read back from the capture the adapter
-                  # declares, not from a pattern the driver hardcodes.
-                  scrape.finalMessage = {
-                    stream = "stdout";
-                    mode = "regex";
-                    pattern = "^NARRATOR_RESULT=(.*)$";
-                  };
-                };
-                # Keep the campaign's implementation role separate from the
-                # shell adapter used by deterministic flow nodes: declaring a
-                # result projection on shell would make every ordinary command
-                # wait for a final message it never emits.
-                adapters.fixture-agent.scrape.finalMessage = {
-                  stream = "stdout";
-                  mode = "regex";
-                  pattern = "^TALLY_FINAL_MESSAGE=(.*)$";
-                };
-                campaigns.fixture = {
-                  enable = true;
-                  forge = "github";
-                  repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
-                  label = "spec-campaign";
-                  # A mention token is posted as a real comment and at-mentions
-                  # whoever it names, so the fixture names the campaign's own
-                  # trusted actor rather than an unrelated real account.
-                  mention = "@operator build";
-                  allowSelfTriggered = true;
-                  allowedActors = [ "operator" ];
-                  pollIntervalSec = 17;
-                  postFailureEvidence = true;
-                  postFailureStderr = true;
-                  worklist = "specs/*/tasks.json";
-                  maxTasks = 7;
-                  maxParallel = 3;
-                  gates = [
-                    {
-                      kind = "command";
-                      id = "content";
-                      # A fixture is copied, so it must not model a no-op probe.
-                      # This one exercises what the gate below actually needs --
-                      # the interpreter the gate argv names -- and asserts that
-                      # the subject the gate tests for is genuinely absent on
-                      # the pristine base, so a green post-change gate is proof
-                      # the agent built it rather than proof it was always
-                      # there.
-                      preflightArgv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -x /bin/sh; test ! -d build"
-                      ];
-                      argv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -d build"
-                      ];
-                    }
-                    {
-                      kind = "forbidPaths";
-                      id = "no-db-artifacts";
-                      forbidPaths = [
-                        "*.db"
-                        "*.db-wal"
-                        "*.db-shm"
-                        "*.sqlite*"
-                      ];
-                      runtimeMaxSec = 11;
-                    }
-                  ];
-                  agent = "fixture-agent";
-                  agentArgv = [ "/bin/true" ];
-                  agentApprovalPolicy = null;
-                  agentSandboxPolicy = null;
-                  agentDiagnosisSandboxPolicy = null;
-                  agentRuntimeMaxSec = 120;
-                  driverRuntimeMaxSec = 30;
-                  mergeMethod = "merge";
-                  # The narrate seam is config-only: an adapter the estate adds
-                  # to the open map, named as this campaign's catalog role. The
-                  # rendered narration argv is the adapter's own argv with this
-                  # campaign's stewardArgv appended, so swapping narrators is an
-                  # adapter change and never a driver change.
-                  steward = "narrator";
-                  stewardArgv = [ "--narrate" ];
-                  stewardRuntimeMaxSec = 45;
-                  pool.name = "fixture-campaign";
-                };
-                # The two-repository seam, rendered: the worklist and local
-                # summary/findings refs live on the spec repository; lanes,
-                # stable task branches, and integration commits live on the
-                # code repository. Each role names an entry of the campaign's
-                # own repositories map.
-                campaigns.split = {
-                  enable = true;
-                  forge = "local";
-                  # The spec corpus is the fixture repository that actually
-                  # holds the worklist; the code repository is a separate
-                  # operational checkout, which is what makes this a split.
-                  # `checkout` is operational state rather than a store source,
-                  # so the code role names a plain path the way an estate would.
-                  repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
-                  repositories."acme/code".checkout = "/srv/campaign-fixtures/split-code";
-                  codeRepository = "acme/code";
-                  specRepository = "acme/spec";
-                  # The worklist this glob resolves to carries seven tasks, so
-                  # maxTasks admits seven. A fixture whose own bounds refuse
-                  # its own worklist describes a configuration that could never
-                  # run a pass.
-                  worklist = "specs/001-toy/tasks.json";
-                  maxTasks = 7;
-                  gates = [
-                    {
-                      kind = "command";
-                      id = "content";
-                      preflightArgv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -x /bin/sh; test ! -d build"
-                      ];
-                      argv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -d build"
-                      ];
-                    }
-                  ];
-                  agentArgv = [ "/bin/true" ];
-                  pool.name = "split-campaign";
-                };
-                campaigns.defaulted = {
-                  enable = true;
-                  repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
-                  maxTasks = 1;
-                  gates = [
-                    {
-                      kind = "command";
-                      id = "content";
-                      preflightArgv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -x /bin/sh; test ! -d build"
-                      ];
-                      argv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -d build"
-                      ];
-                    }
-                  ];
-                  agentArgv = [ "/bin/true" ];
-                  pool.name = "default-campaign";
-                };
-                # The generated campaign producer's projection literals are
-                # mkDefault, so an estate tunes one campaign's public surface
-                # with an ordinary override: no mkForce, no forked producer
-                # builder. The sibling campaign keeps the shipped defaults, so
-                # this also proves the override is scoped to one producer.
-                # `kind` is the producer registry's discriminator, so an
-                # override states it; nothing else here is mkForce.
-                producers.campaign-defaulted = {
-                  kind = "gh";
-                  postEvidence = false;
                 };
               };
             }
@@ -1572,77 +1394,6 @@
                       pool = "slot";
                     };
                   };
-                };
-              };
-            }
-          ];
-        };
-        # Gate fixtures that evaluate cleanly and are then rejected by a named
-        # assertion, so `mkAssertions` can be read for the message.
-        invalidCampaignGateFields = [
-          {
-            kind = "command";
-            id = "mixed";
-            # no-op-probe-allowed: this gate exists to be rejected. It declares
-            # forbidPaths beside a command kind, so the module refuses the
-            # campaign before any probe could run; a representative probe here
-            # would only obscure what the fixture is testing.
-            preflightArgv = [ "true" ];
-            argv = [ "true" ];
-            forbidPaths = [ "*.db" ];
-          }
-          {
-            kind = "forbidPaths";
-            id = "ambiguous-double-star";
-            forbidPaths = [ "src/**.db" ];
-          }
-        ];
-        # `kind` is an enum with no default, so a gate that omits it is refused
-        # one layer earlier than an assertion: the option system itself throws
-        # "The option `...kind' was accessed but has no value defined." That is
-        # the exact failure an out-of-repo configuration written before gate
-        # kinds became mandatory hits on its next deploy, and it is the
-        # migration the CHANGELOG names, so the fixture set has to contain it.
-        # It is kept out of the list above, and out of `invalidCampaignHome`,
-        # because forcing it throws rather than yielding an assertion message:
-        # a fixture carrying it fails at the option system before Home
-        # Manager's assertion machinery runs, so it would take every readable
-        # campaign-gate message down with it and leave
-        # `!invalidCampaignAttempt.success` green even if the campaign-gate
-        # assertions were unwired from the module entirely.
-        missingKindCampaignGate = {
-          id = "no-kind";
-          # no-op-probe-allowed: this gate exists to be refused for the one
-          # field it omits, so nothing here ever runs and a representative
-          # probe would only obscure what the fixture tests.
-          preflightArgv = [ "true" ];
-          argv = [ "true" ];
-        };
-        # The same gate with the one missing field supplied. It is the control:
-        # without it, the refusal below would be evidence only that *something*
-        # about the fixture is wrong.
-        suppliedKindCampaignGate = missingKindCampaignGate // {
-          kind = "command";
-        };
-        invalidCampaignHome = home-manager.lib.homeManagerConfiguration {
-          inherit pkgs;
-          modules = [
-            self.homeManagerModules.tally
-            {
-              home = {
-                username = "tally-invalid-campaign";
-                homeDirectory = "/tmp/tally-invalid-campaign-home";
-                stateVersion = "26.11";
-              };
-              services.tally = {
-                enable = true;
-                campaigns.invalid = {
-                  enable = true;
-                  repositories."acme/spec".checkout = "/tmp/spec";
-                  # Only the field fixtures. This activation is what proves the
-                  # campaign-gate assertions are wired into Home Manager at all,
-                  # and it can only prove that by failing *as an assertion*.
-                  gates = invalidCampaignGateFields;
                 };
               };
             }
@@ -2065,168 +1816,6 @@
         invalidProducerAttempt = builtins.tryEval (
           builtins.deepSeq invalidProducerHome.activationPackage true
         );
-        invalidCampaignSchema = pkgs.lib.evalModules {
-          modules = [
-            {
-              options.services.tally = moduleCommon.mkOptions {
-                defaultPackage = tally;
-                defaultDataDir = "/tmp/tally-data";
-                defaultStateDir = "/tmp/tally-state";
-              };
-              config.services.tally.campaigns.invalid = {
-                repositories."acme/spec".checkout = "/tmp/spec";
-                gates = invalidCampaignGateFields;
-              };
-            }
-          ];
-        };
-        localForgeNativeFieldsSchema = pkgs.lib.evalModules {
-          modules = [
-            {
-              options.services.tally = moduleCommon.mkOptions {
-                defaultPackage = tally;
-                defaultDataDir = "/tmp/tally-data";
-                defaultStateDir = "/tmp/tally-state";
-              };
-              # Repeat the shipped values deliberately: the assertion guards
-              # declarations, not merely non-default values that would happen
-              # to alter a GitHub issue trigger.
-              config.services.tally.campaigns.local = {
-                forge = "local";
-                repositories."acme/spec".checkout = "/tmp/spec";
-                issueRepository = "acme/spec";
-                label = "campaign";
-                mention = "@tally build";
-                allowSelfTriggered = false;
-                allowedActors = [ ];
-                pollIntervalSec = 60;
-              };
-            }
-          ];
-        };
-        mkCampaignGateSchema =
-          gates:
-          pkgs.lib.evalModules {
-            modules = [
-              {
-                options.services.tally = moduleCommon.mkOptions {
-                  defaultPackage = tally;
-                  defaultDataDir = "/tmp/tally-data";
-                  defaultStateDir = "/tmp/tally-state";
-                };
-                config.services.tally.campaigns.invalid = {
-                  repositories."acme/spec".checkout = "/tmp/spec";
-                  inherit gates;
-                };
-              }
-            ];
-          };
-        forceCampaignGates =
-          schema:
-          builtins.tryEval (builtins.deepSeq schema.config.services.tally.campaigns.invalid.gates true);
-        missingKindCampaignAttempt = forceCampaignGates (mkCampaignGateSchema [ missingKindCampaignGate ]);
-        suppliedKindCampaignAttempt = forceCampaignGates (mkCampaignGateSchema [
-          suppliedKindCampaignGate
-        ]);
-        nonCommittingCampaignSchema = pkgs.lib.evalModules {
-          modules = [
-            {
-              options.services.tally = moduleCommon.mkOptions {
-                defaultPackage = tally;
-                defaultDataDir = "/tmp/tally-data";
-                defaultStateDir = "/tmp/tally-state";
-              };
-              # workspace-write is a declared codex sandbox policy, so nothing
-              # about the name is wrong; it is simply one the adapter says
-              # cannot commit, which an implementation node must.
-              config.services.tally = {
-                adapters = moduleCommon.adapterDefaults;
-                campaigns.writable-only = {
-                  enable = true;
-                  repositories."acme/spec".checkout = "/tmp/spec";
-                  gates = [
-                    {
-                      kind = "command";
-                      id = "content";
-                      preflightArgv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -x /bin/sh; test ! -d build"
-                      ];
-                      argv = [
-                        "/bin/sh"
-                        "-eu"
-                        "-c"
-                        "test -d build"
-                      ];
-                    }
-                  ];
-                  agentSandboxPolicy = "workspace-write";
-                };
-              };
-            }
-          ];
-        };
-        reservedCampaignNameSchema = pkgs.lib.evalModules {
-          modules = [
-            {
-              options.services.tally = moduleCommon.mkOptions {
-                defaultPackage = tally;
-                defaultDataDir = "/tmp/tally-data";
-                defaultStateDir = "/tmp/tally-state";
-              };
-              # `campaigns.continuation` renders `producers.campaign-continuation`,
-              # which is the name the campaign layer seeds the generic events-dir
-              # drain under. The fold adds campaign producers on top of that seed,
-              # so the campaign would replace the drain with a gh producer.
-              config.services.tally.campaigns.continuation = {
-                enable = true;
-                repositories."acme/spec".checkout = "/tmp/spec";
-                gates = [
-                  {
-                    kind = "command";
-                    id = "content";
-                    preflightArgv = [
-                      "/bin/sh"
-                      "-eu"
-                      "-c"
-                      "test -x /bin/sh; test ! -d build"
-                    ];
-                    argv = [
-                      "/bin/sh"
-                      "-eu"
-                      "-c"
-                      "test -d build"
-                    ];
-                  }
-                ];
-              };
-            }
-          ];
-        };
-        reservedCampaignNameMessages = map (entry: entry.message) (
-          builtins.filter (entry: !entry.assertion) (
-            moduleCommon.mkAssertions reservedCampaignNameSchema.config.services.tally
-          )
-        );
-        nonCommittingCampaignMessages = map (entry: entry.message) (
-          builtins.filter (entry: !entry.assertion) (
-            moduleCommon.mkAssertions nonCommittingCampaignSchema.config.services.tally
-          )
-        );
-        invalidCampaignAssertions = builtins.filter (entry: !entry.assertion) (
-          moduleCommon.mkAssertions invalidCampaignSchema.config.services.tally
-        );
-        invalidCampaignMessages = map (entry: entry.message) invalidCampaignAssertions;
-        localForgeNativeFieldsMessages = map (entry: entry.message) (
-          builtins.filter (entry: !entry.assertion) (
-            moduleCommon.mkAssertions localForgeNativeFieldsSchema.config.services.tally
-          )
-        );
-        invalidCampaignAttempt = builtins.tryEval (
-          builtins.deepSeq invalidCampaignHome.activationPackage true
-        );
         nixosBase = {
           system.stateVersion = "26.11";
           boot.loader.grub.enable = false;
@@ -2341,22 +1930,6 @@
                   };
                 };
                 flows.fixture.script = ./test/fixtures/flows/valid.js;
-                campaigns.fixture = {
-                  enable = true;
-                  repositories."acme/spec".checkout = "/tmp/spec";
-                  gates = [
-                    {
-                      kind = "command";
-                      id = "tests";
-                      # no-op-probe-allowed: this host is evaluated only to
-                      # prove the unsupported-system assertion fires. The
-                      # campaign never renders a flow, so the gate's content is
-                      # irrelevant to what the fixture asserts.
-                      preflightArgv = [ "true" ];
-                      argv = [ "true" ];
-                    }
-                  ];
-                };
                 pools.metered = {
                   resource = "budget";
                   predicate.windowed-consumption = {
@@ -3482,19 +3055,15 @@
             value = homeServices.${name}.Service.ExecStart;
           in
           if builtins.isList value then builtins.head value else value;
-        campaignAssertionMessages = map (entry: entry.message) (
-          builtins.filter (entry: !entry.assertion) campaignHome.config.assertions
-        );
-        campaignHomeServices = campaignHome.config.systemd.user.services;
-        campaignHomeTimers = campaignHome.config.systemd.user.timers;
-        campaignPollScript = campaignHomeServices.tally-campaign-poll.Service.ExecStart;
+        campaignPollHomeServices = campaignPollHome.config.systemd.user.services;
+        campaignPollHomeTimers = campaignPollHome.config.systemd.user.timers;
+        campaignPollScript = campaignPollHomeServices.tally-campaign-poll.Service.ExecStart;
         campaignSystemPollScript =
           campaignNixos.config.systemd.services.tally-campaign-poll.serviceConfig.ExecStart;
         checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
-        checkedCampaignConfig = campaignHome.config.xdg.configFile."tally/config.json".source;
         systemServices = stockNixos.config.systemd.services;
         systemTimers = stockNixos.config.systemd.timers;
-        campaignSystemConfig = campaignNixos.config.services.tally;
+        forgeSystemConfig = campaignNixos.config.services.tally;
         campaignSystemServices = campaignNixos.config.systemd.services;
         campaignSystemTimers = campaignNixos.config.systemd.timers;
         campaignSystemActivation =
@@ -3540,59 +3109,33 @@
           assert pkgs.lib.hasInfix
             "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000 --producer-marker-horizon 180d"
             (homeServiceExec "tally-retention");
-          # Forge-native campaigns post no continuation comment, so this timer
-          # is the only thing that carries a campaign past its first pass.
+          # The poll timer is the recovery heartbeat for locally armed
+          # campaigns; it survives the retired declaration renderer.
           assert homeServices ? tally-campaign-poll;
           assert homeTimers ? tally-campaign-poll;
           assert homeTimers.tally-campaign-poll.Timer.OnUnitActiveSec == "60s";
           assert homeTimers.tally-campaign-poll.Timer.Unit == "tally-campaign-poll.service";
           assert homeServices.tally-campaign-poll.Service.TimeoutStartSec == "90s";
-          assert campaignHomeTimers.tally-campaign-poll.Timer.OnUnitActiveSec == "4min";
-          assert campaignHomeServices.tally-campaign-poll.Service.TimeoutStartSec == "2min";
+          assert campaignPollHomeTimers.tally-campaign-poll.Timer.OnUnitActiveSec == "4min";
+          assert campaignPollHomeServices.tally-campaign-poll.Service.TimeoutStartSec == "2min";
           assert !(pollDisabledHome.config.systemd.user.timers ? tally-campaign-poll);
           assert !(pollDisabledHome.config.systemd.user.services ? tally-campaign-poll);
-          # campaignMaxNodes and the CLI's max_flow_nodes are two independent
-          # implementations of one budget, and nothing else makes them agree.
-          # The fixture campaign has the shape the CLI unit test uses --
-          # maxParallel 3, two gates, one of them a command gate -- so both
-          # sides must land on 3 + (2 + 2*1) + 3*(12 + 2*2) = 55. Drift on
-          # either side breaks a test rather than silently capping a run below
-          # its own worst case.
-          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 55;
-          # The generated producer's projection literals are mkDefault: an
-          # ordinary estate override wins without mkForce, and every campaign
-          # that states no opinion keeps the shipped defaults bit for bit.
-          assert campaignHome.config.services.tally.producers.campaign-defaulted.postEvidence == false;
-          assert campaignHome.config.services.tally.producers.campaign-defaulted.postReceipt == true;
-          assert campaignHome.config.services.tally.producers.campaign-fixture.postEvidence == true;
-          assert campaignHome.config.services.tally.producers.campaign-fixture.postReceipt == true;
-          assert campaignHome.config.services.tally.producers.campaign-fixture.postGateSummary == false;
-          assert campaignHome.config.services.tally.producers.campaign-fixture.requestReview == false;
-          assert campaignHome.config.services.tally.producers.campaign-fixture.closeOnAcceptance == false;
-          assert campaignHome.config.services.tally.producers.campaign-fixture.closeOnPass == false;
-          assert campaignHome.config.services.tally.producers.campaign-fixture.neverMutate == false;
-          # One drainer, not two. tally-drain.timer already claimed the whole
-          # events directory at this cadence on every tally home, and the drain
-          # RPC drains the directory whoever calls it, so the campaign
-          # continuation producer stays a registry entry and renders no unit:
-          # two timers at the same cadence raced for the right to stamp the
-          # durable admission origin of every event dropped in that directory.
+          assert !(stockHome.options.services.tally ? campaigns);
           assert homeTimers.tally-drain.Timer.OnUnitActiveSec == "5s";
-          assert campaignHomeTimers.tally-drain.Timer.OnUnitActiveSec == "5s";
-          assert campaignHome.config.services.tally.producers.campaign-continuation.selfDrain == false;
-          assert !(campaignHomeTimers ? tally-producer-campaign-continuation);
-          assert !(campaignHomeServices ? tally-producer-campaign-continuation);
           # An ordinary events-dir producer keeps its own unit pair.
           assert homeTimers ? tally-producer-drop;
           assert homeServices ? tally-producer-drop;
-          # The continue node's write into that directory is a declared write
-          # dependency of the driver adapter, so hardening the adapter cannot
-          # silently break a campaign's self-continuation.
+          assert !(stockHome.config.services.tally.producers ? campaign-continuation);
+          # The host-level adapter declaration is independent of the removed
+          # per-campaign surface, including its hardened write allowances.
           assert
-            campaignHome.config.services.tally.adapters.spec-build-driver.extraWritablePaths == [
-              "/tmp/tally-campaign-home/.local/state/tally/events"
-              "/tmp/tally-campaign-home/.local/state/tally/capture/archive"
+            stockHome.config.services.tally.adapters.spec-build-driver.extraWritablePaths == [
+              "/tmp/tally-stock-home/.local/state/tally/events"
+              "/tmp/tally-stock-home/.local/state/tally/capture/archive"
             ];
+          assert
+            stockHome.config.services.tally.adapters.spec-build-driver.scrape.finalMessage.pattern
+            == "^TALLY_FINAL_MESSAGE=(.*)$";
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
           assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
@@ -3622,9 +3165,6 @@
           assert builtins.elem
             "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)"
             unsupportedSystemMessages;
-          assert builtins.elem
-            "services.tally.campaigns must be empty in the NixOS module: a declared campaign is driven by a managed GitHub producer unit and only the Home Manager module renders producer units. Set services.tally.campaignForge.enable = true and arm forge-native campaigns with `tally campaign arm`, or configure declared campaigns with the Home Manager module (tally.homeManagerModules.tally)"
-            unsupportedSystemMessages;
           # The campaign execution surface on NixOS. A stock host renders none
           # of it: the switch is off, so the module deploys the daemon exactly
           # as it did before the option existed.
@@ -3643,31 +3183,25 @@
           # adapter, and a fanout cap that admits a worst-case pass. Repository
           # campaign/<owner>/<repo> mutexes are minted on demand from the name
           # alone, so no generic host-wide campaign pool is configured.
-          assert !(campaignSystemConfig.pools ? campaign);
-          assert campaignSystemConfig.pools.campaign-agent.resource == "slot";
-          assert campaignSystemConfig.pools.campaign-control.resource == "cpu-slot";
-          assert campaignSystemConfig.pools.flow.resource == "cpu-slot";
-          assert campaignSystemConfig.enqueue.fanoutCap == 64;
+          assert !(forgeSystemConfig.pools ? campaign);
+          assert forgeSystemConfig.pools.campaign-agent.resource == "slot";
+          assert forgeSystemConfig.pools.campaign-control.resource == "cpu-slot";
+          assert forgeSystemConfig.pools.flow.resource == "cpu-slot";
+          assert forgeSystemConfig.enqueue.fanoutCap == 64;
           # The events directory the continuation payload is written into, plus
           # the home the driver's own forge identity lives in: a hardened
           # driver adapter has to keep both writable on a system host, because
           # `gh` rewrites its own configuration file on first use.
           assert
-            campaignSystemConfig.adapters.spec-build-driver.extraWritablePaths == [
+            forgeSystemConfig.adapters.spec-build-driver.extraWritablePaths == [
               "/var/lib/tally/forge"
               "/var/lib/tally/state/events"
               "/var/lib/tally/state/capture/archive"
             ];
           assert
-            campaignSystemConfig.adapters.spec-build-driver.scrape.finalMessage.pattern
+            forgeSystemConfig.adapters.spec-build-driver.scrape.finalMessage.pattern
             == "^TALLY_FINAL_MESSAGE=(.*)$";
-          # One registry entry, no producer unit: this module renders no
-          # producer units at all, and tally-drain.timer already drains that
-          # directory at the same cadence the entry declares.
-          assert campaignSystemConfig.producers.campaign-continuation.kind == "events-dir";
-          assert campaignSystemConfig.producers.campaign-continuation.selfDrain == false;
-          assert !(campaignSystemServices ? tally-producer-campaign-continuation);
-          assert !(campaignSystemTimers ? tally-producer-campaign-continuation);
+          assert forgeSystemConfig.producers == { };
           assert campaignSystemTimers.tally-drain.timerConfig.OnUnitActiveSec == "5s";
           # The continuation payload's directory exists before the first job
           # that names it starts, on this module too.
@@ -4057,12 +3591,11 @@
                 python3 ${./test/spec_build_contract_corpus_test.py}
                 touch "$out"
               '';
-          campaign-render =
-            pkgs.runCommand "tally-campaign-render"
+          campaign-runtime =
+            pkgs.runCommand "tally-campaign-runtime"
               {
-                activationPackage = campaignHome.activationPackage;
-                checkedConfig = checkedCampaignConfig;
-                stockConfig = checkedHomeConfig;
+                activationPackage = campaignPollHome.activationPackage;
+                checkedConfig = checkedHomeConfig;
                 pollScript = campaignPollScript;
                 systemPollScript = campaignSystemPollScript;
                 nativeBuildInputs = [
@@ -4071,7 +3604,7 @@
                 ];
               }
               ''
-                trap 'echo "campaign-render: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+                trap 'echo "campaign-runtime: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
                 test -e "$activationPackage"
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
                 # The poll holds the registry lock exclusively for its whole
@@ -4091,144 +3624,27 @@
                   # make nix-store available through their generated PATH.
                   grep -Fq -- "${pkgs.nix}/bin" "$script"
                   if grep -Fq -- "--wait" "$script"; then
-                    echo "campaign-render: poll timer must not pass --wait: $script" >&2
+                    echo "campaign-runtime: poll timer must not pass --wait: $script" >&2
                     exit 1
                   fi
                 done
                 grep -Fq -- "--config /etc/tally/config.json" "$systemPollScript"
                 grep -Fq -- "--socket /run/tally/tally.sock" "$systemPollScript"
                 grep -Fq -- "--state-dir /var/lib/tally/state" "$systemPollScript"
+                # D77 keeps only the host runtime contract. No flow or producer
+                # is synthesized from a module campaign declaration.
                 jq -e '
-                  .producers["campaign-fixture"].enqueue.brief as $fixtureArgs |
-                  .producers["campaign-defaulted"].enqueue.brief as $defaultedArgs |
-                  .producers["campaign-split"].enqueue.brief as $splitArgs |
                   .enqueue.fanoutCap == 64 and
-                  .pools["fixture-campaign"].resource == "mutex" and
-                  .pools["fixture-campaign"].capacity == 1 and
                   .pools["campaign-control"].resource == "cpu-slot" and
                   .pools["campaign-control"].capacity == 4 and
                   .pools["campaign-agent"].resource == "slot" and
                   .pools["campaign-agent"].capacity == 4 and
+                  .pools.flow.resource == "cpu-slot" and
                   .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
-                  .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
-                  ([.adapters.codex.launch.approvalPolicies[][0]] | unique) == ["-c"] and
-                  .adapters.codex.launch.approvalPolicies.never == ["-c", "approval_policy=\"never\""] and
-                  ([.adapters.codex.launch.approvalPolicies[][]] | any(. == "--ask-for-approval") | not) and
-                  .adapters.codex.launch.commitCapableSandboxPolicies == ["danger-full-access", "dangerously-bypass"] and
-                  .flows.fixture.workloadMutex == "fixture-campaign" and
-                  (.flows.fixture.script | endswith("spec-build.js")) and
-                  $fixtureArgs.tally == "${tally}/bin/tally" and
-                  $fixtureArgs.agent.approvalPolicy == null and
-                  $fixtureArgs.agent.sandboxPolicy == null and
-                  $fixtureArgs.agent.diagnosisSandboxPolicy == null and
-                  $fixtureArgs.gates[0].kind == "command" and
-                  $fixtureArgs.gates[0].preflightArgv ==
-                    ["/bin/sh", "-eu", "-c", "test -x /bin/sh; test ! -d build"] and
-                  $fixtureArgs.gates[0].runtimeMaxSec == 900 and
-                  ($fixtureArgs.gates[0] | has("forbidPaths") | not) and
-                  $fixtureArgs.gates[1].kind == "forbidPaths" and
-                  $fixtureArgs.gates[1].forbidPaths == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
-                  ($fixtureArgs.gates[1] | has("preflightArgv") | not) and
-                  ($fixtureArgs.gates[1] | has("argv") | not) and
-                  $fixtureArgs.gates[1].runtimeMaxSec == 11 and
-                  $fixtureArgs.mergeMethod == "merge" and
-                  ($fixtureArgs.captureRoot | endswith("/capture/archive")) and
-                  $fixtureArgs.postFailureEvidence == true and
-                  $fixtureArgs.postFailureStderr == true and
-                  $fixtureArgs.steward.adapter == "narrator" and
-                  $fixtureArgs.steward.argv == [
-                    "/bin/sh", "/srv/campaign-fixtures/narrate", "--narrate"
-                  ] and
-                  $fixtureArgs.steward.runtimeMaxSec == 45 and
-                  $fixtureArgs.steward.env
-                    == {"NARRATOR_ENDPOINT": "https://narrator.invalid/v1"} and
-                  ($fixtureArgs.steward.env == .adapters.narrator.env) and
-                  ($fixtureArgs.steward.finalMessagePattern
-                    == .adapters.narrator.scrape.finalMessage.pattern) and
-                  $fixtureArgs.steward.finalMessagePattern == "^NARRATOR_RESULT=(.*)$" and
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern
                     == "^TALLY_FINAL_MESSAGE=(.*)$" and
-                  # The seam is rendered only where it is configured. A role
-                  # left null is absent from the args, so a single-repository
-                  # campaign carries the same brief it always did.
-                  $splitArgs.codeRepository == "acme/code" and
-                  $splitArgs.specRepository == "acme/spec" and
-                  ($splitArgs | has("issueRepository") | not) and
-                  ($splitArgs.repositories | keys) == ["acme/code", "acme/spec"] and
-                  ($splitArgs.repositories["acme/code"].checkout
-                    != $splitArgs.repositories["acme/spec"].checkout) and
-                  $splitArgs.worklist == "specs/001-toy/tasks.json" and
-                  $splitArgs.maxTasks == 7 and
-                  $fixtureArgs.repositories["acme/spec"].forge == "github" and
-                  $splitArgs.repositories["acme/code"].forge == "local" and
-                  $splitArgs.repositories["acme/spec"].forge == "local" and
-                  $defaultedArgs.repositories["acme/spec"].forge == "github" and
-                  ($defaultedArgs | has("codeRepository") | not) and
-                  ($defaultedArgs | has("specRepository") | not) and
-                  ($defaultedArgs | has("issueRepository") | not) and
-                  ($fixtureArgs | has("specRepository") | not) and
-                  $defaultedArgs.mergeMethod == "squash" and
-                  $defaultedArgs.postFailureEvidence == false and
-                  $defaultedArgs.postFailureStderr == false and
-                  $defaultedArgs.steward == null and
-                  $defaultedArgs.agent.adapter == "codex" and
-                  $defaultedArgs.agent.approvalPolicy == "never" and
-                  $defaultedArgs.agent.sandboxPolicy == "danger-full-access" and
-                  $defaultedArgs.agent.diagnosisSandboxPolicy == "read-only" and
-                  .producers["campaign-fixture"].kind == "gh" and
-                  .producers["campaign-fixture"].enable == true and
-                  .producers["campaign-fixture"].sources[0].search.repositories == ["acme/spec"] and
-                  .producers["campaign-fixture"].sources[0].search.labels == ["spec-campaign"] and
-                  .producers["campaign-fixture"].sources[0].search.state == "open" and
-                  .producers["campaign-fixture"].sources[0].search.kinds == ["issue"] and
-                  .producers["campaign-fixture"].triggers.mentions == ["@operator build"] and
-                  .producers["campaign-fixture"].allowSelfTriggered == true and
-                  .producers["campaign-fixture"].allowedActors == ["operator"] and
-                  .producers["campaign-fixture"].pollIntervalSec == 17 and
-                  .producers["campaign-fixture"].postReceipt == true and
-                  .producers["campaign-fixture"].postEvidence == true and
-                  .producers["campaign-fixture"].postFailureEvidence == true and
-                  .producers["campaign-fixture"].postFailureStderr == true and
-                  .producers["campaign-fixture"].postGateSummary == false and
-                  .producers["campaign-fixture"].closeOnAcceptance == false and
-                  .producers["campaign-fixture"].closeOnPass == false and
-                  .producers["campaign-fixture"].enqueue.pool == ["fixture-campaign", "flow"] and
-                  .producers["campaign-fixture"].enqueue.adapter == "shell" and
-                  .producers["campaign-fixture"].enqueue.evidence == ["exit:0"] and
-                  .producers["campaign-fixture"].enqueue.noEnqueue == false and
-                  .producers["campaign-fixture"].enqueue.argv[0:3] == [
-                    "${tally}/bin/tally", "flow", "run"
-                  ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "55"] and
-                  ([.producers | keys[] | select(test("reconcile"))] == []) and
-                  ([.producers | keys[] | select(startswith("campaign-"))]
-                    == [
-                      "campaign-continuation",
-                      "campaign-defaulted",
-                      "campaign-fixture",
-                      "campaign-split"
-                    ]) and
-                  .producers["campaign-continuation"].kind == "events-dir" and
-                  .producers["campaign-continuation"].pollIntervalSec == 5 and
-                  ($fixtureArgs.continuation.argv
-                    == .producers["campaign-fixture"].enqueue.argv) and
-                  $fixtureArgs.continuation.pool == ["flow", "fixture-campaign"] and
-                  $fixtureArgs.continuation.priority == "low" and
-                  ($fixtureArgs.continuation.eventsDir | endswith("/events")) and
-                  ($fixtureArgs | has("reconcileCommand") | not) and
-                  .producers["campaign-defaulted"].allowSelfTriggered == false
-                  and .producers["campaign-defaulted"].postFailureEvidence == false
-                  and .producers["campaign-defaulted"].postFailureStderr == false
+                  ([.producers | keys[] | select(startswith("campaign-"))] == [])
                 ' "$checkedConfig" >/dev/null
-
-                # The generic drain is installed once and unconditionally, so a
-                # host with only the poll surface and no declared campaign
-                # still renders it: arming needs no Nix change.
-                jq -e '
-                  ([.producers | keys[] | select(startswith("campaign-"))]
-                    == ["campaign-continuation"]) and
-                  .producers["campaign-continuation"].kind == "events-dir"
-                ' "$stockConfig" >/dev/null
 
                 cp -R ${./test/fixtures/spec-build/repo} "$TMPDIR/spec"
                 chmod -R u+w "$TMPDIR/spec"
@@ -4563,124 +3979,6 @@
                 test "$(git -C "$TMPDIR/spec" rev-parse \
                   "refs/heads/$publish_branch")" = "$witnessed_head"
 
-                # `campaigns.defaulted` declares no mention, so its trigger
-                # grammar is whatever the module ships. Reading that grammar
-                # back out of the rendered config keeps the event honest under a
-                # future default change and keeps this file from repeating a
-                # mention literal, which is a live GitHub at-mention wherever it
-                # is copied from.
-                default_mention="$(jq -r \
-                  '.producers["campaign-defaulted"].triggers.mentions[0]' \
-                  "$checkedConfig")"
-                # And the default itself is pinned, because #319 made it a
-                # back-compat contract: it is deliberately left naming a real,
-                # unrelated GitHub account so that campaigns relying on it do
-                # not silently lose their trigger grammar, and a promise nothing
-                # checks is not a promise. Retiring it is a release-boundary
-                # decision, and this pin is what makes that decision explicit
-                # rather than a diff nobody noticed.
-                #
-                # The pin is the digest and not the literal on purpose. #319's
-                # first acceptance criterion is that grepping this file and
-                # doc/ for the account that default names returns nothing, and
-                # a pin that spelled it would fail that criterion in the act of
-                # protecting it. The digest moves if and only if the default
-                # does; the CHANGELOG carries the literal, which is outside
-                # that grep's scope and is where a migrating operator looks.
-                default_mention_sha256="$(printf '%s' "$default_mention" \
-                  | sha256sum | cut -d' ' -f1)"
-                if [ "$default_mention_sha256" != \
-                  "bd13b18429fdb18e7b981e1a552dd2c97d375fc33557e59855616d4e6b956d2d" ]; then
-                  echo "the shipped campaigns.<name>.mention default changed" >&2
-                  echo "  rendered digest: $default_mention_sha256" >&2
-                  echo "  if that change is intended, update this pin and give" >&2
-                  echo "  the CHANGELOG the migration note the old default is" >&2
-                  echo "  owed; if it is not, the module default regressed" >&2
-                  exit 1
-                fi
-                default_event="$(printf '%s' \
-                  '{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"PLACEHOLDER"}}}' \
-                  | jq -c --arg mention "$default_mention" \
-                    '.context.triggeringComment.body = $mention')"
-                mkdir -p "$TMPDIR/data"
-                default_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
-                  __producer-dispatch campaign-defaulted --state-dir "$TMPDIR/state" \
-                  --data-dir "$TMPDIR/data" \
-                  --event "$default_event")"
-                test "$(printf '%s' "$default_dispatch" | jq -r '.filtered.reason')" = \
-                  self-trigger-disabled
-
-                event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-7","commentId":"comment-7","triggerTimestamp":"2026-07-31T09:00:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-7","author":"operator","body":"@operator build"}}}'
-                dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
-                  __producer-dispatch campaign-fixture --state-dir "$TMPDIR/state" \
-                  --data-dir "$TMPDIR/data" \
-                  --event "$event")"
-                payload="$(printf '%s' "$dispatch" | jq -r '.emitted')"
-                runtime_args="$(jq -r '.briefPath' "$payload")"
-                test -f "$runtime_args"
-                test "$(dirname "$(dirname "$runtime_args")")" = "$TMPDIR/data"
-                test ! -e "$TMPDIR/state/briefs"
-                jq -e '
-                  .campaign == "fixture" and
-                  .repository == "acme/spec" and
-                  .issue == {
-                    "number": "7",
-                    "url": "https://github.com/acme/spec/issues/7"
-                  } and
-                  .runId == "comment-7" and
-                  .worklist == "specs/*/tasks.json" and
-                  .maxTasks == 7 and
-                  .maxParallel == 3 and
-                  (.continuation.argv | index("--args-from-brief")) == 4 and
-                  .continuation.argv[6] == "55" and
-                  .continuation.pool == ["flow", "fixture-campaign"] and
-                  .continuation.priority == "low" and
-                  (.continuation.eventsDir | endswith("/events")) and
-                  (has("reconcileCommand") | not) and
-                  .tally == "${tally}/bin/tally" and
-                  .repositories["acme/spec"].baseBranch == "main" and
-                  .repositories["acme/spec"].forge == "github" and
-                  .agent.adapter == "fixture-agent" and
-                  .agent.argv == ["/bin/true"] and
-                  .agent.approvalPolicy == null and
-                  .agent.sandboxPolicy == null and
-                  .agent.diagnosisSandboxPolicy == null and
-                  [.gates[].id] == ["content", "no-db-artifacts"] and
-                  .gates[0].kind == "command" and
-                  .gates[0].preflightArgv ==
-                    ["/bin/sh", "-eu", "-c", "test -x /bin/sh; test ! -d build"] and
-                  .gates[0].argv == ["/bin/sh", "-eu", "-c", "test -d build"] and
-                  .gates[0].runtimeMaxSec == 900 and
-                  (.gates[0] | has("forbidPaths") | not) and
-                  .gates[1].kind == "forbidPaths" and
-                  .gates[1].forbidPaths == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
-                  (.gates[1] | has("preflightArgv") | not) and
-                  (.gates[1] | has("argv") | not) and
-                  .gates[1].runtimeMaxSec == 11
-                ' "$runtime_args" >/dev/null
-                jq -e --arg args "$runtime_args" \
-                  '.briefPath == $args and (has("brief") | not)' "$payload" >/dev/null
-                ${tally}/bin/tally --config "$checkedConfig" flow check \
-                  ${./examples/flows/spec-build.js} --args-path "$runtime_args" >/dev/null
-                test "$(jq -r '.argv[3]' "$payload")" = \
-                  "$(jq -r '.flows.fixture.script' "$checkedConfig")"
-
-                # The self-nudge is local now: no per-campaign reconcile
-                # producer exists to poll a public comment back, and the one
-                # generic drain that replaced it is an events-dir producer.
-                jq -e '
-                  (.producers | has("campaign-fixture-reconcile") | not) and
-                  (.producers | has("campaign-defaulted-reconcile") | not)
-                ' "$checkedConfig" >/dev/null
-                calendar_event='{"kind":"calendar"}'
-                if ${tally}/bin/tally --config "$checkedConfig" \
-                  __producer-dispatch campaign-continuation \
-                  --state-dir "$TMPDIR/state" --data-dir "$TMPDIR/data" \
-                  --event "$calendar_event" 2>"$TMPDIR/continuation-kind.err"; then
-                  echo "campaign-render: campaign-continuation accepted a calendar observation" >&2
-                  exit 1
-                fi
-                grep -Fq 'has kind "events-dir"' "$TMPDIR/continuation-kind.err"
                 touch "$out"
               '';
           flow-dialect-accept =
@@ -4776,10 +4074,10 @@
               ''
                 # tally-campaign-poll.timer ships, so the campaign docs must
                 # not carry the unscoped claim that no periodic campaign timer
-                # exists. Since #306 both campaign classes continue themselves
-                # through a JSON drop in the shipped events directory, and this
-                # timer is the recovery path for a lost continuation event plus
-                # the way an outside edit to an armed issue graph is noticed. A
+                # exists. Locally armed campaigns continue themselves through a
+                # JSON drop in the shipped events directory, and this timer is
+                # the recovery path for a lost continuation event plus the way
+                # an outside edit to an armed issue graph is noticed. A
                 # blanket denial is false of that arrangement too, and a drift
                 # check whose own rationale describes a deleted mechanism is
                 # exactly what the next reader trusts.
@@ -4793,10 +4091,7 @@
           campaign-preflight-probe-drift =
             pkgs.runCommand "tally-campaign-preflight-probe-drift"
               {
-                nativeBuildInputs = [
-                  pkgs.ripgrep
-                  pkgs.python3
-                ];
+                nativeBuildInputs = [ pkgs.ripgrep ];
               }
               ''
                 # The copyable blocks are what an operator pastes, and a probe
@@ -4807,18 +4102,12 @@
                   echo "campaigns.md still ships a version-only preflight probe" >&2
                   exit 1
                 fi
-                # Every command gate's probe on the shipped Nix surface is read
-                # and judged, rather than one exact spelling being grepped for.
-                # The first version of this guard matched only `[ "/bin/true" ]`
-                # and was green while this very file shipped `[ "true" ]` twice.
-                ${pkgs.python3}/bin/python3 ${./test/preflight_probe_drift.py} \
-                  ${./flake.nix} ${./nix/modules/common.nix}
                 # The replacements have to be present, not merely the absence
                 # of the bad ones: a probe that reaches the compiler driver and
                 # resolves the workspace offline, and one that makes rustfmt
-                # format something. The shipped Nix fixture's own replacement is
-                # asserted against the rendered campaign args in
-                # checks.campaign-render, which is stronger than a grep.
+                # format something. Campaign gate policy now comes from the
+                # committed worklist, so only the copyable documentation remains
+                # in this Nix-owned drift check.
                 if ! rg -qF \
                   'command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null' \
                   ${./doc/src/flows/campaigns.md}; then
@@ -5062,59 +4351,6 @@
               invalidProducerMessages;
             assert !invalidProducerAttempt.success;
             pkgs.runCommand "tally-producer-kind-required" { } ''
-              touch "$out"
-            '';
-          campaign-gates-rejected =
-            assert builtins.any (
-              message: nixpkgs.lib.hasInfix "fields must agree with kind" message
-            ) invalidCampaignMessages;
-            assert builtins.any (
-              message: nixpkgs.lib.hasInfix "use '**' only as a complete path component" message
-            ) invalidCampaignMessages;
-            # A gate that omits `kind` is refused by the option system rather
-            # than by an assertion, so it is proved by evaluation failure and
-            # not by a message. The control below is what makes that failure
-            # mean "the missing kind" and not "something about this fixture":
-            # the same gate with `kind = "command"` supplied evaluates.
-            assert !missingKindCampaignAttempt.success;
-            assert suppliedKindCampaignAttempt.success;
-            assert !invalidCampaignAttempt.success;
-            pkgs.runCommand "tally-campaign-gates-rejected" { } ''
-              touch "$out"
-            '';
-          campaign-reserved-name-rejected =
-            # The Home Manager assertion that used to be the only thing
-            # catching this named an internal producer and never the campaign
-            # that collided with it, and it fails closed only for as long as it
-            # exists: the fold *seeds* the generic drain rather than overlaying
-            # it, so relaxing that assertion would make the collision silent.
-            assert builtins.any (
-              message: nixpkgs.lib.hasInfix "tally campaign name continuation is reserved" message
-            ) reservedCampaignNameMessages;
-            # An ordinary campaign name is not caught by it.
-            assert builtins.all (
-              message: !nixpkgs.lib.hasInfix "is reserved" message
-            ) campaignAssertionMessages;
-            pkgs.runCommand "tally-campaign-reserved-name-rejected" { } ''
-              touch "$out"
-            '';
-          campaign-local-forge-fields-rejected =
-            assert builtins.elem
-              "tally campaign local forge=local must not declare forge-native-only fields: allowSelfTriggered, allowedActors, issueRepository, label, mention, pollIntervalSec"
-              localForgeNativeFieldsMessages;
-            pkgs.runCommand "tally-campaign-local-forge-fields-rejected" { } ''
-              touch "$out"
-            '';
-          campaign-noncommitting-sandbox-rejected =
-            assert builtins.any (
-              message:
-              nixpkgs.lib.hasInfix "tally campaign writable-only agentSandboxPolicy must be one of adapter codex commitCapableSandboxPolicies" message
-            ) nonCommittingCampaignMessages;
-            # The shipped defaults are the counter-case: they must not appear.
-            assert builtins.all (
-              message: !nixpkgs.lib.hasInfix "commitCapableSandboxPolicies" message
-            ) campaignAssertionMessages;
-            pkgs.runCommand "tally-campaign-noncommitting-sandbox-rejected" { } ''
               touch "$out"
             '';
           gh-login-grammar =
