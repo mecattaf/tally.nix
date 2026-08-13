@@ -726,3 +726,253 @@ chR/read-model riding anywhere post-deploy. Rationale:
 57 tasks total across ch0–ch5 + chR, all validated on the working tree against
 `normalize_task(require_conflict_domains=True)` at the time of this amendment
 (re-run after the sodimo fold).
+
+# PART 7 — CHAPTER 3-EPSILON (2026-08-13 amendment)
+
+## 7.0 Standing
+
+This part supersedes Part 3 Chapters 3, 4, 5 and P, and item 3 of §6.3, at the
+moment chapter 2 closed (receipt 2026-08-13T12:08:20Z, worklist
+sha256:fde8ad81…, base `52eff4db`). The committed `ch3.json`, `ch4.json`,
+`ch5.json` and `chR.json` files remain in the tree as historical inputs and are
+never armed; their `readFirst` pointers into Part 3 are void. The remaining
+work is realized as **three campaign stages sharing one identity** (§7.2),
+designed from the chapter 0–2 findings F13–F26 and a three-agent design panel
+adjudicated on 2026-08-13.
+
+Bookkeeping corrections carried here rather than by rewriting old parts (D53):
+
+- **S17**: Part 5's identification of `chR.json` as "the Chapter P worklist" is
+  false. `chR.json` is the read-model chapter (its substance rides ε2's
+  R-lane). Chapter P never had a worklist file; its enumeration was done fresh
+  against the tree for ε1.
+- **D68 resolve check**: every `readFirst.specSections` entry in an armed
+  epsilon worklist points into this Part 7. Anything still pointing at Part 3
+  chapter prose is a defect in the worklist, not in the plan.
+
+## 7.1 What chapter 2 falsified
+
+Part 3's chapter 3–5 prose was written against a tree that chapter 2 rewrote:
+
+- `campaign project`, the projection renderer and the master-issue lifecycle
+  are deleted. Campaign authority is v3: `arm` takes a repository plus a
+  committed worklist path and synthesizes a `local://` identity. There is no
+  master issue, no sub-issue projection, and the driver performs zero gh I/O.
+- The release-renderer lineage ch3.json told workers to extend
+  (`render_project_task_body`, campaign.rs digest functions) no longer exists;
+  the surviving digest/summary/branch-naming folds live in the Python driver
+  that ε2's C-lane deletes. Building the renderer in Python first would be
+  writing code that is about to die (D34's own logic) — so the release surface
+  is Rust-native from the start (§7.5).
+- The module-declared campaign is discovered by
+  `local_campaign_declaration_from_document` (crates/tally/src/cli/campaign.rs
+  1733–1894) scanning the rendered config for an **enabled `kind:"gh"`
+  producer named `campaign-<name>`** whose `enqueue.brief` carries the
+  worklist. Deleting `mkCampaignProducer` without re-homing that declaration
+  bricks arming — the single most load-bearing fact in the tree, found
+  independently by both design proposers. ε1's `P1` re-homes it first.
+- The `campaignPoll` units (nix/modules/nixos.nix:665–719,
+  home-manager.nix:591–647) are the local heartbeat and **survive**; Part 3's
+  "delete campaignPoll" prose is wrong.
+- The final conformance bar (`test/final-bar/`) is broken on main: chapter 2's
+  `drop-local-forge-escape-hatches` deleted `--allow-test-local-forge` from
+  `crates/` while four call sites still pass it (cases/manifest.py:286,
+  cases/pipeline.py:149 and :253, cases/registry.py:59) — and nothing noticed,
+  because the bar's only flake attribute (`final-conformance-bar-harness`) runs
+  `--list` without executing a case and fleet-gate has no final-bar step. The
+  bar had **no gate coverage at all** (recorded as fact; repaired in ε0).
+
+## 7.2 The epsilon structure
+
+Three stages, two deploys. One campaign identity: repository
+`mecattaf/tally.nix`, worklist `silent-factory-worklists/epsilon.json`,
+declared as `services.tally.campaigns.epsilon` in the operator's dotfiles.
+The committed content of `epsilon.json` is replaced between stages, only at
+registry quiescence; each stage's exact bytes are pinned by its completion
+receipt hash and recoverable from git history (D73).
+
+1. **deploy-1** (done 2026-08-13): pin `52eff4db`, gitAi host key removed,
+   quiescence guards on deploy admission and activation.
+2. **ε0 — shakedown** (3 tasks + gate, §7.3): the first-ever local-mode
+   campaign. Three real, small, disjoint repairs that double as the checklist
+   for local arm/steer/correction/completion semantics.
+3. **ε1 — deletion wave** (~13 tasks + gate, §7.4): the producers stack, gh
+   origin, gh nix surface, squashes and dead cuts, plus the three hardening
+   tasks (brief-carries-conflictDomains, ownership preflight warn, poll
+   liveness arm).
+4. **deploy-2** (operator act, at ε1 quiescence): hardening and deletions go
+   live for the build wave. The sanctioned moment to adjust the module gate
+   set if needed (D74).
+5. **ε2 — build wave** (~17 tasks + gate, §7.5): release surface, read model,
+   Rust driver port — **authored only after ε1 has merged**, against the
+   observed tree, converting predicted consumer sets into observed ones (the
+   decisive lesson: nine of fourteen chapter 0–2 authority corrections were
+   mis-predicted consumer sets).
+6. **Probe run + self-release**: a real `tally-probe-*` run as a named
+   pre-release operator step with a recorded receipt, then ε2 releases itself
+   with the `tally campaign release` verb it built (D49 self-hosting).
+
+## 7.3 Stage ε0 — shakedown
+
+Three implementation tasks, mutually disjoint, `maxParallel 3` — deliberately
+parallel so the first local campaign exercises multi-lane conflict-domain
+scheduling on day one.
+
+- **`final-bar-local-forge-repair`** — remove the deleted
+  `--allow-test-local-forge` flag from the four final-bar call sites named in
+  §7.1 and bring the whole bar back to exit 0 against the post-chapter-2
+  local-only CLI (`test/final-bar/run <absolute tree path>`; tri-state exit,
+  see test/final-bar/README.md). The bar has not executed since before the
+  chapter 2 deletions, so further staleness found by running it is in scope.
+  Owns `test/final-bar` only.
+- **`gate-keep-going`** — `test/fleet-gate.sh` runs `nix flake check -L`,
+  which stops at the first failing attribute; chapter 2's gate repair found
+  two more stale suites hiding behind the first failure (F14/F21, three
+  campaigns for three). Change the step to `nix flake check -L --keep-going`
+  so one gate failure enumerates every failing attribute. The invocation
+  contract (`usage: … <full-commit-sha>`) is pinned as a regression criterion
+  (F13b). Owns `test/fleet-gate.sh` only.
+- **`steering-grammar-negation`** — F15, the sharpest chapter 2 finding: the
+  managed-agents content contract (`drivers/spec_build_driver.py:176-186`)
+  rejects any text containing `!`, and the rejection redaction (`:3779`)
+  replaces `!` with `.` — so a machine diagnosis cannot state a shell or Nix
+  negation (`! grep …`) without being gagged or mangled. It was silenced twice
+  in chapter 2 while diagnosing correctly. Permit `!` inside inline code
+  spans/argv reproductions while keeping the bang-free rule for ordinary
+  prose, as one named predicate the ε2 Rust port can carry verbatim. The
+  `evidence.rs:1451-1478` / `journal.rs:1190` sites are test assertions on
+  tally's own narration, not this validator — out of scope. Owns `drivers` and
+  `test/spec_build_driver_test.py`.
+
+The chapter checkpoint runs fleet-gate **and** the full final bar — the bar's
+first-ever mechanical gate coverage (D74).
+
+**Shakedown checklist** (operator, during ε0): observe local arm mechanics;
+exercise one deliberate `steer`; run one deliberate worklist-correction cycle
+(edit → commit → push → `resume --reason`) to settle correction semantics
+before ε1 needs them in anger; pin a `>2^31` steering/id value (F18 regression
+watch); observe completion/disarm semantics and the terminal operator signal.
+
+## 7.4 Stage ε1 — deletion wave
+
+Near-serial and honestly so — `conflictDomains` overlap, not `maxParallel`,
+is the binding constraint. Tasks (anchors verified at `bea5c47d`–`52eff4db`):
+
+- **P1 `campaign-declaration-first-class`** — render campaigns as a
+  first-class section of the config document and repoint the reader
+  (campaign.rs 1733–1894); delete `mkCampaignProducer` and the
+  forge-native-only option set it consumed. The raw-JSON reader survives the
+  Rust deletions; only the nix deletion depends on P1. Seam criterion per
+  F19/F20: module-rendered document fixture → declaration found → graph
+  built. Everything gh-ward depends on P1.
+- **P2 `delete-gh-inbound-core`** — gh_intake.rs (2,105 LOC), gh_decision.rs
+  (739), orphan.rs (339), the gh arms of engine/validate/config, build-effect
+  and pool-reachability kinds (D57 grep executed: dotfiles AND sodimo-os
+  clean — fold is unconditional), **and the daemon's outbound gh subsystem**
+  (~250 LOC: completion.rs:75–110 and :186–240, startup.rs:535, daemon
+  re-exports) — the goal states the behavior change: the daemon stops writing
+  to GitHub for producer completions at all. Calendar and events-dir kinds
+  survive and keep passing their suites.
+- **P3 `delete-gh-origin-durable`** — GhOrigin/GhContextSnapshot, wire/taskdb
+  legacy arms, projections. **Keep the `EnqueueSource::Gh` string-decode arm**
+  (D33): measured census 0 gh-sourced events of 3,859, 0 of 1,775 rows carry
+  ghOrigin — the decode arm is cheap insurance, the payload-acceptance path
+  dies. Grants include `crates/tally-flow` (model.rs:622/628/634).
+- **P4 `delete-gh-nix-tree`** — the nix half. `campaignPoll` units survive
+  (§7.1); `pkgs.gh` leaves poll runtimeInputs; the forge option collapses to
+  local; the reviewers validation surface is deleted (D75).
+- **A1 `squash-migration-modules`** — capture_migration.rs and
+  unit_exit_migration.rs sit at tally-core src top level (the committed
+  worklist's "executor domain" is wrong); owns migrate_cli.rs (the known F25
+  config leaker) and cli/mod.rs. `migrate --plan` isClean is a pre-arm
+  operator step, not a lane criterion.
+- **A2 `err-fallbacks`**, **A3 `rowversion-ladder`** (+ taskdb/ subdir +
+  usage.rs domains; the criterion counts `ROW_MIGRATIONS` entries, not
+  `RowMigration {` occurrences), **A4 `dead-cuts`** (+ CONTRIBUTING.md +
+  cli/mod + driver-suite ownership; folds the orphaned
+  `eval_manifest_check_test.py` deletion and the driver `forge:"local"`
+  tightening).
+- **H1 `brief-carries-conflict-domains`** (F22): render `conflictDomains`
+  into the projected task brief at prep; owns drivers, driver suite, the flow
+  and `crates/tally-flow` (prep results pass closed schemas, F24).
+- **H2 `ownership-preflight-warn`**: arm-time textual lint of goal/criteria
+  path tokens against declared domains — warn, never gate. Owns
+  `crates/tally`.
+- **H3 `poll-liveness-arm`** (F23): dispatchable work + zero live nodes ⇒
+  dispatch, regardless of observation digest. Owns `crates/tally` and
+  `flake.nix` (the VM poll assertions are exactly where F21 bit).
+
+## 7.5 Stage ε2 — build wave (authored against the observed post-ε1 tree)
+
+Substance fixed now; line anchors and consumer enumerations are written only
+after ε1 merges. Three genuinely disjoint lanes (`maxParallel 3`):
+
+- **B-lane** (domains: `crates/tally` + `test/release-probe.sh`): B1
+  Rust-native `tally campaign release` reading durable state directly
+  (registry, attempt-receipts JSONL, integration branch, trailer oracle); B2
+  commit validator + `lint-history` in `crates/tally` (D26 "in the
+  renderer"); B3 release-execute with an injectable gh program (fresh seam —
+  the TALLY_GH_PROGRAM precedent is deleted) and idempotency from the local
+  release record, never public-body markers (D4); B4 probe lifecycle with a
+  shim-forge lane criterion — the real `tally-probe-*` run is a named
+  pre-release operator step with receipt; B5 adversarial release lane (D71)
+  plus the F25 sweep for `--config`-less spawns.
+- **R-lane** (domains: `crates/tally-core` + `examples/flows` +
+  `crates/tally-flow`): R1–R4 per chR.json substance with F24 grants added;
+  R4 folds a recorded ε0 shakedown fixture through rebuild as its seam proof.
+- **C-lane** (domains: driver crate + exact `test/spec_build_*.py` files): C1
+  reseat (78 tests, not 49), C2 crate + nix packaging + a per-action
+  dispatcher (`SPEC_BUILD_PY_FALLBACK`) so the port lands incrementally
+  green, C3 worktrees, C4 fold-half, C5 effect-half, C6 argsSchema
+  single-source (flow `:11–~:510`; depends on R3; owns `crates/tally-flow`),
+  C7 rust-driver-seam-proof — repoint `flow_live` at the Rust binary and run
+  a full campaign pass (the port's only genuine F19/F20 oracle), C8
+  delete-python. C8 double-grandfathers `agency_nightly_driver.py` **and**
+  `campaign_worktrees.py` (line 40 imports it) with a named retirement issue
+  (D75); the reseated Python suite survives as the language-agnostic seam
+  harness.
+- **Shared folds ported once**: `stable_publish_branch`, `campaign_digest`,
+  `render_campaign_summary` move into `crates/tally-core` beside
+  `campaign_contract`, consumed by both the release verb and the driver
+  crate — never ported twice.
+
+## 7.6 Supervision playbook (local mode)
+
+- Campaign agent and out-of-band repair workers are **Codex** (D76). The
+  orchestrator writes no tally source; its sanctioned hand-commits are this
+  plan, the worklist files, and the dotfiles declaration.
+- Stall predicate: registration armed ∧ zero `tally-job-*` units ∧
+  `campaign quiescent` ≠ 0, sustained 720 s. A campaign at rest with pending
+  dependent tasks and a free slot is usually correct behavior, not a stall
+  (F23 until H3 is live).
+- Recovery verb is `resume --reason`, always. Never disarm-first — disarm
+  destroys the auto-pardon baseline (F17).
+- "Gate fails once, then passes" is the normal shape (F14/F21; three
+  campaigns for three). Budget: 2–5 out-of-band repair cycles across the
+  three stages; each is a Codex worker in an isolated worktree, nothing
+  pushed by the worker, merged only on a green full gate, then `resume`.
+- `status` blind spots on this pin are pre-briefed as *unknown*, not alarm;
+  captures under `~/.local/state/tally/capture/` are first-line forensics.
+
+## 7.7 Decision register additions
+
+- **D72** — Part 3 Chapters 3/4/5/P and §6.3 item 3 are superseded by the
+  epsilon stages (this part). chR substance rides ε2's R-lane.
+- **D73** — Worklist authority for all epsilon stages is the single committed
+  file `silent-factory-worklists/epsilon.json`; content replaced only at
+  registry quiescence; stage bytes pinned by completion-receipt hashes.
+- **D74** — Module gate set for the epsilon campaign: `driver-suite`
+  (`python3 test/spec_build_driver_test.py`), `cargo-tests`
+  (`nix develop --command cargo test --workspace`), `flake-eval`
+  (`nix flake check --no-build`) — fixed at the declaration activation;
+  final-bar rides the chapter checkpoints instead of the per-lane gate list
+  (it was broken on base at ε0 authoring time, and a command gate's argv is
+  witnessed on the pristine base).
+- **D75** — Panel open questions resolved to defaults:
+  `agency_nightly_driver.py` and `campaign_worktrees.py` are grandfathered
+  together with a named retirement issue; the reviewers validation surface is
+  deleted in ε1; the release act runs on the operator's ambient gh auth from
+  the coordinator; the off-host steering read path (D12) stays deferred;
+  `maxParallel 3`.
+- **D76** — Codex replaces Claude Opus as both the campaign agent adapter and
+  the out-of-band repair worker for all epsilon stages.
