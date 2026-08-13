@@ -57,11 +57,16 @@ fn campaign_arm_takes_repository_and_committed_worklist_identity() {
             command: CampaignCommand::Arm(CampaignArmArgs {
                 code_repository,
                 worklist_pattern,
+                checkout: None,
+                base_branch,
+                remote,
                 no_enqueue: true,
                 ..
             })
         }) if code_repository == "acme/widgets"
             && worklist_pattern == "specs/night/tasks.json"
+            && base_branch == "main"
+            && remote == "origin"
     ));
     assert!(Opts::try_parse_from([
         "tally",
@@ -70,6 +75,34 @@ fn campaign_arm_takes_repository_and_committed_worklist_identity() {
         "https://github.com/acme/widgets/issues/42",
     ])
     .is_err());
+
+    let options = Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "arm",
+        "acme/widgets",
+        "specs/night/tasks.json",
+        "--checkout",
+        "/srv/widgets",
+        "--base-branch",
+        "stable",
+        "--remote",
+        "upstream",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Campaign {
+            command: CampaignCommand::Arm(CampaignArmArgs {
+                checkout: Some(checkout),
+                base_branch,
+                remote,
+                ..
+            })
+        }) if checkout == Path::new("/srv/widgets")
+            && base_branch == "stable"
+            && remote == "upstream"
+    ));
 }
 
 #[test]

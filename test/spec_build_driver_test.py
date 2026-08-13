@@ -606,6 +606,97 @@ class CampaignDriverTests(unittest.TestCase):
                 f"Tally-Revision: {implementation['revision']}",
             )
 
+    def test_worklist_campaign_policy_is_closed_and_bound_to_the_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/epsilon.json"
+            worklist.parent.mkdir(parents=True)
+            document = {
+                "schemaVersion": 1,
+                "campaign": {
+                    "maxTasks": 2,
+                    "maxParallel": 2,
+                    "agent": {},
+                    "gates": [
+                        {
+                            "kind": "command",
+                            "id": "tests",
+                            "preflightArgv": ["true"],
+                            "argv": ["true"],
+                        }
+                    ],
+                },
+                "tasks": [task("task-1"), task("task-2")],
+            }
+            worklist.write_text(json.dumps(document), encoding="utf-8")
+            git(checkout, "add", "specs/campaign/epsilon.json")
+            git(checkout, "commit", "--quiet", "-m", "add campaign policy")
+            git(checkout, "push", "--quiet", "origin", "main")
+
+            admitted = DRIVER.action_worklist(
+                {
+                    "repository": "acme/spec",
+                    "repositoryConfig": repository_config(checkout),
+                    "worklist": "specs/*/epsilon.json",
+                    "maxTasks": 2,
+                    "maxParallel": 2,
+                }
+            )
+            self.assertEqual([item["id"] for item in admitted["tasks"]], ["task-1", "task-2"])
+            normalized = DRIVER.normalize_worklist_campaign(
+                document["campaign"], "specs/campaign/epsilon.json"
+            )
+            self.assertEqual(normalized["name"], "epsilon")
+            self.assertEqual(normalized["mergeMethod"], "squash")
+            self.assertEqual(normalized["driverRuntimeMaxSec"], 900)
+            self.assertIsNone(normalized["runtimeMaxSec"])
+            self.assertEqual(normalized["agent"]["adapter"], "codex")
+            self.assertEqual(normalized["agent"]["runtimeMaxSec"], 14_400)
+
+            with self.assertRaisesRegex(
+                DRIVER.DriverError,
+                "campaign maxTasks disagrees.*campaign=2 brief=3",
+            ):
+                DRIVER.action_worklist(
+                    {
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout),
+                        "worklist": "specs/*/epsilon.json",
+                        "maxTasks": 3,
+                        "maxParallel": 2,
+                    }
+                )
+            with self.assertRaisesRegex(
+                DRIVER.DriverError,
+                "campaign maxParallel disagrees.*campaign=2 brief=1",
+            ):
+                DRIVER.action_worklist(
+                    {
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout),
+                        "worklist": "specs/*/epsilon.json",
+                        "maxTasks": 2,
+                        "maxParallel": 1,
+                    }
+                )
+
+            document["campaign"]["label"] = "forge-only"
+            worklist.write_text(json.dumps(document), encoding="utf-8")
+            git(checkout, "add", "specs/campaign/epsilon.json")
+            git(checkout, "commit", "--quiet", "-m", "add forbidden campaign field")
+            git(checkout, "push", "--quiet", "origin", "main")
+            with self.assertRaisesRegex(DRIVER.DriverError, "unknown fields: label"):
+                DRIVER.action_worklist(
+                    {
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout),
+                        "worklist": "specs/*/epsilon.json",
+                        "maxTasks": 2,
+                        "maxParallel": 2,
+                    }
+                )
+
     def test_pre_post_refresh_refuses_quiescence_after_the_frontier_reopens(self) -> None:
         """A terminal decision may not publish from its earlier empty-frontier read."""
         brief = {

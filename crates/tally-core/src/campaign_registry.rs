@@ -1,9 +1,9 @@
 //! Durable campaign registrations.
 //!
-//! Authority schema 3 is a deliberate local-first cut. Pre-v3 registrations
-//! are refused with an operator remedy instead of being guessed into the new
-//! repository/worklist identity. Host-local settings remain separate from the
-//! closed authority shape.
+//! Authority schema 4 makes the repository binding self-contained. Pre-v4
+//! registrations are refused with an operator remedy instead of recovering
+//! checkout policy from a host campaign declaration. Host-local settings
+//! remain separate from the closed authority shape.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -20,24 +20,27 @@ use thiserror::Error;
 
 use crate::nix_store::{GcRootBackend, NixStore};
 
-pub const REGISTRY_SCHEMA_VERSION: u32 = 3;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 4;
 pub const HOST_TUNING_SCHEMA_VERSION: u32 = 1;
-/// Effective host tuning when a stable-v3 authority has no tuning sidecar.
+/// Effective host tuning when a stable-v4 authority has no tuning sidecar.
 pub const DEFAULT_CAMPAIGN_PROJECTION_WAIT_MS: u64 = 10_000;
 const ASSET_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// The schema-3 authority record.
+/// The schema-4 authority record.
 ///
 /// Do not add fields to this type. Extensions belong in a separately
 /// versioned sidecar and the N/N-1 compatibility tests below must move with
 /// any future authority schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct CampaignRegistrationV3 {
+pub struct CampaignRegistrationV4 {
     pub schema_version: u32,
     pub registration_id: String,
     pub worklist_pattern: String,
     pub code_repository: String,
+    pub checkout: PathBuf,
+    pub base_branch: String,
+    pub remote: String,
     pub armed_at: String,
     pub arm_serial: u64,
     pub approved_graph_digest: String,
@@ -129,26 +132,26 @@ impl AssetGeneration {
 ///
 /// This type intentionally does not implement `Serialize`. Durable writers
 /// must choose the authority or sidecar explicitly, preventing a convenient
-/// whole-value serialization from putting tuning back into closed schema 3.
+/// whole-value serialization from putting tuning back into closed schema 4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CampaignRegistration {
-    authority: CampaignRegistrationV3,
+    authority: CampaignRegistrationV4,
     pub projection_wait_ms: Option<u64>,
 }
 
 impl CampaignRegistration {
-    pub const fn new(authority: CampaignRegistrationV3, projection_wait_ms: Option<u64>) -> Self {
+    pub const fn new(authority: CampaignRegistrationV4, projection_wait_ms: Option<u64>) -> Self {
         Self {
             authority,
             projection_wait_ms,
         }
     }
 
-    pub const fn authority(&self) -> &CampaignRegistrationV3 {
+    pub const fn authority(&self) -> &CampaignRegistrationV4 {
         &self.authority
     }
 
-    pub fn into_authority(self) -> CampaignRegistrationV3 {
+    pub fn into_authority(self) -> CampaignRegistrationV4 {
         self.authority
     }
 
@@ -173,7 +176,7 @@ impl CampaignRegistration {
 }
 
 impl Deref for CampaignRegistration {
-    type Target = CampaignRegistrationV3;
+    type Target = CampaignRegistrationV4;
 
     fn deref(&self) -> &Self::Target {
         &self.authority
@@ -255,7 +258,7 @@ impl CampaignRegistry {
                 ),
             ));
         }
-        let authority: CampaignRegistrationV3 = serde_json::from_value(value)
+        let authority: CampaignRegistrationV4 = serde_json::from_value(value)
             .map_err(|source| invalid_registration(path, source.to_string()))?;
         validate_authority(path, &authority)?;
         let projection_wait_ms = self.read_host_tuning(&authority.registration_id)?;
@@ -1065,12 +1068,15 @@ fn sync_directory(path: &Path) -> Result<(), CampaignRegistryError> {
 
 fn validate_authority(
     path: &Path,
-    registration: &CampaignRegistrationV3,
+    registration: &CampaignRegistrationV4,
 ) -> Result<(), CampaignRegistryError> {
     let invalid = registration.schema_version != REGISTRY_SCHEMA_VERSION
         || uuid::Uuid::parse_str(&registration.registration_id).is_err()
         || !safe_repository(&registration.code_repository)
         || !safe_worklist_pattern(&registration.worklist_pattern)
+        || !registration.checkout.is_absolute()
+        || !non_empty_without_controls(&registration.base_branch)
+        || !safe_remote(&registration.remote)
         || registration.arm_serial == 0
         || !registration
             .approved_graph_digest
@@ -1093,7 +1099,7 @@ fn validate_authority(
     if invalid {
         return Err(invalid_registration(
             path,
-            "record violates schema v3 invariants; disarm and re-arm",
+            "record violates schema v4 invariants; disarm and re-arm",
         ));
     }
     Ok(())
@@ -1119,6 +1125,24 @@ fn safe_repo_part(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn non_empty_without_controls(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_control)
+}
+
+fn safe_remote(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
@@ -1248,68 +1272,54 @@ mod tests {
         }
     }
 
-    /// Literal copy of the closed schema-2 reader. This is a compatibility
+    /// Literal copy of the closed schema-3 reader. This is a compatibility
     /// oracle, not an alias to the current authority type.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields, rename_all = "camelCase")]
-    struct NMinusOneCampaignRegistrationV2 {
+    struct NMinusOneCampaignRegistrationV3 {
         schema_version: u32,
         registration_id: String,
-        #[serde(rename = "issueUrl")]
-        forge_locator: String,
-        #[serde(rename = "repository")]
-        forge_repository: String,
-        #[serde(rename = "issueNumber")]
-        forge_number: u64,
+        worklist_pattern: String,
+        code_repository: String,
         armed_at: String,
         arm_serial: u64,
         approved_graph_digest: String,
-        #[serde(rename = "authenticatedActor")]
-        forge_actor: String,
+        local_actor: String,
         allowed_actors: Vec<String>,
-        #[serde(rename = "allowTestLocalForge")]
-        local_forge_escape_hatch: bool,
-        #[serde(default)]
-        #[serde(rename = "subIssueWalk")]
-        native_projection_walk: bool,
         #[serde(default)]
         last_observation: Option<String>,
-        #[serde(default)]
-        #[serde(rename = "lastForgeObservation")]
-        forge_observation: Option<String>,
         flow: PathBuf,
         driver: PathBuf,
         workspace_root: PathBuf,
     }
 
-    fn n_minus_one_authority() -> NMinusOneCampaignRegistrationV2 {
-        NMinusOneCampaignRegistrationV2 {
-            schema_version: 2,
+    fn n_minus_one_authority() -> NMinusOneCampaignRegistrationV3 {
+        NMinusOneCampaignRegistrationV3 {
+            schema_version: 3,
             registration_id: "0198a62b-41ee-7000-8000-000000000446".to_owned(),
-            forge_locator: "https://github.com/mecattaf/tally.nix/issues/446".to_owned(),
-            forge_repository: "mecattaf/tally.nix".to_owned(),
-            forge_number: 446,
+            worklist_pattern: "silent-factory-worklists/ch1.json".to_owned(),
+            code_repository: "mecattaf/tally.nix".to_owned(),
             armed_at: "2026-08-07T10:00:00Z".to_owned(),
             arm_serial: 2,
             approved_graph_digest: format!("sha256:{}", "b".repeat(64)),
-            forge_actor: "operator".to_owned(),
+            local_actor: "uid:1000".to_owned(),
             allowed_actors: vec!["operator".to_owned()],
-            local_forge_escape_hatch: false,
-            native_projection_walk: true,
             last_observation: Some("observation".to_owned()),
-            forge_observation: Some("forge-observation".to_owned()),
             flow: PathBuf::from("/nix/store/flow/share/spec-build.js"),
             driver: PathBuf::from("/nix/store/driver/bin/spec-build-driver"),
             workspace_root: PathBuf::from("/var/lib/tally/campaigns"),
         }
     }
 
-    fn authority() -> CampaignRegistrationV3 {
-        CampaignRegistrationV3 {
+    fn authority() -> CampaignRegistrationV4 {
+        CampaignRegistrationV4 {
             schema_version: REGISTRY_SCHEMA_VERSION,
             registration_id: "0198a62b-41ee-7000-8000-000000000447".to_owned(),
             worklist_pattern: "silent-factory-worklists/ch2.json".to_owned(),
             code_repository: "mecattaf/tally.nix".to_owned(),
+            checkout: PathBuf::from("/srv/tally.nix"),
+            base_branch: "main".to_owned(),
+            remote: "origin".to_owned(),
             armed_at: "2026-08-08T10:00:00Z".to_owned(),
             arm_serial: 3,
             approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
@@ -1322,13 +1332,13 @@ mod tests {
         }
     }
 
-    fn authority_with_assets(root: &Path) -> CampaignRegistrationV3 {
+    fn authority_with_assets(root: &Path) -> CampaignRegistrationV4 {
         let flow = root.join("source-flow.js");
         let driver = root.join("source-driver");
         fs::write(&flow, "flow-447\n").unwrap();
         fs::write(&driver, "driver-447\n").unwrap();
         fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).unwrap();
-        CampaignRegistrationV3 {
+        CampaignRegistrationV4 {
             flow,
             driver,
             ..authority()
@@ -1383,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn current_authority_is_closed_v3_and_host_tuning_stays_in_its_sidecar() {
+    fn current_authority_is_closed_v4_and_host_tuning_stays_in_its_sidecar() {
         for projection_wait_ms in [None, Some(240_000)] {
             let temporary = tempfile::tempdir().unwrap();
             let registry = CampaignRegistry::open(temporary.path()).unwrap();
@@ -1394,7 +1404,7 @@ mod tests {
             registry.write(&mut registration).unwrap();
 
             let bytes = authority_bytes(&registry, &registration);
-            let decoded: CampaignRegistrationV3 = serde_json::from_slice(&bytes).unwrap();
+            let decoded: CampaignRegistrationV4 = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(decoded, *registration.authority());
             let encoded = String::from_utf8(bytes.clone()).unwrap();
             assert!(!encoded.contains("projectionWaitMs"));
@@ -1404,7 +1414,7 @@ mod tests {
             assert!(!encoded.contains("allowTestLocalForge"));
             assert!(!encoded.contains("subIssueWalk"));
             assert!(!encoded.contains("lastForgeObservation"));
-            assert!(serde_json::from_slice::<NMinusOneCampaignRegistrationV2>(&bytes).is_err());
+            assert!(serde_json::from_slice::<NMinusOneCampaignRegistrationV3>(&bytes).is_err());
 
             let current = registry
                 .read_campaign(
@@ -1431,16 +1441,16 @@ mod tests {
     }
 
     #[test]
-    fn current_reader_refuses_v2_bytes_with_disarm_and_rearm_remedy() {
+    fn current_reader_refuses_v3_bytes_with_disarm_and_rearm_remedy() {
         let temporary = tempfile::tempdir().unwrap();
         let registry = CampaignRegistry::open(temporary.path()).unwrap();
         let legacy = n_minus_one_authority();
         let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
-        let path = authority_dir(temporary.path()).join("legacy-v2.json");
+        let path = authority_dir(temporary.path()).join("legacy-v3.json");
         fs::write(&path, &legacy_bytes).unwrap();
 
         let failure = registry.read(&path).unwrap_err().to_string();
-        assert!(failure.contains("authority schema 2 predates schema 3"));
+        assert!(failure.contains("authority schema 3 predates schema 4"));
         assert!(failure.contains("disarm and re-arm"));
         assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         assert!(host_tuning_files(temporary.path()).is_empty());
@@ -1509,7 +1519,7 @@ mod tests {
             &registration.worklist_pattern,
         );
 
-        let mut rewritten: CampaignRegistrationV3 =
+        let mut rewritten: CampaignRegistrationV4 =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         rewritten.last_observation = Some("written-by-current".to_owned());
         fs::write(&path, serde_json::to_vec_pretty(&rewritten).unwrap()).unwrap();
@@ -1550,7 +1560,7 @@ mod tests {
 
         assert_eq!(registration.flow, flow);
         assert_eq!(registration.driver, driver);
-        let authority: CampaignRegistrationV3 = serde_json::from_slice(
+        let authority: CampaignRegistrationV4 = serde_json::from_slice(
             &fs::read(registry.registration_path(
                 &registration.code_repository,
                 &registration.worklist_pattern,

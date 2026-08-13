@@ -146,8 +146,8 @@ export const meta = {
             },
             additionalProperties: false
           },
-          maxTasks: { type: "integer", minimum: 1, maximum: 100 },
-          maxParallel: { type: "integer", minimum: 1, maximum: 100 },
+          maxTasks: { type: "integer", minimum: 1, maximum: 128 },
+          maxParallel: { type: "integer", minimum: 1, maximum: 128 },
           driverRuntimeMaxSec: { type: "integer", minimum: 1 },
           runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
           pool: {
@@ -167,7 +167,7 @@ export const meta = {
           tasks: {
             type: "array",
             minItems: 1,
-            maxItems: 100,
+            maxItems: 128,
             items: {
               type: "object",
               required: [
@@ -228,7 +228,7 @@ export const meta = {
           tasks: {
             type: "array",
             minItems: 1,
-            maxItems: 100,
+            maxItems: 128,
             items: {
               type: "object",
               required: ["number", "title", "body"],
@@ -393,7 +393,7 @@ export const meta = {
       // Task-addressed steering, keyed by stable task ID for local sources.
       taskSteering: {
         type: "object",
-        maxProperties: 100,
+        maxProperties: 128,
         additionalProperties: {
           type: "array",
           maxItems: 1000,

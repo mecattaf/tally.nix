@@ -19,6 +19,7 @@ use crate::lease::is_campaign_pool_name;
 
 pub const CAMPAIGN_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_MAX_TASKS: usize = 64;
+pub const MAX_CAMPAIGN_TASKS: usize = 128;
 pub const DEFAULT_DRIVER_RUNTIME_MAX_SEC: u64 = 900;
 pub const DEFAULT_AGENT_RUNTIME_MAX_SEC: u64 = 14_400;
 pub const DEFAULT_RUNNER_POOL: &str = "campaign";
@@ -292,8 +293,10 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
     if !matches!(manifest.repository.forge.as_str(), "github" | "local") {
         return Err(invalid("campaign repository.forge must be github or local"));
     }
-    if !(1..=100).contains(&manifest.max_tasks) {
-        return Err(invalid("forge-native campaign maxTasks must be in 1..=100"));
+    if !(1..=MAX_CAMPAIGN_TASKS).contains(&manifest.max_tasks) {
+        return Err(invalid(format!(
+            "campaign maxTasks must be in 1..={MAX_CAMPAIGN_TASKS}"
+        )));
     }
     if !(1..=manifest.max_tasks).contains(&manifest.max_parallel) {
         return Err(invalid(
@@ -1090,6 +1093,34 @@ mod tests {
         assert!(validate_conflict_domains(None, true).is_err());
         assert!(validate_conflict_domains(Some(&[]), true).is_err());
         validate_conflict_domains(Some(&["src".to_owned()]), true).unwrap();
+    }
+
+    #[test]
+    fn campaign_task_and_parallelism_bounds_reach_128() {
+        let mut manifest: CampaignManifest = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "name": "bounded",
+            "repository": {"checkout": "/srv/bounded", "forge": "local"},
+            "maxTasks": 128,
+            "maxParallel": 128,
+            "agent": {},
+            "gates": [{
+                "kind": "command",
+                "id": "tests",
+                "preflightArgv": ["true"],
+                "argv": ["true"]
+            }],
+            "tasks": [{
+                "id": "task",
+                "kind": "implementation",
+                "issue": 1,
+                "conflictDomains": ["src"]
+            }]
+        }))
+        .unwrap();
+        validate_manifest(&manifest).unwrap();
+        manifest.max_tasks = 129;
+        assert!(validate_manifest(&manifest).is_err());
     }
 
     #[test]

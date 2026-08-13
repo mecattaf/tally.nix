@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 use tally_core::campaign_registry::{
-    CampaignRegistration, CampaignRegistrationV3, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
+    CampaignRegistration, CampaignRegistrationV4, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 
 const WORKLIST: &str = "specs/night/tasks.json";
@@ -27,11 +27,14 @@ fn arm_fixture(state_dir: &Path, fixture_dir: &Path) {
     fs::write(&flow, "fixture flow\n").unwrap();
     fs::write(&driver, "fixture driver\n").unwrap();
 
-    let authority = CampaignRegistrationV3 {
+    let authority = CampaignRegistrationV4 {
         schema_version: REGISTRY_SCHEMA_VERSION,
         registration_id: "0198a62b-41ee-7000-8000-000000000539".to_owned(),
         worklist_pattern: WORKLIST.to_owned(),
         code_repository: "acme/widgets".to_owned(),
+        checkout: PathBuf::from("/srv/acme/widgets"),
+        base_branch: "main".to_owned(),
+        remote: "origin".to_owned(),
         armed_at: "2026-08-12T20:00:00Z".to_owned(),
         arm_serial: 1,
         approved_graph_digest: format!("sha256:{}", "a".repeat(64)),

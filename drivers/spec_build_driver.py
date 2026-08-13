@@ -31,6 +31,11 @@ TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 REPOSITORY = re.compile(r"^[^/ \t]+/[^/ \t]+$")
 GIT_OID = re.compile(r"^[0-9a-f]{40,64}$")
+BRIEF_SENTINEL = (
+    "Read the file whose path is in the TALLY_BRIEF environment variable and execute the "
+    "mission it contains. That brief is your complete instruction set."
+)
+MAX_CAMPAIGN_TASKS = 128
 # A campaign machinery fault is not evidence that the task's work is wrong, so
 # it buys a retry instead of a steering attempt. The budget is bounded and read
 # back from durable campaign state: past it, the fault is treated as a failed
@@ -944,6 +949,253 @@ def normalize_task(
     return normalized
 
 
+def worklist_campaign_string(
+    value: Any, context: str, maximum: int | None = None
+) -> str:
+    """Match Rust's non-empty `char::is_control` string validation."""
+    if not isinstance(value, str) or not value:
+        fail(f"{context} must be a non-empty string without control characters")
+    if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+        fail(f"{context} must be a non-empty string without control characters")
+    if maximum is not None and len(value) > maximum:
+        fail(f"{context} exceeds {maximum} characters")
+    return value
+
+
+def worklist_campaign_u64(value: Any, context: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= (2**64 - 1)
+    ):
+        fail(f"{context} must be a positive unsigned 64-bit integer")
+    return value
+
+
+def worklist_campaign_string_list(
+    value: Any, context: str, *, nonempty: bool = False
+) -> list[str]:
+    if not isinstance(value, list) or (nonempty and not value):
+        fail(f"{context} must be {'a non-empty' if nonempty else 'an'} array")
+    return [
+        worklist_campaign_string(item, f"{context}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+
+def worklist_campaign_argv(value: Any, context: str) -> list[str]:
+    return worklist_campaign_string_list(value, context, nonempty=True)
+
+
+def worklist_campaign_agent(value: Any, context: str) -> dict[str, Any]:
+    fields = {
+        "adapter",
+        "argv",
+        "model",
+        "priority",
+        "approvalPolicy",
+        "sandboxPolicy",
+        "diagnosisSandboxPolicy",
+        "runtimeMaxSec",
+    }
+    agent = object_exact(value, fields, context)
+    adapter = worklist_campaign_string(
+        agent.get("adapter", "codex"), f"{context}.adapter"
+    )
+    arguments = worklist_campaign_argv(
+        agent.get("argv", [BRIEF_SENTINEL]), f"{context}.argv"
+    )
+    priority = worklist_campaign_string(
+        agent.get("priority", "low"), f"{context}.priority"
+    )
+    if priority not in {"interrupt", "high", "medium", "low"}:
+        fail(f"{context}.priority is invalid")
+
+    def nullable_string(name: str, default: str | None) -> str | None:
+        item = agent.get(name, default)
+        if item is None:
+            return None
+        return worklist_campaign_string(item, f"{context}.{name}")
+
+    runtime = agent.get("runtimeMaxSec", 14_400)
+    if runtime is not None:
+        runtime = worklist_campaign_u64(runtime, f"{context}.runtimeMaxSec")
+    model = nullable_string("model", None)
+    if model is not None and len(model) > 128:
+        fail(f"{context}.model exceeds 128 characters")
+    return {
+        "adapter": adapter,
+        "argv": arguments,
+        "model": model,
+        "priority": priority,
+        "approvalPolicy": nullable_string("approvalPolicy", "never"),
+        "sandboxPolicy": nullable_string("sandboxPolicy", "danger-full-access"),
+        "diagnosisSandboxPolicy": nullable_string(
+            "diagnosisSandboxPolicy", "read-only"
+        ),
+        "runtimeMaxSec": runtime,
+    }
+
+
+def worklist_campaign_gate(value: Any, context: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(f"{context} must be an object")
+    kind = value.get("kind")
+    if kind == "command":
+        gate = object_exact(
+            value,
+            {"kind", "id", "preflightArgv", "argv", "runtimeMaxSec"},
+            context,
+        )
+        identifier = required_string(gate.get("id"), f"{context}.id", 80)
+        if not COMPONENT.fullmatch(identifier):
+            fail(f"{context}.id is not a safe component")
+        return {
+            "kind": "command",
+            "id": identifier,
+            "preflightArgv": worklist_campaign_argv(
+                gate.get("preflightArgv"), f"{context}.preflightArgv"
+            ),
+            "argv": worklist_campaign_argv(gate.get("argv"), f"{context}.argv"),
+            "runtimeMaxSec": worklist_campaign_u64(
+                gate.get("runtimeMaxSec", 900), f"{context}.runtimeMaxSec"
+            ),
+        }
+    if kind == "forbidPaths":
+        gate = object_exact(
+            value,
+            {"kind", "id", "forbidPaths", "runtimeMaxSec"},
+            context,
+        )
+        identifier = required_string(gate.get("id"), f"{context}.id", 80)
+        if not COMPONENT.fullmatch(identifier):
+            fail(f"{context}.id is not a safe component")
+        patterns = gate.get("forbidPaths")
+        if not isinstance(patterns, list) or not patterns:
+            fail(f"{context}.forbidPaths must be a non-empty array")
+        if len(patterns) > 128:
+            fail(f"{context}.forbidPaths exceeds 128 entries")
+        seen: set[str] = set()
+        for index, pattern in enumerate(patterns):
+            if not isinstance(pattern, str) or not pattern:
+                fail(f"{context}.forbidPaths[{index}] is invalid")
+            components = pattern.split("/")
+            if (
+                len(pattern) > 1024
+                or pattern.startswith("/")
+                or pattern.endswith("/")
+                or "\0" in pattern
+                or ".." in components
+                or any("**" in component and component != "**" for component in components)
+                or pattern in seen
+            ):
+                fail(f"{context}.forbidPaths[{index}] is invalid")
+            seen.add(pattern)
+        return {
+            "kind": "forbidPaths",
+            "id": identifier,
+            "forbidPaths": patterns,
+            "runtimeMaxSec": worklist_campaign_u64(
+                gate.get("runtimeMaxSec", 900), f"{context}.runtimeMaxSec"
+            ),
+        }
+    fail(f"{context}.kind must be command or forbidPaths")
+
+
+def normalize_worklist_campaign(value: Any, source_path: str) -> dict[str, Any]:
+    """Validate and default the committed local campaign-policy section."""
+    campaign = object_exact(
+        value,
+        {
+            "name",
+            "maxTasks",
+            "maxParallel",
+            "mergeMethod",
+            "driverRuntimeMaxSec",
+            "runtimeMaxSec",
+            "agent",
+            "steward",
+            "stewardArgv",
+            "stewardRuntimeMaxSec",
+            "gates",
+        },
+        "worklist.campaign",
+    )
+    name = campaign.get("name", PurePosixPath(source_path).stem)
+    name = required_string(name, "worklist.campaign.name", 80)
+    if not COMPONENT.fullmatch(name):
+        fail("worklist.campaign.name must be a safe path component")
+    max_tasks = campaign.get("maxTasks", 64)
+    if (
+        not isinstance(max_tasks, int)
+        or isinstance(max_tasks, bool)
+        or not 1 <= max_tasks <= MAX_CAMPAIGN_TASKS
+    ):
+        fail(f"worklist.campaign.maxTasks must be in 1..={MAX_CAMPAIGN_TASKS}")
+    max_parallel = campaign.get("maxParallel", 1)
+    if (
+        not isinstance(max_parallel, int)
+        or isinstance(max_parallel, bool)
+        or not 1 <= max_parallel <= MAX_CAMPAIGN_TASKS
+        or max_parallel > max_tasks
+    ):
+        fail(
+            f"worklist.campaign.maxParallel must be in 1..={MAX_CAMPAIGN_TASKS} "
+            "and not exceed maxTasks"
+        )
+    method = worklist_campaign_string(
+        campaign.get("mergeMethod", "squash"), "worklist.campaign.mergeMethod"
+    )
+    if method not in MERGE_METHODS:
+        fail("worklist.campaign.mergeMethod must be merge or squash")
+    driver_runtime = worklist_campaign_u64(
+        campaign.get("driverRuntimeMaxSec", 900),
+        "worklist.campaign.driverRuntimeMaxSec",
+    )
+    runtime = campaign.get("runtimeMaxSec")
+    if runtime is not None:
+        runtime = worklist_campaign_u64(runtime, "worklist.campaign.runtimeMaxSec")
+    steward = campaign.get("steward")
+    if steward is not None:
+        steward = required_string(steward, "worklist.campaign.steward", 80)
+        if not COMPONENT.fullmatch(steward):
+            fail("worklist.campaign.steward must be null or a safe adapter name")
+    steward_argv = worklist_campaign_string_list(
+        campaign.get("stewardArgv", []), "worklist.campaign.stewardArgv"
+    )
+    if steward is None and steward_argv:
+        fail("worklist.campaign.stewardArgv requires a steward adapter")
+    steward_runtime = worklist_campaign_u64(
+        campaign.get("stewardRuntimeMaxSec", 120),
+        "worklist.campaign.stewardRuntimeMaxSec",
+    )
+    gates_value = campaign.get("gates", [])
+    if not isinstance(gates_value, list) or not 1 <= len(gates_value) <= 16:
+        fail("worklist.campaign.gates must contain 1..=16 entries")
+    gates = [
+        worklist_campaign_gate(gate, f"worklist.campaign.gates[{index}]")
+        for index, gate in enumerate(gates_value)
+    ]
+    gate_ids = [gate["id"] for gate in gates]
+    if len(gate_ids) != len(set(gate_ids)):
+        fail("worklist.campaign gate ids must be unique")
+    return {
+        "name": name,
+        "maxTasks": max_tasks,
+        "maxParallel": max_parallel,
+        "mergeMethod": method,
+        "driverRuntimeMaxSec": driver_runtime,
+        "runtimeMaxSec": runtime,
+        "agent": worklist_campaign_agent(
+            campaign.get("agent", {}), "worklist.campaign.agent"
+        ),
+        "steward": steward,
+        "stewardArgv": steward_argv,
+        "stewardRuntimeMaxSec": steward_runtime,
+        "gates": gates,
+    }
+
+
 def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief,
@@ -1021,9 +1273,26 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         document = json.loads(raw)
     except json.JSONDecodeError as error:
         fail(f"worklist is not valid JSON: {error}")
-    document = object_exact(document, {"schemaVersion", "tasks"}, "worklist")
-    if document.get("schemaVersion") != 1:
+    document = object_exact(document, {"schemaVersion", "tasks", "campaign"}, "worklist")
+    schema_version = document.get("schemaVersion")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
         fail("worklist.schemaVersion must equal 1")
+    if "campaign" in document:
+        campaign = normalize_worklist_campaign(document["campaign"], source_path)
+        if campaign["maxTasks"] != max_tasks:
+            fail(
+                "worklist campaign maxTasks disagrees with the witnessed brief: "
+                f"campaign={campaign['maxTasks']} brief={max_tasks}"
+            )
+        if campaign["maxParallel"] != max_parallel:
+            fail(
+                "worklist campaign maxParallel disagrees with the witnessed brief: "
+                f"campaign={campaign['maxParallel']} brief={max_parallel}"
+            )
     candidates = document.get("tasks")
     if not isinstance(candidates, list) or not candidates:
         fail("worklist.tasks must be a non-empty array")
@@ -1446,6 +1715,13 @@ def canonical_manifest(value: Any) -> dict[str, Any]:
     max_parallel = positive_integer(
         manifest["maxParallel"], "canonical campaign manifest v1.maxParallel"
     )
+    if max_tasks > MAX_CAMPAIGN_TASKS:
+        fail(
+            "canonical campaign manifest v1.maxTasks exceeds "
+            f"{MAX_CAMPAIGN_TASKS}"
+        )
+    if max_parallel > max_tasks:
+        fail("canonical campaign manifest v1.maxParallel exceeds maxTasks")
     positive_integer(
         manifest["driverRuntimeMaxSec"], "canonical campaign manifest v1.driverRuntimeMaxSec"
     )
@@ -1477,8 +1753,8 @@ def canonical_campaign_graph(value: Any) -> dict[str, Any]:
     manifest = canonical_manifest(graph["manifest"])
     tasks = graph["tasks"]
     digest = graph["executableDigest"]
-    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 100:
-        fail("canonical campaign graph v1.tasks must contain 1..=100 entries")
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 128:
+        fail("canonical campaign graph v1.tasks must contain 1..=128 entries")
     if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         fail("canonical campaign graph v1.executableDigest must be a lowercase SHA-256 identity")
     canonical_tasks: list[dict[str, Any]] = []

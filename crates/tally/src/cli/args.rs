@@ -267,14 +267,24 @@ pub(super) struct CampaignArmArgs {
     /// Relative committed worklist pattern identifying the campaign.
     #[arg(value_name = "WORKLIST")]
     pub(super) worklist_pattern: String,
+    /// Git checkout containing the worklist and campaign code. Defaults to the
+    /// current working directory.
+    #[arg(long, value_name = "PATH")]
+    pub(super) checkout: Option<PathBuf>,
+    /// Remote base branch carrying the committed campaign authority.
+    #[arg(long, value_name = "BRANCH", default_value = "main")]
+    pub(super) base_branch: String,
+    /// Named Git remote used to fetch the campaign authority and publish work.
+    #[arg(long, value_name = "REMOTE", default_value = "origin")]
+    pub(super) remote: String,
     /// Register and validate without admitting a reconcile runner.
     #[arg(long, conflicts_with = "wait")]
     pub(super) no_enqueue: bool,
     /// Wait for this bounded reconcile pass to become terminal.
     #[arg(long)]
     pub(super) wait: bool,
-    /// GitHub login whose authored issues/comments may supply campaign input.
-    /// Defaults to the currently authenticated gh login; repeat to add actors.
+    /// Compatibility actor name carried in the unchanged reconcile brief.
+    /// Local steering authorization remains bound to the arming UID.
     #[arg(long = "allow-actor", value_name = "LOGIN")]
     pub(super) allowed_actors: Vec<String>,
     /// Override the packaged spec-build flow (primarily for mechanism testing).

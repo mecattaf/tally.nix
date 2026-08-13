@@ -12,14 +12,19 @@ use chrono::{DateTime, SecondsFormat};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tally_core::adapters::{AdapterConfig, AdapterHardening};
+use tally_core::adapters::{AdapterConfig, AdapterHardening, ScrapeMode, ScrapeStream};
 use tally_core::campaign_contract::{
-    admit_manifest_value, validate_argv, CampaignAgent, CampaignGate, CampaignManifest,
-    CampaignRepository, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1, CAMPAIGN_SCHEMA_VERSION,
+    admit_manifest_value, validate_agent, validate_argv, validate_gates, CampaignAgent,
+    CampaignGate, CampaignManifest, CampaignRepository, CampaignSteward, CanonicalCampaignGraphV1,
+    CanonicalCampaignTaskV1, BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION,
+    DEFAULT_AGENT_APPROVAL_POLICY, DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY, DEFAULT_AGENT_PRIORITY,
+    DEFAULT_AGENT_RUNTIME_MAX_SEC, DEFAULT_AGENT_SANDBOX_POLICY, DEFAULT_DRIVER_RUNTIME_MAX_SEC,
+    DEFAULT_MAX_TASKS, DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN, DEFAULT_STEWARD_RUNTIME_MAX_SEC,
+    MAX_CAMPAIGN_TASKS,
 };
 use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
-    CampaignRegistration, CampaignRegistrationV3, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
+    CampaignRegistration, CampaignRegistrationV4, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 use tally_core::config::{PoolConfig, ResourceKind};
 use tally_core::lease::{is_campaign_pool_name, CAMPAIGN_POOL_PREFIX};
@@ -61,17 +66,36 @@ struct ValidatedWorklist {
 }
 
 #[derive(Debug, Clone)]
-struct LocalCampaignDeclaration {
-    manifest_config: Value,
-    worklist_repository: CampaignRepository,
-    flow: PathBuf,
-    driver: PathBuf,
-    workspace_root: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 struct CommittedLocalWorklist {
     document: Value,
+    source_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WorklistCampaignPolicy {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_worklist_max_tasks")]
+    max_tasks: usize,
+    #[serde(default = "default_worklist_max_parallel")]
+    max_parallel: usize,
+    #[serde(default = "default_worklist_merge_method")]
+    merge_method: String,
+    #[serde(default = "default_worklist_driver_runtime_max_sec")]
+    driver_runtime_max_sec: u64,
+    #[serde(default)]
+    runtime_max_sec: Option<u64>,
+    #[serde(default = "default_worklist_agent")]
+    agent: CampaignAgent,
+    #[serde(default)]
+    steward: Option<String>,
+    #[serde(default)]
+    steward_argv: Vec<String>,
+    #[serde(default = "default_worklist_steward_runtime_max_sec")]
+    steward_runtime_max_sec: u64,
+    #[serde(default)]
+    gates: Vec<CampaignGate>,
 }
 
 struct CheckpointBrief<'a> {
@@ -84,6 +108,39 @@ struct CheckpointBrief<'a> {
 #[derive(Debug, Clone)]
 struct CampaignGraph {
     canonical: CanonicalCampaignGraphV1,
+}
+
+const fn default_worklist_max_tasks() -> usize {
+    DEFAULT_MAX_TASKS
+}
+
+const fn default_worklist_max_parallel() -> usize {
+    1
+}
+
+fn default_worklist_merge_method() -> String {
+    "squash".to_owned()
+}
+
+const fn default_worklist_driver_runtime_max_sec() -> u64 {
+    DEFAULT_DRIVER_RUNTIME_MAX_SEC
+}
+
+fn default_worklist_agent() -> CampaignAgent {
+    CampaignAgent {
+        adapter: "codex".to_owned(),
+        argv: vec![BRIEF_SENTINEL.to_owned()],
+        priority: DEFAULT_AGENT_PRIORITY.to_owned(),
+        runtime_max_sec: Some(DEFAULT_AGENT_RUNTIME_MAX_SEC),
+        approval_policy: Some(DEFAULT_AGENT_APPROVAL_POLICY.to_owned()),
+        sandbox_policy: Some(DEFAULT_AGENT_SANDBOX_POLICY.to_owned()),
+        diagnosis_sandbox_policy: Some(DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY.to_owned()),
+        model: None,
+    }
+}
+
+const fn default_worklist_steward_runtime_max_sec() -> u64 {
+    DEFAULT_STEWARD_RUNTIME_MAX_SEC
 }
 
 /// The six-field object an implementation brief has always consumed.
@@ -1720,176 +1777,253 @@ fn resolve_state_dir(value: Option<PathBuf>) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn local_campaign_declaration(
-    config_path: Option<&Path>,
-    code_repository: &str,
-    worklist_pattern: &str,
-) -> Result<Option<LocalCampaignDeclaration>> {
-    let path = config_path.map_or_else(default_config_path, |path| Ok(path.to_owned()))?;
-    let document = read_json_document(&path, "tally configuration")?;
-    local_campaign_declaration_from_document(&document, code_repository, worklist_pattern)
+fn campaign_repository_from_arm(args: &CampaignArmArgs) -> Result<CampaignRepository> {
+    let requested = args
+        .checkout
+        .clone()
+        .map_or_else(std::env::current_dir, Ok)
+        .context("cannot resolve the current directory for campaign --checkout")?;
+    let checkout = fs::canonicalize(&requested)
+        .with_context(|| format!("cannot resolve campaign checkout {}", requested.display()))?;
+    Ok(CampaignRepository {
+        checkout,
+        base_branch: args.base_branch.clone(),
+        remote: args.remote.clone(),
+        forge: "local".to_owned(),
+    })
 }
 
-fn local_campaign_declaration_from_document(
-    config: &Value,
-    code_repository: &str,
-    worklist_pattern: &str,
-) -> Result<Option<LocalCampaignDeclaration>> {
-    let mut candidates = Vec::new();
-    let Some(producers) = config.get("producers").and_then(Value::as_object) else {
-        return Ok(None);
-    };
-    for (producer_name, producer) in producers {
-        let Some(producer) = producer.as_object() else {
-            continue;
-        };
-        if producer.get("kind").and_then(Value::as_str) != Some("gh")
-            || producer.get("enable").and_then(Value::as_bool) != Some(true)
-        {
-            continue;
-        }
-        let Some(brief) = producer
-            .get("enqueue")
-            .and_then(Value::as_object)
-            .and_then(|enqueue| enqueue.get("brief"))
-            .and_then(Value::as_object)
-        else {
-            continue;
-        };
-        if brief.get("worklist").and_then(Value::as_str) != Some(worklist_pattern) {
-            continue;
-        }
-        let Some(campaign) = brief
-            .get("campaign")
-            .and_then(Value::as_str)
-            .filter(|campaign| safe_component(campaign))
-        else {
-            continue;
-        };
-        if producer_name != &format!("campaign-{campaign}") {
-            continue;
-        }
-        if let Some(declared) = brief.get("codeRepository") {
-            if declared.as_str() != Some(code_repository) {
-                continue;
-            }
-        }
-        let Some(repositories) = brief.get("repositories").and_then(Value::as_object) else {
-            continue;
-        };
-        let Some(code_repository_config) = repositories.get(code_repository) else {
-            continue;
-        };
-        if code_repository_config.get("forge").and_then(Value::as_str) != Some("local") {
-            continue;
-        }
-        let spec_repository = brief
-            .get("specRepository")
-            .and_then(Value::as_str)
-            .unwrap_or(code_repository);
-        let worklist_repository: CampaignRepository = serde_json::from_value(
-            repositories
-                .get(spec_repository)
-                .cloned()
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "local campaign {campaign:?} specRepository {spec_repository:?} is not configured"
-                    ))
-                })?,
+fn campaign_repository_from_registration(
+    registration: &CampaignRegistration,
+) -> CampaignRepository {
+    CampaignRepository {
+        checkout: registration.checkout.clone(),
+        base_branch: registration.base_branch.clone(),
+        remote: registration.remote.clone(),
+        forge: "local".to_owned(),
+    }
+}
+
+fn packaged_campaign_asset_from_executable(
+    executable: &Path,
+    relative: &Path,
+    role: &str,
+) -> Result<PathBuf> {
+    let parent = executable.parent().ok_or_else(|| {
+        invalid(format!(
+            "cannot resolve packaged campaign {role}: tally executable {} has no parent",
+            executable.display()
+        ))
+    })?;
+    let probed = parent.join(relative);
+    if !probed.is_file() {
+        return Err(invalid(format!(
+            "packaged campaign {role} is missing; probed {}",
+            probed.display()
+        )));
+    }
+    fs::canonicalize(&probed).with_context(|| {
+        format!(
+            "cannot resolve packaged campaign {role} at {}",
+            probed.display()
         )
-        .with_context(|| {
-            format!("local campaign {campaign:?} has an invalid worklist repository")
+    })
+}
+
+fn resolve_campaign_asset(
+    override_path: Option<PathBuf>,
+    relative: &Path,
+    role: &str,
+) -> Result<PathBuf> {
+    if let Some(path) = override_path {
+        let resolved = fs::canonicalize(&path).with_context(|| {
+            format!("cannot resolve campaign {role} override {}", path.display())
         })?;
-        if worklist_repository.forge != "local" {
+        if !resolved.is_file() {
             return Err(invalid(format!(
-                "local campaign {campaign:?} worklist repository must use forge=local"
+                "campaign {role} override is not a regular file: {}",
+                path.display()
             )));
         }
-        let pool = config
-            .get("flows")
-            .and_then(Value::as_object)
-            .and_then(|flows| flows.get(campaign))
-            .and_then(Value::as_object)
-            .and_then(|flow| flow.get("workloadMutex"))
-            .and_then(Value::as_str)
-            .filter(|pool| !pool.is_empty())
-            .ok_or_else(|| {
-                invalid(format!(
-                    "local campaign {campaign:?} flow has no campaign mutex"
-                ))
-            })?
-            .to_owned();
-        let continuation = brief
-            .get("continuation")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "local campaign {campaign:?} has no continuation configuration"
-                ))
-            })?;
-        let required = |field: &str| {
-            brief.get(field).cloned().ok_or_else(|| {
-                invalid(format!(
-                    "local campaign {campaign:?} is missing declaration field {field:?}"
-                ))
-            })
-        };
-        let manifest_config = json!({
-            "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
-            "name": campaign,
-            "repository": code_repository_config,
-            "maxTasks": required("maxTasks")?,
-            "maxParallel": required("maxParallel")?,
-            "driverRuntimeMaxSec": required("driverRuntimeMaxSec")?,
-            "runtimeMaxSec": continuation.get("runtimeMaxSec").cloned().unwrap_or(Value::Null),
-            "pool": pool,
-            "mergeMethod": required("mergeMethod")?,
-            "agent": required("agent")?,
-            "steward": required("steward")?,
-            "gates": required("gates")?,
-            "tasks": [],
-        });
-        let declared_path = |field: &str| -> Result<PathBuf> {
-            let value = brief
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "local campaign {campaign:?} declaration field {field:?} must be a path"
-                    ))
-                })?;
-            Ok(PathBuf::from(value))
-        };
-        let flow = config
-            .get("flows")
-            .and_then(Value::as_object)
-            .and_then(|flows| flows.get(campaign))
-            .and_then(Value::as_object)
-            .and_then(|flow| flow.get("script"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "local campaign {campaign:?} flow has no script path"
-                ))
-            })?;
-        candidates.push(LocalCampaignDeclaration {
-            manifest_config,
-            worklist_repository,
-            flow,
-            driver: declared_path("driver")?,
-            workspace_root: declared_path("workspaceRoot")?,
-        });
+        return Ok(resolved);
     }
-    if candidates.len() > 1 {
-        bail!(
-            "campaign {code_repository}/{worklist_pattern} matches multiple enabled local campaign declarations ({})",
-            candidates.len()
-        );
+    let executable = std::env::current_exe().context("cannot resolve tally executable")?;
+    packaged_campaign_asset_from_executable(&executable, relative, role)
+}
+
+fn worklist_default_campaign_name(source_path: &str) -> Result<String> {
+    let name = Path::new(source_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| safe_component(stem))
+        .ok_or_else(|| {
+            invalid(format!(
+                "campaign worklist path {source_path:?} has no safe UTF-8 file stem; set campaign.name"
+            ))
+        })?;
+    Ok(name.to_owned())
+}
+
+fn parse_worklist_campaign_policy(
+    document: &Value,
+    source_path: &str,
+) -> Result<WorklistCampaignPolicy> {
+    let empty = json!({});
+    let value = document.get("campaign").unwrap_or(&empty);
+    if document.get("campaign").is_some() && !value.is_object() {
+        return Err(invalid("worklist.campaign must be an object"));
     }
-    Ok(candidates.pop())
+    let mut policy: WorklistCampaignPolicy = serde_json::from_value(value.clone())
+        .map_err(|error| invalid(format!("worklist.campaign is invalid: {error}")))?;
+    if value.get("name").is_some_and(Value::is_null) {
+        return Err(invalid(
+            "worklist.campaign.name must be a string when present",
+        ));
+    }
+    if policy.name.is_none() {
+        policy.name = Some(worklist_default_campaign_name(source_path)?);
+    }
+    if !policy.name.as_deref().is_some_and(safe_component) {
+        return Err(invalid(
+            "worklist.campaign.name must be a safe path component",
+        ));
+    }
+    if !(1..=MAX_CAMPAIGN_TASKS).contains(&policy.max_tasks) {
+        return Err(invalid(format!(
+            "worklist.campaign.maxTasks must be in 1..={MAX_CAMPAIGN_TASKS}"
+        )));
+    }
+    if !(1..=MAX_CAMPAIGN_TASKS).contains(&policy.max_parallel)
+        || policy.max_parallel > policy.max_tasks
+    {
+        return Err(invalid(format!(
+            "worklist.campaign.maxParallel must be in 1..={MAX_CAMPAIGN_TASKS} and not exceed maxTasks"
+        )));
+    }
+    if !matches!(policy.merge_method.as_str(), "merge" | "squash") {
+        return Err(invalid(
+            "worklist.campaign.mergeMethod must be merge or squash",
+        ));
+    }
+    if policy.driver_runtime_max_sec == 0 || policy.runtime_max_sec == Some(0) {
+        return Err(invalid(
+            "worklist.campaign runtime limits must be positive when present",
+        ));
+    }
+    validate_agent(&policy.agent)
+        .map_err(|error| invalid(format!("worklist.campaign.agent is invalid: {error}")))?;
+    if policy.steward.is_none() && !policy.steward_argv.is_empty() {
+        return Err(invalid(
+            "worklist.campaign.stewardArgv requires a steward adapter",
+        ));
+    }
+    if policy.steward_runtime_max_sec == 0 {
+        return Err(invalid(
+            "worklist.campaign.stewardRuntimeMaxSec must be positive",
+        ));
+    }
+    if policy
+        .steward_argv
+        .iter()
+        .any(|argument| argument.is_empty() || argument.chars().any(char::is_control))
+    {
+        return Err(invalid(
+            "worklist.campaign.stewardArgv must contain non-empty strings without control characters",
+        ));
+    }
+    validate_gates(&policy.gates)
+        .map_err(|error| invalid(format!("worklist.campaign.gates are invalid: {error}")))?;
+    Ok(policy)
+}
+
+fn steward_uses_unsupported_job_configuration(adapter: &AdapterConfig) -> bool {
+    adapter.launch.model.is_some()
+        || adapter.launch.effort.is_some()
+        || !adapter.launch.approval_policies.is_empty()
+        || !adapter.launch.sandbox_policies.is_empty()
+        || !adapter.hardening.is_none()
+        || !adapter.extra_writable_paths.is_empty()
+}
+
+fn resolve_worklist_steward(
+    policy: &WorklistCampaignPolicy,
+    adapters: &BTreeMap<String, AdapterConfig>,
+) -> Result<Option<CampaignSteward>> {
+    let Some(name) = policy.steward.as_deref() else {
+        return Ok(None);
+    };
+    if !safe_component(name) {
+        return Err(invalid(
+            "worklist.campaign.steward must be null or a safe adapter name",
+        ));
+    }
+    let adapter = adapters.get(name).ok_or_else(|| {
+        invalid(format!(
+            "worklist campaign references unknown steward adapter {name:?}"
+        ))
+    })?;
+    if steward_uses_unsupported_job_configuration(adapter) {
+        return Err(invalid(format!(
+            "worklist campaign steward adapter {name:?} declares launch policies, hardening, or extraWritablePaths, which the direct narration subprocess cannot apply"
+        )));
+    }
+    let final_message_pattern = match adapter.scrape.get("finalMessage") {
+        None => DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN.to_owned(),
+        Some(capture)
+            if capture.stream == ScrapeStream::Stdout
+                && capture.mode == ScrapeMode::Regex
+                && !capture.pattern.is_empty() =>
+        {
+            capture.pattern.clone()
+        }
+        Some(_) => {
+            return Err(invalid(format!(
+                "worklist campaign steward adapter {name:?} must declare scrape.finalMessage as a non-empty stdout regex"
+            )))
+        }
+    };
+    let mut argv = adapter.argv.clone();
+    argv.extend(policy.steward_argv.clone());
+    Ok(Some(CampaignSteward {
+        adapter: name.to_owned(),
+        argv,
+        env: adapter.env.clone(),
+        final_message_pattern,
+        runtime_max_sec: Some(policy.steward_runtime_max_sec),
+    }))
+}
+
+fn manifest_config_from_worklist(
+    committed: &CommittedLocalWorklist,
+    repository: &CampaignRepository,
+    code_repository: &str,
+    adapters: &BTreeMap<String, AdapterConfig>,
+) -> Result<Value> {
+    let policy = parse_worklist_campaign_policy(&committed.document, &committed.source_path)?;
+    if !adapters.contains_key(&policy.agent.adapter) {
+        return Err(invalid(format!(
+            "worklist campaign references unknown agent adapter {:?}",
+            policy.agent.adapter
+        )));
+    }
+    let pool = format!("campaign/{code_repository}");
+    debug_assert!(is_campaign_pool_name(&pool));
+    let steward = resolve_worklist_steward(&policy, adapters)?;
+    Ok(json!({
+        "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
+        "name": policy.name.expect("campaign name was defaulted above"),
+        "repository": repository,
+        "maxTasks": policy.max_tasks,
+        "maxParallel": policy.max_parallel,
+        "driverRuntimeMaxSec": policy.driver_runtime_max_sec,
+        "runtimeMaxSec": policy.runtime_max_sec,
+        "pool": pool,
+        "mergeMethod": policy.merge_method,
+        "agent": policy.agent,
+        "steward": steward,
+        "gates": policy.gates,
+        "tasks": [],
+    }))
 }
 
 fn committed_local_worklist(
@@ -2005,16 +2139,22 @@ fn committed_local_worklist(
             "campaign worklist {source_path:?} at fetched base revision {revision} is invalid JSON"
         )
     })?;
-    Ok(CommittedLocalWorklist { document })
+    Ok(CommittedLocalWorklist {
+        document,
+        source_path: source_path.clone(),
+    })
 }
 
 fn local_campaign_graph_from_worklist(
-    declaration: LocalCampaignDeclaration,
+    repository: CampaignRepository,
+    code_repository: &str,
     worklist_pattern: &str,
+    adapters: &BTreeMap<String, AdapterConfig>,
 ) -> Result<CampaignGraph> {
-    let committed = committed_local_worklist(&declaration.worklist_repository, worklist_pattern)?;
-    let validated =
-        validate_local_worklist_document(&committed.document, &declaration.manifest_config)?;
+    let committed = committed_local_worklist(&repository, worklist_pattern)?;
+    let manifest_config =
+        manifest_config_from_worklist(&committed, &repository, code_repository, adapters)?;
+    let validated = validate_local_worklist_document(&committed.document, &manifest_config)?;
     if validated.manifest.repository.forge != "local" {
         return Err(invalid(
             "the local worklist arm path requires campaign.repository.forge=local",
@@ -2224,6 +2364,14 @@ fn validate_agent_policies(agent: &CampaignAgent, adapter: &AdapterConfig) -> Re
         if !adapter.launch.sandbox_policies.contains_key(policy) {
             return Err(invalid(format!(
                 "campaign agent sandboxPolicy {policy:?} is not authorized by adapter {:?}",
+                agent.adapter
+            )));
+        }
+    }
+    if let Some(policy) = &agent.diagnosis_sandbox_policy {
+        if !adapter.launch.sandbox_policies.contains_key(policy) {
+            return Err(invalid(format!(
+                "campaign agent diagnosisSandboxPolicy {policy:?} is not authorized by adapter {:?}",
                 agent.adapter
             )));
         }
@@ -3030,23 +3178,31 @@ async fn run_campaign_arm(
 ) -> Result<()> {
     let (code_repository, worklist_pattern) =
         campaign_identity(&args.code_repository, &args.worklist_pattern)?;
-    let state_dir = resolve_state_dir(args.state_dir)?;
+    let state_dir = resolve_state_dir(args.state_dir.clone())?;
     let registry = CampaignRegistry::open(&state_dir)?;
     let prior = registry.read_campaign(&code_repository, &worklist_pattern)?;
     if let Some(registration) = &prior {
         require_local_actor(registration)?;
     }
     let local_actor = local_actor();
-    let declaration = local_campaign_declaration(config_path, &code_repository, &worklist_pattern)?
-        .ok_or_else(|| {
-            invalid(format!(
-                "campaign {code_repository}/{worklist_pattern} has no enabled local declaration"
-            ))
-        })?;
-    let declared_flow = declaration.flow.clone();
-    let declared_driver = declaration.driver.clone();
-    let declared_workspace_root = declaration.workspace_root.clone();
-    let graph = local_campaign_graph_from_worklist(declaration, &worklist_pattern)?;
+    let repository = campaign_repository_from_arm(&args)?;
+    let adapters = load_client_config(config_path)?.adapters;
+    let flow = resolve_campaign_asset(
+        args.flow,
+        Path::new("../share/tally/flows/spec-build.js"),
+        "flow",
+    )?;
+    let driver = resolve_campaign_asset(
+        args.driver,
+        Path::new("../libexec/tally/spec-build-driver"),
+        "driver",
+    )?;
+    let graph = local_campaign_graph_from_worklist(
+        repository,
+        &code_repository,
+        &worklist_pattern,
+        &adapters,
+    )?;
     let allowed_actors = normalize_allowed_actors(&args.allowed_actors, LOCAL_ALLOWED_ACTOR)?;
     let prior_graph = prior
         .as_ref()
@@ -3060,9 +3216,11 @@ async fn run_campaign_arm(
     };
     let (pardon_plan, mut arm_warnings) =
         amendment_pardon_plan(prior_graph.as_ref(), &graph.canonical, &escalated);
-    let flow = args.flow.unwrap_or(declared_flow);
-    let driver = args.driver.unwrap_or(declared_driver);
-    let workspace_root = args.workspace_root.unwrap_or(declared_workspace_root);
+    let workspace_root = args.workspace_root.unwrap_or_else(|| {
+        state_dir
+            .join("campaigns")
+            .join(&graph.canonical.manifest.name)
+    });
     if !workspace_root.is_absolute() {
         return Err(invalid("campaign workspace root must be absolute"));
     }
@@ -3074,7 +3232,7 @@ async fn run_campaign_arm(
             .ok_or_else(|| invalid("campaign arm retry counter is exhausted"))
     })?;
     let mut registration = CampaignRegistration::new(
-        CampaignRegistrationV3 {
+        CampaignRegistrationV4 {
             schema_version: REGISTRY_SCHEMA_VERSION,
             registration_id: prior.as_ref().map_or_else(
                 || uuid::Uuid::now_v7().to_string(),
@@ -3082,6 +3240,9 @@ async fn run_campaign_arm(
             ),
             worklist_pattern: worklist_pattern.clone(),
             code_repository: code_repository.clone(),
+            checkout: graph.canonical.manifest.repository.checkout.clone(),
+            base_branch: graph.canonical.manifest.repository.base_branch.clone(),
+            remote: graph.canonical.manifest.repository.remote.clone(),
             armed_at: Utc::now().to_rfc3339(),
             arm_serial,
             approved_graph_digest: graph.canonical.executable_digest.clone(),
@@ -3212,13 +3373,14 @@ async fn run_campaign_resume(
         ))
     })?;
     require_local_actor(&registration)?;
-    let declaration = local_campaign_declaration(config_path, &code_repository, &worklist_pattern)?
-        .ok_or_else(|| {
-            invalid(format!(
-                "campaign {code_repository}/{worklist_pattern} has no enabled local declaration"
-            ))
-        })?;
-    let graph = local_campaign_graph_from_worklist(declaration, &worklist_pattern)?;
+    let repository = campaign_repository_from_registration(&registration);
+    let adapters = load_client_config(config_path)?.adapters;
+    let graph = local_campaign_graph_from_worklist(
+        repository,
+        &code_repository,
+        &worklist_pattern,
+        &adapters,
+    )?;
     let _ = validate_host(
         &graph,
         config_path,
@@ -3309,6 +3471,7 @@ async fn run_campaign_poll(
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
     let entries = registry.registrations()?;
+    let adapters = load_client_config(config_path)?.adapters;
     let mut had_failures = false;
     for (path, mut registration) in entries {
         let event_issue = campaign_issue_url(
@@ -3317,19 +3480,13 @@ async fn run_campaign_poll(
         );
         let attempt = async {
             require_local_actor(&registration)?;
-            let declaration = local_campaign_declaration(
-                config_path,
+            let repository = campaign_repository_from_registration(&registration);
+            let graph = local_campaign_graph_from_worklist(
+                repository,
                 &registration.code_repository,
                 &registration.worklist_pattern,
-            )?
-            .ok_or_else(|| {
-                invalid(format!(
-                    "campaign {}/{} has no enabled local declaration",
-                    registration.code_repository, registration.worklist_pattern
-                ))
-            })?;
-            let graph =
-                local_campaign_graph_from_worklist(declaration, &registration.worklist_pattern)?;
+                &adapters,
+            )?;
             if graph.canonical.executable_digest != registration.approved_graph_digest {
                 return Ok(CampaignPollAttempt::RearmRequired {
                     approved_graph_digest: registration.approved_graph_digest.clone(),
@@ -3549,18 +3706,6 @@ fn run_campaign_disarm(args: CampaignDisarmArgs) -> Result<()> {
     Ok(())
 }
 
-fn read_json_document(path: &Path, context: &str) -> Result<Value> {
-    let mut bytes = Vec::new();
-    if path == Path::new("-") {
-        std::io::stdin().read_to_end(&mut bytes)?;
-    } else {
-        bytes =
-            fs::read(path).with_context(|| format!("cannot read {context} {}", path.display()))?;
-    }
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("{context} {} is not valid JSON", path.display()))
-}
-
 fn required_worklist_string<'a>(
     object: &'a serde_json::Map<String, Value>,
     field: &str,
@@ -3686,8 +3831,12 @@ fn worklist_tasks(document: &Value, campaign_name: &str) -> Result<Vec<WorklistT
     let candidates = object
         .get("tasks")
         .and_then(Value::as_array)
-        .filter(|tasks| !tasks.is_empty() && tasks.len() <= 100)
-        .ok_or_else(|| invalid("campaign worklist must contain 1..=100 tasks"))?;
+        .filter(|tasks| !tasks.is_empty() && tasks.len() <= MAX_CAMPAIGN_TASKS)
+        .ok_or_else(|| {
+            invalid(format!(
+                "campaign worklist must contain 1..={MAX_CAMPAIGN_TASKS} tasks"
+            ))
+        })?;
     let mut prior = BTreeSet::new();
     let mut issues = BTreeSet::new();
     let mut tasks = Vec::with_capacity(candidates.len());
@@ -3982,8 +4131,7 @@ fn local_string_list(value: &Value, context: &str, nonempty: bool) -> Result<Vec
         .collect()
 }
 
-/// The local file format keeps declaration on the host; the committed file
-/// contains only immutable task briefs.
+/// The committed local file owns campaign policy and immutable task briefs.
 fn validate_local_worklist_document(
     document: &Value,
     manifest_config: &Value,
@@ -3991,7 +4139,12 @@ fn validate_local_worklist_document(
     let object = document
         .as_object()
         .ok_or_else(|| invalid("local campaign worklist must be an object"))?;
-    require_local_fields(object, &["schemaVersion", "tasks"], &[], "local worklist")?;
+    require_local_fields(
+        object,
+        &["schemaVersion", "tasks"],
+        &["campaign"],
+        "local worklist",
+    )?;
     let tasks = object
         .get("tasks")
         .and_then(Value::as_array)
@@ -4489,7 +4642,118 @@ mod tests {
     }
 
     #[test]
-    fn local_arm_ingests_committed_worklist_briefs() {
+    fn worklist_steward_resolves_only_direct_subprocess_configuration() {
+        let document = json!({
+            "schemaVersion": 1,
+            "campaign": {
+                "agent": {"adapter": "codex"},
+                "steward": "narrator",
+                "stewardArgv": ["--json"],
+                "gates": [{
+                    "kind": "command",
+                    "id": "tests",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"]
+                }]
+            },
+            "tasks": []
+        });
+        let committed = CommittedLocalWorklist {
+            document,
+            source_path: "specs/night/epsilon.json".to_owned(),
+        };
+        let repository = CampaignRepository {
+            checkout: PathBuf::from("/srv/acme/widgets"),
+            base_branch: "main".to_owned(),
+            remote: "origin".to_owned(),
+            forge: "local".to_owned(),
+        };
+        let narrator: AdapterConfig = serde_json::from_value(json!({
+            "argv": ["narrator"],
+            "env": {"NARRATOR_ENDPOINT": "https://narrator.invalid/v1"},
+            "scrape": {
+                "finalMessage": {
+                    "stream": "stdout",
+                    "mode": "regex",
+                    "pattern": "^NARRATION=(.*)$"
+                }
+            }
+        }))
+        .unwrap();
+        let mut adapters = BTreeMap::from([
+            ("codex".to_owned(), AdapterConfig::default()),
+            ("narrator".to_owned(), narrator),
+        ]);
+        let config =
+            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
+                .unwrap();
+        assert_eq!(config["steward"]["argv"], json!(["narrator", "--json"]));
+        assert_eq!(
+            config["steward"]["env"]["NARRATOR_ENDPOINT"],
+            "https://narrator.invalid/v1"
+        );
+        assert_eq!(config["steward"]["finalMessagePattern"], "^NARRATION=(.*)$");
+        assert_eq!(config["steward"]["runtimeMaxSec"], 120);
+
+        adapters.get_mut("narrator").unwrap().hardening = AdapterHardening::Strict;
+        let failure =
+            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
+                .unwrap_err()
+                .to_string();
+        assert!(failure.contains("direct narration subprocess"), "{failure}");
+
+        adapters.get_mut("narrator").unwrap().hardening = AdapterHardening::None;
+        adapters
+            .get_mut("narrator")
+            .unwrap()
+            .scrape
+            .get_mut("finalMessage")
+            .unwrap()
+            .stream = ScrapeStream::Stderr;
+        let failure =
+            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
+                .unwrap_err()
+                .to_string();
+        assert!(failure.contains("non-empty stdout regex"), "{failure}");
+    }
+
+    #[test]
+    fn packaged_campaign_assets_are_resolved_beside_the_tally_binary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bin = temporary.path().join("bin");
+        let flow = temporary.path().join("share/tally/flows/spec-build.js");
+        let driver = temporary.path().join("libexec/tally/spec-build-driver");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(flow.parent().unwrap()).unwrap();
+        fs::create_dir_all(driver.parent().unwrap()).unwrap();
+        let executable = bin.join("tally");
+        fs::write(&executable, "tally\n").unwrap();
+        fs::write(&flow, "flow\n").unwrap();
+        fs::write(&driver, "driver\n").unwrap();
+
+        assert_eq!(
+            packaged_campaign_asset_from_executable(
+                &executable,
+                Path::new("../share/tally/flows/spec-build.js"),
+                "flow",
+            )
+            .unwrap(),
+            fs::canonicalize(&flow).unwrap()
+        );
+        fs::remove_file(&driver).unwrap();
+        let failure = packaged_campaign_asset_from_executable(
+            &executable,
+            Path::new("../libexec/tally/spec-build-driver"),
+            "driver",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(failure.contains("packaged campaign driver is missing"));
+        assert!(failure.contains("libexec/tally/spec-build-driver"));
+    }
+
+    #[test]
+    fn local_arm_ingests_committed_worklist_policy_and_gate_edits_change_the_digest() {
         let temporary = tempfile::tempdir().unwrap();
         let checkout = temporary.path().join("checkout");
         let remote = temporary.path().join("remote.git");
@@ -4529,6 +4793,17 @@ mod tests {
         let checkout = fs::canonicalize(checkout).unwrap();
         let document = json!({
             "schemaVersion": 1,
+            "campaign": {
+                "maxTasks": 4,
+                "maxParallel": 1,
+                "agent": {"adapter": "codex"},
+                "gates": [{
+                    "kind": "command",
+                    "id": "test",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"]
+                }]
+            },
             "tasks": [
                 {
                     "id": "foundation",
@@ -4562,88 +4837,37 @@ mod tests {
                 }
             ]
         });
-        let worklist = checkout.join("specs/night/tasks.json");
+        let worklist = checkout.join("specs/night/epsilon.json");
         fs::create_dir_all(worklist.parent().unwrap()).unwrap();
         fs::write(&worklist, serde_json::to_vec(&document).unwrap()).unwrap();
-        run_git(&checkout, &["add", "specs/night/tasks.json"]);
+        run_git(&checkout, &["add", "specs/night/epsilon.json"]);
         run_git(&checkout, &["commit", "--quiet", "-m", "worklist"]);
         run_git(&checkout, &["push", "--quiet", "-u", "origin", "main"]);
 
-        let repository_config = json!({
-            "checkout": checkout,
-            "baseBranch": "main",
-            "remote": "origin",
-            "forge": "local"
-        });
-        let brief = json!({
-            "campaign": "night-build",
-            "repository": "${gh.repo}",
-            "issue": {"number": "${gh.number}", "url": "${gh.url}"},
-            "runId": "${gh.eventId}",
-            "repositories": {"acme/widgets": repository_config},
-            "worklist": "specs/*/tasks.json",
-            "maxTasks": 4,
-            "maxParallel": 1,
-            "continuation": {
-                "argv": ["tally", "flow", "run"],
-                "pool": ["flow", "campaign"],
-                "priority": "low",
-                "runtimeMaxSec": null,
-                "eventsDir": temporary.path().join("events")
-            },
-            "workspaceRoot": temporary.path().join("workspaces"),
-            "captureRoot": temporary.path().join("capture"),
-            "tally": "/bin/tally",
-            "driver": "/bin/spec-build-driver",
-            "driverRuntimeMaxSec": 900,
-            "postFailureEvidence": false,
-            "postFailureStderr": false,
-            "mergeMethod": "squash",
-            "agent": {},
-            "steward": null,
-            "gates": [{
-                "kind": "command",
-                "id": "test",
-                "preflightArgv": ["true"],
-                "argv": ["true"],
-                "runtimeMaxSec": 900
-            }]
-        });
-        let config = json!({
-            "producers": {
-                "campaign-night-build": {
-                    "kind": "gh",
-                    "enable": true,
-                    "enqueue": {"brief": brief}
-                }
-            },
-            "flows": {
-                "night-build": {
-                    "script": "/nix/store/spec-build.js",
-                    "workloadMutex": "campaign"
-                }
-            }
-        });
-        let declaration =
-            local_campaign_declaration_from_document(&config, "acme/widgets", "specs/*/tasks.json")
-                .unwrap()
-                .expect("the local module declaration must match");
-        assert_eq!(declaration.flow, Path::new("/nix/store/spec-build.js"));
-        assert_eq!(
-            declaration.workspace_root,
-            temporary.path().join("workspaces")
-        );
+        let repository = CampaignRepository {
+            checkout: checkout.clone(),
+            base_branch: "main".to_owned(),
+            remote: "origin".to_owned(),
+            forge: "local".to_owned(),
+        };
+        let adapters = BTreeMap::from([("codex".to_owned(), AdapterConfig::default())]);
 
         // The checkout may be dirty; the fetched remote base remains the only
         // authority admitted by arm.
         fs::write(&worklist, b"not json\n").unwrap();
-        let committed =
-            committed_local_worklist(&declaration.worklist_repository, "specs/*/tasks.json")
-                .unwrap();
+        let committed = committed_local_worklist(&repository, "specs/*/epsilon.json").unwrap();
         assert_eq!(committed.document, document);
-        let validated =
-            validate_local_worklist_document(&committed.document, &declaration.manifest_config)
+        assert_eq!(committed.source_path, "specs/night/epsilon.json");
+        let manifest_config =
+            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
                 .unwrap();
+        let validated =
+            validate_local_worklist_document(&committed.document, &manifest_config).unwrap();
+        assert_eq!(validated.manifest.name, "epsilon");
+        assert_eq!(validated.manifest.pool, "campaign/acme/widgets");
+        assert_eq!(validated.manifest.merge_method, "squash");
+        assert_eq!(validated.manifest.driver_runtime_max_sec, 900);
+        assert_eq!(validated.manifest.runtime_max_sec, None);
         assert_eq!(
             validated
                 .manifest
@@ -4659,9 +4883,56 @@ mod tests {
             .contains("Build the local foundation."));
         assert_eq!(graph.canonical.tasks[1].number, 2);
 
-        let mut invalid = document;
-        invalid["campaign"] = json!({});
-        assert!(validate_local_worklist_document(&invalid, &declaration.manifest_config).is_err());
+        let mut forge_field = document.clone();
+        forge_field["campaign"]["label"] = json!("must-not-be-accepted");
+        let failure = manifest_config_from_worklist(
+            &CommittedLocalWorklist {
+                document: forge_field,
+                source_path: committed.source_path.clone(),
+            },
+            &repository,
+            "acme/widgets",
+            &adapters,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(failure.contains("unknown field `label`"), "{failure}");
+
+        let mut unknown_agent = document.clone();
+        unknown_agent["campaign"]["agent"]["adapter"] = json!("missing");
+        let failure = manifest_config_from_worklist(
+            &CommittedLocalWorklist {
+                document: unknown_agent,
+                source_path: committed.source_path,
+            },
+            &repository,
+            "acme/widgets",
+            &adapters,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            failure.contains("unknown agent adapter \"missing\""),
+            "{failure}"
+        );
+
+        let mut revised = document;
+        revised["campaign"]["gates"][0]["argv"] = json!(["false"]);
+        fs::write(&worklist, serde_json::to_vec(&revised).unwrap()).unwrap();
+        run_git(&checkout, &["add", "specs/night/epsilon.json"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "edit gate"]);
+        run_git(&checkout, &["push", "--quiet", "origin", "main"]);
+        let revised_graph = local_campaign_graph_from_worklist(
+            repository,
+            "acme/widgets",
+            "specs/*/epsilon.json",
+            &adapters,
+        )
+        .unwrap();
+        assert_ne!(
+            graph.canonical.executable_digest, revised_graph.canonical.executable_digest,
+            "a committed campaign gate edit must require re-arm"
+        );
     }
 
     #[test]
@@ -5020,6 +5291,108 @@ mod tests {
         assert!(validate_argv(&["true".into(), "".into()], "argv").is_err());
         assert!(validate_argv(&["true".into(), "line\nbreak".into()], "argv").is_err());
         validate_argv(&["true".into(), "--flag".into()], "argv").unwrap();
+
+        let cases = json!([
+            {
+                "gates": [{
+                    "kind": "command",
+                    "id": "tests",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"]
+                }]
+            },
+            {
+                "name": "night-build",
+                "maxTasks": 128,
+                "maxParallel": 2,
+                "mergeMethod": "merge",
+                "driverRuntimeMaxSec": 60,
+                "runtimeMaxSec": null,
+                "agent": {
+                    "adapter": "codex",
+                    "argv": [BRIEF_SENTINEL],
+                    "model": null,
+                    "priority": "low",
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": "danger-full-access",
+                    "diagnosisSandboxPolicy": "read-only",
+                    "runtimeMaxSec": 14400
+                },
+                "steward": "narrator",
+                "stewardArgv": ["--json"],
+                "stewardRuntimeMaxSec": 120,
+                "gates": [{
+                    "kind": "forbidPaths",
+                    "id": "no-state",
+                    "forbidPaths": ["*.db", "generated/**"]
+                }]
+            },
+            {},
+            {"gates": [], "label": "forge-only"},
+            {"maxTasks": 129, "gates": [{"kind": "command", "id": "x", "preflightArgv": ["true"], "argv": ["true"]}]},
+            {"maxTasks": 1, "maxParallel": 2, "gates": [{"kind": "command", "id": "x", "preflightArgv": ["true"], "argv": ["true"]}]},
+            {"name": null, "gates": [{"kind": "command", "id": "x", "preflightArgv": ["true"], "argv": ["true"]}]},
+            {"mergeMethod": null, "gates": [{"kind": "command", "id": "x", "preflightArgv": ["true"], "argv": ["true"]}]},
+            {"stewardArgv": ["--json"], "gates": [{"kind": "command", "id": "x", "preflightArgv": ["true"], "argv": ["true"]}]},
+            {"agent": {"argv": ["line\nbreak"]}, "gates": [{"kind": "command", "id": "x", "preflightArgv": ["true"], "argv": ["true"]}]},
+            {"agent": {"argv": ["delete\u{007f}control"]}, "gates": [{"kind": "command", "id": "x", "preflightArgv": ["true"], "argv": ["true"]}]},
+            {"gates": [{"kind": "forbidPaths", "id": "line-break", "forbidPaths": ["generated\nstate"]}]},
+            {"gates": [
+                {"kind": "command", "id": "same", "preflightArgv": ["true"], "argv": ["true"]},
+                {"kind": "forbidPaths", "id": "same", "forbidPaths": ["*.db"]}
+            ]}
+        ]);
+        let rust_acceptance = cases
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|campaign| {
+                parse_worklist_campaign_policy(
+                    &json!({"campaign": campaign}),
+                    "specs/night/epsilon.json",
+                )
+                .is_ok()
+            })
+            .collect::<Vec<_>>();
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let driver = repo_root.join("drivers/spec_build_driver.py");
+        let input_dir = tempfile::tempdir().unwrap();
+        let input = input_dir.path().join("campaign-policy-cases.json");
+        fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+        let script = r#"
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    cases = json.load(handle)
+accepted = []
+for case in cases:
+    try:
+        module.normalize_worklist_campaign(case, "specs/night/epsilon.json")
+    except module.DriverError:
+        accepted.append(False)
+    else:
+        accepted.append(True)
+print(json.dumps(accepted))
+"#;
+        let output = ProcessCommand::new("python3")
+            .args(["-c", script])
+            .arg(&driver)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "driver policy parity probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let driver_acceptance: Vec<bool> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(rust_acceptance, driver_acceptance);
     }
 
     #[test]
@@ -5151,7 +5524,7 @@ print(json.dumps({
     }
 
     #[test]
-    fn registration_v3_round_trips_local_authority() {
+    fn registration_v4_round_trips_local_repository_authority() {
         let root = tempfile::tempdir().unwrap();
         let state_dir = root.path();
         let forge_actor = "operator".to_owned();
@@ -5160,11 +5533,14 @@ print(json.dumps({
         fs::write(&flow, "flow fixture\n").unwrap();
         fs::write(&driver, "driver fixture\n").unwrap();
         let mut registration = CampaignRegistration::new(
-            CampaignRegistrationV3 {
+            CampaignRegistrationV4 {
                 schema_version: REGISTRY_SCHEMA_VERSION,
                 registration_id: uuid::Uuid::now_v7().to_string(),
                 worklist_pattern: "specs/night/tasks.json".to_owned(),
                 code_repository: "acme/widgets".to_owned(),
+                checkout: PathBuf::from("/srv/acme/widgets"),
+                base_branch: "stable".to_owned(),
+                remote: "upstream".to_owned(),
                 armed_at: "2026-08-01T00:00:00Z".to_owned(),
                 arm_serial: 1,
                 approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
@@ -5188,6 +5564,9 @@ print(json.dumps({
             .unwrap()
             .unwrap();
         assert_eq!(loaded.registration_id, registration.registration_id);
+        assert_eq!(loaded.checkout, Path::new("/srv/acme/widgets"));
+        assert_eq!(loaded.base_branch, "stable");
+        assert_eq!(loaded.remote, "upstream");
         assert_eq!(loaded.allowed_actors, ["operator", "reviewer"]);
         assert_eq!(
             loaded.approved_graph_digest,
@@ -5203,11 +5582,14 @@ print(json.dumps({
     fn local_steering_embargo_and_cursor_bound_dispatch() {
         let temporary = tempfile::tempdir().unwrap();
         let registration = CampaignRegistration::new(
-            CampaignRegistrationV3 {
+            CampaignRegistrationV4 {
                 schema_version: REGISTRY_SCHEMA_VERSION,
                 registration_id: "0198a62b-41ee-7000-8000-000000000571".to_owned(),
                 worklist_pattern: "specs/night/tasks.json".to_owned(),
                 code_repository: "acme/widgets".to_owned(),
+                checkout: PathBuf::from("/srv/acme/widgets"),
+                base_branch: "main".to_owned(),
+                remote: "origin".to_owned(),
                 armed_at: "2026-08-01T00:00:00Z".to_owned(),
                 arm_serial: 1,
                 approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
@@ -5352,11 +5734,14 @@ print(json.dumps({
         let prior = canonical_graph_for_pardon(&[]);
         let amended = canonical_graph_for_pardon(&["prerequisite"]);
         let mut registration = CampaignRegistration::new(
-            CampaignRegistrationV3 {
+            CampaignRegistrationV4 {
                 schema_version: REGISTRY_SCHEMA_VERSION,
                 registration_id: uuid::Uuid::now_v7().to_string(),
                 worklist_pattern: "specs/night/tasks.json".to_owned(),
                 code_repository: "acme/widgets".to_owned(),
+                checkout: PathBuf::from("/srv/acme/widgets"),
+                base_branch: "main".to_owned(),
+                remote: "origin".to_owned(),
                 armed_at: "2026-08-01T00:00:00Z".to_owned(),
                 arm_serial: 1,
                 approved_graph_digest: prior.executable_digest.clone(),
@@ -5522,6 +5907,9 @@ print(json.dumps({
                 "registrationId": uuid::Uuid::now_v7().to_string(),
                 "worklistPattern": worklist_pattern,
                 "codeRepository": code_repository,
+                "checkout": "/srv/acme/widgets",
+                "baseBranch": "main",
+                "remote": "origin",
                 "armedAt": "2026-08-01T00:00:00Z",
                 "armSerial": 1,
                 "approvedGraphDigest": format!("sha256:{}", "a".repeat(64)),
@@ -5562,6 +5950,10 @@ print(json.dumps({
                     (
                         "danger-full-access".to_owned(),
                         vec!["--sandbox".to_owned(), "danger-full-access".to_owned()],
+                    ),
+                    (
+                        "read-only".to_owned(),
+                        vec!["--sandbox".to_owned(), "read-only".to_owned()],
                     ),
                 ]),
                 commit_capable_sandbox_policies: commit_capable
@@ -5755,9 +6147,16 @@ print(json.dumps({
     #[test]
     fn an_undeclared_policy_name_is_still_refused_at_arm_time() {
         let adapter = codex_shaped_adapter(&["danger-full-access"]);
-        let error = validate_agent_policies(&agent_with(Some("read-only")), &adapter)
+        let error = validate_agent_policies(&agent_with(Some("not-declared")), &adapter)
             .unwrap_err()
             .to_string();
         assert!(error.contains("is not authorized by adapter"), "{error}");
+
+        let mut agent = agent_with(Some("danger-full-access"));
+        agent.diagnosis_sandbox_policy = Some("not-declared".to_owned());
+        let error = validate_agent_policies(&agent, &adapter)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("diagnosisSandboxPolicy"), "{error}");
     }
 }
