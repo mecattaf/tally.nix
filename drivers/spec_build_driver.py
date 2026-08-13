@@ -61,9 +61,13 @@ RESUME_MARKER = re.compile(
 )
 # A campaign machinery fault is not evidence that the task's work is wrong, so
 # it buys a retry instead of a steering attempt. The budget is bounded and read
-# back from the forge: past it, the fault is treated as a failed attempt.
+# back from durable campaign state: past it, the fault is treated as a failed
+# attempt.
 MAX_MACHINE_RETRIES = 2
 MAX_RETRY_CHARS = 2_000
+ATTEMPT_RECEIPTS_SCHEMA_VERSION = 1
+ATTEMPT_RECEIPTS_FILE = "attempt-receipts-v1.jsonl"
+MAX_ATTEMPT_RECEIPTS_LOG_BYTES = 128 * 1024 * 1024
 # A worker's final message is a public finding, not an unbounded transcript.
 # The bound covers the complete rendered comment, including its machine marker.
 MAX_WORKER_FINDINGS_BYTES = 8 * 1024
@@ -1667,6 +1671,7 @@ FORGE_NATIVE_RECONCILE_FIELDS = {
     "issue",
     "worklist",
     "campaignGraph",
+    "attemptReceipts",
     # The normalized #433 receipt is also the compatibility form of the
     # public arm/driver boundary. When campaignGraph is absent, its immutable
     # task members are recovered from the native issue graph and the complete
@@ -2554,32 +2559,450 @@ def write_local_blob(
     return True, value
 
 
-def contiguous_receipts(
-    receipts: list[dict[str, Any]], kind: str, warnings: list[str]
-) -> list[dict[str, Any]]:
-    """Keep the attempt-1-anchored run of receipts and witness what it drops.
+def attempt_receipts_path(value: Any, campaign: str) -> Path:
+    """Validate the flow-carried coordinate of one campaign's attempt log."""
+    source = object_complete(
+        value, {"schemaVersion", "kind", "path"}, "attemptReceipts"
+    )
+    if (
+        source.get("schemaVersion") != ATTEMPT_RECEIPTS_SCHEMA_VERSION
+        or source.get("kind") != "local-jsonl"
+    ):
+        fail("attemptReceipts must use local-jsonl schema version 1")
+    path = Path(required_string(source.get("path"), "attemptReceipts.path", 4096))
+    if not path.is_absolute():
+        fail("attemptReceipts.path must be absolute")
+    if (
+        path.name != ATTEMPT_RECEIPTS_FILE
+        or path.parent.name != campaign
+        or path.parent.parent.name != "attempt-receipts"
+    ):
+        fail("attemptReceipts.path does not name this campaign's attempt-receipts log")
+    return path
 
-    An operator who deletes a machine comment between passes leaves a gap. The
-    campaign reports the gap and reasons from the receipts that remain instead
-    of refusing to reconcile at all.
-    """
-    kept: list[dict[str, Any]] = []
-    for task_id in sorted({receipt["taskId"] for receipt in receipts}):
-        owned = sorted(
-            (receipt for receipt in receipts if receipt["taskId"] == task_id),
-            key=lambda receipt: receipt["attempt"],
+
+def attempt_receipt_url(campaign: str, sequence: int) -> str:
+    return f"local://campaign/{campaign}/attempt-receipts/{sequence}"
+
+
+def _attempt_receipts_parent(path: Path) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.parent.is_symlink() or not path.parent.is_dir():
+            fail("attempt-receipts parent must be a real directory")
+        os.chmod(path.parent, 0o700)
+    except OSError as error:
+        fail(f"cannot prepare attempt-receipts directory {path.parent}: {error}")
+
+
+def _validate_attempt_receipt(
+    candidate: Any,
+    path: Path,
+    expected_sequence: int,
+    campaign: str,
+    issue_number: str,
+) -> dict[str, Any]:
+    context = f"attempt receipt {expected_sequence} in {path}"
+    if not isinstance(candidate, dict):
+        fail(f"{context} must be an object")
+    kind = candidate.get("kind")
+    common = {"schemaVersion", "sequence", "kind", "campaign", "issueNumber"}
+    fields = {
+        "diagnosis": common | {"taskId", "attempt", "diagnosis", "redaction"},
+        "retry": common | {"taskId", "attempt", "reason", "redaction"},
+        "escalation": common | {"body"},
+        # `reason`/`actor`/`nonce` are audit metadata for the later local
+        # campaign-resume writer. The fold depends only on the ordered scope.
+        "pardon": common | {"tasks", "reason", "actor", "nonce"},
+    }.get(kind)
+    if fields is None:
+        fail(f"{context} has unknown kind {kind!r}")
+    record = dict(object_exact(candidate, fields, context))
+    sequence = record.get("sequence")
+    if (
+        record.get("schemaVersion") != ATTEMPT_RECEIPTS_SCHEMA_VERSION
+        or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence != expected_sequence
+        or record.get("campaign") != campaign
+        or record.get("issueNumber") != issue_number
+    ):
+        fail(f"{context} has invalid identity or sequence")
+    if kind in {"diagnosis", "retry"}:
+        task_id = required_string(record.get("taskId"), f"{context}.taskId")
+        if not TASK_ID.fullmatch(task_id):
+            fail(f"{context}.taskId is unsafe")
+        if record.get("attempt") not in {1, 2}:
+            fail(f"{context}.attempt must equal 1 or 2")
+        if record.get("redaction") not in PUBLIC_REDACTIONS:
+            fail(f"{context}.redaction is unsupported")
+        payload = "diagnosis" if kind == "diagnosis" else "reason"
+        record[payload] = required_text(
+            record.get(payload),
+            f"{context}.{payload}",
+            MAX_DIAGNOSIS_CHARS if kind == "diagnosis" else MAX_RETRY_CHARS,
         )
-        expected = 1
-        for receipt in owned:
-            if receipt["attempt"] != expected:
+    elif kind == "escalation":
+        record["body"] = required_text(record.get("body"), f"{context}.body", 60_000)
+    else:
+        if "tasks" not in record:
+            fail(f"{context}.tasks is required")
+        tasks = record.get("tasks")
+        if tasks is not None:
+            tasks = string_list(tasks, f"{context}.tasks", nonempty=True)
+            if len(tasks) != len(set(tasks)) or any(
+                not TASK_ID.fullmatch(task_id) for task_id in tasks
+            ):
+                fail(f"{context}.tasks must contain unique safe task IDs")
+            record["tasks"] = tasks
+        if "reason" in record:
+            record["reason"] = required_text(record["reason"], f"{context}.reason", 4_000)
+        if "actor" in record:
+            required_string(record["actor"], f"{context}.actor", 128)
+        if "nonce" in record:
+            nonce = required_string(record["nonce"], f"{context}.nonce", 36)
+            try:
+                uuid.UUID(nonce)
+            except ValueError:
+                fail(f"{context}.nonce must be a UUID")
+    return record
+
+
+def _read_attempt_receipts_descriptor(
+    descriptor: int,
+    path: Path,
+    campaign: str,
+    issue_number: str,
+    *,
+    repair_tail: bool,
+) -> list[dict[str, Any]]:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size > MAX_ATTEMPT_RECEIPTS_LOG_BYTES
+    ):
+        fail(f"attempt-receipts log is not a bounded private regular file: {path}")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = metadata.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    complete = raw.rfind(b"\n") + 1
+    if complete != len(raw):
+        # Match the witness ledger: an interrupted append contributes no fact.
+        # Readers fold the last complete prefix; the next exclusive writer
+        # truncates and fsyncs that same prefix before appending.
+        if repair_tail:
+            os.ftruncate(descriptor, complete)
+            os.fsync(descriptor)
+        raw = raw[:complete]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"attempt-receipts log {path} is not UTF-8: {error}")
+    records: list[dict[str, Any]] = []
+    for sequence, line in enumerate(text.splitlines(), 1):
+        if not line:
+            fail(f"attempt-receipts log {path} contains a blank record")
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError as error:
+            fail(f"attempt receipt {sequence} in {path} is invalid JSON: {error}")
+        records.append(
+            _validate_attempt_receipt(
+                candidate, path, sequence, campaign, issue_number
+            )
+        )
+    return records
+
+
+def read_attempt_receipts(
+    source: Any, campaign: str, issue_number: str
+) -> list[dict[str, Any]]:
+    path = attempt_receipts_path(source, campaign)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        fail(f"cannot open attempt-receipts log {path}: {error}")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        return _read_attempt_receipts_descriptor(
+            descriptor, path, campaign, issue_number, repair_tail=False
+        )
+    except OSError as error:
+        fail(f"cannot read attempt-receipts log {path}: {error}")
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _open_attempt_receipts_writer(path: Path) -> tuple[int, bool]:
+    _attempt_receipts_parent(path)
+    flags = os.O_RDWR | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            fail(f"cannot open attempt-receipts log {path}: {error}")
+        created = False
+    except OSError as error:
+        fail(f"cannot create attempt-receipts log {path}: {error}")
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            fail(f"attempt-receipts log is not a private regular file: {path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if created:
+            directory = os.open(
+                path.parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        return descriptor, created
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _events_from_local_records(
+    records: list[dict[str, Any]], campaign: str
+) -> list[dict[str, Any]]:
+    return [
+        {**record, "comment": attempt_receipt_url(campaign, record["sequence"])}
+        for record in records
+    ]
+
+
+def fold_attempt_receipts(
+    events: list[dict[str, Any]],
+    task_ids: set[str] | None,
+    warnings: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, list[str]]:
+    """Fold ordered counters, contiguity, pardons, and escalation state."""
+    warnings = [] if warnings is None else warnings
+    visible: dict[str, dict[str, list[dict[str, Any]]]] = {
+        "diagnosis": {},
+        "retry": {},
+    }
+    # Pardon counts and escalation causality use every accepted receipt, just
+    # as the former boundary arithmetic did before contiguity was projected.
+    counters: dict[str, dict[str, list[dict[str, Any]]]] = {
+        "diagnosis": {},
+        "retry": {},
+    }
+    escalations: list[dict[str, Any]] = []
+
+    def accepted(kind: str, task_id: str) -> bool:
+        if task_ids is None or task_id in task_ids:
+            return True
+        warnings.append(
+            f"dropped machine {kind} for {task_id!r}: the worklist no longer names that task"
+        )
+        return False
+
+    for event in events:
+        kind = event["kind"]
+        if kind in {"diagnosis", "retry"}:
+            task_id = event["taskId"]
+            if not accepted(kind, task_id):
+                continue
+            counters[kind].setdefault(task_id, []).append(event)
+            kept = visible[kind].setdefault(task_id, [])
+            expected = len(kept) + 1
+            if event["attempt"] != expected:
                 warnings.append(
                     f"dropped machine {kind} for {task_id!r} attempt "
-                    f"{receipt['attempt']}: no attempt {expected} receipt precedes it"
+                    f"{event['attempt']}: no attempt {expected} receipt precedes it"
                 )
                 continue
-            kept.append(receipt)
-            expected += 1
-    return kept
+            payload = "diagnosis" if kind == "diagnosis" else "reason"
+            kept.append(
+                {
+                    "taskId": task_id,
+                    "attempt": event["attempt"],
+                    "comment": event["comment"],
+                    payload: event[payload],
+                }
+            )
+            continue
+        if kind == "escalation":
+            contributors = {
+                task_id
+                for task_id, receipts in counters["diagnosis"].items()
+                if {receipt["attempt"] for receipt in receipts} == {1, 2}
+            }
+            escalations.append(
+                {
+                    "comment": event["comment"],
+                    "contributors": contributors,
+                    "covered": set(),
+                }
+            )
+            continue
+
+        tasks = event["tasks"]
+        pardoned = 0
+        if tasks is None:
+            pardoned += sum(
+                len(receipts)
+                for by_task in counters.values()
+                for receipts in by_task.values()
+            )
+            for by_task in counters.values():
+                by_task.clear()
+            for by_task in visible.values():
+                by_task.clear()
+            pardoned += len(escalations)
+            escalations.clear()
+        else:
+            scope = set(tasks)
+            for kind_name in ("diagnosis", "retry"):
+                for task_id in scope:
+                    pardoned += len(counters[kind_name].pop(task_id, []))
+                    visible[kind_name].pop(task_id, None)
+            remaining_escalations: list[dict[str, Any]] = []
+            for escalation in escalations:
+                escalation["covered"].update(scope & escalation["contributors"])
+                if escalation["contributors"] and escalation["contributors"].issubset(
+                    escalation["covered"]
+                ):
+                    pardoned += 1
+                else:
+                    remaining_escalations.append(escalation)
+            escalations = remaining_escalations
+        if pardoned:
+            scope_text = ""
+            if tasks is not None:
+                scope_text = " for task(s) " + ", ".join(
+                    repr(task_id) for task_id in sorted(tasks)
+                )
+            boundary = event.get("boundaryLabel", "pardon")
+            warnings.append(
+                f"campaign {boundary} {event['comment']} pardoned "
+                f"{pardoned} earlier machine receipt(s){scope_text}"
+            )
+
+    if len(escalations) > 1:
+        fail("multiple machine escalations claim this campaign")
+    diagnoses = [
+        receipt
+        for receipts in visible["diagnosis"].values()
+        for receipt in receipts
+    ]
+    retries = [
+        receipt for receipts in visible["retry"].values() for receipt in receipts
+    ]
+    order_source = task_ids or {record["taskId"] for record in diagnoses + retries}
+    task_order = {task_id: index for index, task_id in enumerate(sorted(order_source))}
+    for records in (diagnoses, retries):
+        records.sort(
+            key=lambda item: (
+                task_order.get(item["taskId"], len(task_order)),
+                item["attempt"],
+            )
+        )
+    escalation = escalations[0]["comment"] if escalations else None
+    return diagnoses, retries, escalation, warnings
+
+
+def append_attempt_receipt(
+    source: Any,
+    campaign: str,
+    issue_number: str,
+    payload: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Append one counter under flock, fsync it, and return its ordered fact."""
+    path = attempt_receipts_path(source, campaign)
+    descriptor, _ = _open_attempt_receipts_writer(path)
+    try:
+        records = _read_attempt_receipts_descriptor(
+            descriptor, path, campaign, issue_number, repair_tail=True
+        )
+        events = _events_from_local_records(records, campaign)
+        diagnoses, retries, escalation, _ = fold_attempt_receipts(events, None)
+        kind = payload.get("kind")
+        if kind in {"diagnosis", "retry"}:
+            active = diagnoses if kind == "diagnosis" else retries
+            matching = [
+                receipt
+                for receipt in active
+                if receipt["taskId"] == payload.get("taskId")
+                and receipt["attempt"] == payload.get("attempt")
+            ]
+            if matching:
+                sequence = int(matching[0]["comment"].rsplit("/", 1)[1])
+                return False, events[sequence - 1]
+            spent = len(
+                [receipt for receipt in active if receipt["taskId"] == payload.get("taskId")]
+            )
+            if payload.get("attempt") != spent + 1:
+                fail(
+                    f"task {payload.get('taskId')!r} {kind} attempt "
+                    f"{payload.get('attempt')} is not next after {spent} log receipts"
+                )
+        elif kind == "escalation" and escalation is not None:
+            sequence = int(escalation.rsplit("/", 1)[1])
+            return False, events[sequence - 1]
+        elif kind == "pardon" and payload.get("nonce") is not None:
+            prior = next(
+                (
+                    event
+                    for event in events
+                    if event["kind"] == "pardon"
+                    and event.get("nonce") == payload.get("nonce")
+                ),
+                None,
+            )
+            if prior is not None:
+                return False, prior
+        sequence = len(records) + 1
+        record = _validate_attempt_receipt(
+            {
+                "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                "sequence": sequence,
+                "campaign": campaign,
+                "issueNumber": issue_number,
+                **payload,
+            },
+            path,
+            sequence,
+            campaign,
+            issue_number,
+        )
+        line = json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        if os.fstat(descriptor).st_size + len(line) > MAX_ATTEMPT_RECEIPTS_LOG_BYTES:
+            fail("attempt-receipts log exceeds 128 MiB")
+        view = memoryview(line)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail(f"cannot append attempt-receipts log {path}: short write")
+            view = view[written:]
+        os.fsync(descriptor)
+        return True, {**record, "comment": attempt_receipt_url(campaign, sequence)}
+    except OSError as error:
+        fail(f"cannot append attempt-receipts log {path}: {error}")
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def forge_campaign_state(
@@ -2589,80 +3012,89 @@ def forge_campaign_state(
     issue_number: str,
     task_ids: set[str] | None = None,
     threads: dict[str, list[dict[str, Any]]] | None = None,
+    attempt_receipts: Any = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, list[str]]:
-    diagnoses: list[dict[str, Any]] = []
-    retries: list[dict[str, Any]] = []
-    escalations: list[str] = []
     warnings: list[str] = []
-    threaded = set(threads or {})
-    # One ledger entry per (kind, task, attempt) whichever surface carries it.
-    counted: set[tuple[str, str, int]] = set()
-    # Scoped re-arm pardons need the original diagnosis chronology to decide
-    # whether a campaign-wide escalation is still live for any unpardoned
-    # task. These IDs never leave this parser.
-    diagnosis_events: list[tuple[int, str, int]] = []
-    escalation_events: list[tuple[int, str]] = []
-    resume_boundaries: list[dict[str, Any]] = []
-
-    def accept(kind: str, task_id: str) -> bool:
-        # A worklist edit that renames or drops a task leaves receipts naming a
-        # task the campaign no longer has. campaigns.md invites those edits
-        # between passes, so an orphan receipt is reported and ignored rather
-        # than treated as forgery.
-        if task_ids is None or task_id in task_ids:
-            return True
-        warnings.append(
-            f"dropped machine {kind} for {task_id!r}: the worklist no longer names that task"
+    if config["forge"] != "github":
+        if attempt_receipts is None:
+            fail("attemptReceipts is required for a local campaign")
+        records = read_attempt_receipts(attempt_receipts, campaign, issue_number)
+        return fold_attempt_receipts(
+            _events_from_local_records(records, campaign), task_ids, warnings
         )
-        return False
 
-    def comment_database_id(comment: dict[str, Any], context: str) -> int:
+    threaded = set(threads or {})
+    counted: set[tuple[str, str, int, int]] = set()
+    events: list[dict[str, Any]] = []
+    master_comments = github_machine_comments(repository, issue_number)
+    pardon_generations: list[tuple[int, set[str] | None]] = []
+    for comment in master_comments:
+        body = comment.get("body")
+        if not isinstance(body, str) or not body:
+            continue
+        match = RESUME_MARKER.fullmatch(body.splitlines()[0])
+        if match is None or match.group(1) != campaign or match.group(2) != issue_number:
+            continue
+        identity = comment.get("id", comment.get("databaseId"))
+        if not isinstance(identity, int) or isinstance(identity, bool) or identity < 1:
+            fail("campaign resume receipt carries no stable GitHub comment id")
+        scoped = match.group(4)
+        pardon_generations.append(
+            (identity, None if scoped is None else set(scoped.split(",")))
+        )
+    has_pardon = bool(pardon_generations)
+    fallback_sequence = 0
+
+    def event_sequence(comment: dict[str, Any], context: str) -> int:
+        nonlocal fallback_sequence
         value = comment.get("id", comment.get("databaseId"))
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        if has_pardon:
             fail(f"{context} carries no stable GitHub comment id")
-        return value
+        fallback_sequence += 1
+        return fallback_sequence
 
-    def pardon_boundary(identity: int, task_id: str) -> dict[str, Any] | None:
-        applicable = [
-            boundary
-            for boundary in resume_boundaries
-            if boundary["id"] >= identity
-            and (boundary["tasks"] is None or task_id in boundary["tasks"])
-        ]
-        return max(applicable, key=lambda boundary: boundary["id"], default=None)
-
-    def ingest(
-        comments: list[dict[str, Any]],
-        *,
-        surface: str | None,
-    ) -> None:
-        """Parse machine receipts from one posting surface.
-
-        `surface` is the task whose sub-issue thread these comments came from,
-        or None for the campaign master. New receipts are always posted to the
-        task's own thread where the campaign has one, but the ledger reads both
-        surfaces: a campaign armed before the walk capability existed -- or
-        re-armed into it mid-flight -- has its earlier receipts on the master,
-        and discarding them reset every task's diagnosis and retry counters, so
-        a task got one attempt more than its budget allows and re-posted a
-        public comment it had already made. A receipt is counted once per
-        (kind, task, attempt). Task threads are ingested first, so where both
-        surfaces carry the same attempt the thread copy is the one counted --
-        it is where the current receipt lives and where a reader should be
-        pointed -- and the master copy is reported as the duplicate.
-        """
+    def ingest(comments: list[dict[str, Any]], *, surface: str | None) -> None:
         expected_escalation = escalation_marker(campaign, issue_number)
         for comment in comments:
             body = comment.get("body")
             if not isinstance(body, str) or not body:
                 continue
             first_line = body.splitlines()[0]
+            resume = RESUME_MARKER.fullmatch(first_line) if surface is None else None
+            if resume is not None:
+                marker_campaign, marker_issue, nonce, scoped_tasks = resume.groups()
+                if marker_campaign != campaign or marker_issue != issue_number:
+                    continue
+                try:
+                    uuid.UUID(nonce)
+                except ValueError:
+                    fail("campaign resume marker carries an invalid nonce")
+                if "\n\n### Campaign resumed\n\n" not in body or "\n\nReason: " not in body:
+                    fail("campaign resume receipt has malformed content")
+                tasks = None if scoped_tasks is None else scoped_tasks.split(",")
+                if tasks is not None and len(tasks) != len(set(tasks)):
+                    fail("campaign resume receipt repeats a scoped task")
+                events.append(
+                    {
+                        "sequence": event_sequence(comment, "campaign resume receipt"),
+                        "kind": "pardon",
+                        "tasks": tasks,
+                        "comment": required_string(
+                            comment.get("html_url"), "campaign resume receipt URL"
+                        ),
+                        "boundaryLabel": "resume",
+                    }
+                )
+                continue
             match = DIAGNOSIS_MARKER.fullmatch(first_line)
             retry_match = None if match is not None else RETRY_MARKER.fullmatch(first_line)
             if match is not None or retry_match is not None:
                 kind = "diagnosis" if match is not None else "retry"
-                groups = (match or retry_match).groups()
-                marker_campaign, marker_issue, task_id, attempt_text = groups
+                marker_campaign, marker_issue, task_id, attempt_text = (
+                    match or retry_match
+                ).groups()
                 if marker_campaign != campaign or marker_issue != issue_number:
                     continue
                 if surface is not None and task_id != surface:
@@ -2671,34 +3103,31 @@ def forge_campaign_state(
                         f"sub-issue thread of {surface!r}"
                     )
                     continue
-                if not accept(kind, task_id):
-                    continue
                 attempt = int(attempt_text)
-                identity = (
-                    comment_database_id(comment, "campaign machine receipt")
-                    if resume_boundaries
-                    else None
+                identity = event_sequence(comment, "campaign machine receipt")
+                generation = max(
+                    (
+                        boundary
+                        for boundary, tasks in pardon_generations
+                        if boundary < identity
+                        and (tasks is None or task_id in tasks)
+                    ),
+                    default=0,
                 )
-                if match is not None and identity is not None:
-                    diagnosis_events.append((identity, task_id, attempt))
-                if identity is not None:
-                    boundary = pardon_boundary(identity, task_id)
-                    if boundary is not None:
-                        boundary["pardoned"] += 1
-                        continue
                 where = (
                     "master thread"
                     if surface is None
                     else f"sub-issue thread of {surface!r}"
                 )
-                if (kind, task_id, attempt) in counted:
+                counted_identity = (kind, task_id, attempt, generation)
+                if counted_identity in counted:
                     warnings.append(
                         f"ignored a duplicate machine {kind} for {task_id!r} attempt "
                         f"{attempt} on the {where}: the ledger counts one receipt "
                         "per attempt"
                     )
                     continue
-                counted.add((kind, task_id, attempt))
+                counted.add(counted_identity)
                 if surface is None and task_id in threaded:
                     warnings.append(
                         f"counted a master-thread machine {kind} for {task_id!r} "
@@ -2714,8 +3143,10 @@ def forge_campaign_state(
                 if not body.startswith(prefix):
                     fail(f"machine {kind} for {task_id!r} has malformed content")
                 payload = "diagnosis" if kind == "diagnosis" else "reason"
-                (diagnoses if kind == "diagnosis" else retries).append(
+                events.append(
                     {
+                        "sequence": identity,
+                        "kind": kind,
                         "taskId": task_id,
                         "attempt": attempt,
                         "comment": required_string(
@@ -2724,234 +3155,33 @@ def forge_campaign_state(
                         payload: required_text(
                             body[len(prefix) :],
                             f"machine {kind} for {task_id!r}",
-                            MAX_DIAGNOSIS_CHARS if kind == "diagnosis" else MAX_RETRY_CHARS,
+                            MAX_DIAGNOSIS_CHARS
+                            if kind == "diagnosis"
+                            else MAX_RETRY_CHARS,
                         ),
                     }
                 )
             elif surface is None and first_line == expected_escalation:
-                # Escalation is campaign-wide and always stays on the master.
-                url = required_string(
-                    comment.get("html_url"), "machine escalation comment URL"
+                events.append(
+                    {
+                        "sequence": event_sequence(
+                            comment, "campaign escalation receipt"
+                        ),
+                        "kind": "escalation",
+                        "comment": required_string(
+                            comment.get("html_url"),
+                            "machine escalation comment URL",
+                        ),
+                    }
                 )
-                if resume_boundaries:
-                    escalation_events.append(
-                        (
-                            comment_database_id(comment, "campaign escalation receipt"),
-                            url,
-                        )
-                    )
-                else:
-                    escalations.append(url)
 
-    if config["forge"] == "github":
-        master_comments = github_machine_comments(repository, issue_number)
-        for comment in master_comments:
-            body = comment.get("body")
-            if not isinstance(body, str) or not body:
-                continue
-            match = RESUME_MARKER.fullmatch(body.splitlines()[0])
-            if match is None:
-                continue
-            marker_campaign, marker_issue, nonce, scoped_tasks = match.groups()
-            if marker_campaign != campaign or marker_issue != issue_number:
-                continue
-            try:
-                uuid.UUID(nonce)
-            except ValueError:
-                fail("campaign resume marker carries an invalid nonce")
-            if "\n\n### Campaign resumed\n\n" not in body or "\n\nReason: " not in body:
-                fail("campaign resume receipt has malformed content")
-            tasks = None if scoped_tasks is None else frozenset(scoped_tasks.split(","))
-            if tasks is not None and len(tasks) != len(scoped_tasks.split(",")):
-                fail("campaign resume receipt repeats a scoped task")
-            resume_boundaries.append(
-                {
-                    "id": comment_database_id(comment, "campaign resume receipt"),
-                    "comment": required_string(
-                        comment.get("html_url"), "campaign resume receipt URL"
-                    ),
-                    "tasks": tasks,
-                    "pardoned": 0,
-                }
-            )
-        resume_boundaries.sort(key=lambda boundary: boundary["id"])
-        # Task threads first: where a task owns one, that is where its current
-        # receipts are posted, so the thread copy is the one a fact should
-        # point at and a master copy of the same attempt is the older duplicate.
-        for task_id in sorted(threaded):
-            ingest(threads[task_id], surface=task_id)
-        ingest(master_comments, surface=None)
-    else:
-        prefix = local_state_prefix(campaign, issue_number)
-        refs = local_remote_refs(config, f"{prefix}/*")
-        diagnosis_prefix = f"{prefix}/diagnosis/"
-        retry_prefix = f"{prefix}/retry/"
-        for ref in sorted(refs):
-            is_retry = ref.startswith(retry_prefix)
-            if not is_retry and not ref.startswith(diagnosis_prefix):
-                continue
-            kind = "retry" if is_retry else "diagnosis"
-            payload = "reason" if is_retry else "diagnosis"
-            receipt = object_exact(
-                read_local_blob(config, ref),
-                {
-                    "schemaVersion",
-                    "kind",
-                    "campaign",
-                    "issueNumber",
-                    "taskId",
-                    "attempt",
-                    payload,
-                    "redaction",
-                },
-                f"local forge {kind} {ref}",
-            )
-            if (
-                receipt.get("schemaVersion") != 1
-                or receipt.get("kind") != kind
-                or receipt.get("campaign") != campaign
-                or receipt.get("issueNumber") != issue_number
-                or receipt.get("redaction") not in PUBLIC_REDACTIONS
-            ):
-                fail(f"local forge {kind} {ref!r} has invalid identity")
-            task_id = required_string(receipt.get("taskId"), f"local {kind} taskId")
-            if not TASK_ID.fullmatch(task_id):
-                fail(f"local forge {kind} {ref!r} has unsafe taskId")
-            attempt = receipt.get("attempt")
-            if attempt not in {1, 2}:
-                fail(f"local forge {kind} {ref!r} has invalid attempt")
-            expected_ref = (
-                f"{retry_prefix if is_retry else diagnosis_prefix}{task_id}/{attempt}"
-            )
-            if ref != expected_ref:
-                fail(f"local forge {kind} {ref!r} disagrees with its identity")
-            if not accept(kind, task_id):
-                continue
-            record = {
-                "taskId": task_id,
-                "attempt": attempt,
-                "comment": f"local://{repository}/{ref}",
-                payload: required_text(
-                    receipt.get(payload),
-                    f"local {kind} for {task_id!r}",
-                    MAX_RETRY_CHARS if is_retry else MAX_DIAGNOSIS_CHARS,
-                ),
-            }
-            (retries if is_retry else diagnoses).append(record)
-        escalation_ref = f"{prefix}/escalation"
-        if escalation_ref in refs:
-            receipt = object_exact(
-                read_local_blob(config, escalation_ref),
-                {"schemaVersion", "kind", "campaign", "issueNumber", "body"},
-                "local forge escalation",
-            )
-            if (
-                receipt.get("schemaVersion") != 1
-                or receipt.get("kind") != "escalation"
-                or receipt.get("campaign") != campaign
-                or receipt.get("issueNumber") != issue_number
-            ):
-                fail("local forge escalation has invalid identity")
-            required_text(receipt.get("body"), "local forge escalation body", 60_000)
-            escalations.append(f"local://{repository}/{escalation_ref}")
-
-    # A global manual resume pardons every earlier escalation. A scoped re-arm
-    # receipt pardons a campaign-wide escalation only when the union of scoped
-    # receipts covers every task whose two diagnosis attempts led to it. That
-    # keeps an unaddressed task escalated while allowing an amended task's
-    # counters to restart independently.
-    for identity, url in escalation_events:
-        global_cover = [
-            boundary
-            for boundary in resume_boundaries
-            if boundary["tasks"] is None and boundary["id"] >= identity
-        ]
-        covering_boundary = max(
-            global_cover, key=lambda boundary: boundary["id"], default=None
-        )
-        if covering_boundary is None:
-            escalated_tasks: set[str] = set()
-            for task_id in {event[1] for event in diagnosis_events}:
-                prior = max(
-                    (
-                        boundary["id"]
-                        for boundary in resume_boundaries
-                        if boundary["id"] < identity
-                        and (
-                            boundary["tasks"] is None
-                            or task_id in boundary["tasks"]
-                        )
-                    ),
-                    default=0,
-                )
-                attempts = {
-                    attempt
-                    for receipt_id, receipt_task, attempt in diagnosis_events
-                    if receipt_task == task_id and prior < receipt_id < identity
-                }
-                if attempts == {1, 2}:
-                    escalated_tasks.add(task_id)
-            scoped_cover = [
-                boundary
-                for boundary in resume_boundaries
-                if boundary["id"] >= identity
-                and boundary["tasks"] is not None
-            ]
-            if escalated_tasks and all(
-                any(task_id in boundary["tasks"] for boundary in scoped_cover)
-                for task_id in escalated_tasks
-            ):
-                # The last contributing receipt is the point at which the
-                # shared escalation became fully pardoned.
-                covering_boundary = max(
-                    (
-                        boundary
-                        for boundary in scoped_cover
-                        if any(task_id in boundary["tasks"] for task_id in escalated_tasks)
-                    ),
-                    key=lambda boundary: boundary["id"],
-                )
-        if covering_boundary is None:
-            escalations.append(url)
-        else:
-            covering_boundary["pardoned"] += 1
-
-    if len(escalations) > 1:
-        fail("multiple machine escalations claim this campaign")
-    for boundary in resume_boundaries:
-        if boundary["pardoned"] == 0:
-            continue
-        scope = ""
-        if boundary["tasks"] is not None:
-            scope = " for task(s) " + ", ".join(
-                repr(task_id) for task_id in sorted(boundary["tasks"])
-            )
-        warnings.append(
-            f"campaign resume {boundary['comment']} pardoned "
-            f"{boundary['pardoned']} earlier machine receipt(s){scope}"
-        )
-    for kind, records in (("diagnosis", diagnoses), ("retry", retries)):
-        seen: set[tuple[str, int]] = set()
-        for record in records:
-            identity = (record["taskId"], record["attempt"])
-            if identity in seen:
-                fail(
-                    f"multiple machine {kind} receipts claim task {identity[0]!r} "
-                    f"attempt {identity[1]}"
-                )
-            seen.add(identity)
-    order_source = task_ids or {record["taskId"] for record in diagnoses + retries}
-    task_order = {task_id: index for index, task_id in enumerate(sorted(order_source))}
-    diagnoses = contiguous_receipts(diagnoses, "diagnosis", warnings)
-    retries = contiguous_receipts(retries, "retry", warnings)
-    for records in (diagnoses, retries):
-        records.sort(
-            key=lambda item: (
-                task_order.get(item["taskId"], len(task_order)),
-                item["attempt"],
-            )
-        )
-    return diagnoses, retries, escalations[0] if escalations else None, warnings
+    # Task threads win duplicate identity, while stable comment IDs restore the
+    # global chronology before the shared ordered fold runs.
+    for task_id in sorted(threaded):
+        ingest(threads[task_id], surface=task_id)
+    ingest(master_comments, surface=None)
+    events.sort(key=lambda event: event["sequence"])
+    return fold_attempt_receipts(events, task_ids, warnings)
 
 
 def task_revision(task: dict[str, Any]) -> str | None:
@@ -4213,19 +4443,22 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         max_parallel = worklist["config"]["maxParallel"]
         coordinates = campaign_coordinates({}, repository, config)
     else:
+        fields = {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "worklist",
+            "maxTasks",
+            "maxParallel",
+        }
+        if "attemptReceipts" in brief:
+            fields.add("attemptReceipts")
         data = object_exact(
             brief,
             seam_fields(
                 brief,
-                {
-                    "campaign",
-                    "repository",
-                    "repositoryConfig",
-                    "issue",
-                    "worklist",
-                    "maxTasks",
-                    "maxParallel",
-                },
+                fields,
             ),
             "reconcile brief",
         )
@@ -4356,6 +4589,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         issue["number"],
         task_ids,
         threads,
+        data.get("attemptReceipts"),
     )
     warnings.extend(walk_warnings)
     warnings.extend(state_warnings)
@@ -5111,14 +5345,15 @@ def post_diagnosis_comment(
     attempt: int,
     heading: str,
     text: str,
+    attempt_receipts: Any = None,
 ) -> str:
-    """Post one machine receipt, GitHub or local forge, and return its address.
+    """Post one machine receipt, GitHub or the local log, and return its address.
 
     GitHub reads receipts back by parsing the marker and heading off the
-    first lines of the comment body; the local forge reads structured fields
-    off the blob directly, so only `text` -- never the marker-prefixed body
-    -- is what it stores. Both the ordinary steering path and the breach
-    path (#386, which posts up to two of these atomically) share this.
+    first lines of the comment body; the local campaign reads structured fields
+    from its ordered JSONL, so only `text` -- never the marker-prefixed body --
+    is stored. Both the ordinary steering path and the breach path (#386,
+    which posts up to two of these in one action) share this.
     """
     if config["forge"] == "github":
         marker = diagnosis_marker(campaign, issue_number, task_id, attempt)
@@ -5139,24 +5374,21 @@ def post_diagnosis_comment(
             posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
             "machine diagnosis comment URL",
         )
-    ref = f"{local_state_prefix(campaign, issue_number)}/diagnosis/{task_id}/{attempt}"
-    created, _ = write_local_blob(
-        config,
-        ref,
+    if attempt_receipts is None:
+        fail("attemptReceipts is required for a local diagnosis")
+    _, receipt = append_attempt_receipt(
+        attempt_receipts,
+        campaign,
+        issue_number,
         {
-            "schemaVersion": 1,
             "kind": "diagnosis",
-            "campaign": campaign,
-            "issueNumber": issue_number,
             "taskId": task_id,
             "attempt": attempt,
             "diagnosis": text,
             "redaction": PUBLIC_REDACTION,
         },
     )
-    if not created:
-        fail(f"local forge diagnosis {ref!r} appeared concurrently")
-    return f"local://{repository}/{ref}"
+    return receipt["comment"]
 
 
 def diagnosis_rejection_reason(
@@ -5277,6 +5509,8 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         fields.add("taskIssue")
     if "checkpointCapture" in brief:
         fields.add("checkpointCapture")
+    if "attemptReceipts" in brief:
+        fields.add("attemptReceipts")
     if "gateEvidence" in brief:
         fields.add("gateEvidence")
     if "breach" in brief:
@@ -5325,7 +5559,13 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         repository, config, data, capabilities, task_id
     )
     existing, _, _, _ = forge_campaign_state(
-        repository, config, campaign, issue["number"], None, threads
+        repository,
+        config,
+        campaign,
+        issue["number"],
+        None,
+        threads,
+        data.get("attemptReceipts"),
     )
     task_receipts = [receipt for receipt in existing if receipt["taskId"] == task_id]
 
@@ -5337,7 +5577,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         # existing `attempt == 2` block rule needs no change at all) by
         # posting whichever of attempt 1 and attempt 2 do not exist yet, both
         # in this one call, so the task is permanently blocked as of this
-        # pass and `contiguous_receipts` never sees a lone attempt 2.
+        # pass and the ordered fold never sees a lone attempt 2.
         already_blocked = next(
             (receipt for receipt in task_receipts if receipt["attempt"] == 2), None
         )
@@ -5389,6 +5629,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
                 post_attempt,
                 diagnosis_heading(task_id, post_attempt),
                 composed,
+                data.get("attemptReceipts"),
             )
         return {
             "kind": "diagnosis",
@@ -5417,7 +5658,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     if attempt != expected_attempt:
         fail(
             f"task {task_id!r} diagnosis attempt {attempt} is not next after "
-            f"{len(task_receipts)} forge receipts"
+            f"{len(task_receipts)} durable receipts"
         )
     capture_note, capture_redacted = public_checkpoint_capture()
     diagnosis = required_text(
@@ -5445,6 +5686,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         attempt,
         diagnosis_heading(task_id, attempt),
         diagnosis,
+        data.get("attemptReceipts"),
     )
     return {
         "kind": "diagnosis",
@@ -5462,8 +5704,8 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
 
     Prep, lane, rebase, merge and publish faults say nothing about whether the
     task's work is right, so they buy a bounded retry instead. The budget is
-    read back from the forge like every other campaign fact; once it is spent
-    the caller must treat the next fault as a failed attempt.
+    read back from durable campaign state like every other campaign fact; once
+    it is spent the caller must treat the next fault as a failed attempt.
     """
     brief, capabilities = take_capabilities(brief)
     fields = {
@@ -5479,6 +5721,8 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
         fields.add("taskIssue")
     if "checkpointCapture" in brief:
         fields.add("checkpointCapture")
+    if "attemptReceipts" in brief:
+        fields.add("attemptReceipts")
     data = object_exact(brief, seam_fields(brief, fields), "retry brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -5503,7 +5747,13 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
         repository, config, data, capabilities, task_id
     )
     _, existing, _, _ = forge_campaign_state(
-        repository, config, campaign, issue["number"], None, threads
+        repository,
+        config,
+        campaign,
+        issue["number"],
+        None,
+        threads,
+        data.get("attemptReceipts"),
     )
     spent = len([receipt for receipt in existing if receipt["taskId"] == task_id])
     if spent >= MAX_MACHINE_RETRIES:
@@ -5554,33 +5804,27 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
             "machine retry comment URL",
         )
     else:
-        ref = (
-            f"{local_state_prefix(campaign, issue['number'])}/retry/"
-            f"{task_id}/{attempt}"
-        )
-        created, _ = write_local_blob(
-            config,
-            ref,
+        if data.get("attemptReceipts") is None:
+            fail("attemptReceipts is required for a local retry")
+        created, receipt = append_attempt_receipt(
+            data["attemptReceipts"],
+            campaign,
+            issue["number"],
             {
-                "schemaVersion": 1,
                 "kind": "retry",
-                "campaign": campaign,
-                "issueNumber": issue["number"],
                 "taskId": task_id,
                 "attempt": attempt,
                 "reason": reason,
                 "redaction": PUBLIC_REDACTION,
             },
         )
-        if not created:
-            fail(f"local forge retry {ref!r} appeared concurrently")
-        comment = f"local://{repository}/{ref}"
+        comment = receipt["comment"]
     return {
         "taskId": task_id,
         "attempt": attempt,
         "comment": comment,
         "exhausted": attempt == MAX_MACHINE_RETRIES,
-        "posted": True,
+        "posted": created if config["forge"] != "github" else True,
         "redacted": redacted,
     }
 
@@ -5601,19 +5845,22 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
             "escalate brief",
         )
     else:
+        fields = {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "worklist",
+            "maxTasks",
+            "maxParallel",
+        }
+        if "attemptReceipts" in brief:
+            fields.add("attemptReceipts")
         data = object_exact(
             brief,
             seam_fields(
                 brief,
-                {
-                    "campaign",
-                    "repository",
-                    "repositoryConfig",
-                    "issue",
-                    "worklist",
-                    "maxTasks",
-                    "maxParallel",
-                },
+                fields,
             ),
             "escalate brief",
         )
@@ -5741,23 +5988,20 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
             "machine escalation comment URL",
         )
     else:
-        ref = f"{local_state_prefix(campaign, issue['number'])}/escalation"
-        created, _ = write_local_blob(
-            config,
-            ref,
+        if data.get("attemptReceipts") is None:
+            fail("attemptReceipts is required for a local escalation")
+        created, receipt = append_attempt_receipt(
+            data["attemptReceipts"],
+            campaign,
+            issue["number"],
             {
-                "schemaVersion": 1,
                 "kind": "escalation",
-                "campaign": campaign,
-                "issueNumber": issue["number"],
                 "body": body,
             },
         )
-        if not created:
-            fail(f"local forge escalation {ref!r} appeared concurrently")
-        comment = f"local://{repository}/{ref}"
+        comment = receipt["comment"]
     return {
-        "posted": True,
+        "posted": created if config["forge"] != "github" else True,
         "comment": comment,
         "summary": summary,
         "diagnosisCount": len(reconciliation["diagnoses"]),
