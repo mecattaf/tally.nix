@@ -1,5 +1,61 @@
 {
   "schemaVersion": 1,
+  "campaign": {
+    "name": "epsilon",
+    "maxTasks": 24,
+    "maxParallel": 3,
+    "steward": "narrator",
+    "gates": [
+      {
+        "kind": "command",
+        "id": "driver-suite",
+        "preflightArgv": [
+          "sh",
+          "-euc",
+          "command -v python3 >/dev/null"
+        ],
+        "argv": [
+          "python3",
+          "test/spec_build_driver_test.py"
+        ],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "cargo-tests",
+        "preflightArgv": [
+          "sh",
+          "-euc",
+          "command -v nix >/dev/null"
+        ],
+        "argv": [
+          "nix",
+          "develop",
+          "--command",
+          "cargo",
+          "test",
+          "--workspace"
+        ],
+        "runtimeMaxSec": 3600
+      },
+      {
+        "kind": "command",
+        "id": "flake-eval",
+        "preflightArgv": [
+          "sh",
+          "-euc",
+          "command -v nix >/dev/null"
+        ],
+        "argv": [
+          "nix",
+          "flake",
+          "check",
+          "--no-build"
+        ],
+        "runtimeMaxSec": 1800
+      }
+    ]
+  },
   "tasks": [
     {
       "id": "final-bar-local-forge-repair",
