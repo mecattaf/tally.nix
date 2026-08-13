@@ -81,10 +81,6 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
-    Migrate {
-        #[command(subcommand)]
-        command: MigrateCommand,
-    },
     /// Operator reader-state on flow runs: `archived` and a free-form triage
     /// tag. Never touched by the daemon, a reconciler, or any run — only by
     /// this verb family. See `doc/src/operating/observability.md`.
@@ -143,41 +139,6 @@ pub(super) enum ReaderStateCommand {
         #[arg(long, value_name = "PATH")]
         data_dir: Option<PathBuf>,
     },
-}
-
-/// One-shot forward migrations of durable state written by an older binary.
-///
-/// These are not compatibility shims: the read paths stay strict, and each verb
-/// exists so the error that refuses old state can name one documented command
-/// instead of leaving an operator to reverse-engineer a naming scheme.
-#[derive(Debug, Subcommand)]
-pub(super) enum MigrateCommand {
-    /// Rewrite pre-label `unit-exit/` records to the labeled unit names the
-    /// current binary derives for rows carrying a campaign `taskRef`.
-    UnitExitLabels(MigrateUnitExitLabelsArgs),
-    /// Move pre-label `capture/` entries to the labeled capture stems the
-    /// current binary derives for rows carrying a campaign `taskRef`.
-    CaptureLabels(MigrateCaptureLabelsArgs),
-}
-
-#[derive(Debug, Args)]
-pub(super) struct MigrateUnitExitLabelsArgs {
-    /// Tally state directory holding `events/` and `unit-exit/`.
-    #[arg(long, value_name = "PATH")]
-    pub(super) state_dir: Option<PathBuf>,
-    /// Write the plan. Without it the plan is printed and nothing changes.
-    #[arg(long)]
-    pub(super) apply: bool,
-}
-
-#[derive(Debug, Args)]
-pub(super) struct MigrateCaptureLabelsArgs {
-    /// Tally state directory holding `events/` and `capture/`.
-    #[arg(long, value_name = "PATH")]
-    pub(super) state_dir: Option<PathBuf>,
-    /// Apply the plan. Without it the plan is printed and nothing moves.
-    #[arg(long)]
-    pub(super) apply: bool,
 }
 
 #[derive(Debug, Subcommand)]
