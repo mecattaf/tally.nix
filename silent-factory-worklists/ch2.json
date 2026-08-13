@@ -173,7 +173,8 @@
         "drivers",
         "test/spec_build_driver_test.py",
         "examples/flows/spec-build.js",
-        "crates/tally-flow/tests"
+        "crates/tally-flow/tests",
+        "crates/tally/tests/flow_live.rs"
       ]
     },
     {
@@ -739,7 +740,8 @@
       ],
       "conflictDomains": [
         "crates/tally-core",
-        "nix/modules"
+        "nix/modules",
+        "crates/tally/tests/flow_live.rs"
       ]
     },
     {
