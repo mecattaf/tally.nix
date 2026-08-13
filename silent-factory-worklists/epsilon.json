@@ -656,6 +656,51 @@
       ]
     },
     {
+      "id": "final-bar-stage1-reseat",
+      "kind": "implementation",
+      "title": "Reseat the final conformance bar on the stage 1 contracts",
+      "goal": "The stage 1 deletions falsified 12 of 24 final-bar cases (fleet-gate itself passes). The machine's gate diagnosis enumerated the full repair, adopt it verbatim: (1) in test/final-bar/cases/adapters.py, recovery.py, and usage.py change top-level 'enqueue' invocations to 'queue enqueue' \u2014 nine failures, the dead-cuts task deleted the duplicate top-level dispatch arm; (2) in cases/pipeline.py remove the retired services.tally.campaignForge fixture and enable campaignPoll directly \u2014 the nix collapse; (3) in cases/parallel.py remove the deleted confirmed_pool_loss_witnesses_and_return_re_presents_the_same_row regression from FOCUSED; (4) in cases/recovery.py drop that same deleted prerequisite from launch_cwd_representation_hydration and retain the represent_hydration_records_launch_cwd_beside_the_pointer seam check. Run the whole bar against your worktree (test/final-bar/run <absolute worktree path>) and bring it to exit 0; further staleness the run reveals inside test/final-bar is in scope.",
+      "deliveredBehaviors": [
+        "test/final-bar/run <tree> exits 0 against the stage 1 tree",
+        "No case invokes the deleted top-level enqueue or campaignForge surfaces"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.4"
+        ],
+        "styleReferences": [
+          "test/final-bar/README.md"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "bar-green",
+          "description": "The full bar passes against this worktree.",
+          "argv": [
+            "bash",
+            "-lc",
+            "exec test/final-bar/run \"$PWD\""
+          ]
+        },
+        {
+          "id": "no-dead-surfaces",
+          "description": "No case names the deleted surfaces.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'campaignForge' test/final-bar"
+          ]
+        }
+      ],
+      "dependencies": [
+        "dead-cuts",
+        "delete-gh-nix-tree"
+      ],
+      "conflictDomains": [
+        "test/final-bar"
+      ]
+    },
+    {
       "id": "chapter-gate",
       "kind": "checkpoint",
       "title": "Epsilon stage 1 gate: full gate ladder plus the final conformance bar",
@@ -678,7 +723,8 @@
         "ownership-preflight-warn",
         "poll-liveness-arm",
         "status-renders-reconciled-truth",
-        "producers-config-variant-box"
+        "producers-config-variant-box",
+        "final-bar-stage1-reseat"
       ]
     }
   ]
