@@ -47,20 +47,6 @@ pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 15] = [
     "TALLY_BRIEF_HASH",
     "TALLY_GATE_MANIFEST",
 ];
-pub(super) const GH_TALLY_ENVIRONMENT: [&str; 11] = [
-    "TALLY_GH_REPO",
-    "TALLY_GH_NUMBER",
-    "TALLY_GH_URL",
-    "TALLY_GH_TYPE",
-    "TALLY_GH_HEAD_SHA",
-    "TALLY_GH_NODE_ID",
-    "TALLY_GH_TRIGGER_KIND",
-    "TALLY_GH_TRIGGER_ACTOR",
-    "TALLY_GH_EVENT_ID",
-    "TALLY_GH_COMMENT_ID",
-    "TALLY_GH_CONTEXT",
-];
-pub(super) const GH_CONTEXT_DIRECTORY: &str = "github-context";
 pub(super) const LAUNCH_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -146,8 +132,6 @@ pub struct ExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_token: Option<String>,
     pub environment: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gh_origin: Option<GhOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

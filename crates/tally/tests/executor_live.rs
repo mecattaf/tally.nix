@@ -73,7 +73,6 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         tally_socket: None,
         job_token: None,
         environment: BTreeMap::new(),
-        gh_origin: None,
         brief_hash: None,
         brief_path: None,
         brief_document: None,

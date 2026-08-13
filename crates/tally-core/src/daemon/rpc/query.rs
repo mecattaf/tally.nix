@@ -1423,10 +1423,6 @@ pub(crate) fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
         resumed_from: row.resumed_from.clone(),
         attempt: row.attempt,
         model: row.model.clone(),
-        gh_origin: row
-            .gh_origin
-            .as_ref()
-            .and_then(crate::query::GhOriginProjection::from_origin),
         related_trigger: row.related_trigger.clone(),
     }
 }

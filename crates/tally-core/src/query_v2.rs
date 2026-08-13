@@ -13,14 +13,11 @@ use crate::journal::TallyEvent;
 use crate::occupancy::{ContextWindow, ContextWindowSource};
 use crate::provenance::{Orchestration, TaskRef};
 use crate::query::{
-    GhOriginProjection, HeadroomSignal, RowStatus, StandupDigest, StandupRunUsage,
-    StandupUsageBasis, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
+    HeadroomSignal, RowStatus, StandupDigest, StandupRunUsage, StandupUsageBasis,
+    QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
 use crate::reader_state::ReaderState;
-use crate::taskdb::{
-    related_trigger_from_gh_origin, AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed,
-    WorkspaceMetadata,
-};
+use crate::taskdb::{AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed, WorkspaceMetadata};
 use crate::usage::{UsageAccounting, UsageObservation};
 use crate::usage_rollup::{
     roll_up, AttestationEvidence, ExpectedUsageRoster, ExpectedUsageTask, UsageRollup,
@@ -110,10 +107,7 @@ impl RowDetailFact {
         let origin = if let Some(origin) = row.origin.as_ref() {
             origin
         } else {
-            fallback_origin = row.gh_origin.as_ref().map_or_else(
-                || AdmissionOrigin::direct(row.source),
-                |github| AdmissionOrigin::github(&github.producer, github.clone()),
-            );
+            fallback_origin = AdmissionOrigin::direct(row.source);
             &fallback_origin
         };
         Self {
@@ -150,11 +144,7 @@ impl RowDetailFact {
             evidence_class: row.evidence_class.clone(),
             manifest_hash: row.manifest_hash.clone(),
             origin: OriginProjection::from_admission(origin),
-            related_trigger: row.related_trigger.clone().or_else(|| {
-                row.gh_origin
-                    .as_ref()
-                    .and_then(|origin| related_trigger_from_gh_origin(origin).ok())
-            }),
+            related_trigger: row.related_trigger.clone(),
         }
     }
 }
@@ -164,7 +154,6 @@ impl RowDetailFact {
 pub struct OriginProjection {
     pub source: String,
     pub producer: Option<ProducerOrigin>,
-    pub github: Option<GhOriginProjection>,
 }
 
 impl OriginProjection {
@@ -172,10 +161,6 @@ impl OriginProjection {
         Self {
             source: origin.source.as_str().to_owned(),
             producer: origin.producer.clone(),
-            github: origin
-                .github
-                .as_ref()
-                .and_then(GhOriginProjection::from_origin),
         }
     }
 }
@@ -3955,7 +3940,6 @@ mod tests {
             origin: OriginProjection {
                 source: "manual".to_owned(),
                 producer: None,
-                github: None,
             },
             related_trigger: None,
             usage: None,
@@ -5817,7 +5801,6 @@ mod tests {
                 gpu_seconds: None,
                 verdict: Verdict::Pass,
                 session_ref: None,
-                gh_origin: None,
             }],
             in_flight: Vec::new(),
             reused: 0,
@@ -6489,7 +6472,6 @@ mod tests {
             gpu_seconds: None,
             verdict: Verdict::Pass,
             session_ref: None,
-            gh_origin: None,
         });
         digest.runs = vec![
             StandupRunUsage {
@@ -6638,7 +6620,6 @@ mod tests {
             gpu_seconds: Some(999.0),
             verdict: Verdict::Reused,
             session_ref: None,
-            gh_origin: None,
         });
         digest.reused = 2;
         digest.canonical_gpu_seconds = 49.0;
@@ -6876,7 +6857,6 @@ mod tests {
             gpu_seconds: None,
             verdict: Verdict::Pass,
             session_ref: None,
-            gh_origin: None,
         };
         let mut digest = standup_fixture(tasks[0]);
         assert_eq!(digest.completed.len(), 1, "fixture seeds `completed`");
@@ -6888,7 +6868,6 @@ mod tests {
             session_ref: None,
             state: "running".to_owned(),
             last_event_at: None,
-            gh_origin: None,
         }];
         digest.runs = vec![StandupRunUsage {
             flow_run_id: archived_run.to_owned(),

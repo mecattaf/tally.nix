@@ -23,8 +23,7 @@ use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
 use crate::taskdb::{
-    effective_cwd, gh_trigger_task_uuid, AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTrigger,
-    WorkspaceMetadata,
+    effective_cwd, AdmissionOrigin, EnqueueSource, RelatedTrigger, WorkspaceMetadata,
 };
 use crate::witness::Derivation;
 
@@ -513,12 +512,6 @@ define_enqueue_payload! {
     caller_job_id: Option<String> => "callerJobId",
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caller_job_token: Option<String> => "callerJobToken",
-    #[serde(default, rename = "ghTriggerActor", alias = "ghActor")]
-    gh_trigger_actor: Option<String> => "ghTriggerActor",
-    #[serde(default)]
-    gh_self_actor: Option<String> => "ghSelfActor",
-    #[serde(default)]
-    gh_origin: Option<GhOrigin> => "ghOrigin",
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_uuid: Option<String> => "taskUuid",
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,7 +565,6 @@ pub struct ResolvedEnqueue {
     pub no_enqueue: bool,
     pub credentials: BTreeMap<String, PathBuf>,
     pub origin: AdmissionOrigin,
-    pub gh_origin: Option<GhOrigin>,
     pub task_uuid: Option<String>,
     pub related_trigger: Option<RelatedTrigger>,
     pub depth: u32,
@@ -756,7 +748,7 @@ impl GuardrailState {
 
     pub fn validate_enqueue(
         &mut self,
-        mut payload: EnqueuePayload,
+        payload: EnqueuePayload,
         defaults: &ProducerDefaults,
     ) -> Result<ResolvedEnqueue, WireError> {
         let argv = match (payload.invocation.as_deref(), payload.argv) {
@@ -822,18 +814,10 @@ impl GuardrailState {
         let evidence = evidence_spec.render();
 
         let source = payload.source.unwrap_or(defaults.source);
-        if payload.gh_origin.is_none() {
-            payload.gh_origin = payload
-                .origin
-                .as_ref()
-                .and_then(|origin| origin.github.clone());
-        }
-        let origin = payload.origin.clone().unwrap_or_else(|| {
-            payload.gh_origin.as_ref().map_or_else(
-                || AdmissionOrigin::direct(source),
-                |github| AdmissionOrigin::github(&github.producer, github.clone()),
-            )
-        });
+        let origin = payload
+            .origin
+            .clone()
+            .unwrap_or_else(|| AdmissionOrigin::direct(source));
         if origin.source != source {
             return Err(WireError::invalid(
                 "origin source does not match enqueue source",
@@ -842,14 +826,6 @@ impl GuardrailState {
         origin
             .validate()
             .map_err(|error| WireError::invalid(error.to_string()))?;
-        if origin.github.as_ref() != payload.gh_origin.as_ref() {
-            return Err(WireError::invalid(
-                "legacy ghOrigin and nested origin github detail disagree",
-            ));
-        }
-        if payload.gh_origin.is_some() && source != EnqueueSource::Gh {
-            return Err(WireError::invalid("ghOrigin is valid only for source=gh"));
-        }
         if let Some(related) = &payload.related_trigger {
             if source == EnqueueSource::Gh {
                 return Err(WireError::invalid(
@@ -860,62 +836,14 @@ impl GuardrailState {
                 .validate()
                 .map_err(|error| WireError::invalid(error.to_string()))?;
         }
-        if let Some(origin) = &payload.gh_origin {
-            origin
-                .validate()
-                .map_err(|error| WireError::invalid(error.to_string()))?;
-            if payload.gh_trigger_actor.as_deref() != Some(origin.trigger_actor.as_str())
-                || payload.gh_self_actor.as_deref() != Some(origin.self_actor.as_str())
-            {
-                return Err(WireError::invalid(
-                    "GitHub trigger actor fields do not match the durable ghOrigin",
-                ));
-            }
-        }
         if let Some(task_uuid) = &payload.task_uuid {
             uuid::Uuid::parse_str(task_uuid)
                 .map_err(|_| WireError::invalid("taskUuid must be a UUID"))?;
-            if let Some(origin) = payload.gh_origin.as_ref() {
-                let expected = gh_trigger_task_uuid(origin)
-                    .map_err(|error| WireError::invalid(error.to_string()))?
-                    .to_string();
-                if task_uuid != &expected {
-                    return Err(WireError::invalid(
-                        "preassigned GitHub taskUuid does not match its trigger identity",
-                    ));
-                }
-            } else if payload.drv.is_none() {
+            if payload.drv.is_none() {
                 return Err(WireError::invalid(
-                    "taskUuid may be preassigned only by a GitHub trigger or drv seed",
+                    "taskUuid may be preassigned only by a drv seed",
                 ));
             }
-        }
-        let excluded = payload.gh_origin.as_ref().is_some_and(|origin| {
-            if origin.schema_version == 0 {
-                if origin.actor_exclude == "self" {
-                    origin.trigger_actor == origin.self_actor
-                } else {
-                    origin.trigger_actor == origin.actor_exclude
-                }
-            } else {
-                (!origin.allowed_actors.is_empty()
-                    && !origin
-                        .allowed_actors
-                        .iter()
-                        .any(|actor| actor == &origin.trigger_actor))
-                    || (origin.trigger_actor == origin.self_actor && !origin.allow_self_triggered)
-                    || origin.trigger_actor == origin.actor_exclude
-            }
-        }) || payload.gh_origin.is_none()
-            && payload
-                .gh_trigger_actor
-                .as_deref()
-                .zip(payload.gh_self_actor.as_deref())
-                .is_some_and(|(actor, own)| actor == own);
-        if source == EnqueueSource::Gh && excluded {
-            return Err(WireError::invalid(
-                "GitHub trigger actor is filtered by producer policy",
-            ));
         }
         let mut pools = payload.pools.unwrap_or_else(|| defaults.pools.clone());
         crate::poolset::canonicalize(&mut pools)
@@ -1015,7 +943,6 @@ impl GuardrailState {
             no_enqueue: payload.no_enqueue,
             credentials: payload.credentials,
             origin,
-            gh_origin: payload.gh_origin,
             task_uuid: payload.task_uuid,
             related_trigger: payload.related_trigger,
             depth,
@@ -2067,15 +1994,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_github_actor_wire_name_maps_to_trigger_actor() {
-        let mut encoded = serde_json::to_value(child_payload()).unwrap();
-        encoded.as_object_mut().unwrap().remove("ghTriggerActor");
-        encoded["ghActor"] = Value::String("legacy-trigger".to_owned());
-        let decoded: EnqueuePayload = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.gh_trigger_actor.as_deref(), Some("legacy-trigger"));
-    }
-
-    #[test]
     fn enqueue_pool_set_rejections_are_actionable_and_canonicalization_is_stable() {
         let mut state = GuardrailState::new(GuardrailConfig::default()).unwrap();
         let mut payload = child_payload();
@@ -2173,9 +2091,6 @@ mod tests {
             origin: None,
             caller_job_id: Some("job-parent".to_owned()),
             caller_job_token: None,
-            gh_trigger_actor: None,
-            gh_self_actor: None,
-            gh_origin: None,
             task_uuid: None,
             related_trigger: None,
             wait: false,
@@ -2307,7 +2222,6 @@ mod tests {
         let resolved = state.validate_enqueue(payload, &defaults()).unwrap();
         assert_eq!(resolved.source, EnqueueSource::Orchestrator);
         assert_eq!(resolved.related_trigger, Some(related.clone()));
-        assert!(resolved.gh_origin.is_none());
 
         let mut dishonest = child_payload();
         dishonest.caller_job_id = None;
@@ -2408,17 +2322,6 @@ mod tests {
             .unwrap_err()
             .message
             .contains("must be absolute"));
-    }
-
-    #[test]
-    fn github_self_actor_is_excluded() {
-        let mut state = GuardrailState::new(GuardrailConfig::default()).unwrap();
-        let mut payload = child_payload();
-        payload.caller_job_id = None;
-        payload.source = Some(EnqueueSource::Gh);
-        payload.gh_trigger_actor = Some("bot".to_owned());
-        payload.gh_self_actor = Some("bot".to_owned());
-        assert!(state.validate_enqueue(payload, &defaults()).is_err());
     }
 
     #[test]

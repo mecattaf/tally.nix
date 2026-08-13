@@ -92,7 +92,6 @@ fn migrate_origin_v1_to_v2(original: &RowSeed) -> Result<RowSeed, String> {
     let mut allowed_delta = original.clone();
     allowed_delta.row_version = 2;
     allowed_delta.origin = canonical.origin.clone();
-    allowed_delta.gh_origin = canonical.gh_origin.clone();
     if allowed_delta != canonical {
         return Err(
             "rowVersion 1 differs from canonical rowVersion 2 beyond origin back-fill".to_owned(),

@@ -1203,7 +1203,7 @@ mod tests {
     use tally_core::config::Priority;
     use tally_core::provenance::Orchestration as KernelOrchestration;
     use tally_core::taskdb::{
-        AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTriggerOutcome, WorkspaceMetadata,
+        AdmissionOrigin, EnqueueSource, RelatedTriggerOutcome, WorkspaceMetadata,
     };
     use tally_core::wire::{
         canonical_payload, canonical_payload_hash, EnqueuePayload, GuardrailConfig, GuardrailState,
@@ -1747,16 +1747,6 @@ export const meta = {
                 PathBuf::from("/run/credentials/token"),
             )]),
             origin: AdmissionOrigin::direct(EnqueueSource::Orchestrator),
-            gh_origin: Some(
-                serde_json::from_value::<GhOrigin>(json!({
-                    "producer": "github",
-                    "source": "notifications",
-                    "actor": "maintainer",
-                    "selfActor": "tally-bot",
-                    "actorExclude": "tally-bot"
-                }))
-                .unwrap(),
-            ),
             task_uuid: Some("00000000-0000-4000-8000-000000000144".to_owned()),
             related_trigger: Some(related_trigger()),
             depth: 4,
