@@ -24,6 +24,8 @@ SPEC.loader.exec_module(driver)
 
 MISSING = object()
 
+TASK_REVISION = "sha256:" + "c" * 64
+
 
 def git(*argv: str, cwd: Path | None = None, check: bool = True) -> str:
     return subprocess.run(
@@ -165,7 +167,11 @@ class PublicationHarness(unittest.TestCase):
         git("push", "--set-upstream", "origin", "main", cwd=self.checkout)
         self.base_rev = git("rev-parse", "HEAD", cwd=self.checkout)
         self.local_branch = "tally-work/fixture/conflict-domain"
-        self.publish_branch = "tally/fixture-issue-7/conflict-domain"
+        self.publish_branch = driver.stable_publish_branch(
+            "fixture", "7", "conflict-domain", TASK_REVISION
+        )
+        self.integration_ref = f"refs/heads/{driver.integration_branch('fixture', '7')}"
+        git("update-ref", self.integration_ref, self.base_rev, cwd=self.checkout)
         self.advances = 0
         git("switch", "-c", self.local_branch, cwd=self.checkout)
 
@@ -195,7 +201,10 @@ class PublicationHarness(unittest.TestCase):
             },
             "runId": "conflict-domain-test",
             "workspaceRoot": str(self.root / "workspaces"),
-            "task": task("conflict-domain", conflict_domains),
+            "task": {
+                **task("conflict-domain", conflict_domains),
+                "revision": TASK_REVISION,
+            },
             "domainsRequired": domains_required,
             "workspace": {
                 "taskId": "conflict-domain",
@@ -242,6 +251,10 @@ class PublicationHarness(unittest.TestCase):
         about rebased lanes while the other production shape disagreed, which
         is the failure #338 landed this helper to prevent. `BASE_MERGE_METHOD`
         selects one; `PublicationHarness` subclasses run the suite under both.
+
+        The campaign's own base is its local integration branch, so the landed
+        commit advances that branch too: it is the revision publication and the
+        gates resolve a lane's path union against.
         """
         advancer = self.root / "advancer"
         if not advancer.exists():
@@ -268,14 +281,21 @@ class PublicationHarness(unittest.TestCase):
             git("merge", "--no-ff", "--no-edit", sibling, cwd=advancer)
         git("push", "origin", "main", cwd=advancer)
         git("fetch", "origin", cwd=self.checkout)
-        return git("rev-parse", "HEAD", cwd=advancer)
+        advanced = git("rev-parse", "HEAD", cwd=advancer)
+        git("update-ref", self.integration_ref, advanced, cwd=self.checkout)
+        return advanced
+
+    def published_head(self) -> str:
+        return git(
+            "rev-parse", f"refs/heads/{self.publish_branch}", cwd=self.checkout
+        )
 
     def assert_not_published(self) -> None:
         result = subprocess.run(
             [
                 "git",
-                "--git-dir",
-                str(self.remote),
+                "-C",
+                str(self.checkout),
                 "show-ref",
                 "--verify",
                 "--quiet",
@@ -308,15 +328,7 @@ class PublicationConflictDomainTests(PublicationHarness):
             published["ownership"]["ownedPaths"],
             ["internal/cli/root.go", "internal/contacts/model.go"],
         )
-        self.assertEqual(
-            git(
-                "--git-dir",
-                str(self.remote),
-                "rev-parse",
-                f"refs/heads/{self.publish_branch}",
-            ),
-            head,
-        )
+        self.assertEqual(self.published_head(), head)
 
     def test_shared_registration_file_is_rejected_before_push_when_undeclared(self) -> None:
         contact = self.checkout / "internal/contacts/model.go"
@@ -442,16 +454,17 @@ class PublicationConflictDomainTests(PublicationHarness):
         )
         published_head = self.commit("fixture: under-declare rebased task")
         git(
-            "push",
-            "origin",
-            f"HEAD:refs/heads/{self.publish_branch}",
+            "update-ref",
+            f"refs/heads/{self.publish_branch}",
+            published_head,
             cwd=self.checkout,
         )
 
         git("switch", "main", cwd=self.checkout)
         (self.checkout / "README.md").write_text("advanced base\n", encoding="utf-8")
-        self.commit("fixture: advance base")
+        advanced = self.commit("fixture: advance base")
         git("push", "origin", "main", cwd=self.checkout)
+        git("update-ref", self.integration_ref, advanced, cwd=self.checkout)
         git("switch", self.local_branch, cwd=self.checkout)
 
         brief = self.brief(["internal/contacts"])
@@ -485,21 +498,7 @@ class PublicationConflictDomainTests(PublicationHarness):
         ):
             driver.action_rebase(brief)
 
-        self.assertNotEqual(
-            subprocess.run(
-                [
-                    "git",
-                    "--git-dir",
-                    str(self.remote),
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    f"refs/heads/{self.publish_branch}",
-                ],
-                check=False,
-            ).returncode,
-            0,
-        )
+        self.assert_not_published()
 
     def test_rebase_fast_path_rechecks_and_witnesses_ownership(self) -> None:
         contact = self.checkout / "internal/contacts/model.go"
@@ -860,7 +859,7 @@ class PublicationConflictDomainTests(PublicationHarness):
         ):
             driver.action_merge(merge_brief(False))
         self.assertEqual(
-            git("--git-dir", str(self.remote), "rev-parse", "refs/heads/main"),
+            git("rev-parse", self.integration_ref, cwd=self.checkout),
             self.base_rev,
         )
 
@@ -868,7 +867,11 @@ class PublicationConflictDomainTests(PublicationHarness):
 
         self.assertEqual(merged["taskId"], "conflict-domain")
         self.assertEqual(merged["ownership"], integrated["ownership"])
-        self.assertNotEqual(
+        self.assertEqual(
+            git("rev-parse", self.integration_ref, cwd=self.checkout),
+            merged["mergeCommit"],
+        )
+        self.assertEqual(
             git("--git-dir", str(self.remote), "rev-parse", "refs/heads/main"),
             self.base_rev,
         )
@@ -911,7 +914,10 @@ class PublicationNarrationTests(PublicationHarness):
                 "repository": "acme/spec",
                 "issue": self.brief()["issue"],
                 "workspaceRoot": str(self.root / "workspaces"),
-                "task": task("conflict-domain", ["README.md"]),
+                "task": {
+                    **task("conflict-domain", ["README.md"]),
+                    "revision": TASK_REVISION,
+                },
             },
             config,
             {
@@ -966,15 +972,14 @@ class PublicationNarrationTests(PublicationHarness):
 
         merge_commit = self.merge_squash(published, head)
         self.assertEqual(
-            git("--git-dir", str(self.remote), "log", "-1", "--format=%B", merge_commit).strip(),
+            git("log", "-1", "--format=%B", merge_commit, cwd=self.checkout).strip(),
             "feat(readme): record the delivered behavior\n\n"
-            "Narrated by the steward, executed by the node.",
+            "Narrated by the steward, executed by the node.\n\n"
+            + driver.completion_trailer_block("conflict-domain", TASK_REVISION),
         )
         self.assertEqual(
             len(
-                git(
-                    "--git-dir", str(self.remote), "log", "-1", "--format=%P", merge_commit
-                ).split()
+                git("log", "-1", "--format=%P", merge_commit, cwd=self.checkout).split()
             ),
             1,
         )
@@ -1010,13 +1015,10 @@ class PublicationNarrationTests(PublicationHarness):
             ["failed", "failed"],
         )
         # The lane proceeds: the branch is published and the squash still lands.
-        self.assertEqual(
-            git("--git-dir", str(self.remote), "rev-parse", f"refs/heads/{self.publish_branch}"),
-            head,
-        )
+        self.assertEqual(self.published_head(), head)
         merge_commit = self.merge_squash(published, head)
         self.assertEqual(
-            git("--git-dir", str(self.remote), "log", "-1", "--format=%s", merge_commit),
+            git("log", "-1", "--format=%s", merge_commit, cwd=self.checkout),
             "conflict-domain: Implement conflict-domain",
         )
 

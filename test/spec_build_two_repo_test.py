@@ -177,11 +177,9 @@ class TwoRepositoryCampaign(unittest.TestCase):
     def land_task_one(self) -> str:
         """Put a marked task-1 commit on the local integration branch."""
         reconciliation = driver.action_reconcile(self.brief())
-        marker = driver.pull_request_marker(
-            "fixture", "7", "task-1", self.task_one["revision"]
-        )
+        trailers = driver.completion_trailer_block("task-1", self.task_one["revision"])
         landed = self.code.commit(
-            "src/task-1.txt", "done\n", f"fixture: land task-1\n\n{marker}"
+            "src/task-1.txt", "done\n", f"fixture: land task-1\n\n{trailers}"
         )
         integration_ref = f"refs/heads/{driver.integration_branch('fixture', '7')}"
         git(

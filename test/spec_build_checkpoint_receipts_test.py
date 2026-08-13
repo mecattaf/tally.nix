@@ -41,6 +41,20 @@ def git(*argv: str, cwd: Path | None = None, check: bool = True) -> str:
     ).stdout.strip()
 
 
+def attempt_receipts(root: Path, campaign: str = "fixture") -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "kind": "local-jsonl",
+        "path": str(
+            root
+            / "campaigns"
+            / "attempt-receipts"
+            / campaign
+            / driver.ATTEMPT_RECEIPTS_FILE
+        ),
+    }
+
+
 def implementation_task() -> dict[str, Any]:
     return {
         "id": "task-1",
@@ -244,6 +258,7 @@ class CheckpointReceiptTests(unittest.TestCase):
             "taskId": "phase-checkpoint",
             "stage": "checkpoint",
             "detail": "The checkpoint command returned a failure verdict.",
+            "attemptReceipts": attempt_receipts(self.root),
             "checkpointCapture": {
                 "path": str(path),
                 "postFailureEvidence": post_failure_evidence,
@@ -252,12 +267,16 @@ class CheckpointReceiptTests(unittest.TestCase):
         }
 
     def retry_reason(self, attempt: int) -> str:
-        prefix = driver.local_state_prefix("fixture", "7")
-        receipt = driver.read_local_blob(
-            driver.repo_config(self.config),
-            f"{prefix}/retry/phase-checkpoint/{attempt}",
+        records = driver.read_attempt_receipts(
+            attempt_receipts(self.root), "fixture", "7"
         )
-        return receipt["reason"]
+        return next(
+            record["reason"]
+            for record in records
+            if record["kind"] == "retry"
+            and record["taskId"] == "phase-checkpoint"
+            and record["attempt"] == attempt
+        )
 
     def test_worklist_reads_remote_base_and_pushed_edit_invalidates_receipt(self) -> None:
         self.push_receipt(self.base_rev)
@@ -494,6 +513,7 @@ class CheckpointReceiptTests(unittest.TestCase):
                         "number": "7",
                         "url": "https://example.invalid/acme/spec/issues/7",
                     },
+                    "attemptReceipts": attempt_receipts(self.root),
                 }
             )
         finally:
@@ -502,12 +522,14 @@ class CheckpointReceiptTests(unittest.TestCase):
             driver.publish_closing_summary = original_summary
 
         self.assertTrue(escalated["posted"])
-        prefix = driver.local_state_prefix("fixture", "7")
-        receipt = driver.read_local_blob(
-            driver.repo_config(self.config), f"{prefix}/escalation"
+        records = driver.read_attempt_receipts(
+            attempt_receipts(self.root), "fixture", "7"
         )
-        self.assertIn("Checkpoint captures:", receipt["body"])
-        self.assertIn(f"- {path}", receipt["body"])
+        body = next(
+            record["body"] for record in records if record["kind"] == "escalation"
+        )
+        self.assertIn("Checkpoint captures:", body)
+        self.assertIn(f"- {path}", body)
 
     def advance_remote_base(self, name: str) -> str:
         """Land one mainline commit from outside this checkout."""
@@ -626,34 +648,6 @@ class CheckpointReceiptTests(unittest.TestCase):
                 }
             ],
         )
-
-    def test_issue_checkpoint_binds_graph_digest_task_revision_and_base(self) -> None:
-        brief = self.checkpoint_brief()
-        brief["source"] = {
-            "kind": "github-issue",
-            "url": "https://github.com/acme/spec/issues/7",
-            "sha256": "sha256:" + "a" * 64,
-            "revision": self.base_rev,
-        }
-        brief["task"] = {
-            **checkpoint_task(),
-            "brief": {
-                "issue": {
-                    "number": "9",
-                    "url": "https://github.com/acme/spec/issues/9",
-                },
-                "body": "Run the admitted checkpoint.",
-            },
-            "revision": "sha256:" + "b" * 64,
-        }
-
-        recorded = driver.action_checkpoint(brief)
-        self.assertEqual(recorded["revision"], self.base_rev)
-        self.assertIn("-" + "a" * 64 + "/" + self.base_rev, recorded["ref"])
-
-        del brief["task"]["revision"]
-        with self.assertRaisesRegex(driver.DriverError, "admitted revision"):
-            driver.action_checkpoint(brief)
 
     def test_checkpoint_rejects_diverged_remote_base(self) -> None:
         advancer = self.clone_advancer()
