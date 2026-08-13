@@ -49,9 +49,6 @@
     {"name": "reject-merge-enum", "expect": "reject", "ops": [
       {"op": "set", "path": ["mergeMethod"], "value": "rebase"}
     ]},
-    {"name": "reject-git-ai-enum", "expect": "reject", "ops": [
-      {"op": "set", "path": ["gitAiBinding"], "value": "silent"}
-    ]},
     {"name": "reject-priority-enum", "expect": "reject", "ops": [
       {"op": "set", "path": ["agent", "priority"], "value": "background"}
     ]},

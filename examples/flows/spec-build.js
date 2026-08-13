@@ -154,8 +154,6 @@ export const meta = {
               "runtimeMaxSec",
               "pool",
               "mergeMethod",
-              "gitAiBinding",
-              "gitAiAwaitSec",
               "agent",
               "steward",
               "gates",
@@ -196,8 +194,6 @@ export const meta = {
                 pattern: "^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|campaign/(?!\\.{1,2}/)[A-Za-z0-9_.-]+/(?!\\.{1,2}$)[A-Za-z0-9_.-]+)$"
               },
               mergeMethod: { enum: ["merge", "squash"] },
-              gitAiBinding: { enum: ["off", "advisory", "required"] },
-              gitAiAwaitSec: { type: "integer", minimum: 1 },
               agent: { $ref: "#/$defs/canonicalAgent" },
               steward: { $ref: "#/$defs/canonicalSteward" },
               gates: {
@@ -442,13 +438,6 @@ export const meta = {
       // default, `squash`: the footprint a campaign should leave behind is one
       // conventional commit per task, not a merge commit with a template message.
       mergeMethod: { enum: ["merge", "squash"] },
-      // Whether the merge node binds Git AI authorship on the commit it
-      // integrated. Absent means `off`: the shipped state binds nothing.
-      gitAiBinding: { enum: ["off", "advisory", "required"] },
-      // How long the merge node may wait on git-ai's settlement barrier. The
-      // module derives it from this campaign's own node deadline; absent is
-      // the driver's default.
-      gitAiAwaitSec: { type: "integer", minimum: 1 },
       // Both module-declared and forge-native paths carry the normalized
       // contract; the driver never fills these members in.
       steward: { $ref: "#/$defs/canonicalSteward" },
@@ -769,8 +758,6 @@ const effectiveConfigSchema = {
     "repositoryConfig",
     "maxParallel",
     "mergeMethod",
-    "gitAiBinding",
-    "gitAiAwaitSec",
     "agent",
     "gates"
   ],
@@ -793,8 +780,6 @@ const effectiveConfigSchema = {
     },
     maxParallel: { type: "integer", minimum: 1, maximum: 128 },
     mergeMethod: { enum: ["merge", "squash"] },
-    gitAiBinding: { enum: ["off", "advisory", "required"] },
-    gitAiAwaitSec: { type: "integer", minimum: 1 },
     agent: canonicalCampaignAgentSchema,
     steward: canonicalCampaignStewardSchema,
     gates: {
@@ -1215,32 +1200,6 @@ const integrationSchema = {
   additionalProperties: false
 };
 
-// What the post-merge Git AI binding found, journaled with the merge node.
-// It is a receipt, never a gate: under `advisory` every status other than
-// `bound` is an observable warning and the campaign continues.
-const authorshipReceiptSchema = {
-  type: ["object", "null"],
-  required: ["binding", "status", "revision", "noteRef", "published", "reason"],
-  properties: {
-    binding: { enum: ["advisory", "required"] },
-    // Exactly what `bind_authorship` can settle on. `conflict` is the remote
-    // already carrying a different authorship record for this revision, which
-    // is refused rather than merged.
-    status: {
-      enum: ["bound", "unavailable", "missing-note", "mismatch", "conflict", "error"]
-    },
-    revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
-    noteRef: { const: "refs/notes/ai" },
-    // The campaign remote's refs/notes/ai after publication -- what a reader
-    // fetching the notes ref will resolve, not what the checkout holds.
-    notesRefTarget: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
-    noteSha256: { type: ["string", "null"], pattern: "^sha256:[0-9a-f]{64}$" },
-    published: { type: "boolean" },
-    reason: { type: ["string", "null"], maxLength: 400 }
-  },
-  additionalProperties: false
-};
-
 const mergeSchema = {
   type: "object",
   required: [
@@ -1250,7 +1209,6 @@ const mergeSchema = {
     "pullRequest",
     "regated",
     "ownership",
-    "authorship",
     "trailer"
   ],
   properties: {
@@ -1260,10 +1218,9 @@ const mergeSchema = {
     pullRequest: { type: "string", minLength: 1 },
     regated: { type: "boolean" },
     ownership: ownershipSchema,
-    authorship: authorshipReceiptSchema,
     // The exact `Assisted-by:` line the node wrote into the squash message,
     // or null when the campaign could not name the assisting session. The
-    // trailer is a pointer; the note is the proof.
+    // trailer is a pointer into the witness ledger.
     trailer: { type: ["string", "null"], maxLength: 400 }
   },
   additionalProperties: false
@@ -2095,8 +2052,6 @@ function sweepDeferral(sweepNode) {
         repositoryConfig: args.repositories[codeRepository],
         maxParallel: args.maxParallel,
         mergeMethod: args.mergeMethod || "squash",
-        gitAiBinding: args.gitAiBinding || "off",
-        gitAiAwaitSec: args.gitAiAwaitSec || 60,
         postFailureEvidence: args.postFailureEvidence === true,
         postFailureStderr: args.postFailureStderr === true,
         agent: diagnosisSandboxed(args.agent),
@@ -2980,8 +2935,6 @@ function sweepDeferral(sweepNode) {
         task,
         domainsRequired,
         mergeMethod: effective.mergeMethod,
-        gitAiBinding: effective.gitAiBinding,
-        gitAiAwaitSec: effective.gitAiAwaitSec,
         assistedBy: lane.assistedBy || null,
         workspace: lane.prepared,
         integration: integration.result

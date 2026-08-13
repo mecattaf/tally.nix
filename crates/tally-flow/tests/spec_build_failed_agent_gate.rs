@@ -526,7 +526,6 @@ fn restamp_replies(task: Value) -> BTreeMap<String, Reply> {
             "pullRequest": "https://github.com/acme/spec/pull/9",
             "regated": false,
             "ownership": ownership,
-            "authorship": null,
             "trailer": null
         })),
     );

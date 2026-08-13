@@ -47,8 +47,6 @@ fn campaign_args(runner_pool: &str) -> Value {
                 "runtimeMaxSec": null,
                 "pool": runner_pool,
                 "mergeMethod": "squash",
-                "gitAiBinding": "off",
-                "gitAiAwaitSec": 30,
                 "agent": {
                     "adapter": "codex",
                     "argv": ["implement"],

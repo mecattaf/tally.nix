@@ -3357,9 +3357,6 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 "1",
                 "task integration must not advance the shared remote base"
             );
-            // gitAiBinding defaults to off, so the merge node binds nothing
-            // and says so rather than leaving the reader to guess.
-            assert_eq!(second_value["merged"][0]["authorship"], Value::Null);
             assert_eq!(second_value["failures"][0]["taskId"], "task-1");
             assert_eq!(
                 second_value["failures"][0]["stage"],

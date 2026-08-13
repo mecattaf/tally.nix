@@ -1825,7 +1825,7 @@ fn local_campaign_declaration_from_document(
                 ))
             })
         };
-        let mut manifest_config = json!({
+        let manifest_config = json!({
             "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
             "name": campaign,
             "repository": code_repository_config,
@@ -1840,14 +1840,6 @@ fn local_campaign_declaration_from_document(
             "gates": required("gates")?,
             "tasks": [],
         });
-        for field in ["gitAiBinding", "gitAiAwaitSec"] {
-            if let Some(value) = brief.get(field) {
-                manifest_config
-                    .as_object_mut()
-                    .expect("local manifest configuration is an object")
-                    .insert(field.to_owned(), value.clone());
-            }
-        }
         let declared_path = |field: &str| -> Result<PathBuf> {
             let value = brief
                 .get(field)
@@ -4964,78 +4956,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_git_ai_binding_is_off_by_default_and_refuses_unknown_postures() {
-        // The shipped state binds nothing. A local manifest that names
-        // no posture gets the same integration it always had.
-        let tasks = json!([{ "id": "task-1", "kind": "implementation", "issue": 8 }]);
-        let manifest: CampaignManifest =
-            serde_json::from_value(manifest_value_for_test(tasks.clone())).unwrap();
-        assert_eq!(manifest.git_ai_binding, "off");
-        assert!(manifest.agent.model.is_none());
-        validate_manifest(&manifest).unwrap();
-
-        for posture in ["advisory", "required"] {
-            let mut value = manifest_value_for_test(tasks.clone());
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert("gitAiBinding".into(), json!(posture));
-            let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
-            validate_manifest(&manifest).unwrap();
-            assert_eq!(manifest.git_ai_binding, posture);
-        }
-
-        let mut value = manifest_value_for_test(tasks.clone());
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("gitAiBinding".into(), json!("on"));
-        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
-        let error = validate_manifest(&manifest).unwrap_err().to_string();
-        assert!(
-            error.contains("gitAiBinding must be off, advisory, or required"),
-            "{error}"
-        );
-
-        // The settlement barrier runs inside the merge node, so its budget and
-        // that node's deadline are not independent numbers. A pairing that
-        // would kill the node mid-await on every task is refused at arm time
-        // rather than presenting later as a timeout.
-        let mut value = manifest_value_for_test(tasks.clone());
-        let object = value.as_object_mut().unwrap();
-        object.insert("gitAiBinding".into(), json!("advisory"));
-        object.insert("gitAiAwaitSec".into(), json!(60));
-        object.insert("driverRuntimeMaxSec".into(), json!(90));
-        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
-        let error = validate_manifest(&manifest).unwrap_err().to_string();
-        assert!(
-            error.contains("driverRuntimeMaxSec must be at least twice gitAiAwaitSec (120)"),
-            "{error}"
-        );
-
-        let mut value = manifest_value_for_test(tasks.clone());
-        let object = value.as_object_mut().unwrap();
-        object.insert("gitAiBinding".into(), json!("advisory"));
-        object.insert("gitAiAwaitSec".into(), json!(12));
-        object.insert("driverRuntimeMaxSec".into(), json!(30));
-        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
-        validate_manifest(&manifest).unwrap();
-        assert_eq!(manifest.git_ai_await_sec, 12);
-
-        // With the binding off the two numbers are unrelated again, which is
-        // what keeps the shipped default from constraining anyone.
-        let mut value = manifest_value_for_test(tasks.clone());
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("driverRuntimeMaxSec".into(), json!(5));
-        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
-        validate_manifest(&manifest).unwrap();
-        assert_eq!(manifest.git_ai_await_sec, 60);
-
+    fn manifest_agent_model_must_be_non_empty_when_present() {
         // An empty model would render a job asking the adapter for nothing at
         // all, and a trailer naming nothing at all.
-        let mut value = manifest_value_for_test(tasks);
+        let mut value = manifest_value_for_test(json!([
+            { "id": "task-1", "kind": "implementation", "issue": 8 }
+        ]));
         value
             .as_object_mut()
             .unwrap()

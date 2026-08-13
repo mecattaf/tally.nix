@@ -72,8 +72,6 @@ def base_manifest(checkout: Path) -> dict[str, Any]:
         "runtimeMaxSec": 600,
         "pool": "campaign",
         "mergeMethod": "squash",
-        "gitAiBinding": "off",
-        "gitAiAwaitSec": 60,
         "agent": {
             "adapter": "shell",
             "argv": ["/bin/sh", "-c", "true"],
