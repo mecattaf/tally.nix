@@ -232,6 +232,130 @@
             exit 23
           '';
         };
+        pollLivenessProbe = pkgs.writeShellApplication {
+          name = "tally-poll-liveness-probe";
+          runtimeInputs = [ pkgs.coreutils ];
+          text = ''
+            set -euo pipefail
+
+            pass_file=/srv/tally/poll-liveness/passes
+            passes=0
+            if test -e "$pass_file"; then
+              read -r passes < "$pass_file"
+            fi
+            passes=$((passes + 1))
+            printf '%s\n' "$passes" > "$pass_file"
+
+            if test "$passes" -eq 1; then
+              printf '%s\n' 'TALLY_FINAL_MESSAGE={"campaign":"poll-liveness-vm","repository":"acme/poll-liveness","tasks":[{"id":"foundation","title":"Foundation","dependencies":[]},{"id":"liveness-task","title":"Liveness task","dependencies":["foundation"]}],"merged":[{"taskId":"foundation","pullRequest":"local://acme/poll-liveness/foundation"}],"checkpoints":[],"frontier":[],"anomalies":[]}'
+            else
+              printf '%s\n' 'TALLY_FINAL_MESSAGE={"campaign":"poll-liveness-vm","repository":"acme/poll-liveness","tasks":[{"id":"foundation","title":"Foundation","dependencies":[]},{"id":"liveness-task","title":"Liveness task","dependencies":["foundation"]}],"merged":[{"taskId":"foundation","pullRequest":"local://acme/poll-liveness/foundation"},{"taskId":"liveness-task","pullRequest":"local://acme/poll-liveness/liveness-task"}],"checkpoints":[],"frontier":[],"anomalies":[]}'
+            fi
+          '';
+        };
+        pollLivenessFlow = pkgs.writeText "tally-poll-liveness-flow.js" ''
+          export const meta = {
+            name: "spec-build",
+            description: "exercise unchanged-observation campaign liveness",
+            pools: ["campaign-control"],
+            argsSchema: {
+              type: "object",
+              required: ["campaignIdentity"],
+              properties: {
+                campaignIdentity: { type: "string", minLength: 1 }
+              },
+              additionalProperties: true
+            },
+            maxNodes: 1,
+            selectors: []
+          };
+
+          (async () => job({
+            argv: ["${pollLivenessProbe}/bin/tally-poll-liveness-probe"],
+            adapter: "poll-liveness-probe",
+            pools: ["campaign-control"],
+            priority: "low",
+            runtimeMaxSec: 60,
+            evidence: ["exit:0"],
+            key: "spec-build-reconcile",
+            label: "spec-build-reconcile",
+            taskRef: args.campaignIdentity + "/foundation",
+            resultSchema: {
+              type: "object",
+              required: ["campaign", "repository", "tasks", "merged", "frontier"],
+              additionalProperties: true
+            }
+          }, { settle: true }))();
+        '';
+        pollLivenessWorklist = pkgs.writeText "tally-poll-liveness-worklist.json" (
+          builtins.toJSON {
+            schemaVersion = 1;
+            campaign = {
+              name = "poll-liveness-vm";
+              maxTasks = 2;
+              maxParallel = 1;
+              agent = {
+                adapter = "shell";
+                argv = [ "${pkgs.coreutils}/bin/true" ];
+                priority = "low";
+                runtimeMaxSec = 60;
+                approvalPolicy = null;
+                sandboxPolicy = null;
+                diagnosisSandboxPolicy = null;
+              };
+              gates = [
+                {
+                  kind = "command";
+                  id = "fixture";
+                  preflightArgv = [ "${pkgs.coreutils}/bin/true" ];
+                  argv = [ "${pkgs.coreutils}/bin/true" ];
+                }
+              ];
+            };
+            tasks = [
+              {
+                id = "foundation";
+                kind = "implementation";
+                title = "Foundation";
+                goal = "Provide the completed prerequisite for the VM liveness fixture.";
+                deliveredBehaviors = [ "The prerequisite is complete" ];
+                readFirst = {
+                  specSections = [ "VM fixture" ];
+                  styleReferences = [ ];
+                };
+                acceptanceCriteria = [
+                  {
+                    id = "foundation-complete";
+                    description = "The fixture prerequisite passes.";
+                    argv = [ "${pkgs.coreutils}/bin/true" ];
+                  }
+                ];
+                dependencies = [ ];
+                conflictDomains = [ "vm-foundation" ];
+              }
+              {
+                id = "liveness-task";
+                kind = "implementation";
+                title = "Liveness task";
+                goal = "Remain dispatchable after the first VM reconcile pass.";
+                deliveredBehaviors = [ "The next poll dispatches the task" ];
+                readFirst = {
+                  specSections = [ "VM fixture" ];
+                  styleReferences = [ ];
+                };
+                acceptanceCriteria = [
+                  {
+                    id = "liveness-complete";
+                    description = "The liveness fixture passes.";
+                    argv = [ "${pkgs.coreutils}/bin/true" ];
+                  }
+                ];
+                dependencies = [ "foundation" ];
+                conflictDomains = [ "vm-liveness" ];
+              }
+            ];
+          }
+        );
         mkCargoCheck =
           {
             pname,
@@ -1782,6 +1906,11 @@
             {
               imports = [ self.nixosModules.tally ];
               system.stateVersion = "26.11";
+              system.extraDependencies = [
+                pollLivenessFlow
+                pollLivenessProbe
+                pollLivenessWorklist
+              ];
               virtualisation.memorySize = 2048;
 
               systemd.tmpfiles.rules = [
@@ -1806,6 +1935,11 @@
                   pkgs.git
                   pkgs.nix
                 ];
+                adapters."poll-liveness-probe".scrape.finalMessage = {
+                  stream = "stdout";
+                  mode = "regex";
+                  pattern = "^TALLY_FINAL_MESSAGE=(.*)$";
+                };
                 adapters.production-probe = {
                   hardening = "production";
                   extraWritablePaths = [ "/srv/tally/production-agent" ];
@@ -1829,7 +1963,7 @@
             machine.succeed("test \"$(stat -c '%U:%G:%a' /srv/tally/state)\" = tally:tally:700")
 
             result = json.loads(machine.succeed(
-              "${tally}/bin/tally --socket /run/tally/tally.sock enqueue --pool stock --wait -- ${pkgs.coreutils}/bin/true"
+              "${tally}/bin/tally --socket /run/tally/tally.sock queue enqueue --pool stock --wait -- ${pkgs.coreutils}/bin/true"
             ))
             assert result["verdict"] == "pass", result
             assert result["exit_code"] == 0, result
@@ -1851,7 +1985,7 @@
 
             submitted = json.loads(machine.succeed(
               "${tally}/bin/tally --socket /run/tally/tally.sock "
-              "enqueue --pool stock --adapter production-probe -- "
+              "queue enqueue --pool stock --adapter production-probe -- "
               "${hardeningProbe}/bin/tally-hardening-probe"
             ))
             hardened_task = submitted["task_uuid"]
@@ -1921,6 +2055,124 @@
               " 'select(.payload.taskUuid == $task and .payload.adapter == \"production-probe\")' "
               "/srv/tally/state/exec-attestations.jsonl"
             )
+
+            # An unchanged observation used to strand the dependent task once
+            # the prior pass and all of its nodes were terminal. Exercise the
+            # public poll twice: once to prove the liveness arm creates a new
+            # pass rather than reusing the completed dedup witness, then once
+            # to prove an all-done campaign remains at rest.
+            poll_root = "/srv/tally/poll-liveness"
+            checkout = poll_root + "/checkout"
+            remote = poll_root + "/remote.git"
+            worklist = "silent-factory-worklists/vm.json"
+            machine.succeed(
+              "install -d -o tally -g tally -m 0700 "
+              + poll_root + " " + poll_root + "/home " + poll_root + "/workspaces"
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git init --bare --quiet "
+              "--initial-branch=main " + remote
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git init --quiet "
+              "--initial-branch=main " + checkout
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git -C " + checkout
+              + " config user.name 'Poll Liveness VM'"
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git -C " + checkout
+              + " config user.email poll-liveness@example.invalid"
+            )
+            machine.succeed(
+              "install -d -o tally -g tally -m 0700 "
+              + checkout + "/silent-factory-worklists"
+            )
+            machine.succeed(
+              "install -o tally -g tally -m 0600 ${pollLivenessWorklist} "
+              + checkout + "/" + worklist
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git -C " + checkout + " add " + worklist
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git -C " + checkout
+              + " commit --quiet -m 'poll liveness fixture'"
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git -C " + checkout
+              + " remote add origin " + remote
+            )
+            machine.succeed(
+              "runuser -u tally -- ${pkgs.git}/bin/git -C " + checkout
+              + " push --quiet --set-upstream origin main"
+            )
+            campaign_cli = (
+              "runuser -u tally -- ${pkgs.coreutils}/bin/env "
+              "HOME=" + poll_root + "/home XDG_RUNTIME_DIR=/run/user/" + uid + " "
+              "${tally}/bin/tally --config /etc/tally/config.json "
+              "--socket /run/tally/tally.sock --rpc-timeout-sec 120"
+            )
+            campaign_identity = "acme/poll-liveness"
+            campaign_state = "/srv/tally/state"
+            arm = (
+              campaign_cli + " campaign arm " + campaign_identity + " " + worklist
+              + " --checkout " + checkout
+              + " --flow ${pollLivenessFlow}"
+              + " --driver ${pkgs.coreutils}/bin/true"
+              + " --state-dir " + campaign_state
+              + " --workspace-root " + poll_root + "/workspaces --wait"
+            )
+            armed = json.loads(machine.succeed(arm))
+            assert armed["verdict"] == "pass", armed
+            assert machine.succeed("cat " + poll_root + "/passes").strip() == "1"
+
+            status_command = (
+              campaign_cli + " campaign status " + campaign_identity + " " + worklist
+              + " --json --state-dir " + campaign_state
+            )
+            resting = json.loads(machine.succeed(status_command))
+            assert resting["state"] == "idle", resting
+            assert resting["counts"] == {
+              "done": 1,
+              "running": 0,
+              "blocked": 0,
+              "pending": 1,
+            }, resting
+            assert resting["currentNodes"] == [], resting
+            observation = resting["latestObservation"]
+            first_run = resting["flowRunId"]
+
+            poll_command = (
+              campaign_cli + " campaign poll --once --wait --state-dir " + campaign_state
+            )
+            dispatched = [
+              json.loads(line)
+              for line in machine.succeed(poll_command).splitlines()
+            ]
+            assert len(dispatched) == 1, dispatched
+            assert dispatched[0]["status"] == "dispatched", dispatched
+            assert machine.succeed("cat " + poll_root + "/passes").strip() == "2"
+
+            complete = json.loads(machine.succeed(status_command))
+            assert complete["state"] == "complete", complete
+            assert complete["counts"] == {
+              "done": 2,
+              "running": 0,
+              "blocked": 0,
+              "pending": 0,
+            }, complete
+            assert complete["latestObservation"] == observation, complete
+            assert complete["flowRunId"] != first_run, (resting, complete)
+
+            unchanged = [
+              json.loads(line)
+              for line in machine.succeed(poll_command).splitlines()
+            ]
+            assert len(unchanged) == 1, unchanged
+            assert unchanged[0]["status"] == "unchanged", unchanged
+            assert machine.succeed("cat " + poll_root + "/passes").strip() == "2"
 
           '';
         };
@@ -1994,7 +2246,7 @@
             shared = machine.succeed(nix_store + " --add /tmp/tally-shared").strip()
 
             enqueue(
-              cli + " enqueue --pool stock" +
+              cli + " queue enqueue --pool stock" +
               " --evidence store:" + old_only +
               " --evidence store:" + shared +
               " --wait -- ${pkgs.coreutils}/bin/sleep 1"
@@ -2004,7 +2256,7 @@
 
             machine.succeed("${pkgs.coreutils}/bin/sleep 4")
             enqueue(
-              cli + " enqueue --pool stock" +
+              cli + " queue enqueue --pool stock" +
               " --evidence store:" + shared +
               " --wait -- ${pkgs.coreutils}/bin/sleep 1"
             )
