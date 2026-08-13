@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
-"""The two-repository seam, exercised end to end against a local forge.
+"""The two-repository seam, exercised end to end against local repositories.
 
 A spec-corpus campaign reads its worklist from a spec repository, cuts lanes
-and publishes branches on a code repository, and keeps its campaign thread --
-and therefore every machine receipt -- on an issue repository. The three
-coordinates default inward, so the last class in this file is the control: a
-campaign that configures none of them takes the same code path it took before
-the seam existed, and nothing it emits moves.
+and stable branches on a code repository, and keeps its local summaries and
+worker findings on a receipt repository. Attempt receipts live in their own
+append-only JSONL store. The three coordinates default inward, so the last
+class in this file is the single-repository control.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 
 DRIVER = Path(
@@ -34,19 +32,6 @@ assert SPEC is not None and SPEC.loader is not None
 driver = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(driver)
 
-CONTRACT_CORPUS = Path(
-    os.environ.get(
-        "SPEC_BUILD_CONTRACT_CORPUS",
-        Path(__file__).parents[1] / "test/fixtures/spec-build/contract-corpus.json",
-    )
-)
-PULL_REQUEST_WORKSPACE_FIELDS = frozenset(
-    json.loads(CONTRACT_CORPUS.read_text(encoding="utf-8"))["requiredKeySets"][
-        "pullRequestWorkspaceFixture"
-    ]
-)
-
-
 def git(*argv: str, cwd: Path | None = None, check: bool = True) -> str:
     return subprocess.run(
         ["git", *argv],
@@ -55,6 +40,20 @@ def git(*argv: str, cwd: Path | None = None, check: bool = True) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def attempt_receipts(root: Path, campaign: str = "fixture") -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "kind": "local-jsonl",
+        "path": str(
+            root
+            / "campaigns"
+            / "attempt-receipts"
+            / campaign
+            / driver.ATTEMPT_RECEIPTS_FILE
+        ),
+    }
 
 
 def checkpoint_task(identifier: str, dependencies: list[str]) -> dict[str, Any]:
@@ -84,23 +83,8 @@ def implementation_task(identifier: str, domain: str) -> dict[str, Any]:
     }
 
 
-def pull_request_workspace(
-    task_id: str, base_rev: str, publish_branch: str
-) -> dict[str, str]:
-    workspace = {
-        "taskId": task_id,
-        "baseRev": base_rev,
-        "publishBranch": publish_branch,
-    }
-    if set(workspace) != PULL_REQUEST_WORKSPACE_FIELDS:
-        raise AssertionError(
-            "two-repository pull-request fixture keys differ from contract-corpus.json"
-        )
-    return workspace
-
-
 class Repository:
-    """A bare remote plus one writable checkout, the local-forge shape."""
+    """A bare remote plus one writable checkout."""
 
     def __init__(self, root: Path, name: str, owner: str = "acme") -> None:
         self.name = f"{owner}/{name}"
@@ -191,13 +175,20 @@ class TwoRepositoryCampaign(unittest.TestCase):
         self.temporary.cleanup()
 
     def land_task_one(self) -> str:
-        """Put a merged task-1 on the code repository's publish branch."""
-        branch = driver.stable_publish_branch(
+        """Put a marked task-1 commit on the local integration branch."""
+        reconciliation = driver.action_reconcile(self.brief())
+        marker = driver.pull_request_marker(
             "fixture", "7", "task-1", self.task_one["revision"]
         )
-        landed = self.code.commit("src/task-1.txt", "done\n", "fixture: land task-1")
+        landed = self.code.commit(
+            "src/task-1.txt", "done\n", f"fixture: land task-1\n\n{marker}"
+        )
+        integration_ref = f"refs/heads/{driver.integration_branch('fixture', '7')}"
         git(
-            "push", "--quiet", "origin", f"{landed}:refs/heads/{branch}",
+            "update-ref",
+            integration_ref,
+            landed,
+            reconciliation["baseRevision"],
             cwd=self.code.checkout,
         )
         return landed
@@ -253,6 +244,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
             "worklist": "specs/*/tasks.json",
             "maxTasks": 4,
             "maxParallel": 1,
+            "attemptReceipts": attempt_receipts(self.root),
             "specRepository": self.spec.coordinate,
             "issueRepository": self.issues.coordinate,
         }
@@ -376,9 +368,13 @@ class TwoRepositoryCampaign(unittest.TestCase):
             publication["pullRequest"],
             f"local://{self.code.name}/{prepared['publishBranch']}",
         )
-        self.assertIn(
-            f"refs/heads/{prepared['publishBranch']}",
-            self.code.refs(f"refs/heads/{prepared['publishBranch']}"),
+        self.assertEqual(
+            git(
+                "rev-parse",
+                f"refs/heads/{prepared['publishBranch']}",
+                cwd=self.code.checkout,
+            ),
+            head,
         )
 
         merged = driver.action_merge(
@@ -407,12 +403,19 @@ class TwoRepositoryCampaign(unittest.TestCase):
             }
         )
         self.assertEqual(merged["taskId"], "task-1")
-        # The merge landed on the code repository's base branch, and nothing
-        # was written to the spec or issue repositories by the chain.
+        # The merge advances the never-rewritten local integration branch. The
+        # remote base and the other two repositories remain untouched.
         git("fetch", "--quiet", "--prune", "origin", cwd=self.code.checkout)
         self.assertEqual(
-            git("rev-parse", "origin/main", cwd=self.code.checkout),
+            git(
+                "rev-parse",
+                driver.integration_branch("fixture", "7"),
+                cwd=self.code.checkout,
+            ),
             merged["mergeCommit"],
+        )
+        self.assertEqual(
+            git("rev-parse", "origin/main", cwd=self.code.checkout), self.code_rev
         )
         self.assertEqual(self.spec.refs(), {})
         self.assertEqual(self.issues.refs(), {})
@@ -422,53 +425,6 @@ class TwoRepositoryCampaign(unittest.TestCase):
             [fact["taskId"] for fact in settled["merged"]], ["task-1"]
         )
         self.assertEqual(settled["merged"][0]["mergeCommit"], merged["mergeCommit"])
-
-    def pull_request_body(self, **seam: Any) -> str:
-        """The body `github_pull_request` writes, with `gh` stubbed out."""
-        data = {
-            "campaign": "fixture",
-            "repository": self.code.name,
-            "issue": {"number": "7", "url": "https://example.invalid/acme/board/7"},
-            "workspace": pull_request_workspace(
-                "task-1",
-                self.code_rev,
-                driver.stable_publish_branch(
-                    "fixture", "7", "task-1", self.task_one["revision"]
-                ),
-            ),
-            "task": self.task_one,
-            **seam,
-        }
-        created = subprocess.CompletedProcess(
-            [], 0, "https://github.com/acme/code/pull/4\n", ""
-        )
-        with mock.patch.object(driver, "pull_requests_by_head", return_value=[]):
-            with mock.patch.object(driver, "run", return_value=created) as run:
-                driver.github_pull_request(
-                    data,
-                    driver.repo_config(self.code.config),
-                    self.code.checkout,
-                    self.code_rev,
-                    {"source": "template", "subject": "task-1: Build", "body": ""},
-                )
-        command = run.call_args_list[-1].args[0]
-        return command[command.index("--body") + 1]
-
-    def test_the_pull_request_names_the_repository_its_campaign_issue_lives_on(
-        self,
-    ) -> None:
-        """`owner/name#N` resolves in the repository it names, not in the reader's.
-
-        Rendering the campaign back-reference against the code repository put a
-        cross-reference on whatever object happened to be `#7` there -- an
-        unrelated public thread, once per task.
-        """
-        body = self.pull_request_body(
-            specRepository=self.spec.coordinate,
-            issueRepository=self.issues.coordinate,
-        )
-        self.assertIn(f"campaign progress for {self.issues.name}#7", body)
-        self.assertNotIn(f"{self.code.name}#7", body)
 
     def test_the_closing_summary_names_both_histories(self) -> None:
         settled = self.complete_campaign()
@@ -487,7 +443,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
         )
         self.assertNotEqual(settled["baseRevision"], self.spec_rev)
 
-    def test_machine_receipts_land_on_the_issue_repository_only(self) -> None:
+    def test_attempt_receipts_stay_outside_all_three_repositories(self) -> None:
         steered = driver.action_steer(
             {
                 "campaign": "fixture",
@@ -497,27 +453,28 @@ class TwoRepositoryCampaign(unittest.TestCase):
                 "taskId": "task-1",
                 "attempt": 1,
                 "diagnosis": "Diagnosed a lane that needs a narrower change.",
+                "attemptReceipts": attempt_receipts(self.root),
                 "specRepository": self.spec.coordinate,
                 "issueRepository": self.issues.coordinate,
             }
         )
         self.assertTrue(steered["posted"])
-        prefix = driver.local_state_prefix("fixture", "7")
         self.assertEqual(
             steered["comment"],
-            f"local://{self.issues.name}/{prefix}/diagnosis/task-1/1",
+            "local://campaign/fixture/attempt-receipts/1",
         )
-        self.assertIn(f"{prefix}/diagnosis/task-1/1", self.issues.refs())
+        self.assertTrue(Path(attempt_receipts(self.root)["path"]).is_file())
+        self.assertEqual(self.issues.refs(), {})
         self.assertEqual(self.spec.refs(), {})
         self.assertEqual(self.code.refs(), {})
-        # And the reconciler reads them back from the same coordinate.
+        # The reconciler folds the same local append-only log.
         reconciliation = driver.action_reconcile(self.brief())
         self.assertEqual(
             [(item["taskId"], item["attempt"]) for item in reconciliation["diagnoses"]],
             [("task-1", 1)],
         )
 
-    def test_a_retry_receipt_follows_the_campaign_thread(self) -> None:
+    def test_a_retry_receipt_uses_the_local_attempt_log(self) -> None:
         recorded = driver.action_retry(
             {
                 "campaign": "fixture",
@@ -527,13 +484,18 @@ class TwoRepositoryCampaign(unittest.TestCase):
                 "taskId": "task-1",
                 "stage": "prep",
                 "detail": "The lane could not be cut.",
+                "attemptReceipts": attempt_receipts(self.root),
                 "specRepository": self.spec.coordinate,
                 "issueRepository": self.issues.coordinate,
             }
         )
         self.assertTrue(recorded["posted"])
-        prefix = driver.local_state_prefix("fixture", "7")
-        self.assertIn(f"{prefix}/retry/task-1/1", self.issues.refs())
+        self.assertEqual(
+            recorded["comment"], "local://campaign/fixture/attempt-receipts/1"
+        )
+        self.assertTrue(Path(attempt_receipts(self.root)["path"]).is_file())
+        self.assertEqual(self.issues.refs(), {})
+        self.assertEqual(self.spec.refs(), {})
         self.assertEqual(self.code.refs(), {})
         reconciliation = driver.action_reconcile(self.brief())
         self.assertEqual(
@@ -587,49 +549,6 @@ class TwoRepositoryCampaign(unittest.TestCase):
             )
         self.assertIn("repositoryConfig", str(raised.exception))
 
-    def test_a_pull_request_on_a_foreign_repository_never_completes_a_task(self) -> None:
-        """The walk's cross-repository reference must be checked, not trusted."""
-        revision = self.task_one["revision"]
-        marker = driver.pull_request_marker("fixture", "7", "task-1", revision)
-        branch = driver.stable_publish_branch("fixture", "7", "task-1", revision)
-        landed = self.code.commit("src/task-1.txt", "done\n", "fixture: land task-1")
-        foreign = {
-            "url": "https://github.com/acme/elsewhere/pull/9",
-            "body": marker,
-            "merged": True,
-            "baseRefName": "main",
-            "headRefName": branch,
-            "mergeCommit": {"oid": landed},
-            "repository": {"nameWithOwner": "acme/elsewhere"},
-        }
-        walk = {
-            11: {
-                "number": 11,
-                "state": "open",
-                "url": "https://github.com/acme/board/issues/11",
-                "pullRequests": [foreign],
-                "comments": [],
-            }
-        }
-        task = dict(self.task_one)
-        task["brief"] = {"issue": {"number": "11", "url": "https://example.invalid/11"}}
-        facts, restamps, warnings = driver.merged_github_tasks(
-            self.code.name,
-            driver.repo_config(self.code.config),
-            "fixture",
-            "7",
-            "main",
-            None,
-            [task],
-            walk,
-        )
-        self.assertEqual(facts, [])
-        self.assertEqual(restamps, [])
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("acme/elsewhere", warnings[0])
-        self.assertIn("not campaign code repository", warnings[0])
-
-
 class IssueDefaultsToTheSpecRepository(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -650,7 +569,7 @@ class IssueDefaultsToTheSpecRepository(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_a_two_repository_campaign_keeps_its_receipts_with_the_spec(self) -> None:
+    def test_attempt_receipts_do_not_default_to_the_spec_repository(self) -> None:
         steered = driver.action_steer(
             {
                 "campaign": "fixture",
@@ -660,14 +579,15 @@ class IssueDefaultsToTheSpecRepository(unittest.TestCase):
                 "taskId": "task-1",
                 "attempt": 1,
                 "diagnosis": "Narrowed the change.",
+                "attemptReceipts": attempt_receipts(self.root),
                 "specRepository": self.spec.coordinate,
             }
         )
-        prefix = driver.local_state_prefix("fixture", "7")
         self.assertEqual(
-            steered["comment"], f"local://{self.spec.name}/{prefix}/diagnosis/task-1/1"
+            steered["comment"], "local://campaign/fixture/attempt-receipts/1"
         )
-        self.assertIn(f"{prefix}/diagnosis/task-1/1", self.spec.refs())
+        self.assertTrue(Path(attempt_receipts(self.root)["path"]).is_file())
+        self.assertEqual(self.spec.refs(), {})
         self.assertEqual(self.code.refs(), {})
 
 
@@ -700,6 +620,7 @@ class SingleRepositoryControl(unittest.TestCase):
             "worklist": "specs/*/tasks.json",
             "maxTasks": 4,
             "maxParallel": 1,
+            "attemptReceipts": attempt_receipts(self.root),
         }
 
     def test_the_witness_carries_no_seam_and_the_anchors_coincide(self) -> None:
@@ -710,38 +631,8 @@ class SingleRepositoryControl(unittest.TestCase):
         self.assertEqual(reconciliation["source"]["revision"], self.base_rev)
         self.assertEqual(reconciliation["baseRevision"], self.base_rev)
 
-    def test_the_pull_request_body_and_summary_keep_their_pre_seam_shape(self) -> None:
+    def test_the_summary_keeps_its_single_repository_shape(self) -> None:
         reconciliation = driver.action_reconcile(self.brief())
-        task = reconciliation["tasks"][0]
-        data = {
-            "campaign": "fixture",
-            "repository": self.repository.name,
-            "issue": {"number": "7", "url": "https://example.invalid/acme/solo/7"},
-            "workspace": pull_request_workspace(
-                "task-1",
-                self.base_rev,
-                driver.stable_publish_branch(
-                    "fixture", "7", "task-1", task["revision"]
-                ),
-            ),
-            "task": task,
-        }
-        created = subprocess.CompletedProcess(
-            [], 0, "https://github.com/acme/solo/pull/4\n", ""
-        )
-        with mock.patch.object(driver, "pull_requests_by_head", return_value=[]):
-            with mock.patch.object(driver, "run", return_value=created) as run:
-                driver.github_pull_request(
-                    data,
-                    driver.repo_config(self.repository.config),
-                    self.repository.checkout,
-                    self.base_rev,
-                    {"source": "template", "subject": "task-1: Build", "body": ""},
-                )
-        command = run.call_args_list[-1].args[0]
-        body = command[command.index("--body") + 1]
-        self.assertIn(f"campaign progress for {self.repository.name}#7", body)
-
         summary = driver.render_campaign_summary(
             driver.campaign_digest(reconciliation, "quiescent")
         )
@@ -752,7 +643,7 @@ class SingleRepositoryControl(unittest.TestCase):
         )
         self.assertNotIn("code base", summary)
 
-    def test_receipts_stay_in_the_one_repository(self) -> None:
+    def test_attempt_receipts_stay_outside_the_repository(self) -> None:
         steered = driver.action_steer(
             {
                 "campaign": "fixture",
@@ -762,14 +653,15 @@ class SingleRepositoryControl(unittest.TestCase):
                 "taskId": "task-1",
                 "attempt": 1,
                 "diagnosis": "Narrowed the change.",
+                "attemptReceipts": attempt_receipts(self.root),
             }
         )
-        prefix = driver.local_state_prefix("fixture", "7")
         self.assertEqual(
             steered["comment"],
-            f"local://{self.repository.name}/{prefix}/diagnosis/task-1/1",
+            "local://campaign/fixture/attempt-receipts/1",
         )
-        self.assertIn(f"{prefix}/diagnosis/task-1/1", self.repository.refs())
+        self.assertTrue(Path(attempt_receipts(self.root)["path"]).is_file())
+        self.assertEqual(self.repository.refs(), {})
 
     def test_an_unknown_brief_field_is_still_refused(self) -> None:
         brief = self.brief()
@@ -777,22 +669,6 @@ class SingleRepositoryControl(unittest.TestCase):
         with self.assertRaises(driver.DriverError) as raised:
             driver.action_reconcile(brief)
         self.assertIn("reconcile brief", str(raised.exception))
-
-    def test_a_forge_native_campaign_refuses_the_seam(self) -> None:
-        with self.assertRaises(driver.DriverError) as raised:
-            driver.action_reconcile(
-                {
-                    "repository": self.repository.name,
-                    "issue": {"number": "7", "url": "local://acme/solo/issues/7"},
-                    "worklist": {"kind": "github-issue", "graphDigest": "sha256:" + "0" * 64},
-                    "specRepository": {
-                        "repository": "acme/other",
-                        "repositoryConfig": self.repository.config,
-                    },
-                }
-            )
-        self.assertIn("forge-native campaign cannot carry specRepository", str(raised.exception))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

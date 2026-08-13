@@ -25,9 +25,7 @@ use tally_flow::{
 const SOURCE: &str = include_str!("../../../examples/flows/spec-build.js");
 const TASK_ID: &str = "build";
 const REV: &str = "0123456789abcdef0123456789abcdef01234567";
-const RESTAMP_HEAD: &str = "1111111111111111111111111111111111111111";
 const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const OLD_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 #[derive(Clone)]
 struct Reply {
@@ -200,30 +198,6 @@ fn implementation_task(conflict_domains: Option<Value>) -> Value {
     task
 }
 
-/// A frontier task shaped like `issueTaskSchema`: the arm the forge-native
-/// issue-graph builder produces, and therefore the arm every ad-hoc campaign in
-/// production actually runs on. `taskSchema` is one `oneOf` over both arms and
-/// does not depend on the campaign mode, so a fixture may exercise this arm
-/// through the same run as the other one; what is being pinned is the schema,
-/// not the producer.
-fn issue_task(conflict_domains: Option<Value>) -> Value {
-    let mut task = json!({
-        "id": TASK_ID,
-        "kind": "implementation",
-        "title": "Build the thing",
-        "brief": {
-            "issue": {"number": "8", "url": "https://github.test/acme/spec/issues/8"},
-            "body": "Deliver the bounded behaviour."
-        },
-        "dependencies": [],
-        "revision": DIGEST
-    });
-    if let Some(domains) = conflict_domains {
-        task["conflictDomains"] = domains;
-    }
-    task
-}
-
 /// A single-repository campaign with one implementation task and one
 /// `forbidPaths` gate. No command gate, so the pristine-base preflight lane is
 /// not admitted and the pass is the shortest one that reaches an agent node.
@@ -247,7 +221,6 @@ fn args() -> Value {
         "maxParallel": 1,
         "steering": [],
         "taskSteering": {},
-        "allowedActors": ["operator"],
         "localActor": "uid:1000",
         "steeringSource": {
             "schemaVersion": 1,
@@ -294,7 +267,6 @@ fn reconcile_result(task: Value) -> Value {
         "baseRevision": REV,
         "tasks": [task.clone()],
         "merged": [],
-        "restamps": [],
         "checkpoints": [],
         "remaining": [TASK_ID],
         "frontier": [task],
@@ -305,7 +277,6 @@ fn reconcile_result(task: Value) -> Value {
         "quiescent": false,
         "escalation": null,
         "complete": false,
-        "anomalies": [],
         "warnings": [],
         "closingSummary": null
     })
@@ -392,141 +363,6 @@ fn replies(task: Value, tree_delta: Reply) -> BTreeMap<String, Reply> {
             "blocked": true,
             "posted": true,
             "redacted": false
-        })),
-    );
-    replies.insert(
-        "spec-build-continue".to_owned(),
-        Reply::passed(json!({
-            "event": "/srv/spec/events/continuation.json",
-            "dedupKey": "campaign:acme/spec:7:run-424",
-            "runId": "continuation-run-424",
-            "created": true,
-            "receipt": null
-        })),
-    );
-    replies.insert(
-        format!("cleanup-{TASK_ID}"),
-        Reply::passed(json!({"taskId": TASK_ID, "cleaned": true})),
-    );
-    replies
-}
-
-/// One successful deterministic re-stamp lane. An unscripted submission is a
-/// test panic, so deliberately omitting every agent label is the executable
-/// assertion that the flow never tries to dispatch one.
-fn restamp_replies(task: Value) -> BTreeMap<String, Reply> {
-    let completion = json!({
-        "taskId": TASK_ID,
-        "pullRequest": "https://github.com/acme/spec/pull/8",
-        "mergeCommit": REV,
-        "revision": OLD_DIGEST
-    });
-    let ownership = json!({
-        "taskId": TASK_ID,
-        "domainsRequired": false,
-        "ownedPaths": [],
-        "baseRev": REV,
-        "head": RESTAMP_HEAD
-    });
-    let narration = json!({
-        "source": "template",
-        "subject": "chore(campaign): re-stamp completion",
-        "body": ""
-    });
-    let mut reconciled = reconcile_result(task.clone());
-    reconciled["restamps"] = json!([completion.clone()]);
-
-    let mut replies = BTreeMap::new();
-    replies.insert(
-        "spec-build-sweep".to_owned(),
-        Reply::passed(json!({
-            "currentRunHash": "0123456789ab",
-            "blockingJobs": [],
-            "cleaned": [],
-            "liveRuns": [],
-            "warnings": []
-        })),
-    );
-    replies.insert("spec-build-reconcile".to_owned(), Reply::passed(reconciled));
-    replies.insert(
-        format!("prep-{TASK_ID}"),
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "baseRev": REV,
-            "branch": "tally-work/fixture/build",
-            "publishBranch": "tally/fixture-issue-7/build-0123456789abcdef",
-            "worktreePath": "/srv/spec/worktrees/build"
-        })),
-    );
-    replies.insert(
-        format!("restamp-{TASK_ID}"),
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "head": RESTAMP_HEAD,
-            "revision": DIGEST,
-            "completion": completion
-        })),
-    );
-    replies.insert(
-        format!("ownership-{TASK_ID}"),
-        Reply::passed(ownership.clone()),
-    );
-    replies.insert(
-        format!("tree-delta-{TASK_ID}"),
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "checkedPaths": 0,
-            "allowlistBasis": "owned-paths-fallback",
-            "allowlist": [],
-            "ownershipRan": true
-        })),
-    );
-    replies.insert(
-        format!("gate-{TASK_ID}-no-db"),
-        Reply::passed(json!({
-            "gateId": "no-db",
-            "kind": "forbidPaths",
-            "patterns": ["*.db"],
-            "checkedPaths": 0,
-            "baseRev": REV,
-            "head": RESTAMP_HEAD
-        })),
-    );
-    replies.insert(
-        format!("publish-{TASK_ID}"),
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "branch": "tally/fixture-issue-7/build-0123456789abcdef",
-            "head": RESTAMP_HEAD,
-            "pullRequest": "https://github.com/acme/spec/pull/9",
-            "narration": narration.clone(),
-            "narrationAttempts": [],
-            "ownership": ownership.clone()
-        })),
-    );
-    replies.insert(
-        format!("rebase-{TASK_ID}"),
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "baseRev": REV,
-            "branch": "tally/fixture-issue-7/build-0123456789abcdef",
-            "head": RESTAMP_HEAD,
-            "pullRequest": "https://github.com/acme/spec/pull/9",
-            "narration": narration,
-            "regate": false,
-            "ownership": ownership.clone()
-        })),
-    );
-    replies.insert(
-        format!("merge-{TASK_ID}"),
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "head": RESTAMP_HEAD,
-            "mergeCommit": "2222222222222222222222222222222222222222",
-            "pullRequest": "https://github.com/acme/spec/pull/9",
-            "regated": false,
-            "ownership": ownership,
-            "trailer": null
         })),
     );
     replies.insert(
@@ -711,9 +547,6 @@ fn assert_keyless_task_reaches_ungated_gate(arm: &str, task: Value) {
     );
 }
 
-/// The optional wire shape is pinned on both implementation arms of
-/// `taskSchema`.
-///
 /// The refusal branch of `action_tree_delta` — #424 ruling 3, "no allowlist, no
 /// pass" — is the required failed-agent outcome when an admitted serial task
 /// declares no `conflictDomains`: no ownership receipt exists to supply the
@@ -721,64 +554,13 @@ fn assert_keyless_task_reaches_ungated_gate(arm: &str, task: Value) {
 /// the key absent all the way to the gate; inserting `[]` would turn an
 /// unjudgeable pass into a false declared-empty breach.
 ///
-/// `taskSchema` is a `oneOf` over four arms and two of them are implementation
-/// arms: `implementationTaskSchema`, which a file-based worklist produces, and
-/// `issueTaskSchema`, which the forge-native issue-graph builder produces and
-/// which every ad-hoc campaign in production therefore runs on. Round 2 of the
-/// eval found that relaxing `required` on the second arm alone left every suite
-/// green, so both are exercised here. The `oneOf` does not depend on the
-/// campaign mode, so one run shape reaches both arms; what is pinned is the
-/// schema, not the producer. (The two checkpoint arms do not carry the key and
-/// do not need to: a checkpoint lane returns before the agent node and can
-/// reach neither treeDelta call.)
-///
-/// If either arm makes the field required again or a composition step inserts
-/// `[]`, this test fails at the exact boundary that lost the third state.
-fn both_implementation_arms_preserve_an_omitted_conflict_domain_case() {
+/// If the file-task schema makes the field required again or a composition step
+/// inserts `[]`, this test fails at the exact boundary that lost the third state.
+fn implementation_tasks_preserve_an_omitted_conflict_domain_case() {
     assert_keyless_task_reaches_ungated_gate(
         "file-based implementationTaskSchema",
         implementation_task(None),
     );
-    assert_keyless_task_reaches_ungated_gate("forge-native issueTaskSchema", issue_task(None));
-}
-
-/// #459 tier 2. A historical fact admitted by the completion oracle takes the
-/// deterministic restamp node and rejoins the ordinary proof pipeline at
-/// ownership. It never submits steering, implementation, diagnosis, or
-/// narration agents.
-fn a_restamp_lane_never_dispatches_an_agent_case() {
-    let client = TestClient::new(restamp_replies(issue_task(None)));
-    let report = run(client.clone()).expect("the deterministic marker lane completes");
-    let labels = client.labels();
-    assert!(
-        client.submitted(&format!("restamp-{TASK_ID}")),
-        "{labels:?}"
-    );
-    assert!(
-        client.submitted(&format!("ownership-{TASK_ID}")),
-        "{labels:?}"
-    );
-    assert!(client.submitted(&format!("merge-{TASK_ID}")), "{labels:?}");
-    for forbidden in [
-        format!("steering-recheck-{TASK_ID}"),
-        format!("agent-{TASK_ID}"),
-        format!("diagnose-{TASK_ID}"),
-        format!("steer-{TASK_ID}"),
-    ] {
-        assert!(
-            !client.submitted(&forbidden),
-            "an agent-free restamp submitted {forbidden}: {labels:?}"
-        );
-    }
-    let publish = client.brief(&format!("publish-{TASK_ID}"));
-    assert_eq!(
-        publish["steward"],
-        Value::Null,
-        "the publish node must use deterministic narration: {publish}"
-    );
-    let merge = client.brief(&format!("merge-{TASK_ID}"));
-    assert_eq!(merge["assistedBy"], Value::Null, "{merge}");
-    assert_eq!(report.final_value.as_ref().unwrap()["state"], "advanced");
 }
 
 #[test]
@@ -792,11 +574,6 @@ fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure() {
 }
 
 #[test]
-fn both_implementation_arms_preserve_an_omitted_conflict_domain() {
-    on_flow_test_stack(both_implementation_arms_preserve_an_omitted_conflict_domain_case);
-}
-
-#[test]
-fn a_restamp_lane_never_dispatches_an_agent() {
-    on_flow_test_stack(a_restamp_lane_never_dispatches_an_agent_case);
+fn implementation_tasks_preserve_an_omitted_conflict_domain() {
+    on_flow_test_stack(implementation_tasks_preserve_an_omitted_conflict_domain_case);
 }

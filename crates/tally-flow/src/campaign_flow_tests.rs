@@ -27,53 +27,53 @@ fn spec_build_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/flows/spec-build.js")
 }
 
-fn campaign_args(runner_pool: &str) -> Value {
+fn local_campaign_args(runner_pool: &str) -> Value {
     let digest = format!("sha256:{}", "a".repeat(64));
+    let manifest = json!({
+        "schemaVersion": 1,
+        "name": "fixture",
+        "repository": {
+            "checkout": "/tmp/tally-fixture",
+            "baseBranch": "main",
+            "remote": "origin",
+            "forge": "local"
+        },
+        "maxTasks": 1,
+        "maxParallel": 1,
+        "driverRuntimeMaxSec": 60,
+        "runtimeMaxSec": null,
+        "pool": runner_pool,
+        "mergeMethod": "squash",
+        "agent": {
+            "adapter": "codex",
+            "argv": ["implement"],
+            "priority": "medium",
+            "runtimeMaxSec": null,
+            "approvalPolicy": null,
+            "sandboxPolicy": null,
+            "diagnosisSandboxPolicy": null,
+            "model": null
+        },
+        "steward": null,
+        "gates": [{
+            "kind": "forbidPaths",
+            "id": "scope",
+            "forbidPaths": ["flake.nix"],
+            "runtimeMaxSec": 60
+        }],
+        "tasks": [{
+            "id": "task-1",
+            "kind": "implementation",
+            "issue": 537,
+            "dependencies": [],
+            "argv": null,
+            "runtimeMaxSec": null
+        }]
+    });
     json!({
         "campaignIdentity": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
         "campaignGraph": {
-            "manifest": {
-                "schemaVersion": 1,
-                "name": "fixture",
-                "repository": {
-                    "checkout": "/tmp/tally-fixture",
-                    "baseBranch": "main",
-                    "remote": "origin",
-                    "forge": "github"
-                },
-                "maxTasks": 1,
-                "maxParallel": 1,
-                "driverRuntimeMaxSec": 60,
-                "runtimeMaxSec": null,
-                "pool": runner_pool,
-                "mergeMethod": "squash",
-                "agent": {
-                    "adapter": "codex",
-                    "argv": ["implement"],
-                    "priority": "medium",
-                    "runtimeMaxSec": null,
-                    "approvalPolicy": null,
-                    "sandboxPolicy": null,
-                    "diagnosisSandboxPolicy": null,
-                    "model": null
-                },
-                "steward": null,
-                "gates": [{
-                    "kind": "forbidPaths",
-                    "id": "scope",
-                    "forbidPaths": ["flake.nix"],
-                    "runtimeMaxSec": 60
-                }],
-                "tasks": [{
-                    "id": "task-1",
-                    "kind": "implementation",
-                    "issue": 537,
-                    "dependencies": [],
-                    "conflictDomains": [],
-                    "argv": null,
-                    "runtimeMaxSec": null
-                }]
-            },
+            "manifest": manifest.clone(),
             "tasks": [{
                 "number": 537,
                 "title": "Fixture task",
@@ -83,14 +83,17 @@ fn campaign_args(runner_pool: &str) -> Value {
         },
         "repository": "mecattaf/tally.nix",
         "issue": {
-            "number": "536",
-            "url": "https://github.com/mecattaf/tally.nix/issues/536"
+            "number": "1",
+            "url": "local://mecattaf/tally.nix/specs/ch2.json"
         },
         "runId": "fixture-run",
+        // campaign.rs still emits this opaque selector spelling. The flow
+        // verifies its digest, then reads the committed local path above.
         "worklist": {
             "kind": "github-issue",
             "graphDigest": digest
         },
+        "armedManifest": manifest,
         "continuation": {
             "argv": ["tally", "campaign", "resume"],
             "pool": ["campaign-control"],
@@ -104,7 +107,20 @@ fn campaign_args(runner_pool: &str) -> Value {
         "driver": "/bin/spec-build-driver",
         "driverRuntimeMaxSec": 60,
         "steering": [],
-        "allowedActors": ["mecattaf"]
+        "taskSteering": {},
+        "localActor": "uid:1000",
+        "steeringSource": {
+            "schemaVersion": 1,
+            "kind": "local-jsonl",
+            "registrationId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+            "localActor": "uid:1000",
+            "logPath": "/tmp/tally-state/steering.jsonl",
+            "lockPath": "/tmp/tally-state/steering.lock",
+            "preparedCursor": 0
+        },
+        // Accepted but ignored until campaign.rs drops these transport fields.
+        "allowedActors": ["local"],
+        "capabilities": {"subIssueWalk": false}
     })
 }
 
@@ -280,21 +296,20 @@ fn checkpoint_failure(stage: &str) -> Value {
 }
 
 #[test]
-fn campaign_namespace_runner_passes_the_flow_schema_and_evaluates() {
-    let args = campaign_args("campaign/mecattaf/tally.nix");
+fn local_campaign_dispatch_passes_the_flow_schema_and_binds_the_file_worklist() {
+    let args = local_campaign_args("campaign/mecattaf/tally.nix");
     check_campaign_args(&args).unwrap();
 
     let mut realm = CampaignFlowRealm::new(&args);
-    assert_eq!(
-        realm.call(
-            "authorizedComments",
-            &[json!({"id": "task-1", "kind": "implementation"})]
-        ),
-        json!([])
-    );
+    let inputs = realm.call("campaignInputs", &[]);
+    assert_eq!(inputs["campaign"], json!("fixture"));
+    assert_eq!(inputs["repositoryConfig"]["forge"], json!("local"));
+    assert_eq!(inputs["worklist"], json!("specs/ch2.json"));
+    assert_eq!(inputs["maxTasks"], json!(1));
+    assert_eq!(inputs["maxParallel"], json!(1));
 
-    check_campaign_args(&campaign_args("campaign/Acme-Inc/widget_repo.rs")).unwrap();
-    check_campaign_args(&campaign_args("legacy-runner")).unwrap();
+    check_campaign_args(&local_campaign_args("campaign/Acme-Inc/widget_repo.rs")).unwrap();
+    check_campaign_args(&local_campaign_args("legacy-runner")).unwrap();
 }
 
 #[test]
@@ -307,39 +322,13 @@ fn malformed_campaign_namespace_runners_stay_out_of_the_flow_schema() {
         "campaign/mecattaf/tally.nix/extra",
         "campaign/mecattaf/tally nix",
     ] {
-        let error = check_campaign_args(&campaign_args(runner_pool)).unwrap_err();
+        let error = check_campaign_args(&local_campaign_args(runner_pool)).unwrap_err();
         assert_eq!(error.code, "args-schema-mismatch");
         assert!(
             error.message.contains("/campaignGraph/manifest/pool"),
             "wrong schema failure for {runner_pool:?}: {error}"
         );
     }
-}
-
-/// A validated historical completion fact selects the deterministic branch
-/// that bypasses implementation-agent admission. `restampFor` is the exact
-/// predicate the live lane uses before it constructs `agentSpec`.
-#[test]
-fn a_restamp_fact_selects_only_its_own_agent_free_lane() {
-    let mut realm = CampaignFlowRealm::new(&json!({}));
-    let fact = json!({
-        "taskId": "build",
-        "pullRequest": "https://github.com/acme/spec/pull/8",
-        "mergeCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "revision": format!("sha256:{}", "1".repeat(64)),
-    });
-    let reconciliation = json!({"restamps": [fact.clone()]});
-    assert_eq!(
-        realm.call(
-            "restampFor",
-            &[reconciliation.clone(), json!({"id": "build"})]
-        ),
-        fact
-    );
-    assert_eq!(
-        realm.call("restampFor", &[reconciliation, json!({"id": "unrelated"})]),
-        Value::Null
-    );
 }
 
 /// #337: the deferral arm has to cover the whole deferred lane.
@@ -513,24 +502,20 @@ fn a_codex_tool_router_session_death_is_priced_as_machinery() {
     );
 }
 
-/// #334 item 5: the per-task steering composition, executed rather than grepped.
-///
-/// An allowed-actor comment on task A's sub-issue must reach A's brief, a
-/// master comment must reach every task, and neither may reach the other task's
-/// thread.
+/// Local task-addressed steering composes with campaign-wide steering without
+/// leaking between stable task IDs.
 #[test]
-fn task_steering_composes_the_master_thread_with_the_task_thread() {
+fn task_steering_composes_the_campaign_and_task_logs() {
     let args = json!({
-        "capabilities": {"subIssueWalk": true},
         "steering": [{"id": 1, "body": "campaign-wide note"}],
         "taskSteering": {
-            "8": [{"id": 2, "body": "note for alpha"}],
-            "9": [{"id": 3, "body": "note for beta"}],
+            "alpha": [{"id": 2, "body": "note for alpha"}],
+            "beta": [{"id": 3, "body": "note for beta"}],
         },
     });
     let mut realm = CampaignFlowRealm::new(&args);
-    let alpha = json!({"id": "alpha", "kind": "implementation", "brief": {"issue": {"number": 8}}});
-    let beta = json!({"id": "beta", "kind": "implementation", "brief": {"issue": {"number": 9}}});
+    let alpha = json!({"id": "alpha", "kind": "implementation"});
+    let beta = json!({"id": "beta", "kind": "implementation"});
     assert_eq!(
         realm.call("authorizedComments", &[alpha]),
         json!([{"id": 1, "body": "campaign-wide note"}, {"id": 2, "body": "note for alpha"}])
@@ -539,28 +524,9 @@ fn task_steering_composes_the_master_thread_with_the_task_thread() {
         realm.call("authorizedComments", &[beta]),
         json!([{"id": 1, "body": "campaign-wide note"}, {"id": 3, "body": "note for beta"}])
     );
-    // A task with no sub-issue thread of its own still receives the master.
-    let unthreaded = json!({"id": "gamma", "kind": "implementation"});
+    let untargeted = json!({"id": "gamma", "kind": "implementation"});
     assert_eq!(
-        realm.call("authorizedComments", &[unthreaded]),
-        json!([{"id": 1, "body": "campaign-wide note"}])
-    );
-}
-
-/// Without the arm-time walk capability there are no task threads at all, so
-/// every task sees exactly the master thread even where `taskSteering` was
-/// supplied. A degraded campaign must not silently read a native surface.
-#[test]
-fn a_degraded_campaign_composes_only_the_master_thread() {
-    let args = json!({
-        "capabilities": {"subIssueWalk": false},
-        "steering": [{"id": 1, "body": "campaign-wide note"}],
-        "taskSteering": {"8": [{"id": 2, "body": "note for alpha"}]},
-    });
-    let mut realm = CampaignFlowRealm::new(&args);
-    let alpha = json!({"id": "alpha", "kind": "implementation", "brief": {"issue": {"number": 8}}});
-    assert_eq!(
-        realm.call("authorizedComments", &[alpha]),
+        realm.call("authorizedComments", &[untargeted]),
         json!([{"id": 1, "body": "campaign-wide note"}])
     );
 }
