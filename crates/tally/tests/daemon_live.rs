@@ -160,6 +160,7 @@ async fn enqueue_wait_rearms_after_restart_and_observes_terminal_verdict() {
             .args([
                 "--rpc-timeout-sec",
                 "2",
+                "queue",
                 "enqueue",
                 "--pool",
                 "test-slot",

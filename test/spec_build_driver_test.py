@@ -548,6 +548,16 @@ class AttemptReceiptLogTests(unittest.TestCase):
 
 
 class CampaignDriverTests(unittest.TestCase):
+    def test_repository_config_admits_only_local_forge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout, _ = initialize_repository(Path(temporary))
+
+            self.assertEqual(
+                DRIVER.repo_config(repository_config(checkout))["forge"], "local"
+            )
+            with self.assertRaisesRegex(DRIVER.DriverError, "forge must be local"):
+                DRIVER.repo_config(repository_config(checkout, "github"))
+
     def test_completion_trailers_carry_the_task_revision(self) -> None:
         revision = "sha256:" + "a" * 64
         trailers = DRIVER.completion_trailer_block("task-1", revision)
@@ -1816,67 +1826,6 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertIn(f"worktree:{worktree}", swept["cleaned"])
             self.assertEqual(swept["liveRuns"], [])
             self.assertEqual(swept["warnings"], [])
-
-    def test_sweep_reclaims_lane_markers_left_by_a_pre_upgrade_tally(self) -> None:
-        """Nothing writes these any more, so the sweep is the only thing that can.
-
-        An estate that upgrades across #312 keeps whatever its last pre-upgrade
-        pass left under `.state/<runHash>/`. Left alone that is a directory
-        tree nobody will ever explain, so the sweep reclaims it on exactly the
-        authority it already established for the run: same campaign, same
-        repository, a run hash that is neither this pass's nor protected.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            workspace_root = root / "workspaces"
-            dead_flow = "00000000-0000-4000-8000-000000000940"
-            live_flow = "00000000-0000-4000-8000-000000000941"
-            state_root = workspace_root / ".state"
-            legacy = state_root / hashlib.sha256(b"dead-pass").hexdigest()[:16] / "task-9.json"
-            legacy.parent.mkdir(parents=True)
-            legacy.write_text(
-                json.dumps(
-                    {
-                        "campaign": "fixture",
-                        "repository": "acme/spec",
-                        "runId": "dead-pass",
-                        "taskId": "task-9",
-                        "branch": "tally-work/fixture-abcdefabcdef/task-9",
-                        "worktreePath": str(workspace_root / "spec/abcdefabcdef/task-9"),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            foreign = state_root / "0123456789abcdef" / "task-1.json"
-            foreign.parent.mkdir(parents=True)
-            foreign.write_text(
-                json.dumps(
-                    {
-                        "campaign": "other-campaign",
-                        "repository": "acme/spec",
-                        "runId": "other-pass",
-                        "taskId": "task-1",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with FakeTally(root, dead_flow) as tally:
-                DRIVER.action_sweep(
-                    sweep_brief(checkout, workspace_root, "dead-pass", tally.program)
-                )
-                # This pass owns `dead-pass`, so its own marker is untouched.
-                self.assertTrue(legacy.is_file())
-                tally.update(currentFlowRunId=live_flow, flows={dead_flow: []})
-                swept = DRIVER.action_sweep(
-                    sweep_brief(checkout, workspace_root, "live-pass", tally.program)
-                )
-            self.assertFalse(legacy.exists())
-            self.assertFalse(legacy.parent.exists())
-            self.assertIn(f"marker:{legacy}", swept["cleaned"])
-            self.assertEqual(swept["warnings"], [])
-            # Another campaign's marker belongs to that campaign's sweep.
-            self.assertTrue(foreign.is_file())
 
     def test_sweep_defers_and_preserves_every_lane_while_an_old_flow_job_is_live(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

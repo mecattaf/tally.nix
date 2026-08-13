@@ -142,11 +142,6 @@ the no-workflows assertion, and the changelog stage. A pull request must touch `
 carry the `no-changelog` label. A main-branch audit records that this rule was enforced on the pull
 request head rather than inventing a second diff.
 
-The runner writes a local transcript below
-`${XDG_STATE_HOME:-$HOME/.local/state}/tally-fleet-gate/transcripts/` and prints its path. Paste the
-transcript tail into the pull request. That worker-run transcript is the merge evidence; the runner
-does not publish evidence or write any merge-control state to GitHub.
-
 ## Merge control
 
 `main` changes only through a tally campaign merge. Hand merges are not permitted, including by the operator, and there are no exceptions.

@@ -3461,10 +3461,6 @@ async fn run_campaign_poll(
     if !args.once {
         return Err(invalid("campaign poll currently requires --once"));
     }
-    // Events written by the previous release may still carry this hidden
-    // argument. Accept it during the rollback window, but derive progress from
-    // the same durable repository state as every public poll.
-    let _legacy_continuation_token = args.continuation_token.as_deref();
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
     let entries = registry.registrations()?;

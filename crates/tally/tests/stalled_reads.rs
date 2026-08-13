@@ -370,6 +370,7 @@ async fn query_run_falls_back_to_a_labelled_durable_view_that_agrees_with_the_li
                 &config_path,
                 &paths.socket,
                 &[
+                    "queue",
                     "enqueue",
                     "--pool",
                     "stock",

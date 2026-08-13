@@ -15,32 +15,6 @@ fn rpc_timeout_flag_is_global() {
 }
 
 #[test]
-fn legacy_campaign_continuation_token_remains_parseable() {
-    let options = Opts::try_parse_from([
-        "tally",
-        "campaign",
-        "poll",
-        "--once",
-        "--continuation-token",
-        "sha256:legacy",
-        "--state-dir",
-        "/var/lib/tally/state",
-    ])
-    .unwrap();
-    assert!(matches!(
-        options.command,
-        Some(Command::Campaign {
-            command: CampaignCommand::Poll(CampaignPollArgs {
-                once: true,
-                continuation_token: Some(token),
-                state_dir: Some(state_dir),
-                ..
-            })
-        }) if token == "sha256:legacy" && state_dir == Path::new("/var/lib/tally/state")
-    ));
-}
-
-#[test]
 fn campaign_arm_takes_repository_and_committed_worklist_identity() {
     let options = Opts::try_parse_from([
         "tally",
@@ -356,11 +330,31 @@ fn flow_failure_taxonomy_has_distinguished_exit_codes() {
 fn full_top_level_surface_is_visible() {
     let help = Opts::command().render_long_help().to_string();
     for verb in [
-        "enqueue", "queue", "adapter", "witness", "lease", "daemon", "query", "flow",
+        "queue", "adapter", "witness", "lease", "daemon", "query", "flow",
     ] {
         assert!(help.contains(verb), "missing {verb} from help");
     }
     assert!(!help.contains("__record-unit-exit"));
+}
+
+#[test]
+fn retired_top_level_spellings_are_refused_but_check_config_remains() {
+    assert!(Opts::try_parse_from(["tally", "--mode", "daemon"]).is_err());
+    assert!(Opts::try_parse_from(["tally", "enqueue", "--pool", "gpu", "--", "true"]).is_err());
+    assert!(matches!(
+        Opts::try_parse_from([
+            "tally",
+            "--mode",
+            "check-config",
+            "--config",
+            "/etc/tally/config.json",
+        ]),
+        Ok(Opts {
+            mode: Some(Mode::CheckConfig),
+            command: None,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -635,9 +629,10 @@ fn waited_signal_exit_is_never_success() {
 }
 
 #[test]
-fn enqueue_accepts_direct_argv_or_invocation() {
+fn queue_enqueue_accepts_direct_argv_or_invocation() {
     let direct = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "gpu",
@@ -662,6 +657,7 @@ fn enqueue_accepts_direct_argv_or_invocation() {
 fn enqueue_submission_mode_defaults_to_full_and_accepts_legacy() {
     let default = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "gpu",
@@ -671,13 +667,17 @@ fn enqueue_submission_mode_defaults_to_full_and_accepts_legacy() {
         "true",
     ])
     .unwrap();
-    let Some(Command::Enqueue(default)) = default.command else {
+    let Some(Command::Queue {
+        command: QueueCommand::Enqueue(default),
+    }) = default.command
+    else {
         panic!("expected enqueue command");
     };
     assert_eq!(default.submission, CliSubmissionMode::Full);
 
     let legacy = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "gpu",
@@ -689,13 +689,17 @@ fn enqueue_submission_mode_defaults_to_full_and_accepts_legacy() {
         "true",
     ])
     .unwrap();
-    let Some(Command::Enqueue(legacy)) = legacy.command else {
+    let Some(Command::Queue {
+        command: QueueCommand::Enqueue(legacy),
+    }) = legacy.command
+    else {
         panic!("expected enqueue command");
     };
     assert_eq!(legacy.submission, CliSubmissionMode::Legacy);
 
     let invalid = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "gpu",
@@ -822,6 +826,7 @@ fn enqueue_accepts_opaque_evidence_metadata_flags() {
     let evidence_class = r#"{"arbitrary":[true,7,{"nested":null}]}"#;
     let options = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "gpu",
@@ -833,7 +838,10 @@ fn enqueue_accepts_opaque_evidence_metadata_flags() {
         "true",
     ])
     .unwrap();
-    let Some(Command::Enqueue(args)) = options.command else {
+    let Some(Command::Queue {
+        command: QueueCommand::Enqueue(args),
+    }) = options.command
+    else {
         panic!("expected enqueue command");
     };
     assert_eq!(
@@ -847,6 +855,7 @@ fn enqueue_accepts_opaque_evidence_metadata_flags() {
 
     let scalar = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "gpu",
@@ -858,7 +867,10 @@ fn enqueue_accepts_opaque_evidence_metadata_flags() {
         "true",
     ])
     .unwrap();
-    let Some(Command::Enqueue(args)) = scalar.command else {
+    let Some(Command::Queue {
+        command: QueueCommand::Enqueue(args),
+    }) = scalar.command
+    else {
         panic!("expected enqueue command");
     };
     assert_eq!(args.evidence_class, Some(Value::from(-1)));
@@ -869,6 +881,7 @@ fn enqueue_accepts_opaque_evidence_metadata_flags() {
 fn enqueue_wave_three_options_and_public_continuation_parse_directly() {
     let options = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "build",
@@ -906,7 +919,10 @@ fn enqueue_wave_three_options_and_public_continuation_parse_directly() {
         "implement issue 28",
     ])
     .unwrap();
-    let Some(Command::Enqueue(args)) = options.command else {
+    let Some(Command::Queue {
+        command: QueueCommand::Enqueue(args),
+    }) = options.command
+    else {
         panic!("expected enqueue command");
     };
     assert_eq!(
@@ -958,6 +974,7 @@ fn enqueue_wave_three_options_and_public_continuation_parse_directly() {
 fn related_trigger_fallback_parses_strictly() {
     let fallback = Opts::try_parse_from([
         "tally",
+        "queue",
         "enqueue",
         "--pool",
         "gpu",
@@ -969,7 +986,10 @@ fn related_trigger_fallback_parses_strictly() {
         "true",
     ])
     .unwrap();
-    let Some(Command::Enqueue(args)) = fallback.command else {
+    let Some(Command::Queue {
+        command: QueueCommand::Enqueue(args),
+    }) = fallback.command
+    else {
         panic!("expected enqueue command");
     };
     let related = args.related_trigger.unwrap();

@@ -663,7 +663,11 @@ async fn a_degraded_membership_admission_warns_the_caller_that_the_node_will_be_
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_connection(stream, handler).await.unwrap();
                 });
-                let output = run_tally(&socket, &["enqueue", "--pool", "slot", "--", "true"]).await;
+                let output = run_tally(
+                    &socket,
+                    &["queue", "enqueue", "--pool", "slot", "--", "true"],
+                )
+                .await;
                 let stderr = String::from_utf8(output.stderr).unwrap();
                 assert!(output.status.success(), "{stderr}");
                 if degraded {
@@ -850,12 +854,16 @@ async fn cli_maps_rpc_and_waited_verdict_exit_codes() {
 
             let passed = run_tally(
                 &socket,
-                &["enqueue", "--pool", "gpu", "--wait", "--", "true"],
+                &["queue", "enqueue", "--pool", "gpu", "--wait", "--", "true"],
             )
             .await;
             assert_eq!(passed.status.code(), Some(0));
 
-            let invalid = run_tally(&socket, &["enqueue", "--pool", "invalid", "--", "true"]).await;
+            let invalid = run_tally(
+                &socket,
+                &["queue", "enqueue", "--pool", "invalid", "--", "true"],
+            )
+            .await;
             assert_eq!(invalid.status.code(), Some(2));
 
             let missing = run_tally(&socket, &["query", "status"]).await;
@@ -886,7 +894,15 @@ async fn no_enqueue_job_cannot_continue_and_empty_job_id_is_unset() {
 
             let admitted = run_tally_with_job_id(
                 &socket,
-                &["enqueue", "--pool", "gpu", "--no-enqueue", "--", "true"],
+                &[
+                    "queue",
+                    "enqueue",
+                    "--pool",
+                    "gpu",
+                    "--no-enqueue",
+                    "--",
+                    "true",
+                ],
                 Some(""),
             )
             .await;
@@ -929,7 +945,7 @@ async fn cli_forwards_the_inherited_job_token_with_the_caller_identity() {
             let token = "ab".repeat(32);
             let output = run_tally_with_identity(
                 &socket,
-                &["enqueue", "--pool", "slot", "--", "true"],
+                &["queue", "enqueue", "--pool", "slot", "--", "true"],
                 Some(NO_ENQUEUE_JOB),
                 Some(&token),
             )
@@ -959,6 +975,7 @@ async fn cli_forwards_opaque_evidence_metadata() {
             let output = run_tally(
                 &socket,
                 &[
+                    "queue",
                     "enqueue",
                     "--pool",
                     "metadata",
@@ -997,6 +1014,7 @@ async fn cli_submission_flag_preserves_legacy_wire_bytes_and_omits_keyless_mode(
             let default_full = run_tally(
                 &socket,
                 &[
+                    "queue",
                     "enqueue",
                     "--pool",
                     "slot",
@@ -1012,6 +1030,7 @@ async fn cli_submission_flag_preserves_legacy_wire_bytes_and_omits_keyless_mode(
             let explicit_full = run_tally(
                 &socket,
                 &[
+                    "queue",
                     "enqueue",
                     "--pool",
                     "slot",
@@ -1029,6 +1048,7 @@ async fn cli_submission_flag_preserves_legacy_wire_bytes_and_omits_keyless_mode(
             let legacy = run_tally(
                 &socket,
                 &[
+                    "queue",
                     "enqueue",
                     "--pool",
                     "slot",
@@ -1046,6 +1066,7 @@ async fn cli_submission_flag_preserves_legacy_wire_bytes_and_omits_keyless_mode(
             let keyless = run_tally(
                 &socket,
                 &[
+                    "queue",
                     "enqueue",
                     "--pool",
                     "slot",
@@ -1098,6 +1119,7 @@ async fn cli_carries_a_canonical_multi_pool_set_over_enqueue_and_acquire_rpc() {
             let enqueued = run_tally(
                 &socket,
                 &[
+                    "queue",
                     "enqueue",
                     "--pool",
                     "zeta",
@@ -1981,7 +2003,7 @@ async fn submitting_commands_exit_quietly_when_their_reader_is_gone() {
             // `enqueue` and `queue continue` share `submit_payload`, the print
             // site the first pass left on stock `println!`.
             for args in [
-                vec!["enqueue", "--pool", "slot", "--", "true"],
+                vec!["queue", "enqueue", "--pool", "slot", "--", "true"],
                 vec![
                     "queue",
                     "continue",
