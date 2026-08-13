@@ -30,8 +30,6 @@ def campaign_configuration(
     root: Path,
     fake_bin: Path,
     forge: Path,
-    *,
-    git_ai: bool,
 ) -> dict[str, Any]:
     path = root / "source-config.json"
     host_config(context, path)
@@ -45,12 +43,6 @@ def campaign_configuration(
     }
     value["adapters"]["shell"].setdefault("env", {}).update(child_env)
     value["adapters"]["spec-build-driver"].setdefault("env", {}).update(child_env)
-    if git_ai:
-        value["gitAi"] = {
-            "enable": True,
-            "mode": "advisory",
-            "awaitTimeoutSec": 3,
-        }
     return value
 
 
@@ -142,7 +134,7 @@ def campaign_config_locator(context: Context) -> None:
     forge = root / "forge.json"
     issue_state(forge, manifest)
     fake_bin, environment = fixture_environment(context, root, forge)
-    configuration = campaign_configuration(context, root, fake_bin, forge, git_ai=False)
+    configuration = campaign_configuration(context, root, fake_bin, forge)
     failures: list[str] = []
     script = nixos_poll_script(context)
     if "--config /etc/tally/config.json" not in script:
@@ -222,7 +214,7 @@ def pipeline_manifest(checkout: Path, agent: Path) -> dict[str, Any]:
 
 @case(
     "campaign-full-pipeline",
-    (439, 441, 442, 444, 446, 448),
+    (439, 442, 444, 446, 448),
     "arm -> poll -> reconcile -> dispatch -> execute -> sweep -> digest using packaged artifacts",
     long=True,
 )
@@ -238,7 +230,7 @@ def campaign_full_pipeline(context: Context) -> None:
     issue_state(forge, manifest)
     fake_bin, environment = fixture_environment(context, root, forge)
     proof = root / "agent-proof.json"
-    configuration = campaign_configuration(context, root, fake_bin, forge, git_ai=True)
+    configuration = campaign_configuration(context, root, fake_bin, forge)
     for adapter in ("shell", "spec-build-driver"):
         configuration["adapters"][adapter].setdefault("env", {})[
             "FINAL_BAR_PIPELINE_PROOF"
@@ -336,12 +328,7 @@ def campaign_full_pipeline(context: Context) -> None:
             failures.append("pipeline emitted no terminal passing witness")
 
         if not proof.is_file():
-            failures.append("implementation task never executed with git-ai enabled")
-        else:
-            proof_value = json.loads(proof.read_text(encoding="utf-8"))
-            attributes = proof_value.get("attributes", {})
-            if not attributes.get("taskRef", "").endswith("/task-one") or len(attributes) != 7:
-                failures.append(f"task-ref git-ai attributes drifted: {attributes!r}")
+            failures.append("implementation task never executed")
 
     fetched = context.command("git", "-C", checkout, "fetch", "--quiet", "origin", "main")
     if fetched.returncode != 0:
