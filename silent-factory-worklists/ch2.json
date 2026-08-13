@@ -336,7 +336,10 @@
         "drivers",
         "crates/tally-core/src/campaign_contract.rs",
         "examples/flows",
-        "test/fixtures"
+        "test/fixtures",
+        "crates/tally/src/cli/campaign.rs",
+        "crates/tally-core/tests/campaign_contract_corpus.rs",
+        "test/spec_build_driver_test.py"
       ]
     },
     {
