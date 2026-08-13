@@ -245,9 +245,6 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             )
             .await
         }
-        None if matches!(opts.mode, Some(Mode::Daemon)) => {
-            run_daemon_runtime(opts.config, socket, None, None, None, None, 20).await
-        }
         Some(Command::Daemon {
             command: DaemonCommand::Drain,
         }) => {
@@ -294,9 +291,6 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
                 }
                 other => other,
             }
-        }
-        Some(Command::Enqueue(args)) => {
-            run_enqueue(&socket, opts.config.as_deref(), rpc_timeout, *args).await
         }
         Some(Command::Gc(args)) => run_gc(args),
         Some(Command::Queue {

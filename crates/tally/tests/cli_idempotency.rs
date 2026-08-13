@@ -105,6 +105,7 @@ async fn enqueue(socket: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tally"))
         .arg("--socket")
         .arg(socket)
+        .arg("queue")
         .arg("enqueue")
         .args(args)
         .env_remove("TALLY_JOB_ID")

@@ -546,8 +546,8 @@ def repo_config(value: Any) -> dict[str, Any]:
     base_branch = required_string(config.get("baseBranch"), "repositoryConfig.baseBranch")
     remote = required_string(config.get("remote"), "repositoryConfig.remote")
     forge = config.get("forge")
-    if forge not in {"github", "local"}:
-        fail("repositoryConfig.forge must be github or local")
+    if forge != "local":
+        fail("repositoryConfig.forge must be local")
     git(checkout, "rev-parse", "--git-dir")
     return {
         # Campaign checkouts arrive filesystem-canonical from Rust. Keep that
@@ -5322,68 +5322,6 @@ def query_live_campaign_jobs(
     return sorted(live, key=lambda item: (item["flowRunId"], item["anchor"]))
 
 
-def legacy_state_markers(state_root: Path) -> list[Path]:
-    """The per-lane JSON markers a tally from before #312 wrote.
-
-    Lane identity lives in git's own worktree config now and nothing writes
-    these again, but an estate that upgraded across #312 keeps whatever its
-    last pre-upgrade pass left behind. They are enumerated only so the sweep
-    can reclaim them once; `passes/` is this driver's own run-scoped record and
-    is never a lane marker.
-    """
-    if not state_root.is_dir() or state_root.is_symlink():
-        return []
-    return sorted(
-        marker
-        for marker in state_root.glob("*/*.json")
-        if marker.parent != state_root / "passes" and marker.is_file() and not marker.is_symlink()
-    )
-
-
-def reclaim_legacy_markers(
-    state_root: Path,
-    campaign: str,
-    repository: str,
-    current_hash: str,
-    protected_hashes: set[str],
-    cleaned: list[str],
-    warnings: list[str],
-) -> None:
-    """Delete this campaign's pre-#312 lane markers for runs already proved dead.
-
-    The marker is no longer read by anything, so leaving it costs only disk --
-    but leaving it silently means an upgraded estate keeps a directory tree
-    nobody will ever explain. A marker is reclaimed on exactly the authority
-    the sweep already established for its run: same campaign, same repository,
-    and a run hash that is neither this pass's nor protected.
-    """
-    for marker in legacy_state_markers(state_root):
-        try:
-            saved = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            warnings.append(f"left unreadable campaign state marker untouched: {marker}: {error}")
-            continue
-        if not isinstance(saved, dict):
-            warnings.append(f"left non-object campaign state marker untouched: {marker}")
-            continue
-        if saved.get("campaign") != campaign or saved.get("repository") != repository:
-            continue
-        saved_run_id = saved.get("runId")
-        if not isinstance(saved_run_id, str) or not saved_run_id:
-            warnings.append(f"left identity-less campaign state marker untouched: {marker}")
-            continue
-        saved_hash = hashlib.sha256(saved_run_id.encode()).hexdigest()[:12]
-        if saved_hash == current_hash or saved_hash in protected_hashes:
-            continue
-        try:
-            marker.unlink()
-        except OSError as error:
-            warnings.append(f"could not reclaim campaign state marker {marker}: {error}")
-            continue
-        prune_empty_ancestors(marker.parent, state_root)
-        cleaned.append(f"marker:{marker}")
-
-
 def validated_pass_record(
     workspace_root: Path,
     run_hash: str,
@@ -5718,10 +5656,6 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
                     f"tally-work/{campaign_slug}-{lane_hash}/{lane_name}",
                     check=False,
                 )
-
-    reclaim_legacy_markers(
-        state_root, campaign, repository, current_hash, protected_hashes, cleaned, warnings
-    )
 
     if repository_root.is_dir():
         for child in repository_root.iterdir():
