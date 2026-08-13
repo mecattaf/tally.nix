@@ -3882,6 +3882,11 @@ async fn run_campaign_status(
     if let Some(registration) = &registration {
         require_local_actor(registration)?;
     }
+    let approved_graph = registration
+        .as_ref()
+        .map(|registration| read_approved_graph_snapshot(&state_dir, registration))
+        .transpose()?
+        .flatten();
     let issue_url = campaign_issue_url(&code_repository, &worklist_pattern);
     let params = json!({
         "issueUrl": issue_url,
@@ -3893,14 +3898,209 @@ async fn run_campaign_status(
             .and_then(|registration| registration.last_observation.as_deref()),
     });
     let client = connect_rpc(socket, config_path).await?;
-    let status = client
+    let latest = client
         .call_with_deadline("__campaign.status", Some(params), rpc_timeout)
         .await?;
+    let status = reconciled_campaign_status(
+        &client,
+        rpc_timeout,
+        latest,
+        registration.as_ref(),
+        approved_graph.as_ref(),
+        &code_repository,
+        &worklist_pattern,
+    )
+    .await?;
     if args.json {
         outln!("{}", serde_json::to_string(&status)?);
         return Ok(());
     }
     print_campaign_status_human(&status)
+}
+
+fn campaign_status_tasks<'a>(value: &'a Value, context: &str) -> Result<&'a [Value]> {
+    match value.get("tasks") {
+        None => Ok(&[]),
+        Some(tasks) => tasks
+            .as_array()
+            .map(Vec::as_slice)
+            .ok_or_else(|| invalid(format!("daemon returned an invalid {context} task table"))),
+    }
+}
+
+async fn most_recent_reconciled_campaign_run(
+    client: &RpcClient,
+    rpc_timeout: Duration,
+    status: &Value,
+) -> Result<Option<Value>> {
+    let latest = status["flowRunId"]
+        .as_str()
+        .ok_or_else(|| invalid("daemon returned an unidentifiable campaign pass"))?;
+    let flow_runs = status["flowRuns"]
+        .as_array()
+        .ok_or_else(|| invalid("daemon returned an invalid campaign pass lineage"))?;
+    for candidate in flow_runs.iter().rev() {
+        let candidate = candidate
+            .as_str()
+            .ok_or_else(|| invalid("daemon returned a non-string campaign pass ID"))?;
+        if candidate == latest {
+            continue;
+        }
+        let run = client
+            .call_with_deadline("query.run", Some(json!({"id": candidate})), rpc_timeout)
+            .await?;
+        if !campaign_status_tasks(&run, "prior campaign run")?.is_empty() {
+            return Ok(Some(run));
+        }
+    }
+    Ok(None)
+}
+
+fn durable_registration_task_state(
+    registration: &CampaignRegistration,
+    graph: &CanonicalCampaignGraphV1,
+) -> Result<(Value, Value)> {
+    let titles = graph
+        .tasks
+        .iter()
+        .map(|task| (task.number, task.title.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = 0usize;
+    let mut blocked = 0usize;
+    let tasks = graph
+        .manifest
+        .tasks
+        .iter()
+        .map(|task| {
+            let title = titles.get(&task.issue).ok_or_else(|| {
+                invalid(format!(
+                    "campaign approved graph has no content for task {}",
+                    task.id
+                ))
+            })?;
+            let status = if task.dependencies.is_empty() {
+                pending += 1;
+                "pending"
+            } else {
+                blocked += 1;
+                "blocked"
+            };
+            Ok(json!({
+                "taskRef": format!("{}/{}", registration.registration_id, task.id),
+                "title": title,
+                "status": status,
+                "blockedBy": task.dependencies,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        Value::Array(tasks),
+        json!({"done": 0, "running": 0, "blocked": blocked, "pending": pending}),
+    ))
+}
+
+fn campaign_name_for_status(
+    graph: Option<&CanonicalCampaignGraphV1>,
+    reconciled: &Value,
+    worklist_pattern: &str,
+) -> String {
+    graph
+        .map(|graph| graph.manifest.name.clone())
+        .or_else(|| {
+            reconciled["campaign"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty() && *name != "campaign")
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| worklist_default_campaign_name(worklist_pattern).ok())
+        .unwrap_or_else(|| worklist_pattern.to_owned())
+}
+
+fn replace_campaign_projection(target: &mut Value, source: &Value) -> Result<()> {
+    let target = target
+        .as_object_mut()
+        .ok_or_else(|| invalid("daemon returned a non-object campaign status"))?;
+    for field in [
+        "flowRunId",
+        "state",
+        "flowName",
+        "counts",
+        "items",
+        "tasks",
+        "anomalies",
+        "currentNodes",
+        "failures",
+    ] {
+        if let Some(value) = source.get(field) {
+            target.insert(field.to_owned(), value.clone());
+        } else if matches!(field, "items" | "anomalies" | "currentNodes" | "failures") {
+            target.insert(field.to_owned(), json!([]));
+        }
+    }
+    Ok(())
+}
+
+/// Keep a queued successor visible without letting its empty pre-reconcile
+/// projection erase the most recent task truth.
+async fn reconciled_campaign_status(
+    client: &RpcClient,
+    rpc_timeout: Duration,
+    mut status: Value,
+    registration: Option<&CampaignRegistration>,
+    graph: Option<&CanonicalCampaignGraphV1>,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> Result<Value> {
+    let unreconciled = status["flowRunId"].as_str().is_some()
+        && campaign_status_tasks(&status, "campaign")?.is_empty();
+    let mut name_source = status.clone();
+    if unreconciled {
+        let queued_flow_run = status["flowRunId"]
+            .as_str()
+            .expect("the unreconciled predicate requires a flow run")
+            .to_owned();
+        if let Some(reconciled) =
+            most_recent_reconciled_campaign_run(client, rpc_timeout, &status).await?
+        {
+            name_source = reconciled.clone();
+            replace_campaign_projection(&mut status, &reconciled)?;
+            let object = status
+                .as_object_mut()
+                .expect("replace_campaign_projection validated the status object");
+            object.insert("taskTableSource".to_owned(), json!("reconciled-pass"));
+        } else {
+            let (registration, graph) = registration.zip(graph).ok_or_else(|| {
+                invalid(format!(
+                    "queued campaign pass {queued_flow_run} has no reconciled predecessor or durable approved graph"
+                ))
+            })?;
+            let (tasks, counts) = durable_registration_task_state(registration, graph)?;
+            let object = status
+                .as_object_mut()
+                .ok_or_else(|| invalid("daemon returned a non-object campaign status"))?;
+            object.remove("flowRunId");
+            object.insert("state".to_owned(), json!("armed"));
+            object.insert("counts".to_owned(), counts);
+            object.insert("items".to_owned(), json!([]));
+            object.insert("tasks".to_owned(), tasks);
+            object.insert("anomalies".to_owned(), json!([]));
+            object.insert("currentNodes".to_owned(), json!([]));
+            object.insert("failures".to_owned(), json!([]));
+            object.insert("taskTableSource".to_owned(), json!("registration"));
+        }
+        status
+            .as_object_mut()
+            .expect("campaign status was validated above")
+            .insert("queuedFlowRunId".to_owned(), json!(queued_flow_run));
+    }
+
+    let name = campaign_name_for_status(graph, &name_source, worklist_pattern);
+    let object = status
+        .as_object_mut()
+        .ok_or_else(|| invalid("daemon returned a non-object campaign status"))?;
+    object.insert("campaign".to_owned(), json!(name));
+    object.insert("repository".to_owned(), json!(code_repository));
+    Ok(status)
 }
 
 fn print_campaign_status_human(status: &Value) -> Result<()> {
@@ -3910,8 +4110,8 @@ fn print_campaign_status_human(status: &Value) -> Result<()> {
     let state = status["state"].as_str().unwrap_or("unknown");
     let name = status["campaign"]
         .as_str()
-        .or_else(|| status["repository"].as_str())
-        .unwrap_or("campaign");
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("campaign status has no authoritative campaign name"))?;
     outln!("Campaign {}  {}", compact_text(name), compact_text(state));
     outln!("  {}", compact_text(issue));
     if status["registered"].as_bool() == Some(true) {
@@ -3926,12 +4126,29 @@ fn print_campaign_status_human(status: &Value) -> Result<()> {
         "Observation: {}",
         compact_text(status["latestObservation"].as_str().unwrap_or("none"))
     );
+    let run_count = status["flowRuns"].as_array().map_or(0, Vec::len);
+    if let Some(queued_flow_run) = status["queuedFlowRunId"].as_str() {
+        outln!(
+            "Latest flow run: {} (queued, awaiting reconciliation; {} pass{})",
+            compact_text(queued_flow_run),
+            run_count,
+            if run_count == 1 { "" } else { "es" }
+        );
+        if let Some(flow_run) = status["flowRunId"].as_str() {
+            outln!(
+                "Rendered truth: {} (most recent reconciled pass)",
+                compact_text(flow_run)
+            );
+        } else {
+            outln!("Rendered truth: durable registration (no pass has reconciled yet)");
+        }
+        return print_run_body(status, None, "Campaign usage");
+    }
     let Some(flow_run) = status["flowRunId"].as_str() else {
         outln!("Latest flow run: none (no reconcile pass admitted)");
         outln!("Campaign usage: no flow run admitted");
         return Ok(());
     };
-    let run_count = status["flowRuns"].as_array().map_or(0, Vec::len);
     outln!(
         "Latest flow run: {} ({} pass{})",
         compact_text(flow_run),
