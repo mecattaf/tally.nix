@@ -277,9 +277,6 @@ pub(super) struct CampaignArmArgs {
     /// Defaults to the currently authenticated gh login; repeat to add actors.
     #[arg(long = "allow-actor", value_name = "LOGIN")]
     pub(super) allowed_actors: Vec<String>,
-    /// Permit forge=local for an explicitly test-only campaign.
-    #[arg(long)]
-    pub(super) allow_test_local_forge: bool,
     /// Override the packaged spec-build flow (primarily for mechanism testing).
     #[arg(long, value_name = "PATH")]
     pub(super) flow: Option<PathBuf>,
