@@ -1472,12 +1472,12 @@ let campaignTaskIdentity = null;
 let attemptReceipts = null;
 
 // The campaign's three repository coordinates, resolved once. `code` is where
-// lanes, publish branches, pull requests and merges live; `spec` is where the
-// worklist artifact is read from; `issue` is where the campaign thread and
-// every machine receipt live. Each defaults inward -- issue to spec, spec and
-// code to the repository the campaign issue was read from -- so a campaign
-// that names none of them resolves all three to the same repository and takes
-// exactly the pre-seam path.
+// lanes, stable task branches and the local integration branch live; `spec` is
+// where the worklist artifact is read from; `issue` is where the campaign
+// thread and every machine receipt live. Each defaults inward -- issue to spec,
+// spec and code to the repository the campaign issue was read from -- so a
+// campaign that names none of them resolves all three to the same repository
+// and takes exactly the pre-seam path.
 const codeRepository = args.codeRepository || args.repository;
 const specRepository = args.specRepository || args.repository;
 const issueRepository = args.issueRepository || specRepository;
@@ -2075,7 +2075,7 @@ function sweepDeferral(sweepNode) {
     repositoryConfigFor(specRepository);
     repositoryConfigFor(issueRepository);
   }
-  campaignTaskIdentity = forgeNative ? args.campaignIdentity : args.campaign;
+  campaignTaskIdentity = args.campaignIdentity || args.campaign;
   if (!forgeNative) {
     const configuredGateIds = [];
     for (const gate of args.gates) {
@@ -2130,6 +2130,7 @@ function sweepDeferral(sweepNode) {
   }
   const reconcileBrief = forgeNative
     ? withCapabilities({
+        campaignIdentity: campaignTaskIdentity,
         repository: codeRepository,
         issue: args.issue,
         worklist: args.worklist,
@@ -2144,6 +2145,7 @@ function sweepDeferral(sweepNode) {
       })
     : withSeam({
         campaign: args.campaign,
+        campaignIdentity: campaignTaskIdentity,
         repository: codeRepository,
         repositoryConfig: args.repositories[codeRepository],
         issue: args.issue,
@@ -2348,18 +2350,17 @@ function sweepDeferral(sweepNode) {
     const taskRef = taskRefFor(task.id);
     const prepBrief = {
       campaign: effective.campaign,
+      campaignIdentity: campaignTaskIdentity,
       repository: codeRepository,
       repositoryConfig,
       issue: args.issue,
       runId: args.runId,
       workspaceRoot: args.workspaceRoot,
       task,
-      // The revision the reconciler witnessed the worklist at. Prep cuts the
-      // lane from whatever the remote base resolves to at its own later fetch;
-      // carrying the witnessed revision lets it refuse a base that does not
-      // descend from the history the worklist described.
-      // A lane forks from the code history, which is the worklist revision
-      // only while the campaign lives in one repository.
+      // A lane forks from the code history the reconciler witnessed. For a
+      // local campaign that is its integration branch, which advances without
+      // moving the shared remote base; GitHub campaigns still witness their
+      // remote base branch here.
       sourceRevision: reconciliation.baseRevision
     };
     const prepared = await driverNode(
@@ -2413,6 +2414,7 @@ function sweepDeferral(sweepNode) {
             seamSplit
               ? {
                   campaign: effective.campaign,
+                  campaignIdentity: campaignTaskIdentity,
                   repository: codeRepository,
                   repositoryConfig,
                   issue: args.issue,
@@ -2425,11 +2427,13 @@ function sweepDeferral(sweepNode) {
                 }
                 : {
                   campaign: effective.campaign,
+                  campaignIdentity: campaignTaskIdentity,
                   repository: codeRepository,
                   repositoryConfig,
                   issue: args.issue,
                   task,
                   source: reconciliation.source,
+                  baseRevision: reconciliation.baseRevision,
                   workspace: prepared.result,
                   captureRoot: args.captureRoot,
                   execution
@@ -2796,6 +2800,7 @@ function sweepDeferral(sweepNode) {
 
     const publishBrief = withCapabilities(withSeam({
       campaign: effective.campaign,
+      campaignIdentity: campaignTaskIdentity,
       repository: codeRepository,
       repositoryConfig,
       issue: args.issue,
@@ -2804,8 +2809,9 @@ function sweepDeferral(sweepNode) {
       task,
       domainsRequired,
       gates: effective.gates,
-      // A re-stamp is deterministic machinery all the way through: its PR
-      // uses the validated template rather than spending a narration turn.
+      // A re-stamp is deterministic machinery all the way through: its local
+      // layer uses the validated template rather than spending a narration
+      // turn.
       steward: completion === null ? effective.steward || null : null,
       workspace: prepared.result,
       constraints: constraintResults,
@@ -2887,9 +2893,10 @@ function sweepDeferral(sweepNode) {
   const publications = lanes.filter(lane => lane.publication);
   const merged = [];
 
-  // Publication work is parallel; integration is deliberately ordered. Before
-  // every merge the driver compares the tested base to current main. Only a
-  // moved base causes a rebase and a second witnessed gate pass.
+  // Stable local snapshots are parallel; integration is deliberately ordered.
+  // Before every merge the driver compares the tested base to the campaign's
+  // integration branch. Only a moved branch causes a rebase and a second
+  // witnessed gate pass.
   for (const lane of publications) {
     const task = lane.task;
     const taskRef = taskRefFor(task.id);
@@ -2898,6 +2905,7 @@ function sweepDeferral(sweepNode) {
       "rebase",
       {
         campaign: effective.campaign,
+        campaignIdentity: campaignTaskIdentity,
         repository: codeRepository,
         repositoryConfig,
         issue: args.issue,
@@ -2963,6 +2971,7 @@ function sweepDeferral(sweepNode) {
       "merge",
       withCapabilities({
         campaign: effective.campaign,
+        campaignIdentity: campaignTaskIdentity,
         repository: codeRepository,
         repositoryConfig,
         issue: args.issue,

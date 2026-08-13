@@ -1667,6 +1667,7 @@ def canonical_manifest_config(
 
 
 FORGE_NATIVE_RECONCILE_FIELDS = {
+    "campaignIdentity",
     "repository",
     "issue",
     "worklist",
@@ -3252,21 +3253,16 @@ def checkpoint_ref(
 
 
 def merge_receipt_ref(
-    campaign: str, issue_number: str, task_id: str, revision: str | None = None
+    campaign: str, campaign_id: str, task_id: str, revision: str | None = None
 ) -> str:
-    """Where a local-forge squash merge records the commit it produced.
+    """Where a local squash records the layer commit it produced.
 
-    A `--no-ff` merge proves itself: the published task head becomes an
-    ancestor of the base branch. A squash mints a new commit and leaves the
-    task head unreachable from base, so the local read path needs the same kind
-    of witnessed pointer the GitHub path gets for free from the pull request's
-    `mergeCommit` oid. The receipt lives in the campaign's existing hidden ref
-    namespace, is named by the same task identity as the publish branch, and
-    proves nothing on its own: the reader still requires the commit it names to
-    be an ancestor of the witnessed base.
+    The ref is an audit index, never completion authority. The local oracle
+    independently reads exact task markers from the campaign's witnessed
+    integration history, so a missing or damaged index cannot change truth.
     """
     suffix = "" if revision is None else "-" + revision.removeprefix("sha256:")[:16]
-    return f"{local_state_prefix(campaign, issue_number)}/merge/{task_id}{suffix}"
+    return f"{local_state_prefix(campaign, campaign_id)}/merge/{task_id}{suffix}"
 
 
 def remote_ref_oid(checkout: Path, remote: str, reference: str) -> str | None:
@@ -3534,7 +3530,12 @@ def merged_github_tasks(
     base_rev: str | None,
     tasks: list[dict[str, Any]],
     walk: dict[int, dict[str, Any]] | None = None,
+    *,
+    campaign_id: str | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
+    # The issue-keyed spelling remains readable for compatibility callers;
+    # current flows supply the armed campaign identity explicitly.
+    branch_identity = issue_number if campaign_id is None else campaign_id
     facts: list[dict[str, str]] = []
     restamps: list[dict[str, str]] = []
     warnings: list[str] = []
@@ -3575,7 +3576,7 @@ def merged_github_tasks(
     def validated_candidate(
         candidate: dict[str, Any], task_id: str, revision: str | None
     ) -> tuple[dict[str, str] | None, str | None]:
-        branch = stable_publish_branch(campaign, issue_number, task_id, revision)
+        branch = stable_publish_branch(campaign, branch_identity, task_id, revision)
         url_value = candidate.get("url")
         url = url_value if isinstance(url_value, str) and url_value else "unidentifiable PR"
         problems: list[str] = []
@@ -3629,7 +3630,7 @@ def merged_github_tasks(
             continue
         marker = markers[task["id"]]
         revision = revisions[task["id"]]
-        branch = stable_publish_branch(campaign, issue_number, task["id"], revision)
+        branch = stable_publish_branch(campaign, branch_identity, task["id"], revision)
         if walk is None:
             candidates = pull_requests_by_head(repository, branch, "closed", 20)
         else:
@@ -3714,66 +3715,102 @@ def merged_github_tasks(
     return facts, restamps, list(dict.fromkeys(warnings))
 
 
-def stable_publish_branch(
-    campaign: str, issue_number: str, task_id: str, revision: str | None = None
-) -> str:
+def campaign_branch_prefix(campaign: str, campaign_id: str) -> str:
+    """The private branch namespace for one armed campaign generation."""
     campaign_slug = safe_slug(campaign, 32)
+    identity_slug = safe_slug(campaign_id, 64)
+    return f"tally/{campaign_slug}-campaign-{identity_slug}"
+
+
+def integration_branch(campaign: str, campaign_id: str) -> str:
+    """The never-rewritten local branch witnessed lane merges advance."""
+    return f"{campaign_branch_prefix(campaign, campaign_id)}/integration"
+
+
+def stable_publish_branch(
+    campaign: str, campaign_id: str, task_id: str, revision: str | None = None
+) -> str:
     suffix = "" if revision is None else "-" + revision.removeprefix("sha256:")[:16]
-    return f"tally/{campaign_slug}-issue-{issue_number}/{task_id}{suffix}"
+    return f"{campaign_branch_prefix(campaign, campaign_id)}/{task_id}{suffix}"
+
+
+def local_refs(checkout: Path, prefix: str) -> dict[str, str]:
+    """List refs below ``prefix`` without consulting a configured remote."""
+    viewed = git(
+        checkout,
+        "for-each-ref",
+        "--format=%(objectname)%09%(refname)",
+        prefix,
+    )
+    refs: dict[str, str] = {}
+    for line in viewed.stdout.splitlines():
+        fields = line.split("\t", 1)
+        if (
+            len(fields) != 2
+            or not GIT_OID.fullmatch(fields[0])
+            or not fields[1].startswith("refs/")
+        ):
+            fail("local campaign branch listing returned malformed output")
+        refs[fields[1]] = fields[0]
+    return refs
+
+
+def local_branch_oid(checkout: Path, branch: str) -> str | None:
+    return local_refs(checkout, f"refs/heads/{branch}").get(f"refs/heads/{branch}")
 
 
 def merged_local_tasks(
     repository: str,
     config: dict[str, Any],
     campaign: str,
+    campaign_id: str,
     issue_number: str,
     base_rev: str | None,
     tasks: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
+    """Read completion solely from marked integration-branch commits."""
     checkout: Path = config["checkout"]
-    remote = config["remote"]
-    git(checkout, "fetch", "--prune", "--no-tags", remote)
+    branch_tip = local_branch_oid(checkout, integration_branch(campaign, campaign_id))
+    if branch_tip is None:
+        return []
     if base_rev is None:
-        base_rev = git(
+        base_rev = branch_tip
+    else:
+        base_rev = full_git_oid(base_rev, "local integration revision")
+        if git(
             checkout,
-            "rev-parse",
-            "--verify",
-            f"{remote}/{config['baseBranch']}^{{commit}}",
-        ).stdout.strip()
+            "merge-base",
+            "--is-ancestor",
+            base_rev,
+            branch_tip,
+            check=False,
+        ).returncode:
+            fail("witnessed local integration revision is not on the integration branch")
     facts: list[dict[str, str]] = []
     implementations = [task for task in tasks if task["kind"] == "implementation"]
-    # One listing serves every task. Squash receipts are the only merged-ness
-    # proof a squashed task leaves behind, and a campaign that switched
-    # mergeMethod between passes has tasks of both shapes at once, so both
-    # proofs are read on every pass rather than gated on the current setting.
-    receipts = (
-        local_remote_refs(config, f"{local_state_prefix(campaign, issue_number)}/merge/*")
-        if implementations
-        else {}
-    )
     for task in implementations:
         revision = task_revision(task)
-        branch = stable_publish_branch(campaign, issue_number, task["id"], revision)
-        merge_commit: str | None = None
-        receipt = receipts.get(merge_receipt_ref(campaign, issue_number, task["id"], revision))
-        if receipt is not None and not git(
-            checkout, "merge-base", "--is-ancestor", receipt, base_rev, check=False
-        ).returncode:
-            merge_commit = receipt
-        if merge_commit is None:
-            remote_ref = f"refs/remotes/{remote}/{branch}"
-            if git(
-                checkout, "show-ref", "--verify", "--quiet", remote_ref, check=False
-            ).returncode:
-                continue
-            head = git(
-                checkout, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"
-            ).stdout.strip()
-            if git(
-                checkout, "merge-base", "--is-ancestor", head, base_rev, check=False
-            ).returncode:
-                continue
-            merge_commit = head
+        if revision is None:
+            fail(f"local completion task {task['id']!r} carries no revision marker")
+        marker = pull_request_marker(campaign, issue_number, task["id"], revision)
+        branch = stable_publish_branch(campaign, campaign_id, task["id"], revision)
+        matches = git(
+            checkout,
+            "log",
+            "--first-parent",
+            "--format=%H",
+            "--fixed-strings",
+            f"--grep={marker}",
+            base_rev,
+        ).stdout.split()
+        if len(matches) > 1:
+            fail(
+                f"multiple local integration commits claim campaign task "
+                f"{task['id']!r} revision {revision}"
+            )
+        if not matches:
+            continue
+        merge_commit = matches[0]
         facts.append(
             {
                 "taskId": task["id"],
@@ -3800,10 +3837,11 @@ def completed_checkpoint_tasks(
     checkout: Path = config["checkout"]
     remote = config["remote"]
     git(checkout, "fetch", "--prune", "--no-tags", remote)
-    # A checkpoint receipt names a revision of the *code* repository. Where the
-    # worklist is read from a second repository those are two different
-    # histories, so the anchor is passed in; with one repository the caller
-    # passes the worklist revision and nothing moves.
+    # A checkpoint receipt names a revision of the *code* repository. Current
+    # reconciliation passes that anchor explicitly because it may be a local
+    # integration tip or belong to a repository other than the worklist.
+    # Compatibility callers may omit it when the worklist revision is the code
+    # anchor too.
     base_rev = required_string(
         source.get("revision") if base_rev is None else base_rev,
         "campaign base revision",
@@ -4445,6 +4483,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     else:
         fields = {
             "campaign",
+            "campaignIdentity",
             "repository",
             "repositoryConfig",
             "issue",
@@ -4494,6 +4533,11 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         if same_repository(coordinates["spec"], code)
         else observed_base_revision(code["config"])
     )
+    local_campaign_id = campaign_id(data)
+    if config["forge"] != "github":
+        base_rev = ensure_integration_branch(
+            code["config"], campaign, local_campaign_id, base_rev
+        )
     if forge_native and worklist.get("masterClosed") is True:
         return {
             "schemaVersion": 1,
@@ -4539,12 +4583,14 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             base_rev,
             worklist["tasks"],
             walk,
+            campaign_id=local_campaign_id,
         )
     else:
         merged = merged_local_tasks(
             code["repository"],
             code["config"],
             campaign,
+            local_campaign_id,
             issue["number"],
             base_rev,
             worklist["tasks"],
@@ -4648,9 +4694,9 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "campaign": campaign,
         "repository": repository,
         "source": worklist["source"],
-        # The code history this pass reasoned from. Equal to the worklist
-        # revision for a single-repository campaign; the code repository's own
-        # base tip once the worklist lives somewhere else.
+        # The code history this pass reasoned from: the integration tip for a
+        # local campaign, or the remote code base for a GitHub campaign. The
+        # worklist revision remains an independent source witness.
         "baseRevision": base_rev,
         "tasks": worklist["tasks"],
         "merged": merged,
@@ -5847,6 +5893,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
     else:
         fields = {
             "campaign",
+            "campaignIdentity",
             "repository",
             "repositoryConfig",
             "issue",
@@ -6182,11 +6229,93 @@ def safe_slug(value: str, maximum: int) -> str:
     return slug[:maximum]
 
 
+def campaign_id(data: dict[str, Any]) -> str:
+    """Return the arm identity, with the pre-v3 issue key as a narrow fallback."""
+    value = data.get("campaignIdentity")
+    if value is not None:
+        return required_string(value, "campaignIdentity", 128)
+    # Compatibility briefs admitted before authority v3 still carry no arm
+    # identity. They remain readable during this transition, but every current
+    # flow forwards the registration id explicitly.
+    issue = data.get("issue")
+    if issue is not None:
+        return campaign_issue(issue)["number"]
+    return required_string(data.get("campaign"), "campaign", 128)
+
+
+def ensure_integration_branch(
+    config: dict[str, Any],
+    campaign: str,
+    identity: str,
+    start_rev: str,
+    lineage_rev: str | None = None,
+) -> str:
+    """Create one campaign's local integration branch or validate its lineage."""
+    checkout: Path = config["checkout"]
+    start_rev = full_git_oid(start_rev, "integration branch start revision")
+    lineage_rev = full_git_oid(
+        start_rev if lineage_rev is None else lineage_rev,
+        "integration branch witnessed revision",
+    )
+    git(checkout, "cat-file", "-e", f"{start_rev}^{{commit}}")
+    git(checkout, "cat-file", "-e", f"{lineage_rev}^{{commit}}")
+    branch = integration_branch(campaign, identity)
+    reference = f"refs/heads/{branch}"
+    current = local_branch_oid(checkout, branch)
+    if current is None:
+        created = git(
+            checkout,
+            "update-ref",
+            reference,
+            start_rev,
+            "0" * len(start_rev),
+            check=False,
+        )
+        if created.returncode == 0:
+            return start_rev
+        # A concurrent initializer may have won the compare-and-swap. Read its
+        # result and put it through the same lineage check below.
+        current = local_branch_oid(checkout, branch)
+        if current is None:
+            detail = created.stderr.strip() or created.stdout.strip() or "no output"
+            fail(f"cannot create local integration branch {branch!r}: {detail}")
+    common = git(checkout, "merge-base", start_rev, current, check=False)
+    if common.returncode or not GIT_OID.fullmatch(common.stdout.strip()):
+        fail(
+            f"local integration branch {branch!r} shares no history with "
+            f"repository revision {start_rev}"
+        )
+    if lineage_rev != start_rev and git(
+        checkout,
+        "merge-base",
+        "--is-ancestor",
+        lineage_rev,
+        current,
+        check=False,
+    ).returncode:
+        fail(
+            f"local integration branch {branch!r} does not descend from "
+            f"witnessed revision {lineage_rev}"
+        )
+    return current
+
+
+def required_integration_revision(
+    config: dict[str, Any], campaign: str, identity: str
+) -> str:
+    branch = integration_branch(campaign, identity)
+    revision = local_branch_oid(config["checkout"], branch)
+    if revision is None:
+        fail(f"local integration branch {branch!r} does not exist")
+    return revision
+
+
 def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     data = object_exact(
         brief,
         {
             "campaign",
+            "campaignIdentity",
             "repository",
             "repositoryConfig",
             "issue",
@@ -6219,6 +6348,7 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
         fail("sourceRevision must be a full Git object ID")
     identity = {
         "campaign": campaign,
+        "campaignId": campaign_id(data),
         "repository": repository,
         "issueNumber": issue["number"],
         "runId": run_id,
@@ -6960,7 +7090,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     branch = f"tally-work/{campaign_slug}-{run_hash}/{identity['taskId']}"
     publish_branch = stable_publish_branch(
         identity["campaign"],
-        identity["issueNumber"],
+        identity["campaignId"],
         identity["taskId"],
         task_revision(data["task"]),
     )
@@ -6985,22 +7115,33 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     # stale baseRev with no error at all.
     git(checkout, "fetch", "--prune", remote)
     base_ref = f"{remote}/{base_branch}"
-    base_tip = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
-    # Worklist/worktree revision coherence. The reconciler read the worklist at
-    # one revision; this fetch happens later and resolves the base branch to
-    # whatever it points at now. A rewound or force-replaced remote would
-    # otherwise cut lanes from a history the witnessed worklist never
-    # described, silently. Checkpoint lanes already assert exactly this
-    # relationship, so implementation lanes fail closed the same way.
-    if git(
-        checkout,
-        "merge-base",
-        "--is-ancestor",
-        identity["sourceRevision"],
-        base_tip,
-        check=False,
-    ).returncode:
-        fail("prepared lane base does not descend from the witnessed worklist revision")
+    remote_tip = git(
+        checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}"
+    ).stdout.strip()
+    # `sourceRevision` is the code-history revision reconciliation witnessed.
+    # For GitHub that is the remote base. For a local campaign it is the
+    # integration tip, which intentionally advances while the remote base does
+    # not. The remote still establishes repository continuity and seeds first
+    # use; the local branch supplies the lane base and the race witness.
+    if config["forge"] == "github":
+        if git(
+            checkout,
+            "merge-base",
+            "--is-ancestor",
+            identity["sourceRevision"],
+            remote_tip,
+            check=False,
+        ).returncode:
+            fail("prepared lane base does not descend from the witnessed worklist revision")
+        base_tip = remote_tip
+    else:
+        base_tip = ensure_integration_branch(
+            config,
+            identity["campaign"],
+            identity["campaignId"],
+            remote_tip,
+            identity["sourceRevision"],
+        )
 
     resumed = worktree_call(
         worktrees.resume, checkout, worktree, expected, required=("baserev",)
@@ -7036,7 +7177,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         # where it forks from base, so it is healed rather than refused.
         lane_head = resumed["head"]
     else:
-        publish_ref = f"refs/remotes/{remote}/{publish_branch}"
+        publish_ref = f"refs/heads/{publish_branch}"
         published = identity["taskKind"] == "implementation" and git(
             checkout,
             "show-ref",
@@ -7945,6 +8086,7 @@ def enforce_constraint_results(
 def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, Any], dict[str, Any], Path]:
     allowed = {
         "campaign",
+        "campaignIdentity",
         "repository",
         "repositoryConfig",
         "issue",
@@ -8138,7 +8280,10 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         fail("agent produced no commit relative to the prepared base")
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
-    current_base = current_base_revision(worktree, config)
+    identity = campaign_id(data)
+    current_base = required_integration_revision(
+        config, required_string(data.get("campaign"), "campaign"), identity
+    )
     ownership = enforce_conflict_domains(
         worktree,
         base_rev,
@@ -8156,15 +8301,28 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         constraints,
     )
     # The implementation has now passed the same identity, ownership, and gate
-    # checks that authorize publication. Retain its report before push/PR
-    # machinery can fail; an exact marker makes a retried publish idempotent.
+    # checks that authorize the stable local snapshot. Retain its report before
+    # that snapshot is advanced; an exact marker makes a retry idempotent.
     publish_worker_findings(data, capabilities)
-    git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
-    # The publish node is the crossing point between the two surfaces (§3), so
-    # it is where the steward narrates. Everything it is given is already
-    # public or about to be: the task brief, the shape of the diff, and the
-    # campaign's own identifiers. The narration governs the pull request text
-    # here and the squash commit message at the merge node.
+    expected_branch = stable_publish_branch(
+        required_string(data.get("campaign"), "campaign"),
+        identity,
+        task_id,
+        task_revision(data["task"]),
+    )
+    if publish_branch != expected_branch:
+        fail(
+            f"workspace.publishBranch is {publish_branch!r}, expected local stable "
+            f"branch {expected_branch!r}"
+        )
+    git(
+        config["checkout"],
+        "update-ref",
+        f"refs/heads/{publish_branch}",
+        head,
+    )
+    # Narration is fixed beside the stable local snapshot so the later layer
+    # commit cannot drift from the gated task identity or diff it describes.
     task = data["task"]
     steward = steward_role(data.get("steward"))
     narration_task = {
@@ -8202,10 +8360,7 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         }
     )
     narration, transcript = narrate(steward, task, request)
-    if config["forge"] == "github":
-        pull_request = github_pull_request(data, config, worktree, head, narration)
-    else:
-        pull_request = f"local://{data['repository']}/{publish_branch}"
+    pull_request = f"local://{data['repository']}/{publish_branch}"
     return {
         "taskId": task_id,
         "branch": publish_branch,
@@ -8255,17 +8410,16 @@ def publication(value: Any, context: str = "publication") -> dict[str, Any]:
 
 
 def abandon_published_head(
-    worktree: Path,
-    remote: str,
+    checkout: Path,
     published: dict[str, str],
     context: str,
 ) -> None:
     abandoned = git(
-        worktree,
-        "push",
-        f"--force-with-lease=refs/heads/{published['branch']}:{published['head']}",
-        remote,
-        f":refs/heads/{published['branch']}",
+        checkout,
+        "update-ref",
+        "-d",
+        f"refs/heads/{published['branch']}",
+        published["head"],
         check=False,
     )
     if abandoned.returncode != 0:
@@ -8301,15 +8455,11 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
             )
 
     checkout: Path = config["checkout"]
-    remote = config["remote"]
-    git(checkout, "fetch", "--prune", remote)
-    base_ref = f"{remote}/{config['baseBranch']}"
-    branch_ref = f"{remote}/{published['branch']}"
-    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
-    remote_head = git(
-        checkout, "rev-parse", "--verify", f"{branch_ref}^{{commit}}"
-    ).stdout.strip()
-    if remote_head != published["head"]:
+    campaign = required_string(data.get("campaign"), "campaign")
+    identity = campaign_id(data)
+    base_rev = required_integration_revision(config, campaign, identity)
+    branch_head = local_branch_oid(checkout, published["branch"])
+    if branch_head != published["head"]:
         fail("published branch moved before integration")
 
     if git(worktree, "merge-base", "--is-ancestor", base_rev, local_head, check=False).returncode == 0:
@@ -8337,8 +8487,7 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
         detail = rebased.stderr.strip() or rebased.stdout.strip() or "no output"
         aborted = git(worktree, "rebase", "--abort", check=False)
         abandon_published_head(
-            worktree,
-            remote,
+            checkout,
             published,
             f"cannot rebase task onto current base {base_rev}: {detail}; "
             f"rebase abort exited {aborted.returncode}",
@@ -8375,8 +8524,7 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
             )
     except DriverError as error:
         abandon_published_head(
-            worktree,
-            remote,
+            checkout,
             published,
             f"rebased task failed integration policy against current base {base_rev}: {error}",
         )
@@ -8385,13 +8533,20 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
             f"exact published head {published['head']} was abandoned so a fresh pass can "
             "rebuild the task"
         )
-    git(
-        worktree,
-        "push",
-        f"--force-with-lease=refs/heads/{published['branch']}:{published['head']}",
-        remote,
-        f"HEAD:refs/heads/{published['branch']}",
+    advanced = git(
+        checkout,
+        "update-ref",
+        f"refs/heads/{published['branch']}",
+        rebased_head,
+        published["head"],
+        check=False,
     )
+    if advanced.returncode != 0:
+        detail = advanced.stderr.strip() or advanced.stdout.strip() or "no output"
+        fail(
+            f"published branch moved while rebasing exact head "
+            f"{published['head']}: {detail}"
+        )
     return {
         "taskId": published["taskId"],
         "baseRev": base_rev,
@@ -8499,15 +8654,38 @@ def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
     return {"taskId": task_id, "cleaned": True}
 
 
-def merge_commit_body(narration: dict[str, Any], trailer: str | None) -> str:
+def local_completion_marker(data: dict[str, Any]) -> str:
+    task = data.get("task")
+    if not isinstance(task, dict):
+        fail("local merge task must be an object")
+    revision = task_revision(task)
+    if revision is None:
+        fail("local merge task must carry a completion revision")
+    return pull_request_marker(
+        required_string(data.get("campaign"), "campaign"),
+        campaign_issue(data.get("issue"))["number"],
+        required_string(task.get("id"), "task.id"),
+        revision,
+    )
+
+
+def merge_commit_body(
+    narration: dict[str, Any],
+    trailer: str | None,
+    marker: str | None = None,
+) -> str:
     """Validated prose plus the node's own provenance pointer, in that order."""
-    parts = [part for part in (narration["body"], trailer) if part]
+    parts = [part for part in (narration["body"], marker, trailer) if part]
     return "\n\n".join(parts)
 
 
-def merge_commit_message(narration: dict[str, Any], trailer: str | None = None) -> str:
+def merge_commit_message(
+    narration: dict[str, Any],
+    trailer: str | None = None,
+    marker: str | None = None,
+) -> str:
     """The validated message the node writes. The model never runs git."""
-    body = merge_commit_body(narration, trailer)
+    body = merge_commit_body(narration, trailer, marker)
     if body:
         return f"{narration['subject']}\n\n{body}\n"
     return f"{narration['subject']}\n"
@@ -8968,92 +9146,112 @@ def merge_local(
     narration: dict[str, Any],
     trailer: str | None = None,
 ) -> str:
+    """Integrate one gated snapshot without cloning or touching the remote base."""
     checkout: Path = config["checkout"]
-    remote_url = git(checkout, "remote", "get-url", config["remote"]).stdout.strip()
+    campaign = required_string(data.get("campaign"), "campaign")
+    identity = campaign_id(data)
+    message = merge_commit_message(
+        narration, trailer, local_completion_marker(data)
+    )
+    integration_name = integration_branch(campaign, identity)
+    integration_ref = f"refs/heads/{integration_name}"
+    published_ref = f"refs/heads/{integration['branch']}"
+    actual_base = local_branch_oid(checkout, integration_name)
+    actual_head = local_branch_oid(checkout, integration["branch"])
+    if actual_base != integration["baseRev"]:
+        fail("local integration branch moved after the rebased head was gated")
+    if actual_head != integration["head"]:
+        fail("published branch moved after the rebased head was gated")
+
     workspace_root = Path(data["workspaceRoot"])
     workspace_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="merge-", dir=workspace_root) as temporary:
-        integration_checkout = Path(temporary) / "repository"
-        run(["git", "clone", "--quiet", remote_url, str(integration_checkout)])
-        git(integration_checkout, "config", "user.name", "tally spec-build")
-        git(integration_checkout, "config", "user.email", "tally-spec-build@invalid")
+        integration_checkout = Path(temporary) / "worktree"
         git(
-            integration_checkout,
-            "fetch",
-            "origin",
-            config["baseBranch"],
-            integration["branch"],
+            checkout,
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            str(integration_checkout),
+            actual_base,
         )
-        actual_base = git(
-            integration_checkout, "rev-parse", f"origin/{config['baseBranch']}"
-        ).stdout.strip()
-        actual_head = git(
-            integration_checkout, "rev-parse", f"origin/{integration['branch']}"
-        ).stdout.strip()
-        if actual_base != integration["baseRev"]:
-            fail("remote base moved after the rebased head was gated")
-        if actual_head != integration["head"]:
-            fail("published branch moved after the rebased head was gated")
-        git(integration_checkout, "switch", "-C", config["baseBranch"], actual_base)
-        if method == "squash":
+        try:
+            if method == "squash":
+                git(integration_checkout, "merge", "--squash", actual_head)
+                if not git(
+                    integration_checkout, "diff", "--cached", "--quiet", check=False
+                ).returncode:
+                    fail("squash merge staged no change against the witnessed base")
+                git(
+                    integration_checkout,
+                    "-c",
+                    "user.name=tally spec-build",
+                    "-c",
+                    "user.email=tally-spec-build@invalid",
+                    "commit",
+                    "--quiet",
+                    "--file",
+                    "-",
+                    input_text=message,
+                )
+            else:
+                git(
+                    integration_checkout,
+                    "-c",
+                    "user.name=tally spec-build",
+                    "-c",
+                    "user.email=tally-spec-build@invalid",
+                    "merge",
+                    "--no-ff",
+                    "--no-commit",
+                    actual_head,
+                )
+                git(
+                    integration_checkout,
+                    "-c",
+                    "user.name=tally spec-build",
+                    "-c",
+                    "user.email=tally-spec-build@invalid",
+                    "commit",
+                    "--quiet",
+                    "--file",
+                    "-",
+                    input_text=message,
+                )
+            merge_commit = git(
+                integration_checkout, "rev-parse", "HEAD"
+            ).stdout.strip()
+
+            transaction = [
+                "start",
+                f"verify {published_ref} {actual_head}",
+                f"update {integration_ref} {merge_commit} {actual_base}",
+            ]
+            if method == "squash":
+                receipt = merge_receipt_ref(
+                    campaign,
+                    identity,
+                    integration["taskId"],
+                    task_revision(data["task"]),
+                )
+                transaction.append(f"update {receipt} {merge_commit}")
+            transaction.extend(("prepare", "commit"))
             git(
-                integration_checkout,
-                "merge",
-                "--squash",
-                f"origin/{integration['branch']}",
+                checkout,
+                "update-ref",
+                "--stdin",
+                input_text="\n".join(transaction) + "\n",
             )
-            if not git(
-                integration_checkout, "diff", "--cached", "--quiet", check=False
-            ).returncode:
-                fail("squash merge staged no change against the witnessed base")
+        finally:
             git(
-                integration_checkout,
-                "commit",
-                "--quiet",
-                "--file",
-                "-",
-                input_text=merge_commit_message(narration, trailer),
-            )
-        else:
-            git(
-                integration_checkout,
-                "merge",
-                "--no-ff",
-                "--no-edit",
-                f"origin/{integration['branch']}",
-            )
-        merge_commit = git(integration_checkout, "rev-parse", "HEAD").stdout.strip()
-        if method == "squash":
-            # Published before the base advances, and forced. A receipt naming
-            # a commit that never reached base proves nothing, because the
-            # reader requires it to be an ancestor of the witnessed base
-            # anyway, so the ref carries no authority that fast-forward
-            # protection would defend. It does need to be replaceable: if the
-            # base push below loses a race to a sibling lane, the next pass
-            # rebases and mints a squash with a different parent and a
-            # different oid, and a non-forced push of that oid is a
-            # non-fast-forward. Refusing it would fail the node before the base
-            # push it needs to make progress, wedging the task permanently
-            # behind a hidden ref no operator has been told about.
-            receipt = merge_receipt_ref(
-                required_string(data.get("campaign"), "campaign"),
-                campaign_issue(data.get("issue"))["number"],
-                integration["taskId"],
-                task_revision(data["task"]),
-            )
-            git(
-                integration_checkout,
-                "push",
+                checkout,
+                "worktree",
+                "remove",
                 "--force",
-                "origin",
-                f"{merge_commit}:{receipt}",
+                str(integration_checkout),
+                check=False,
             )
-        git(
-            integration_checkout,
-            "push",
-            "origin",
-            f"HEAD:refs/heads/{config['baseBranch']}",
-        )
     return merge_commit
 
 
@@ -9244,6 +9442,7 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     brief, capabilities = take_capabilities(brief)
     fields = {
         "campaign",
+        "campaignIdentity",
         "repository",
         "repositoryConfig",
         "issue",
@@ -9320,9 +9519,10 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):
         fail("source.revision must be a full Git object ID")
     # The lineage assertion below reasons inside the *code* checkout. A split
-    # campaign's worklist revision is a commit of another history entirely, so
-    # the reconciler hands the code anchor down explicitly; unsplit campaigns
-    # send nothing and the worklist revision remains the anchor.
+    # campaign's worklist revision belongs to another history, while a local
+    # campaign's code anchor advances on its integration branch. Current flows
+    # therefore carry the reconciled code anchor explicitly; compatibility
+    # briefs may still use the worklist revision when those identities match.
     code_revision = source_revision
     if data.get("baseRevision") is not None:
         code_revision = required_string(data.get("baseRevision"), "baseRevision")
@@ -9373,12 +9573,24 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     checkout: Path = config["checkout"]
     remote = config["remote"]
     git(checkout, "fetch", "--prune", "--no-tags", remote)
-    current_base = git(
-        checkout,
-        "rev-parse",
-        "--verify",
-        f"{remote}/{config['baseBranch']}^{{commit}}",
-    ).stdout.strip()
+    integration_identity = data.get("campaignIdentity")
+    uses_integration = config["forge"] != "github" and integration_identity is not None
+    if uses_integration:
+        current_base = required_integration_revision(
+            config,
+            campaign,
+            required_string(integration_identity, "campaignIdentity", 128),
+        )
+    else:
+        # Compatibility checkpoint briefs admitted before campaign identity
+        # was carried still validate the remote base. Current local flows name
+        # their arm and therefore validate the integration branch above.
+        current_base = git(
+            checkout,
+            "rev-parse",
+            "--verify",
+            f"{remote}/{config['baseBranch']}^{{commit}}",
+        ).stdout.strip()
     if git(
         checkout,
         "merge-base",
@@ -9396,7 +9608,8 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         current_base,
         check=False,
     ).returncode:
-        fail("remote base diverged after the checkpoint command was witnessed")
+        subject = "integration branch" if uses_integration else "remote base"
+        fail(f"{subject} diverged after the checkpoint command was witnessed")
     reference = checkpoint_ref(
         campaign, issue["number"], task_id, source_sha256, base_rev
     )
@@ -9552,6 +9765,11 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         fail("integration.taskId does not match workspace.taskId")
     if integration["branch"] != data["workspace"]["publishBranch"]:
         fail("integration.branch does not match workspace.publishBranch")
+    binding_message = merge_commit_message(
+        narration,
+        trailer,
+        local_completion_marker(data) if config["forge"] != "github" else None,
+    )
     if config["forge"] == "github":
         merge_commit = merge_github(
             data, config, integration, capabilities, method, narration, trailer
@@ -9567,7 +9785,7 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         method,
         merge_commit,
         binding,
-        merge_commit_message(narration, trailer),
+        binding_message,
         await_sec,
     )
     return {

@@ -102,6 +102,7 @@ def attempt_receipts(root: Path, campaign: str = "fixture") -> dict[str, object]
 
 LOCAL_STEERING_REGISTRATION = "0198a62b-41ee-7000-8000-000000000571"
 LOCAL_STEERING_ACTOR = "uid:1000"
+CAMPAIGN_ID = "0198a62b-41ee-7000-8000-000000000573"
 
 
 def local_steering_comment(identifier: int, body: str) -> dict[str, object]:
@@ -213,6 +214,7 @@ def prep_brief(
 ) -> dict[str, object]:
     return {
         "campaign": "fixture",
+        "campaignIdentity": CAMPAIGN_ID,
         "repository": "acme/spec",
         "repositoryConfig": repository_config(checkout, forge),
         "issue": issue(),
@@ -543,6 +545,7 @@ class ForgeNativeReconcileTests(unittest.TestCase):
             self.assertEqual(result["source"], worklist["source"])
             self.assertEqual(result["source"]["revision"], base_revision)
             self.assertEqual(merged.call_args.args[5], base_revision)
+            self.assertEqual(merged.call_args.kwargs["campaign_id"], "7")
             self.assertEqual([item["id"] for item in result["frontier"]], ["task-1"])
 
 
@@ -2721,6 +2724,7 @@ class NativeSubIssueTests(unittest.TestCase):
             "calls": [],
         }
         brief = {
+            "campaignIdentity": CAMPAIGN_ID,
             "repository": "acme/spec",
             "issue": issue(),
             "worklist": {"kind": "github-issue", "graphDigest": digest},
@@ -2833,7 +2837,7 @@ class NativeSubIssueTests(unittest.TestCase):
                     graph["manifest"], reference, content
                 )
                 branch = DRIVER.stable_publish_branch(
-                    "fixture", "7", task["id"], revision
+                    "fixture", CAMPAIGN_ID, task["id"], revision
                 )
                 marker = DRIVER.pull_request_marker(
                     "fixture", "7", task["id"], revision
@@ -2890,7 +2894,7 @@ class NativeSubIssueTests(unittest.TestCase):
                     graph["manifest"], reference, content
                 )
                 branch = DRIVER.stable_publish_branch(
-                    "fixture", "7", task["id"], revision
+                    "fixture", CAMPAIGN_ID, task["id"], revision
                 )
                 state["merged"].append(
                     {
@@ -2940,6 +2944,11 @@ class NativeSubIssueTests(unittest.TestCase):
             brief["attemptReceipts"] = attempt_receipts(root)
             digest = brief["campaignGraph"]["executableDigest"]
             base_revision = git(checkout, "rev-parse", "origin/main")
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+            DRIVER.ensure_integration_branch(
+                config, "fixture", CAMPAIGN_ID, base_revision
+            )
+            integration_tip = base_revision
             graph = brief["campaignGraph"]
             for task, reference, content in zip(
                 self.MANIFEST_TASKS,
@@ -2951,15 +2960,35 @@ class NativeSubIssueTests(unittest.TestCase):
                     graph["manifest"], reference, content
                 )
                 branch = DRIVER.stable_publish_branch(
+                    "fixture", CAMPAIGN_ID, task["id"], revision
+                )
+                marker = DRIVER.pull_request_marker(
                     "fixture", "7", task["id"], revision
                 )
                 git(
                     checkout,
-                    "push",
+                    "commit",
                     "--quiet",
-                    "origin",
-                    f"{base_revision}:refs/heads/{branch}",
+                    "--allow-empty",
+                    "-m",
+                    f"fixture: integrate {task['id']}",
+                    "-m",
+                    marker,
                 )
+                integration_tip = git(checkout, "rev-parse", "HEAD")
+                git(
+                    checkout,
+                    "update-ref",
+                    f"refs/heads/{branch}",
+                    integration_tip,
+                )
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{DRIVER.integration_branch('fixture', CAMPAIGN_ID)}",
+                integration_tip,
+                base_revision,
+            )
 
             with FakeGitHub(root, state) as github:
                 result = DRIVER.action_reconcile(brief)
@@ -3068,7 +3097,9 @@ class NativeSubIssueTests(unittest.TestCase):
                         self.merged_pull(
                             "https://github.com/acme/spec/pull/8",
                             pre_edit,
-                            "tally/fixture-issue-7/task-1-1111111111111111",
+                            DRIVER.stable_publish_branch(
+                                "fixture", CAMPAIGN_ID, "task-1", old_revision
+                            ),
                             base_revision,
                         )
                     ],
@@ -3481,6 +3512,7 @@ class LaneLifecycleTests(unittest.TestCase):
                 publication = DRIVER.action_publish(
                     {
                         "campaign": "fixture",
+                        "campaignIdentity": CAMPAIGN_ID,
                         "repository": "acme/spec",
                         "repositoryConfig": repository_config(checkout, "github"),
                         "issue": issue(),
@@ -3503,9 +3535,28 @@ class LaneLifecycleTests(unittest.TestCase):
                     }
                 )
             self.assertEqual(publication["head"], restamped["head"])
-            created = github.state()["createdPullRequests"][0]
-            title = created[created.index("--title") + 1]
-            self.assertEqual(title, "[marker] task-1: Task task-1")
+            self.assertEqual(
+                publication["pullRequest"],
+                f"local://acme/spec/{prepared['publishBranch']}",
+            )
+            self.assertEqual(
+                git(checkout, "rev-parse", prepared["publishBranch"]),
+                restamped["head"],
+            )
+            self.assertNotEqual(
+                command(
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "ls-remote",
+                    "--exit-code",
+                    "origin",
+                    f"refs/heads/{prepared['publishBranch']}",
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertNotIn("createdPullRequests", github.state())
 
     def test_publish_posts_bounded_redacted_worker_findings_or_stays_silent(self) -> None:
         agent_task_uuid = "019fecc0-bbad-7153-969b-51174cf064ca"
@@ -3554,9 +3605,10 @@ class LaneLifecycleTests(unittest.TestCase):
                     "calls": [],
                 }
                 with FakeGitHub(root, state) as github:
-                    DRIVER.action_publish(
+                    publication = DRIVER.action_publish(
                         {
                             "campaign": "fixture",
+                            "campaignIdentity": CAMPAIGN_ID,
                             "repository": "acme/spec",
                             "repositoryConfig": repository_config(checkout, "github"),
                             "issue": issue(),
@@ -3600,10 +3652,11 @@ class LaneLifecycleTests(unittest.TestCase):
                     if call[:2] == ["issue", "comment"]
                 ]
                 self.assertEqual([call[2] for call in comment_calls], ["8"])
-                pull_request = published["createdPullRequests"][0]
-                pull_request_body = pull_request[pull_request.index("--body") + 1]
-                self.assertNotIn("Worker findings", pull_request_body)
-                self.assertNotIn(secret, pull_request_body)
+                self.assertEqual(
+                    publication["pullRequest"],
+                    f"local://acme/spec/{prepared['publishBranch']}",
+                )
+                self.assertNotIn("createdPullRequests", published)
 
     def test_marker_only_lane_passes_the_marker_safe_changelog_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3697,6 +3750,7 @@ class LaneLifecycleTests(unittest.TestCase):
                     checkout,
                     workspace_root,
                     "coherent-pass",
+                    forge="github",
                     source_revision=witnessed,
                 )
             )
@@ -3722,6 +3776,7 @@ class LaneLifecycleTests(unittest.TestCase):
                         checkout,
                         workspace_root,
                         "rewound-pass",
+                        forge="github",
                         source_revision=witnessed,
                     )
                 )
@@ -3750,6 +3805,7 @@ class LaneLifecycleTests(unittest.TestCase):
                     checkout,
                     workspace_root,
                     "resumed-pass",
+                    forge="github",
                     source_revision=witnessed,
                 )
             )
@@ -3760,6 +3816,7 @@ class LaneLifecycleTests(unittest.TestCase):
                     checkout,
                     workspace_root,
                     "resumed-pass",
+                    forge="github",
                     source_revision=witnessed,
                 )
             )
@@ -3788,12 +3845,147 @@ class LaneLifecycleTests(unittest.TestCase):
                         checkout,
                         workspace_root,
                         "resumed-pass",
+                        forge="github",
                         source_revision=witnessed,
                     )
                 )
             self.assertIn(
                 "does not descend from the witnessed worklist revision",
                 str(raised.exception),
+            )
+
+    def test_local_prep_uses_integration_after_the_remote_worklist_diverges(
+        self,
+    ) -> None:
+        """Remote worklist commits do not become the local lane merge target."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            config = DRIVER.repo_config(repository_config(checkout))
+            initial = git(checkout, "rev-parse", "origin/main")
+            integration_branch = DRIVER.integration_branch(
+                "fixture", CAMPAIGN_ID
+            )
+            DRIVER.ensure_integration_branch(
+                config, "fixture", CAMPAIGN_ID, initial
+            )
+
+            git(checkout, "switch", "--quiet", "-c", "integrated-task")
+            git(
+                checkout,
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "fixture: integrate task-0",
+            )
+            integration_tip = git(checkout, "rev-parse", "HEAD")
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{integration_branch}",
+                integration_tip,
+                initial,
+            )
+
+            git(checkout, "switch", "--quiet", "main")
+            (checkout / "worklist.json").write_text("{}\n", encoding="utf-8")
+            git(checkout, "add", "worklist.json")
+            git(checkout, "commit", "--quiet", "-m", "operator: revise worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
+            remote_tip = git(checkout, "rev-parse", "origin/main")
+            self.assertNotEqual(remote_tip, integration_tip)
+
+            # Reconciliation observes the new worklist revision but preserves
+            # the already-advanced campaign branch as the code-history base.
+            self.assertEqual(
+                DRIVER.ensure_integration_branch(
+                    config, "fixture", CAMPAIGN_ID, remote_tip
+                ),
+                integration_tip,
+            )
+            prepared = DRIVER.action_prep(
+                prep_brief(
+                    checkout,
+                    workspace_root,
+                    "diverged-worklist-pass",
+                    source_revision=integration_tip,
+                )
+            )
+            self.assertEqual(prepared["baseRev"], integration_tip)
+            self.assertEqual(
+                git(Path(prepared["worktreePath"]), "rev-parse", "HEAD"),
+                integration_tip,
+            )
+            self.assertEqual(git(checkout, "rev-parse", "origin/main"), remote_tip)
+
+    def test_local_checkpoint_validates_the_integration_tip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout))
+            initial = git(checkout, "rev-parse", "origin/main")
+            integration_branch = DRIVER.integration_branch(
+                "fixture", CAMPAIGN_ID
+            )
+            DRIVER.ensure_integration_branch(
+                config, "fixture", CAMPAIGN_ID, initial
+            )
+
+            git(checkout, "switch", "--quiet", "-c", "checkpoint-lane")
+            git(
+                checkout,
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "fixture: integrate task-1",
+            )
+            integration_tip = git(checkout, "rev-parse", "HEAD")
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{integration_branch}",
+                integration_tip,
+                initial,
+            )
+
+            recorded = DRIVER.action_checkpoint(
+                {
+                    "campaign": "fixture",
+                    "campaignIdentity": CAMPAIGN_ID,
+                    "repository": "acme/spec",
+                    "repositoryConfig": repository_config(checkout),
+                    "issue": issue(),
+                    "task": {
+                        "id": "phase-checkpoint",
+                        "kind": "checkpoint",
+                        "title": "Validate phase one",
+                        "argv": ["true"],
+                        "runtimeMaxSec": 60,
+                        "dependencies": ["task-1"],
+                    },
+                    "source": {
+                        "path": "worklist.json",
+                        "sha256": "sha256:" + "a" * 64,
+                        "revision": initial,
+                    },
+                    "baseRevision": integration_tip,
+                    "workspace": {
+                        "taskId": "phase-checkpoint",
+                        "baseRev": integration_tip,
+                        "branch": "checkpoint-lane",
+                        "publishBranch": "unused-checkpoint-branch",
+                        "worktreePath": str(checkout),
+                    },
+                }
+            )
+            self.assertEqual(recorded["revision"], integration_tip)
+            self.assertEqual(git(checkout, "rev-parse", "origin/main"), initial)
+            self.assertEqual(
+                git(checkout, "ls-remote", "origin", recorded["ref"]).split()[0],
+                integration_tip,
             )
 
     def test_a_prep_brief_without_a_source_revision_is_refused(self) -> None:
@@ -4058,18 +4250,33 @@ class LaneLifecycleTests(unittest.TestCase):
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             workspace_root = root / "workspaces"
-            stable_branch = "tally/fixture-issue-7/task-1"
+            stable_branch = DRIVER.stable_publish_branch(
+                "fixture", CAMPAIGN_ID, "task-1"
+            )
+            config = DRIVER.repo_config(repository_config(checkout))
+            initial = DRIVER.ensure_integration_branch(
+                config,
+                "fixture",
+                CAMPAIGN_ID,
+                git(checkout, "rev-parse", "origin/main"),
+            )
 
             git(checkout, "switch", "--quiet", "-c", "published")
             (checkout / "root.go").write_text("task\n", encoding="utf-8")
             git(checkout, "commit", "--quiet", "-am", "task change")
             published_head = git(checkout, "rev-parse", "HEAD")
-            git(checkout, "push", "--quiet", "origin", f"HEAD:refs/heads/{stable_branch}")
+            git(checkout, "update-ref", f"refs/heads/{stable_branch}", published_head)
             git(checkout, "switch", "--quiet", "main")
             (checkout / "root.go").write_text("main\n", encoding="utf-8")
             git(checkout, "commit", "--quiet", "-am", "base change")
             current_main = git(checkout, "rev-parse", "HEAD")
-            git(checkout, "push", "--quiet", "origin", "main")
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{DRIVER.integration_branch('fixture', CAMPAIGN_ID)}",
+                current_main,
+                initial,
+            )
 
             old_brief = prep_brief(checkout, workspace_root, "old-pass")
             old_brief["task"]["conflictDomains"] = ["root.go"]
@@ -4122,10 +4329,10 @@ class LaneLifecycleTests(unittest.TestCase):
                     "git",
                     "-C",
                     str(checkout),
-                    "ls-remote",
-                    "--exit-code",
-                    "origin",
-                    stable_branch,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{stable_branch}",
                     check=False,
                 ).returncode,
                 0,
@@ -4163,18 +4370,34 @@ class LaneLifecycleTests(unittest.TestCase):
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             workspace_root = root / "workspaces"
-            stable_branch = "tally/fixture-issue-7/task-1"
+            stable_branch = DRIVER.stable_publish_branch(
+                "fixture", CAMPAIGN_ID, "task-1"
+            )
+            config = DRIVER.repo_config(repository_config(checkout))
+            initial = DRIVER.ensure_integration_branch(
+                config,
+                "fixture",
+                CAMPAIGN_ID,
+                git(checkout, "rev-parse", "origin/main"),
+            )
 
             git(checkout, "switch", "--quiet", "-c", "published")
             (checkout / "root.go").write_text("task\n", encoding="utf-8")
             git(checkout, "commit", "--quiet", "-am", "task change")
             published_head = git(checkout, "rev-parse", "HEAD")
-            git(checkout, "push", "--quiet", "origin", f"HEAD:refs/heads/{stable_branch}")
+            git(checkout, "update-ref", f"refs/heads/{stable_branch}", published_head)
             git(checkout, "switch", "--quiet", "main")
             (checkout / "main-only.txt").write_text("main\n", encoding="utf-8")
             git(checkout, "add", "main-only.txt")
             git(checkout, "commit", "--quiet", "-m", "independent base change")
-            git(checkout, "push", "--quiet", "origin", "main")
+            current_main = git(checkout, "rev-parse", "HEAD")
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{DRIVER.integration_branch('fixture', CAMPAIGN_ID)}",
+                current_main,
+                initial,
+            )
 
             rebase_task = task("task-1")
             rebase_task["conflictDomains"] = ["owned-only.txt"]
@@ -4224,10 +4447,10 @@ class LaneLifecycleTests(unittest.TestCase):
                     "git",
                     "-C",
                     str(checkout),
-                    "ls-remote",
-                    "--exit-code",
-                    "origin",
-                    stable_branch,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{stable_branch}",
                     check=False,
                 ).returncode,
                 0,
@@ -5722,10 +5945,17 @@ class SquashMergeTests(unittest.TestCase):
     """Squash integration, and the proofs that replace head ancestry."""
 
     def integration(self, checkout: Path, branch: str, head: str) -> dict[str, object]:
+        config = DRIVER.repo_config(repository_config(checkout))
+        base = DRIVER.ensure_integration_branch(
+            config,
+            "fixture",
+            CAMPAIGN_ID,
+            git(checkout, "rev-parse", "origin/main"),
+        )
         return {
             "taskId": "task-1",
             "branch": branch,
-            "baseRev": git(checkout, "rev-parse", "origin/main"),
+            "baseRev": base,
             "head": head,
             "pullRequest": f"local://acme/spec/{branch}",
         }
@@ -5738,10 +5968,9 @@ class SquashMergeTests(unittest.TestCase):
         (checkout / "delivered.txt").write_text("one\ntwo\n", encoding="utf-8")
         git(checkout, "add", "delivered.txt")
         git(checkout, "commit", "--quiet", "-m", "wip: second")
-        git(checkout, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
         head = git(checkout, "rev-parse", "HEAD")
+        git(checkout, "update-ref", f"refs/heads/{branch}", head)
         git(checkout, "switch", "--quiet", "main")
-        git(checkout, "fetch", "--quiet", "--prune", "origin")
         return head
 
     def test_local_squash_lands_one_commit_and_a_readable_receipt(self) -> None:
@@ -5751,11 +5980,14 @@ class SquashMergeTests(unittest.TestCase):
             workspace_root = root / "workspaces"
             workspace_root.mkdir()
             revision = "sha256:" + "a" * 64
-            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+            branch = DRIVER.stable_publish_branch(
+                "fixture", CAMPAIGN_ID, "task-1", revision
+            )
             head = self.publish_branch(checkout, branch)
             config = DRIVER.repo_config(repository_config(checkout))
             data = {
                 "campaign": "fixture",
+                "campaignIdentity": CAMPAIGN_ID,
                 "repository": "acme/spec",
                 "issue": issue(),
                 "workspaceRoot": str(workspace_root),
@@ -5773,14 +6005,21 @@ class SquashMergeTests(unittest.TestCase):
                 "squash",
                 narration,
             )
-            git(checkout, "fetch", "--quiet", "--prune", "origin")
-            base = git(checkout, "rev-parse", "origin/main")
+            base = git(
+                checkout,
+                "rev-parse",
+                DRIVER.integration_branch("fixture", CAMPAIGN_ID),
+            )
             self.assertEqual(base, merge_commit)
+            self.assertNotEqual(base, git(checkout, "rev-parse", "origin/main"))
             # One parent: a squash, not a merge commit.
             self.assertEqual(len(git(checkout, "log", "-1", "--format=%P", base).split()), 1)
             self.assertEqual(
                 git(checkout, "log", "-1", "--format=%B", base).strip(),
-                "feat(fixture): deliver the first task\n\nSteward-authored body.",
+                "feat(fixture): deliver the first task\n\nSteward-authored body.\n\n"
+                + DRIVER.pull_request_marker(
+                    "fixture", "7", "task-1", revision
+                ),
             )
             # The task head is deliberately not an ancestor of base: that is
             # exactly why the pre-squash assertion had to be replaced.
@@ -5791,14 +6030,17 @@ class SquashMergeTests(unittest.TestCase):
                 ).returncode,
                 0,
             )
-            receipt = DRIVER.merge_receipt_ref("fixture", "7", "task-1", revision)
+            receipt = DRIVER.merge_receipt_ref(
+                "fixture", CAMPAIGN_ID, "task-1", revision
+            )
             self.assertEqual(
-                DRIVER.local_remote_refs(config, receipt).get(receipt), merge_commit
+                DRIVER.local_refs(checkout, receipt).get(receipt), merge_commit
             )
             facts = DRIVER.merged_local_tasks(
                 "acme/spec",
                 config,
                 "fixture",
+                CAMPAIGN_ID,
                 "7",
                 None,
                 [{**task("task-1"), "revision": revision}],
@@ -5814,63 +6056,85 @@ class SquashMergeTests(unittest.TestCase):
                     }
                 ],
             )
+            # The marker on canonical integration history is the oracle. A
+            # damaged receipt may lose its indexing value, but cannot veto
+            # that independently readable completion fact.
+            git(
+                checkout,
+                "update-ref",
+                receipt,
+                git(checkout, "rev-parse", f"{merge_commit}^"),
+            )
+            self.assertEqual(
+                DRIVER.merged_local_tasks(
+                    "acme/spec",
+                    config,
+                    "fixture",
+                    CAMPAIGN_ID,
+                    "7",
+                    None,
+                    [{**task("task-1"), "revision": revision}],
+                ),
+                facts,
+            )
 
-    def test_a_lost_base_push_race_leaves_the_task_mergeable_on_the_next_pass(self) -> None:
-        """A receipt must never outrank the merge it only points at.
-
-        Git enforces fast-forward on every non-tag ref, the campaign's hidden
-        namespace included, and a retried squash always mints a different oid.
-        A receipt pushed without --force therefore refuses its own successor and
-        fails the node before the base push it needs to make progress, so one
-        lost race would wedge the task behind a ref nothing documents.
-        """
+    def test_a_moved_integration_branch_is_refused_and_mergeable_next_pass(self) -> None:
+        """The actual-base guard catches a sibling merge after the regate."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkout, remote = initialize_repository(root, remote=True)
+            checkout, _ = initialize_repository(root, remote=True)
             workspace_root = root / "workspaces"
             workspace_root.mkdir()
             revision = "sha256:" + "a" * 64
-            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+            branch = DRIVER.stable_publish_branch(
+                "fixture", CAMPAIGN_ID, "task-1", revision
+            )
             head = self.publish_branch(checkout, branch)
             config = DRIVER.repo_config(repository_config(checkout))
             data = {
                 "campaign": "fixture",
+                "campaignIdentity": CAMPAIGN_ID,
                 "repository": "acme/spec",
                 "issue": issue(),
                 "workspaceRoot": str(workspace_root),
                 "task": {**task("task-1"), "revision": revision},
             }
             narration = DRIVER.template_narration(task("task-1"))
-            receipt = DRIVER.merge_receipt_ref("fixture", "7", "task-1", revision)
-
-            # A sibling lane wins the base push in the window between the two
-            # pushes. To the loser that is exactly a non-fast-forward refusal.
-            hook = remote / "hooks/pre-receive"
-            hook.parent.mkdir(parents=True, exist_ok=True)
-            hook.write_text(
-                "#!/bin/sh\nwhile read -r _ _ ref; do\n"
-                '  case "$ref" in refs/heads/*) echo "non-fast-forward" >&2; exit 1 ;; esac\n'
-                "done\nexit 0\n",
-                encoding="utf-8",
+            receipt = DRIVER.merge_receipt_ref(
+                "fixture", CAMPAIGN_ID, "task-1", revision
             )
-            hook.chmod(0o755)
-            with self.assertRaises(DRIVER.DriverError):
+            witnessed = self.integration(checkout, branch, head)
+
+            # A sibling wins after this task was regated. Its commit advances
+            # only the private integration branch; origin/main remains still.
+            (checkout / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+            git(checkout, "add", "sibling.txt")
+            git(checkout, "commit", "--quiet", "-m", "sibling: advance integration")
+            sibling = git(checkout, "rev-parse", "HEAD")
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{DRIVER.integration_branch('fixture', CAMPAIGN_ID)}",
+                sibling,
+                witnessed["baseRev"],
+            )
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "integration branch moved"
+            ):
                 DRIVER.merge_local(
                     data,
                     config,
-                    self.integration(checkout, branch, head),
+                    witnessed,
                     "squash",
                     narration,
                 )
-            first_receipt = DRIVER.local_remote_refs(config, receipt).get(receipt)
-            self.assertIsNotNone(first_receipt)
-            # The receipt names a commit that never reached base, so it proves
-            # nothing and the task correctly still reads as unmerged.
+            self.assertIsNone(DRIVER.local_refs(checkout, receipt).get(receipt))
             self.assertEqual(
                 DRIVER.merged_local_tasks(
                     "acme/spec",
                     config,
                     "fixture",
+                    CAMPAIGN_ID,
                     "7",
                     None,
                     [{**task("task-1"), "revision": revision}],
@@ -5878,20 +6142,13 @@ class SquashMergeTests(unittest.TestCase):
                 [],
             )
 
-            # The winner's commit lands and the next pass rebases onto it, so
-            # the retry's squash necessarily has a different oid.
-            hook.unlink()
-            git(checkout, "switch", "--quiet", "main")
-            (checkout / "sibling.txt").write_text("sibling\n", encoding="utf-8")
-            git(checkout, "add", "sibling.txt")
-            git(checkout, "commit", "--quiet", "-m", "sibling: advance base")
-            git(checkout, "push", "--quiet", "origin", "HEAD:refs/heads/main")
+            # The next pass rebases the exact stable task branch and retries
+            # against the now-current integration tip.
             git(checkout, "switch", "--quiet", "work")
-            git(checkout, "rebase", "--quiet", "origin/main")
+            git(checkout, "rebase", "--quiet", sibling)
             rebased = git(checkout, "rev-parse", "HEAD")
-            git(checkout, "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{branch}")
+            git(checkout, "update-ref", f"refs/heads/{branch}", rebased, head)
             git(checkout, "switch", "--quiet", "main")
-            git(checkout, "fetch", "--quiet", "--prune", "origin")
 
             merge_commit = DRIVER.merge_local(
                 data,
@@ -5901,12 +6158,17 @@ class SquashMergeTests(unittest.TestCase):
                 narration,
             )
 
-            self.assertNotEqual(merge_commit, first_receipt)
             self.assertEqual(
-                DRIVER.local_remote_refs(config, receipt).get(receipt), merge_commit
+                DRIVER.local_refs(checkout, receipt).get(receipt), merge_commit
             )
-            git(checkout, "fetch", "--quiet", "--prune", "origin")
-            self.assertEqual(git(checkout, "rev-parse", "origin/main"), merge_commit)
+            self.assertEqual(
+                git(
+                    checkout,
+                    "rev-parse",
+                    DRIVER.integration_branch("fixture", CAMPAIGN_ID),
+                ),
+                merge_commit,
+            )
             self.assertEqual(
                 [
                     fact["mergeCommit"]
@@ -5914,6 +6176,7 @@ class SquashMergeTests(unittest.TestCase):
                         "acme/spec",
                         config,
                         "fixture",
+                        CAMPAIGN_ID,
                         "7",
                         None,
                         [{**task("task-1"), "revision": revision}],
@@ -5922,21 +6185,126 @@ class SquashMergeTests(unittest.TestCase):
                 [merge_commit],
             )
 
+    def test_a_moved_published_branch_is_refused_by_the_actual_head_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            workspace_root.mkdir()
+            revision = "sha256:" + "b" * 64
+            branch = DRIVER.stable_publish_branch(
+                "fixture", CAMPAIGN_ID, "task-1", revision
+            )
+            head = self.publish_branch(checkout, branch)
+            config = DRIVER.repo_config(repository_config(checkout))
+            integration = self.integration(checkout, branch, head)
+            data = {
+                "campaign": "fixture",
+                "campaignIdentity": CAMPAIGN_ID,
+                "repository": "acme/spec",
+                "issue": issue(),
+                "workspaceRoot": str(workspace_root),
+                "task": {**task("task-1"), "revision": revision},
+            }
+
+            git(checkout, "switch", "--quiet", "work")
+            (checkout / "delivered.txt").write_text(
+                "one\ntwo\nthree\n", encoding="utf-8"
+            )
+            git(checkout, "add", "delivered.txt")
+            git(checkout, "commit", "--quiet", "-m", "wip: moved after gate")
+            moved = git(checkout, "rev-parse", "HEAD")
+            git(checkout, "update-ref", f"refs/heads/{branch}", moved, head)
+            git(checkout, "switch", "--quiet", "main")
+
+            with self.assertRaisesRegex(
+                DRIVER.DriverError, "published branch moved"
+            ):
+                DRIVER.merge_local(
+                    data,
+                    config,
+                    integration,
+                    "squash",
+                    DRIVER.template_narration(task("task-1")),
+                )
+            self.assertEqual(
+                git(
+                    checkout,
+                    "rev-parse",
+                    DRIVER.integration_branch("fixture", CAMPAIGN_ID),
+                ),
+                integration["baseRev"],
+            )
+
+    def test_a_reachable_but_unmarked_commit_does_not_complete_a_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout))
+            base = DRIVER.ensure_integration_branch(
+                config,
+                "fixture",
+                CAMPAIGN_ID,
+                git(checkout, "rev-parse", "origin/main"),
+            )
+            revision = "sha256:" + "d" * 64
+            branch = DRIVER.stable_publish_branch(
+                "fixture", CAMPAIGN_ID, "task-1", revision
+            )
+            git(
+                checkout,
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "unmarked integration commit",
+            )
+            unmarked = git(checkout, "rev-parse", "HEAD")
+            git(
+                checkout,
+                "update-ref",
+                f"refs/heads/{DRIVER.integration_branch('fixture', CAMPAIGN_ID)}",
+                unmarked,
+                base,
+            )
+            git(checkout, "update-ref", f"refs/heads/{branch}", unmarked)
+            receipt = DRIVER.merge_receipt_ref(
+                "fixture", CAMPAIGN_ID, "task-1", revision
+            )
+            git(checkout, "update-ref", receipt, unmarked)
+
+            self.assertEqual(
+                DRIVER.merged_local_tasks(
+                    "acme/spec",
+                    config,
+                    "fixture",
+                    CAMPAIGN_ID,
+                    "7",
+                    None,
+                    [{**task("task-1"), "revision": revision}],
+                ),
+                [],
+            )
+
     def test_local_merge_method_still_produces_a_merge_commit_and_no_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout, _ = initialize_repository(root, remote=True)
             workspace_root = root / "workspaces"
             workspace_root.mkdir()
-            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
+            revision = "sha256:" + "c" * 64
+            branch = DRIVER.stable_publish_branch(
+                "fixture", CAMPAIGN_ID, "task-1", revision
+            )
             head = self.publish_branch(checkout, branch)
             config = DRIVER.repo_config(repository_config(checkout))
             data = {
                 "campaign": "fixture",
+                "campaignIdentity": CAMPAIGN_ID,
                 "repository": "acme/spec",
                 "issue": issue(),
                 "workspaceRoot": str(workspace_root),
-                "task": task("task-1"),
+                "task": {**task("task-1"), "revision": revision},
             }
             merge_commit = DRIVER.merge_local(
                 data,
@@ -5945,8 +6313,11 @@ class SquashMergeTests(unittest.TestCase):
                 "merge",
                 DRIVER.template_narration(task("task-1")),
             )
-            git(checkout, "fetch", "--quiet", "--prune", "origin")
-            base = git(checkout, "rev-parse", "origin/main")
+            base = git(
+                checkout,
+                "rev-parse",
+                DRIVER.integration_branch("fixture", CAMPAIGN_ID),
+            )
             self.assertEqual(len(git(checkout, "log", "-1", "--format=%P", base).split()), 2)
             self.assertEqual(
                 command(
@@ -5956,16 +6327,23 @@ class SquashMergeTests(unittest.TestCase):
                 0,
             )
             self.assertEqual(
-                DRIVER.local_remote_refs(
-                    config, f"{DRIVER.local_state_prefix('fixture', '7')}/merge/*"
+                DRIVER.local_refs(
+                    checkout,
+                    f"{DRIVER.local_state_prefix('fixture', CAMPAIGN_ID)}/merge/",
                 ),
                 {},
             )
             self.assertEqual(
                 [fact["mergeCommit"] for fact in DRIVER.merged_local_tasks(
-                    "acme/spec", config, "fixture", "7", None, [task("task-1")]
+                    "acme/spec",
+                    config,
+                    "fixture",
+                    CAMPAIGN_ID,
+                    "7",
+                    None,
+                    [{**task("task-1"), "revision": revision}],
                 )],
-                [head],
+                [merge_commit],
             )
             self.assertNotEqual(merge_commit, head)
 
@@ -6013,6 +6391,7 @@ class SquashMergeTests(unittest.TestCase):
             checkout, _ = initialize_repository(root, remote=True)
             branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
             head = self.publish_branch(checkout, branch)
+            git(checkout, "push", "--quiet", "origin", f"{head}:refs/heads/{branch}")
             squash = self.integration_commit(checkout, branch, "squash")
             config = DRIVER.repo_config(repository_config(checkout, "github"))
             data = {
@@ -6086,6 +6465,7 @@ class SquashMergeTests(unittest.TestCase):
             checkout, _ = initialize_repository(root, remote=True)
             branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
             head = self.publish_branch(checkout, branch)
+            git(checkout, "push", "--quiet", "origin", f"{head}:refs/heads/{branch}")
             minted = self.integration_commit(checkout, branch, "merge")
             config = DRIVER.repo_config(repository_config(checkout, "github"))
             data = {
@@ -6183,10 +6563,8 @@ raise SystemExit(2)
 class GitAiBindingTests(unittest.TestCase):
     """The post-merge fourth proof axis (AUGUST-01-DESIGN.md §7, ruling §9.3.2).
 
-    Every scenario runs against a squash the campaign did not mint locally --
-    `merge_local` clones the remote and squashes there, which is the same shape
-    `gh pr merge --squash` produces -- because that is the case the spike
-    proved arrives unbound.
+    Every scenario runs against the layer commit on the local integration
+    branch, while the compatibility binding still projects its note outward.
     """
 
     def arm(self, root: Path, *, provisioned: bool) -> dict[str, str]:
@@ -6227,7 +6605,9 @@ class GitAiBindingTests(unittest.TestCase):
         workspace_root = root / "workspaces"
         workspace_root.mkdir()
         revision = "sha256:" + "a" * 64
-        branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+        branch = DRIVER.stable_publish_branch(
+            "fixture", CAMPAIGN_ID, "task-1", revision
+        )
         git(checkout, "switch", "--quiet", "-c", "work", "origin/main")
         (checkout / "delivered.txt").write_text("one\n", encoding="utf-8")
         git(checkout, "add", "delivered.txt")
@@ -6235,13 +6615,19 @@ class GitAiBindingTests(unittest.TestCase):
         (checkout / "delivered.txt").write_text("one\ntwo\n", encoding="utf-8")
         git(checkout, "add", "delivered.txt")
         git(checkout, "commit", "--quiet", "-m", "wip: second")
-        git(checkout, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
         head = git(checkout, "rev-parse", "HEAD")
+        git(checkout, "update-ref", f"refs/heads/{branch}", head)
         git(checkout, "switch", "--quiet", "main")
-        git(checkout, "fetch", "--quiet", "--prune", "origin")
         config = DRIVER.repo_config(repository_config(checkout))
+        base = DRIVER.ensure_integration_branch(
+            config,
+            "fixture",
+            CAMPAIGN_ID,
+            git(checkout, "rev-parse", "origin/main"),
+        )
         data = {
             "campaign": "fixture",
+            "campaignIdentity": CAMPAIGN_ID,
             "repository": "acme/spec",
             "issue": issue(),
             "workspaceRoot": str(workspace_root),
@@ -6250,7 +6636,7 @@ class GitAiBindingTests(unittest.TestCase):
         integration = {
             "taskId": "task-1",
             "branch": branch,
-            "baseRev": git(checkout, "rev-parse", "origin/main"),
+            "baseRev": base,
             "head": head,
             "pullRequest": f"local://acme/spec/{branch}",
         }
@@ -6304,7 +6690,7 @@ class GitAiBindingTests(unittest.TestCase):
         ).stdout.strip()
         return sorted(line.split()[1] for line in listing.splitlines() if line.strip())
 
-    def test_a_forge_side_squash_is_bound_and_the_note_reaches_the_remote(self) -> None:
+    def test_a_local_layer_squash_is_bound_and_the_note_reaches_the_remote(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = self.arm(root, provisioned=True)
@@ -6315,9 +6701,8 @@ class GitAiBindingTests(unittest.TestCase):
                 merge_commit = DRIVER.merge_local(
                     data, config, integration, "squash", self.NARRATION, trailer
                 )
-                # The squash was minted in a throwaway clone, exactly like a
-                # forge-side one: it arrives with no note at all.
-                git(checkout, "fetch", "--quiet", "--prune", "origin")
+                # The layer commit exists locally before the compatibility
+                # binding reconstructs and copies its note.
                 self.assertNotEqual(
                     command(
                         "git", "-C", str(checkout), "notes", "--ref", "refs/notes/ai",
