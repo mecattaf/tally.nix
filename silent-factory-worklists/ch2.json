@@ -339,7 +339,13 @@
         "test/fixtures",
         "crates/tally/src/cli/campaign.rs",
         "crates/tally-core/tests/campaign_contract_corpus.rs",
-        "test/spec_build_driver_test.py"
+        "test/spec_build_driver_test.py",
+        "crates/tally-flow/src/campaign_flow_tests.rs",
+        "crates/tally-flow/tests/spec_build_failed_agent_gate.rs",
+        "crates/tally/tests/campaign_poll.rs",
+        "crates/tally/tests/flow_live.rs",
+        "test/spec_build_two_repo_test.py",
+        "test/final-bar"
       ]
     },
     {
