@@ -535,7 +535,6 @@ impl Daemon {
             gh_program: PathBuf::from("gh"),
             tally_socket,
             brief_root: paths.data_dir.clone(),
-            git_ai: config.git_ai.clone(),
             exec_attestations: config.attestations.exec.enable,
             attestations: Arc::new(std::sync::Mutex::new(attestations)),
             flow_lineage_cache: Rc::new(RefCell::new(None)),

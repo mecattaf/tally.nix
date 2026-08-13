@@ -97,7 +97,6 @@
             ./drivers/spec_build_driver.py
             ./test/fixtures/flows
             ./test/fixtures/gh-login
-            ./test/fixtures/git-ai
             ./test/fixtures/ledger
             ./test/fixtures/pools
             ./test/fixtures/redaction
@@ -1459,61 +1458,6 @@
             minimumFreeBytes = 67108864;
           };
         };
-        gitAiRemoteTally = pkgs.writeShellScript "tally-d12-remote-helper" ''
-          export PATH="/var/lib/tally-worker/fleet-bin:${pkgs.git}/bin:${pkgs.coreutils}/bin:${pkgs.python3}/bin:$PATH"
-          exec ${tally}/bin/tally "$@"
-        '';
-        gitAiRemoteJob = pkgs.writeShellApplication {
-          name = "tally-d12-remote-job";
-          runtimeInputs = [
-            pkgs.coreutils
-            pkgs.git
-          ];
-          text = ''
-            printf '%s\n' 'authored on the remote worktree host' > remote-authored.txt
-            git add remote-authored.txt
-            git commit -qm 'D12 remote authorship fixture'
-            revision="$(git rev-parse HEAD)"
-            printf \
-              '{"schemaVersion":1,"artifact":{"resultRevision":"%s"},"gates":[{"id":"d12","status":"pass"}]}\n' \
-              "$revision" > gates.json
-            touch remote-job-running
-            sleep 15
-          '';
-        };
-        gitAiRemoteConfig = pkgs.writeText "tally-d12-remote-config.json" (
-          builtins.toJSON {
-            retention.enable = false;
-            storage = vmStorageBudget;
-            attestations.exec.enable = false;
-            gitAi = {
-              enable = true;
-              mode = "required";
-              awaitTimeoutSec = 30;
-              globalAwaitOk = false;
-            };
-            pools.worker-slot = {
-              resource = "build-slot";
-              capacity = 1;
-              enforce = "cooperative";
-            };
-            adapters.shell.hardening = "workspace";
-            executors.worker = {
-              kind = "ssh";
-              host = "worker";
-              user = "tally-worker";
-              sshProgram = "${pkgs.openssh}/bin/ssh";
-              identityFile = "/etc/tally-fs7/id_ed25519";
-              knownHostsFile = "/etc/tally-fs7/worker-known-hosts";
-              program = "${gitAiRemoteTally}";
-              stateDir = "/var/lib/tally-remote";
-              connectTimeoutSec = 5;
-              serverAliveIntervalSec = 1;
-              serverAliveCountMax = 2;
-              retryIntervalMs = 100;
-            };
-          }
-        );
         flowReplayProgram = pkgs.writeShellApplication {
           name = "tally-fs7-replay";
           text = ''
@@ -1914,16 +1858,6 @@
                   agentRuntimeMaxSec = 120;
                   driverRuntimeMaxSec = 30;
                   mergeMethod = "merge";
-                  # Advisory is the only posture this wave arms: the merge node
-                  # records what the binding found and never fails on it. The
-                  # externally provisioned binary is absent from this fixture,
-                  # so what it records here is that fact.
-                  gitAiBinding = "advisory";
-                  # driverRuntimeMaxSec is 30 here, and the settlement barrier
-                  # runs inside that node. The evaluated assertion requires the
-                  # deadline to be at least twice this budget, so the fixture
-                  # states a budget its own node can actually host.
-                  gitAiAwaitSec = 12;
                   # The narrate seam is config-only: an adapter the estate adds
                   # to the open map, named as this campaign's catalog role. The
                   # rendered narration argv is the adapter's own argv with this
@@ -4189,208 +4123,6 @@
               "jq -e '.summary.diverged >= 1' /tmp/tally-u6-diverged.json"
             )
 
-            # D12: this test-only protocol peer is copied into a fleet-owned
-            # runtime directory. No product derivation or module provisions
-            # Git AI; the worker helper merely inherits the fleet PATH.
-            worker.succeed(
-              "install -d -m 0700 -o tally-worker -g users "
-              "/var/lib/tally-worker/fleet-bin "
-              "/var/lib/tally-worker/git-ai-worktree"
-            )
-            worker.succeed(
-              "install -m 0755 -o tally-worker -g users "
-              "${./test/fixtures/git-ai/fleet-provider.py} "
-              "/var/lib/tally-worker/fleet-bin/git-ai"
-            )
-            worker.succeed(
-              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
-              "${pkgs.git}/bin/git -C /var/lib/tally-worker/git-ai-worktree init -q"
-            )
-            worker.succeed(
-              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
-              "${pkgs.git}/bin/git -C /var/lib/tally-worker/git-ai-worktree "
-              "config user.name 'Tally D12 worker'"
-            )
-            worker.succeed(
-              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
-              "${pkgs.git}/bin/git -C /var/lib/tally-worker/git-ai-worktree "
-              "config user.email tally-d12@example.invalid"
-            )
-            coordinator.succeed(
-              "${tally}/bin/tally --mode check-config --config ${gitAiRemoteConfig}"
-            )
-
-            d12_socket = "/run/user/1000/tally/d12-git-ai.sock"
-            d12_tally = (
-              "${tally}/bin/tally"
-              + " --config ${gitAiRemoteConfig}"
-              + " --socket "
-              + d12_socket
-            )
-            d12_cli = user + " " + d12_tally
-            coordinator.succeed(
-              user
-              + " systemd-run --user --unit=tally-d12-git-ai-daemon --collect --quiet "
-              + "--property=Type=exec -- "
-              + "${tally}/bin/tally --config ${gitAiRemoteConfig} --socket "
-              + d12_socket
-              + " daemon run "
-              + "--cpu-weight 100 "
-              + "--memory-max-bytes 8589934592 "
-              + "--state-dir /var/lib/tally-coordinator/d12-state "
-              + "--data-dir /var/lib/tally-coordinator/d12-data"
-            )
-            coordinator.wait_until_succeeds("test -S " + d12_socket)
-            coordinator.succeed(
-              user
-              + " systemd-run --user --unit=tally-d12-git-ai-enqueue --collect --quiet "
-              + "--property=Type=exec "
-              + "--property=StandardOutput=append:/tmp/tally-d12-git-ai.out "
-              + "--property=StandardError=append:/tmp/tally-d12-git-ai.err -- "
-              + d12_tally
-              + " enqueue --pool worker-slot --executor worker "
-              + "--workspace-repo mecattaf/tally.nix "
-              + "--workspace-base-rev unborn "
-              + "--workspace-branch d12-vm "
-              + "--workspace-worktree /var/lib/tally-worker/git-ai-worktree "
-              + "--gate-manifest /var/lib/tally-worker/git-ai-worktree/gates.json "
-              + "--required-gate d12 "
-              + "--acceptance-policy execution-and-gates "
-              + "--evidence exit:0 --wait -- "
-              + "${gitAiRemoteJob}/bin/tally-d12-remote-job"
-            )
-            worker.wait_until_succeeds(
-              "test -f /var/lib/tally-worker/git-ai-worktree/remote-job-running"
-            )
-            worker.succeed(
-              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
-              "XDG_RUNTIME_DIR=/run/user/1001 ${pkgs.bash}/bin/bash -euc '"
-              "unit=$(systemctl --user list-units --type=service --state=running "
-              "\"tally-git-ai-*.service\" --no-legend "
-              "| ${pkgs.gawk}/bin/awk \"NR == 1 { print \\$1 }\"); "
-              "test -n \"$unit\"; "
-              "systemctl --user show \"$unit\" "
-              "--property=ProtectSystem --property=ProtectHome "
-              "--property=PrivateTmp --property=NoNewPrivileges "
-              "--property=RestrictAddressFamilies --property=ReadWritePaths "
-              "> /var/lib/tally-worker/d12-git-ai-hardening'"
-            )
-            worker.succeed(
-              "grep -Fx ProtectSystem=strict "
-              "/var/lib/tally-worker/d12-git-ai-hardening"
-            )
-            worker.succeed(
-              "grep -Fx ProtectHome=read-only "
-              "/var/lib/tally-worker/d12-git-ai-hardening"
-            )
-            worker.succeed(
-              "grep -Fx PrivateTmp=yes "
-              "/var/lib/tally-worker/d12-git-ai-hardening"
-            )
-            worker.succeed(
-              "grep -Fx NoNewPrivileges=yes "
-              "/var/lib/tally-worker/d12-git-ai-hardening"
-            )
-            worker.succeed(
-              "grep -Fx RestrictAddressFamilies=AF_UNIX "
-              "/var/lib/tally-worker/d12-git-ai-hardening"
-            )
-            worker.succeed(
-              "${pkgs.bash}/bin/bash -euc '"
-              "paths=$(sed -n \"s/^ReadWritePaths=//p\" "
-              "/var/lib/tally-worker/d12-git-ai-hardening); "
-              "test -n \"$paths\"; "
-              "for path in $paths; do "
-              "case \"$path\" in "
-              "/var/lib/tally-remote/git-ai/*|"
-              "/var/lib/tally-worker/git-ai-worktree*) ;; "
-              "*) echo \"unexpected writable path: $path\" >&2; exit 1 ;; "
-              "esac; "
-              "done'"
-            )
-            coordinator.fail(
-              user
-              + " systemctl --user list-units --type=service --state=running "
-              + "\"tally-git-ai-*.service\" --no-legend | grep -F tally-git-ai-"
-            )
-
-            coordinator.wait_until_succeeds(
-              "grep -F '\"verdict\":\"pass\"' /tmp/tally-d12-git-ai.out"
-            )
-            coordinator.succeed(
-              "jq -er '.task_uuid // .taskUuid' /tmp/tally-d12-git-ai.out "
-              "> /tmp/tally-d12-git-ai-task"
-            )
-            coordinator.succeed(
-              d12_cli
-              + " query job \"$(cat /tmp/tally-d12-git-ai-task)\" "
-              + "> /tmp/tally-d12-git-ai-job.json"
-            )
-            coordinator.succeed(
-              "jq -e '.job.terminalVerdict == \"pass\" and "
-              ".job.executor == \"worker\" and "
-              ".job.authorship.status == \"bound\" and "
-              ".job.authorship.provider == \"git-ai\" and "
-              ".job.authorship.providerVersion == \"1.6.17\" and "
-              ".job.authorship.identityMismatch == false and "
-              ".job.authorship.workspace.value.worktreePath == "
-              "\"/var/lib/tally-worker/git-ai-worktree\" and "
-              ".job.authorship.gitAiSessions[0].value.tool == "
-              "\"remote-fixture\"' /tmp/tally-d12-git-ai-job.json"
-            )
-            coordinator.succeed(
-              d12_cli
-              + " query proof --task \"$(cat /tmp/tally-d12-git-ai-task)\" "
-              + "| jq -e '.status == \"verified\" and "
-              + ".witnessRecord.hostId == \"worker\" and "
-              + ".authorship.status == \"bound\"'"
-            )
-            worker.succeed(
-              "observation=$(find /var/lib/tally-remote/git-ai "
-              "-name fixture-observation.json -print -quit); "
-              "test -n \"$observation\"; "
-              "jq -e '.host == \"worker\" and "
-              ".attributes.adapter == \"shell\" and "
-              ".attributes.taskUuid != null' \"$observation\""
-            )
-            worker.succeed(
-              "find /var/lib/tally-remote/git-ai -name trace-observed "
-              "-print -quit | grep -F trace-observed"
-            )
-            worker.succeed(
-              "runuser -u tally-worker -- ${pkgs.git}/bin/git "
-              "-C /var/lib/tally-worker/git-ai-worktree "
-              "notes --ref refs/notes/ai show HEAD | grep -F "
-              "'\"schema_version\":\"authorship/3.0.0\"'"
-            )
-
-            worker_scp = (
-              "runuser -u tally -- ${pkgs.openssh}/bin/scp -F /dev/null "
-              "-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
-              "-o UserKnownHostsFile=/etc/tally-fs7/worker-known-hosts "
-              "-i /etc/tally-fs7/id_ed25519"
-            )
-            coordinator.succeed(
-              worker_scp
-              + " /var/lib/tally-coordinator/d12-data/witness.jsonl "
-              + "tally-worker@worker:/var/lib/tally-worker/d12-witness.jsonl"
-            )
-            coordinator.succeed(
-              worker_scp
-              + " /tmp/tally-d12-git-ai-task "
-              + "tally-worker@worker:/var/lib/tally-worker/d12-task"
-            )
-            worker.succeed(
-              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
-              "${tally}/bin/tally witness verify-authorship "
-              "--ledger /var/lib/tally-worker/d12-witness.jsonl "
-              "--repository /var/lib/tally-worker/git-ai-worktree "
-              "--task \"$(cat /var/lib/tally-worker/d12-task)\" --format json "
-              "| ${pkgs.jq}/bin/jq -e '.ok and .status == \"match\"'"
-            )
-            coordinator.succeed(
-              user + " systemctl --user stop tally-d12-git-ai-daemon.service"
-            )
           '';
         };
         badPoolNixos = nixpkgs.lib.nixosSystem {
@@ -4601,13 +4333,6 @@
               };
             };
           assert stockHome.config.services.tally.attestations.exec.enable;
-          assert
-            stockHome.config.services.tally.gitAi == {
-              enable = false;
-              mode = "advisory";
-              awaitTimeoutSec = 60;
-              globalAwaitOk = false;
-            };
           assert homeServices ? tally-retention;
           assert homeTimers ? tally-retention;
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
@@ -4983,7 +4708,6 @@
               .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"producerMarkerHorizon":"180d","lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
               .storage == {"pollIntervalSec":60,"dataDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592},"stateDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592}} and
               .attestations == {"exec":{"enable":true}} and
-              .gitAi == {"enable":false,"mode":"advisory","awaitTimeoutSec":60,"globalAwaitOk":false} and
               .pools.build.resource == "build-slot" and
               .pools.build.capacity == 2 and
               .pools.build.enforce == "cooperative" and
@@ -5208,9 +4932,6 @@
                   ($fixtureArgs.gates[1] | has("argv") | not) and
                   $fixtureArgs.gates[1].runtimeMaxSec == 11 and
                   $fixtureArgs.mergeMethod == "merge" and
-                  $fixtureArgs.gitAiBinding == "advisory" and
-                  $fixtureArgs.gitAiAwaitSec == 12 and
-                  ($fixtureArgs.driverRuntimeMaxSec >= 2 * $fixtureArgs.gitAiAwaitSec) and
                   ($fixtureArgs.captureRoot | endswith("/capture/archive")) and
                   $fixtureArgs.postFailureEvidence == true and
                   $fixtureArgs.postFailureStderr == true and
@@ -5247,8 +4968,6 @@
                   ($defaultedArgs | has("issueRepository") | not) and
                   ($fixtureArgs | has("specRepository") | not) and
                   $defaultedArgs.mergeMethod == "squash" and
-                  $defaultedArgs.gitAiBinding == "off" and
-                  $defaultedArgs.gitAiAwaitSec == 60 and
                   $defaultedArgs.postFailureEvidence == false and
                   $defaultedArgs.postFailureStderr == false and
                   $defaultedArgs.steward == null and

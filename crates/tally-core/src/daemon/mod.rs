@@ -100,7 +100,7 @@ use crate::completion::{
     evaluate_completion, ExecutionFact, ExecutionStatus, GateManifestSpec, GateSummaryStatus,
     SemanticCompletion,
 };
-use crate::config::{Config, GitAiConfig, PoolPredicate, Priority, ResourceKind};
+use crate::config::{Config, PoolPredicate, Priority, ResourceKind};
 use crate::evidence::{
     parse_evidence_specs, probe_dedup, probe_full_pass, run_evidence_gate, CheckOutcome,
     DedupMissReason, RetryTrigger, RunOutcome,
@@ -118,7 +118,6 @@ use crate::flow_membership::{
     record_membership, FlowMembership, FlowMembershipError, FlowMembershipRecord,
     MembershipDisposition, MembershipWrite,
 };
-use crate::git_ai::GitAiExecution;
 use crate::history::{HistoryError, LifecycleStore};
 use crate::journal::{EmitEvent, JournalEmitter, JournalEntry, TallyEvent};
 use crate::lease::{
@@ -674,7 +673,6 @@ struct DaemonHandler {
     gh_program: PathBuf,
     tally_socket: String,
     brief_root: PathBuf,
-    git_ai: GitAiConfig,
     exec_attestations: bool,
     attestations: Arc<std::sync::Mutex<SharedAttestations>>,
     flow_lineage_cache: Rc<RefCell<Option<CachedFlowLineage>>>,

@@ -161,8 +161,12 @@ pub struct ExecutionRequest {
     pub workspace: Option<WorkspaceMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_manifest: Option<GateManifestSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_ai: Option<GitAiExecution>,
+    /// Source-compatibility placeholder for callers that still initialize the
+    /// removed integration to `None`. It is neither serializable nor
+    /// inhabitable, so no request can carry gate configuration through it.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub git_ai: Option<std::convert::Infallible>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_attestation: Option<ExecAttestationContext>,
     #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
@@ -245,8 +249,8 @@ pub struct ExecutionOutcome {
     /// Structured execution/gate/acceptance facts computed on the filesystem
     /// that owns the declared gate manifest.
     pub semantic_completion: Option<SemanticCompletion>,
-    /// Exact result/authorship binding computed on the host that owns the
-    /// result worktree. Both remain absent when Git AI integration is disabled.
+    /// Historical result/authorship payloads remain representable for the
+    /// passive read side; new execution outcomes leave these fields unset.
     pub result_revision: Option<String>,
     pub authorship: Option<Authorship>,
     pub authorship_sessions: Option<Vec<AuthorshipSession>>,

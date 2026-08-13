@@ -74,8 +74,16 @@ fn seed(
     uuid
 }
 
-fn migrate(state_dir: &Path, apply: bool) -> Value {
+fn tally_with_empty_config(config_dir: &Path) -> Command {
+    let config = config_dir.join("empty-config.json");
+    std::fs::write(&config, b"{}").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
+    command.arg("--config").arg(config);
+    command
+}
+
+fn migrate(state_dir: &Path, config_dir: &Path, apply: bool) -> Value {
+    let mut command = tally_with_empty_config(config_dir);
     command
         .arg("migrate")
         .arg("unit-exit-labels")
@@ -118,7 +126,7 @@ fn the_named_migration_plans_then_relabels_and_is_a_no_op_afterwards() {
     let plain = seed(state_dir, None, ExecutionIdentity::unit_name);
     let plain_unit_before = recorded_unit(state_dir, plain);
 
-    let plan = migrate(state_dir, false);
+    let plan = migrate(state_dir, temp.path(), false);
     assert_eq!(plan["applied"], json!(false));
     assert_eq!(plan["labeledRows"], json!(1));
     assert_eq!(plan["rewritten"].as_array().unwrap().len(), 1);
@@ -137,7 +145,7 @@ fn the_named_migration_plans_then_relabels_and_is_a_no_op_afterwards() {
         "a plan-only run must not write"
     );
 
-    let applied = migrate(state_dir, true);
+    let applied = migrate(state_dir, temp.path(), true);
     assert_eq!(applied["applied"], json!(true));
     assert_eq!(applied["rewritten"].as_array().unwrap().len(), 1);
     assert_eq!(
@@ -150,7 +158,7 @@ fn the_named_migration_plans_then_relabels_and_is_a_no_op_afterwards() {
         "a row with no taskRef is out of scope and untouched"
     );
 
-    let again = migrate(state_dir, true);
+    let again = migrate(state_dir, temp.path(), true);
     assert_eq!(again["rewritten"].as_array().unwrap().len(), 0);
     assert_eq!(again["alreadyLabeled"], json!(1));
     assert_eq!(again["skipped"].as_array().unwrap().len(), 0);
@@ -172,7 +180,7 @@ fn a_state_directory_that_holds_no_durable_rows_is_refused_rather_than_reported_
         if label == "worker" {
             std::fs::create_dir_all(dir.join(UNIT_EXIT_DIRECTORY)).unwrap();
         }
-        let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        let output = tally_with_empty_config(temp.path())
             .arg("migrate")
             .arg("unit-exit-labels")
             .arg("--state-dir")
@@ -316,7 +324,7 @@ fn capture_labels_moves_pre_label_captures_and_is_idempotent() {
     .unwrap();
 
     let migrate = |apply: bool| -> Value {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
+        let mut command = tally_with_empty_config(temp.path());
         command
             .arg("migrate")
             .arg("capture-labels")

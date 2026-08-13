@@ -63,28 +63,6 @@ fn request() -> ExecutionRequest {
     }
 }
 
-fn git_ai_execution() -> GitAiExecution {
-    GitAiExecution {
-        config: crate::config::GitAiConfig {
-            enable: true,
-            mode: crate::config::GitAiMode::Advisory,
-            await_timeout_sec: 60,
-            global_await_ok: true,
-        },
-        attributes: BTreeMap::from([
-            ("adapter".to_owned(), "codex".to_owned()),
-            ("attempt".to_owned(), "1".to_owned()),
-            ("leaseEpoch".to_owned(), "7".to_owned()),
-            (
-                "taskUuid".to_owned(),
-                "00000000-0000-4000-8000-000000000002".to_owned(),
-            ),
-        ]),
-        expected_session: None,
-        expected_model: None,
-    }
-}
-
 fn gh_origin(item_type: GhItemType) -> GhOrigin {
     GhOrigin {
         schema_version: GH_ORIGIN_SCHEMA_VERSION,
@@ -802,71 +780,6 @@ fn strict_writes_are_scoped_to_declared_execution_paths() {
 }
 
 #[test]
-fn git_ai_hardening_grants_the_linked_worktree_common_git_directory() {
-    let temp = tempfile::tempdir().unwrap();
-    let repository = temp.path().join("repository");
-    let worktree = temp.path().join("linked-worktree");
-    std::fs::create_dir(&repository).unwrap();
-    let git = |cwd: &Path, args: &[&str]| {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    git(&repository, &["init", "-q"]);
-    git(&repository, &["config", "user.name", "Tally Test"]);
-    git(
-        &repository,
-        &["config", "user.email", "tally@example.invalid"],
-    );
-    std::fs::write(repository.join("file"), "initial\n").unwrap();
-    git(&repository, &["add", "file"]);
-    git(&repository, &["commit", "-q", "-m", "initial"]);
-    git(
-        &repository,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "tally-linked-test",
-            worktree.to_str().unwrap(),
-            "HEAD",
-        ],
-    );
-
-    let mut enabled = request();
-    enabled.hardening = AdapterHardening::Strict;
-    enabled.workspace = Some(WorkspaceMetadata {
-        repo: "acme/widgets".to_owned(),
-        base_rev: "HEAD".to_owned(),
-        branch: "tally-linked-test".to_owned(),
-        worktree_path: worktree.clone(),
-    });
-    enabled.git_ai = Some(git_ai_execution());
-    let args = strings(
-        &executor(&temp.path().join("state"))
-            .build_systemd_argv(&enabled)
-            .unwrap(),
-    );
-    let writable = args
-        .windows(2)
-        .find(|pair| pair[0] == "--property" && pair[1].starts_with("ReadWritePaths="))
-        .unwrap()[1]
-        .clone();
-    assert!(writable.contains(worktree.to_str().unwrap()));
-    assert!(writable.contains(repository.join(".git").to_str().unwrap()));
-    assert!(writable.contains(".git/worktrees/linked-worktree"));
-}
-
-#[test]
 fn gate_manifest_path_is_exported_or_scrubbed_and_defaults_per_target() {
     let local = executor(Path::new("/coordinator-state"));
     let mut declared = request();
@@ -925,73 +838,6 @@ fn execution_environment_preserves_scalar_compatibility_and_encodes_multi_pool_s
     assert!(multi_environment
         .iter()
         .any(|(name, value)| { name == "TALLY_POOL" && value == r#"["alpha","zeta"]"# }));
-}
-
-#[test]
-fn git_ai_custom_attributes_are_exact_and_disabled_integration_is_absent() {
-    let mut enabled = request();
-    enabled.environment.insert(
-        "GIT_AI_CUSTOM_ATTRIBUTES".to_owned(),
-        r#"{"spoofed":"value"}"#.to_owned(),
-    );
-    enabled.git_ai = Some(git_ai_execution());
-    let environment = execution_environment(&enabled, None).unwrap();
-    assert_eq!(
-        environment
-            .iter()
-            .rev()
-            .find(|(name, _)| name == "GIT_AI_CUSTOM_ATTRIBUTES")
-            .map(|(_, value)| value.as_str()),
-        Some(
-            r#"{"adapter":"codex","attempt":"1","leaseEpoch":"7","taskUuid":"00000000-0000-4000-8000-000000000002"}"#
-        )
-    );
-    assert!(!environment_to_unset(&enabled).contains(&"GIT_AI_CUSTOM_ATTRIBUTES"));
-
-    let disabled = request();
-    assert!(execution_environment(&disabled, None)
-        .unwrap()
-        .iter()
-        .all(|(name, _)| name != "GIT_AI_CUSTOM_ATTRIBUTES"));
-    assert!(environment_to_unset(&disabled).contains(&"GIT_AI_CUSTOM_ATTRIBUTES"));
-    assert!(serde_json::to_value(&disabled)
-        .unwrap()
-        .get("gitAi")
-        .is_none());
-}
-
-#[test]
-fn private_git_ai_runtime_routes_only_the_job_to_its_control_and_trace_sockets() {
-    let temp = tempfile::tempdir().unwrap();
-    let state_dir = temp.path().join("state");
-    let executor = executor(&state_dir);
-    let mut enabled = request();
-    enabled.git_ai = Some(git_ai_execution());
-    let runtime = git_ai::private_daemon_paths(
-        Path::new("/opt/dotfiles/bin/git-ai"),
-        "1.6.17",
-        &state_dir,
-        "task-53:1:7",
-        Path::new("/run/current-system/sw/bin/systemctl"),
-    )
-    .unwrap();
-    let expected = runtime
-        .child_environment()
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let args = strings(
-        &executor
-            .build_systemd_argv_with_git_ai(&enabled, Some(&runtime))
-            .unwrap(),
-    );
-    for (name, value) in expected {
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--setenv" && pair[1] == format!("{name}={value}")),
-            "job unit omitted {name}"
-        );
-    }
-    std::mem::forget(runtime);
 }
 
 #[test]

@@ -5,14 +5,6 @@ impl Executor {
         &self,
         request: &ExecutionRequest,
     ) -> Result<Vec<OsString>, ExecutorError> {
-        self.build_systemd_argv_with_git_ai(request, None)
-    }
-
-    pub(super) fn build_systemd_argv_with_git_ai(
-        &self,
-        request: &ExecutionRequest,
-        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
-    ) -> Result<Vec<OsString>, ExecutorError> {
         self.validate_request(request)?;
         let paths = self.paths(&request.identity);
         let unit_stem = self.unit_stem(&request.identity);
@@ -72,10 +64,7 @@ impl Executor {
             .as_ref()
             .filter(|origin| origin.is_current())
             .map(|_| self.gh_context_path(&request.identity));
-        let mut environment = execution_environment(request, gh_context_path.as_deref())?;
-        if let Some(runtime) = git_ai_runtime {
-            environment.extend(runtime.child_environment());
-        }
+        let environment = execution_environment(request, gh_context_path.as_deref())?;
         for (name, value) in environment {
             push_pair(&mut args, "--setenv", format!("{name}={value}"));
         }
@@ -178,9 +167,6 @@ impl Executor {
         let mut writable = Vec::new();
         if let Some(workspace) = &request.workspace {
             writable.push(workspace.worktree_path.clone());
-            if request.git_ai.is_some() {
-                writable.extend(git_repository_write_paths(&workspace.worktree_path));
-            }
         }
         if strict {
             // Keep the transient unit's state writers explicit. systemd opens
@@ -318,12 +304,6 @@ pub(super) fn execution_environment(
             display_path(&manifest.path)?.to_owned(),
         ));
     }
-    if let Some(git_ai) = &request.git_ai {
-        environment.push((
-            "GIT_AI_CUSTOM_ATTRIBUTES".to_owned(),
-            git_ai.attributes_json()?,
-        ));
-    }
     if let Some(workspace) = &request.workspace {
         environment.extend([
             ("TALLY_WORKSPACE_REPO".to_owned(), workspace.repo.clone()),
@@ -433,9 +413,6 @@ pub(super) fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static s
     }
     if request.gate_manifest.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[14]);
-    }
-    if request.git_ai.is_none() {
-        names.push("GIT_AI_CUSTOM_ATTRIBUTES");
     }
     if request
         .gh_origin
