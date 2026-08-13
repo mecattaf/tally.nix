@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "final-bar-local-forge-repair",
+      "kind": "implementation",
+      "title": "Repair the final conformance bar for the post-chapter-2 local-only CLI",
+      "goal": "Chapter 2's drop-local-forge-escape-hatches deleted --allow-test-local-forge from crates/tally, but the final conformance bar still passes it in four call sites: test/final-bar/cases/manifest.py line 286, cases/pipeline.py lines 149 and 253, and cases/registry.py line 59. The bar is therefore broken on main and nothing noticed: its only flake attribute (final-conformance-bar-harness) runs --list without executing a case, and test/fleet-gate.sh has no final-bar step. Remove the dead flag from the four spawn argvs and bring the whole bar back to exit 0 by running it against your worktree (test/final-bar/run <absolute path to the worktree>; tri-state exit per test/final-bar/README.md). The bar has not executed since before the chapter 2 deletions, so any further staleness the run reveals inside test/final-bar is in scope for this task. Do not touch test/fleet-gate.sh (owned by gate-keep-going in this campaign); the epsilon chapter checkpoint runs the bar directly.",
+      "deliveredBehaviors": [
+        "test/final-bar/run <tree> exits 0 against the post-chapter-2 local-only CLI",
+        "No final-bar case passes --allow-test-local-forge"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 sections 7.1 and 7.3"
+        ],
+        "styleReferences": [
+          "test/final-bar/README.md"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-dead-flag",
+          "description": "The deleted flag is gone from every final-bar case.",
+          "argv": [
+            "bash",
+            "-lc",
+            "! grep -rn 'allow-test-local-forge' test/final-bar"
+          ]
+        },
+        {
+          "id": "bar-green",
+          "description": "The full final conformance bar passes against this worktree.",
+          "argv": [
+            "bash",
+            "-lc",
+            "exec test/final-bar/run \"$PWD\""
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "test/final-bar"
+      ]
+    },
+    {
+      "id": "gate-keep-going",
+      "kind": "implementation",
+      "title": "Make the fleet gate enumerate every failing flake attribute",
+      "goal": "test/fleet-gate.sh runs 'nix flake check -L', which stops at the first failing attribute. Chapter 2's gate repair found two additional stale suites hiding behind the first failure only when re-run with --keep-going (findings F14/F21; three campaigns for three, each gate failure cost a full cycle per hidden attribute). Change that step to 'nix flake check -L --keep-going' so a single gate failure enumerates every failing attribute in one transcript. Keep the stage order (cheap failures first) and the invocation contract intact: the script must still print its 'usage: ... <full-commit-sha>' line when invoked without a commit argument (finding F13b regression pin).",
+      "deliveredBehaviors": [
+        "One fleet-gate failure lists every failing flake attribute instead of the first",
+        "The usage contract for the commit-sha argument is unchanged"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.3"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "keep-going-flag",
+          "description": "The script parses and the flake-check step carries --keep-going.",
+          "argv": [
+            "bash",
+            "-lc",
+            "bash -n test/fleet-gate.sh && grep -q -- '--keep-going' test/fleet-gate.sh"
+          ]
+        },
+        {
+          "id": "usage-pin",
+          "description": "Argument-less invocation still prints the usage contract.",
+          "argv": [
+            "bash",
+            "-lc",
+            "test/fleet-gate.sh 2>&1 | grep -qi 'usage: .* <full-commit-sha>'"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "test/fleet-gate.sh"
+      ]
+    },
+    {
+      "id": "steering-grammar-negation",
+      "kind": "implementation",
+      "title": "Let machine diagnoses state a negation without being gagged",
+      "goal": "Finding F15, the sharpest of chapter 2: the managed-agents content contract in drivers/spec_build_driver.py (lines 176-186) rejects any text containing an exclamation mark, and the rejection redaction path (line 3779) replaces '!' with '.'. A machine diagnosis therefore cannot state a shell or Nix negation such as '! grep -n pattern file' without being rejected or mangled; it was silenced twice in chapter 2 while diagnosing correctly. Change the contract to permit exclamation marks inside inline code spans and argv reproductions (backtick-delimited text, or an equivalent explicit encoding you choose and document in the predicate's docstring) while keeping the bang-free rule for ordinary prose, and update the redaction at line 3779 so code spans are preserved rather than mangled. Implement the rule as one named predicate so the future Rust port of this driver carries it verbatim. Out of scope: crates/tally-core/src/evidence.rs lines 1451-1478 and journal.rs line 1190 are test assertions on tally's own narration text, not this validator; leave them alone. Update test/spec_build_driver_test.py to cover the new grammar, including a negative case proving bare '!' in prose is still refused.",
+      "deliveredBehaviors": [
+        "A diagnosis containing a backtick-quoted shell negation passes the content contract",
+        "Bare exclamation marks in ordinary prose are still refused",
+        "The redaction path preserves code spans instead of rewriting '!' to '.'"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.3"
+        ],
+        "styleReferences": [
+          "drivers/spec_build_driver.py lines 160-200"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "negation-survives",
+          "description": "The content contract accepts a diagnosis whose code span carries a shell negation.",
+          "argv": [
+            "bash",
+            "-lc",
+            "python3 -c \"import importlib.util; spec = importlib.util.spec_from_file_location('d', 'drivers/spec_build_driver.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); assert m.validate_outcome_first('Recorded a failing check. Reproduce with \\`! grep -n stale test/x.py\\`.', max_chars=4000, context='diagnosis') is None\""
+          ]
+        },
+        {
+          "id": "suite-green",
+          "description": "The driver test suite passes with the new grammar cases.",
+          "argv": [
+            "python3",
+            "test/spec_build_driver_test.py"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "drivers",
+        "test/spec_build_driver_test.py"
+      ]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Epsilon stage 0 gate: full gate ladder plus the final conformance bar",
+      "argv": [
+        "bash",
+        "-lc",
+        "test/fleet-gate.sh \"$(git rev-parse HEAD)\" && exec test/final-bar/run \"$PWD\""
+      ],
+      "runtimeMaxSec": 10800,
+      "dependencies": [
+        "final-bar-local-forge-repair",
+        "gate-keep-going",
+        "steering-grammar-negation"
+      ]
+    }
+  ]
+}
