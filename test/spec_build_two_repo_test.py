@@ -392,8 +392,6 @@ class TwoRepositoryCampaign(unittest.TestCase):
                 "task": task,
                 "domainsRequired": False,
                 "mergeMethod": "squash",
-                "gitAiBinding": "off",
-                "gitAiAwaitSec": 60,
                 "assistedBy": None,
                 "workspace": prepared,
                 "integration": {

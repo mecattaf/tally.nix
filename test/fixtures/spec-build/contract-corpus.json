@@ -6,8 +6,6 @@
       "agent",
       "driverRuntimeMaxSec",
       "gates",
-      "gitAiAwaitSec",
-      "gitAiBinding",
       "maxParallel",
       "maxTasks",
       "mergeMethod",
@@ -48,8 +46,6 @@
         "runtimeMaxSec": 86400,
         "pool": "campaign",
         "mergeMethod": "squash",
-        "gitAiBinding": "off",
-        "gitAiAwaitSec": 60,
         "agent": {
           "adapter": "codex",
           "argv": [
@@ -84,7 +80,7 @@
           }
         ]
       },
-      "manifestCanonicalJson": "{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"gitAiAwaitSec\":60,\"gitAiBinding\":\"off\",\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]}",
+      "manifestCanonicalJson": "{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]}",
       "graph": {
         "manifest": {
           "schemaVersion": 1,
@@ -101,8 +97,6 @@
           "runtimeMaxSec": 86400,
           "pool": "campaign",
           "mergeMethod": "squash",
-          "gitAiBinding": "off",
-          "gitAiAwaitSec": 60,
           "agent": {
             "adapter": "codex",
             "argv": [
@@ -144,10 +138,10 @@
             "body": "Implement the minimal admitted fixture."
           }
         ],
-        "executableDigest": "sha256:88d083229c86ce1c189dca07f2581d01baf24c438b3974979f6926131613a07a"
+        "executableDigest": "sha256:580204b83450dc43e9977c6f25b4c03aa8d30cb29ee18ec60540a793c18b7177"
       },
-      "graphCanonicalJson": "{\"executableDigest\":\"sha256:88d083229c86ce1c189dca07f2581d01baf24c438b3974979f6926131613a07a\",\"manifest\":{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"gitAiAwaitSec\":60,\"gitAiBinding\":\"off\",\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]},\"tasks\":[{\"body\":\"Implement the minimal admitted fixture.\",\"number\":101,\"title\":\"Build the fixture\"}]}",
-      "digest": "sha256:88d083229c86ce1c189dca07f2581d01baf24c438b3974979f6926131613a07a"
+      "graphCanonicalJson": "{\"executableDigest\":\"sha256:580204b83450dc43e9977c6f25b4c03aa8d30cb29ee18ec60540a793c18b7177\",\"manifest\":{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]},\"tasks\":[{\"body\":\"Implement the minimal admitted fixture.\",\"number\":101,\"title\":\"Build the fixture\"}]}",
+      "digest": "sha256:580204b83450dc43e9977c6f25b4c03aa8d30cb29ee18ec60540a793c18b7177"
     },
     {
       "name": "complete-parallel-mixed",
@@ -166,8 +160,6 @@
         "runtimeMaxSec": null,
         "pool": "campaign-corpus",
         "mergeMethod": "merge",
-        "gitAiBinding": "advisory",
-        "gitAiAwaitSec": 60,
         "agent": {
           "adapter": "codex",
           "argv": [
@@ -243,7 +235,7 @@
           }
         ]
       },
-      "manifestCanonicalJson": "{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"read the admitted brief\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":\"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm\",\"priority\":\"medium\",\"runtimeMaxSec\":null,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"argv\":[\"cargo\",\"test\"],\"id\":\"tests\",\"kind\":\"command\",\"preflightArgv\":[\"true\"],\"runtimeMaxSec\":600},{\"forbidPaths\":[\"*.db\",\"target/**\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":30}],\"gitAiAwaitSec\":60,\"gitAiBinding\":\"advisory\",\"maxParallel\":2,\"maxTasks\":4,\"mergeMethod\":\"merge\",\"name\":\"corpus-complete\",\"pool\":\"campaign-corpus\",\"repository\":{\"baseBranch\":\"trunk\",\"checkout\":\"/srv/contract-corpus/complete\",\"forge\":\"github\",\"remote\":\"upstream\"},\"runtimeMaxSec\":null,\"schemaVersion\":1,\"steward\":{\"adapter\":\"narrator\",\"argv\":[\"narrate\",\"--json\"],\"env\":{\"NARRATOR_ENDPOINT\":\"https://narrator.invalid/v1\"},\"finalMessagePattern\":\"^(?:résultat: )([A-Z\\\\d_-]+)$\",\"runtimeMaxSec\":240},\"tasks\":[{\"argv\":null,\"conflictDomains\":[\"src/build\",\"SRC/build\"],\"dependencies\":[],\"id\":\"build\",\"issue\":201,\"kind\":\"implementation\",\"runtimeMaxSec\":null},{\"argv\":[\"cargo\",\"test\"],\"dependencies\":[\"build\"],\"id\":\"verify\",\"issue\":202,\"kind\":\"checkpoint\",\"runtimeMaxSec\":300}]}",
+      "manifestCanonicalJson": "{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"read the admitted brief\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":\"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm\",\"priority\":\"medium\",\"runtimeMaxSec\":null,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"argv\":[\"cargo\",\"test\"],\"id\":\"tests\",\"kind\":\"command\",\"preflightArgv\":[\"true\"],\"runtimeMaxSec\":600},{\"forbidPaths\":[\"*.db\",\"target/**\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":30}],\"maxParallel\":2,\"maxTasks\":4,\"mergeMethod\":\"merge\",\"name\":\"corpus-complete\",\"pool\":\"campaign-corpus\",\"repository\":{\"baseBranch\":\"trunk\",\"checkout\":\"/srv/contract-corpus/complete\",\"forge\":\"github\",\"remote\":\"upstream\"},\"runtimeMaxSec\":null,\"schemaVersion\":1,\"steward\":{\"adapter\":\"narrator\",\"argv\":[\"narrate\",\"--json\"],\"env\":{\"NARRATOR_ENDPOINT\":\"https://narrator.invalid/v1\"},\"finalMessagePattern\":\"^(?:résultat: )([A-Z\\\\d_-]+)$\",\"runtimeMaxSec\":240},\"tasks\":[{\"argv\":null,\"conflictDomains\":[\"src/build\",\"SRC/build\"],\"dependencies\":[],\"id\":\"build\",\"issue\":201,\"kind\":\"implementation\",\"runtimeMaxSec\":null},{\"argv\":[\"cargo\",\"test\"],\"dependencies\":[\"build\"],\"id\":\"verify\",\"issue\":202,\"kind\":\"checkpoint\",\"runtimeMaxSec\":300}]}",
       "graph": {
         "manifest": {
           "schemaVersion": 1,
@@ -260,8 +252,6 @@
           "runtimeMaxSec": null,
           "pool": "campaign-corpus",
           "mergeMethod": "merge",
-          "gitAiBinding": "advisory",
-          "gitAiAwaitSec": 60,
           "agent": {
             "adapter": "codex",
             "argv": [
@@ -349,10 +339,10 @@
             "body": "Run the admitted verification."
           }
         ],
-        "executableDigest": "sha256:eb52ef9cfe1267337ea5f643de4aa1a4bef5d295d5476d7bd1be731dece93efa"
+        "executableDigest": "sha256:aa43ee004de6fb24dd9a6e277418c391d38bc0275dbba465dd0d2bceb891d74d"
       },
-      "graphCanonicalJson": "{\"executableDigest\":\"sha256:eb52ef9cfe1267337ea5f643de4aa1a4bef5d295d5476d7bd1be731dece93efa\",\"manifest\":{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"read the admitted brief\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":\"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm\",\"priority\":\"medium\",\"runtimeMaxSec\":null,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"argv\":[\"cargo\",\"test\"],\"id\":\"tests\",\"kind\":\"command\",\"preflightArgv\":[\"true\"],\"runtimeMaxSec\":600},{\"forbidPaths\":[\"*.db\",\"target/**\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":30}],\"gitAiAwaitSec\":60,\"gitAiBinding\":\"advisory\",\"maxParallel\":2,\"maxTasks\":4,\"mergeMethod\":\"merge\",\"name\":\"corpus-complete\",\"pool\":\"campaign-corpus\",\"repository\":{\"baseBranch\":\"trunk\",\"checkout\":\"/srv/contract-corpus/complete\",\"forge\":\"github\",\"remote\":\"upstream\"},\"runtimeMaxSec\":null,\"schemaVersion\":1,\"steward\":{\"adapter\":\"narrator\",\"argv\":[\"narrate\",\"--json\"],\"env\":{\"NARRATOR_ENDPOINT\":\"https://narrator.invalid/v1\"},\"finalMessagePattern\":\"^(?:résultat: )([A-Z\\\\d_-]+)$\",\"runtimeMaxSec\":240},\"tasks\":[{\"argv\":null,\"conflictDomains\":[\"src/build\",\"SRC/build\"],\"dependencies\":[],\"id\":\"build\",\"issue\":201,\"kind\":\"implementation\",\"runtimeMaxSec\":null},{\"argv\":[\"cargo\",\"test\"],\"dependencies\":[\"build\"],\"id\":\"verify\",\"issue\":202,\"kind\":\"checkpoint\",\"runtimeMaxSec\":300}]},\"tasks\":[{\"body\":\"Brief for the implementation task.\",\"number\":201,\"title\":\"Implement the thing\"},{\"body\":\"Run the admitted verification.\",\"number\":202,\"title\":\"Verify the thing\"}]}",
-      "digest": "sha256:eb52ef9cfe1267337ea5f643de4aa1a4bef5d295d5476d7bd1be731dece93efa"
+      "graphCanonicalJson": "{\"executableDigest\":\"sha256:aa43ee004de6fb24dd9a6e277418c391d38bc0275dbba465dd0d2bceb891d74d\",\"manifest\":{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"read the admitted brief\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":\"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm\",\"priority\":\"medium\",\"runtimeMaxSec\":null,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"argv\":[\"cargo\",\"test\"],\"id\":\"tests\",\"kind\":\"command\",\"preflightArgv\":[\"true\"],\"runtimeMaxSec\":600},{\"forbidPaths\":[\"*.db\",\"target/**\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":30}],\"maxParallel\":2,\"maxTasks\":4,\"mergeMethod\":\"merge\",\"name\":\"corpus-complete\",\"pool\":\"campaign-corpus\",\"repository\":{\"baseBranch\":\"trunk\",\"checkout\":\"/srv/contract-corpus/complete\",\"forge\":\"github\",\"remote\":\"upstream\"},\"runtimeMaxSec\":null,\"schemaVersion\":1,\"steward\":{\"adapter\":\"narrator\",\"argv\":[\"narrate\",\"--json\"],\"env\":{\"NARRATOR_ENDPOINT\":\"https://narrator.invalid/v1\"},\"finalMessagePattern\":\"^(?:résultat: )([A-Z\\\\d_-]+)$\",\"runtimeMaxSec\":240},\"tasks\":[{\"argv\":null,\"conflictDomains\":[\"src/build\",\"SRC/build\"],\"dependencies\":[],\"id\":\"build\",\"issue\":201,\"kind\":\"implementation\",\"runtimeMaxSec\":null},{\"argv\":[\"cargo\",\"test\"],\"dependencies\":[\"build\"],\"id\":\"verify\",\"issue\":202,\"kind\":\"checkpoint\",\"runtimeMaxSec\":300}]},\"tasks\":[{\"body\":\"Brief for the implementation task.\",\"number\":201,\"title\":\"Implement the thing\"},{\"body\":\"Run the admitted verification.\",\"number\":202,\"title\":\"Verify the thing\"}]}",
+      "digest": "sha256:aa43ee004de6fb24dd9a6e277418c391d38bc0275dbba465dd0d2bceb891d74d"
     }
   ],
   "rejected": [
@@ -384,26 +374,6 @@
         "kind": "remove",
         "pointer": "",
         "key": "gates"
-      }
-    },
-    {
-      "name": "missing-manifest-git-ai-await-sec",
-      "decoder": "manifest",
-      "base": "complete-parallel-mixed",
-      "mutation": {
-        "kind": "remove",
-        "pointer": "",
-        "key": "gitAiAwaitSec"
-      }
-    },
-    {
-      "name": "missing-manifest-git-ai-binding",
-      "decoder": "manifest",
-      "base": "complete-parallel-mixed",
-      "mutation": {
-        "kind": "remove",
-        "pointer": "",
-        "key": "gitAiBinding"
       }
     },
     {

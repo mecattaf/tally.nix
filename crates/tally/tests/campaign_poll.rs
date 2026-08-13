@@ -36,8 +36,6 @@ manifest = {
     "runtimeMaxSec": None,
     "pool": "campaign",
     "mergeMethod": "squash",
-    "gitAiBinding": "off",
-    "gitAiAwaitSec": 60,
     "agent": {
         "adapter": "codex",
         "argv": ["codex", "exec"],

@@ -171,10 +171,6 @@ pub struct CampaignManifest {
     pub pool: String,
     #[serde(default = "default_merge_method")]
     pub merge_method: String,
-    #[serde(default = "default_git_ai_binding")]
-    pub git_ai_binding: String,
-    #[serde(default = "default_git_ai_await_sec")]
-    pub git_ai_await_sec: u64,
     pub agent: CampaignAgent,
     #[serde(default)]
     pub steward: Option<CampaignSteward>,
@@ -316,25 +312,6 @@ pub fn validate_manifest(manifest: &CampaignManifest) -> Result<(), CampaignCont
     }
     if !matches!(manifest.merge_method.as_str(), "merge" | "squash") {
         return Err(invalid("campaign mergeMethod must be merge or squash"));
-    }
-    if !matches!(
-        manifest.git_ai_binding.as_str(),
-        "off" | "advisory" | "required"
-    ) {
-        return Err(invalid(
-            "campaign gitAiBinding must be off, advisory, or required",
-        ));
-    }
-    if manifest.git_ai_await_sec == 0 {
-        return Err(invalid("campaign gitAiAwaitSec must be positive"));
-    }
-    if manifest.git_ai_binding != "off"
-        && manifest.driver_runtime_max_sec < 2 * manifest.git_ai_await_sec
-    {
-        return Err(invalid(format!(
-            "campaign driverRuntimeMaxSec must be at least twice gitAiAwaitSec ({}) while gitAiBinding is not off",
-            2 * manifest.git_ai_await_sec
-        )));
     }
     validate_agent(&manifest.agent)?;
     if let Some(steward) = &manifest.steward {
@@ -751,8 +728,6 @@ pub fn task_completion_revision(
         campaign: &'a str,
         repository: &'a CampaignRepository,
         merge_method: &'a str,
-        git_ai_binding: &'a str,
-        git_ai_await_sec: u64,
         agent: &'a CampaignAgent,
         steward: &'a Option<CampaignSteward>,
         gates: &'a [CampaignGate],
@@ -765,8 +740,6 @@ pub fn task_completion_revision(
         campaign: &manifest.name,
         repository: &manifest.repository,
         merge_method: &manifest.merge_method,
-        git_ai_binding: &manifest.git_ai_binding,
-        git_ai_await_sec: manifest.git_ai_await_sec,
         agent: &manifest.agent,
         steward: &manifest.steward,
         gates: &manifest.gates,
@@ -929,14 +902,6 @@ const fn default_campaign_runtime_max_sec() -> Option<u64> {
 
 fn default_merge_method() -> String {
     "squash".to_owned()
-}
-
-fn default_git_ai_binding() -> String {
-    "off".to_owned()
-}
-
-const fn default_git_ai_await_sec() -> u64 {
-    60
 }
 
 fn default_runner_pool() -> String {

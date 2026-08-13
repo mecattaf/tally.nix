@@ -190,8 +190,6 @@ fn generated_corpus() -> String {
             "runtimeMaxSec": null,
             "pool": "campaign-corpus",
             "mergeMethod": "merge",
-            "gitAiBinding": "advisory",
-            "gitAiAwaitSec": 60,
             "agent": {
                 "adapter": "codex",
                 "argv": ["read the admitted brief"],
