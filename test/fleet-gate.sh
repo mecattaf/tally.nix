@@ -43,8 +43,18 @@ prepare_pristine_clone() {
   git --git-dir="$pristine_clone" fetch --quiet --force --prune origin \
     '+refs/heads/*:refs/remotes/origin/*' \
     '+refs/pull/*/head:refs/remotes/pull/*'
+
+  # A campaign integration head may exist only in the checkout invoking this
+  # gate. Import that exact committed object without making the disposable
+  # worktree depend on any uncommitted state in the checkout.
+  if ! git --git-dir="$pristine_clone" cat-file -e "$gate_sha^{commit}" 2>/dev/null; then
+    if [[ -n "$gate_local_repo" ]] \
+      && git -C "$gate_local_repo" cat-file -e "$gate_sha^{commit}" 2>/dev/null; then
+      git --git-dir="$pristine_clone" fetch --quiet "$gate_local_repo" "$gate_sha"
+    fi
+  fi
   git --git-dir="$pristine_clone" cat-file -e "$gate_sha^{commit}" \
-    || fail "commit is not fetchable from $gate_remote: $gate_sha"
+    || fail "commit is neither fetchable from $gate_remote nor present in the invoking repository: $gate_sha"
 }
 
 create_disposable_worktree() {
@@ -140,17 +150,23 @@ run_cargo_deny_stage() {
 # than of when the last stage happened to execute.
 resolve_pull_request_metadata() {
   local pull_json main_sha
-  pull_json="$(
+  if ! pull_json="$(
     gh api "repos/$gate_repo/commits/$gate_sha/pulls?per_page=100" \
-      --jq "[.[] | select(.state == \"open\" and .head.sha == \"$gate_sha\")][0] // {}"
-  )" || fail "cannot list pull requests for $gate_sha in $gate_repo (is the commit pushed?)"
+      --jq "[.[] | select(.state == \"open\" and .head.sha == \"$gate_sha\")][0] // {}" \
+      2>/dev/null
+  )"; then
+    jq -e '.status == 422 or .status == "422"' <<<"$pull_json" >/dev/null 2>&1 \
+      || fail "cannot list pull requests for $gate_sha in $gate_repo (is the commit pushed?)"
+    pull_json="{}"
+  fi
   gate_pr_number="$(jq -r '.number // empty' <<<"$pull_json")"
   gate_base_sha="$(jq -r '.base.sha // empty' <<<"$pull_json")"
   gate_no_changelog_label="$(
     jq -r 'any(.labels[]?; .name == "no-changelog")' <<<"$pull_json"
   )"
   gate_is_main_audit=false
-  gate_changelog_subject="neither an open pull-request head nor the tip of main"
+  gate_is_local_audit=false
+  gate_changelog_subject="local head; no pull request"
 
   if [[ -n "$gate_pr_number" ]]; then
     gate_changelog_subject="head of open pull request #$gate_pr_number"
@@ -162,11 +178,18 @@ resolve_pull_request_metadata() {
   if [[ "$main_sha" == "$gate_sha" ]]; then
     gate_is_main_audit=true
     gate_changelog_subject="tip of main"
+    return
   fi
+
+  gate_is_local_audit=true
 }
 
 run_changelog_stage() {
   printf '\n==> changelog policy\n'
+  if [[ "$gate_is_local_audit" == true ]]; then
+    printf 'NOT RUN changelog-touch rule: the changelog policy is a pull-request policy; no pull request exists for a local head\n'
+    return
+  fi
   if [[ ! -f CHANGELOG.md ]]; then
     printf 'NOT RUN changelog-touch rule: the changelog policy has not landed yet\n'
     return
@@ -289,6 +312,8 @@ require_command hostname
 require_command jq
 require_command nix
 require_command tee
+
+gate_local_repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 
 mkdir -p "$state_dir/transcripts"
 chmod 0700 "$state_dir" "$state_dir/transcripts"
