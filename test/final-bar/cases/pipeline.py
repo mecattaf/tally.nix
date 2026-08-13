@@ -6,30 +6,22 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 from typing import Any, Iterator
 
-from cases.manifest import ISSUE_URL, base_manifest, host_config, issue_state, repository
+from cases.manifest import (
+    CODE_REPOSITORY,
+    WORKLIST_PATTERN,
+    base_manifest,
+    commit_worklist,
+    host_config,
+    repository,
+)
 from support import SUITE_ROOT, Context, case, copy_executable, make_case_directory, require
-
-
-def fixture_environment(context: Context, root: Path, forge: Path) -> tuple[Path, dict[str, str]]:
-    fake_bin = root / "bin"
-    fake_bin.mkdir()
-    copy_executable(SUITE_ROOT / "fixtures/pipeline/fake-gh.py", fake_bin / "gh")
-    environment = context.environment(
-        TALLY_GH_PROGRAM=fake_bin / "gh",
-        FINAL_BAR_FORGE_STATE=forge,
-        PATH=f"{fake_bin}:{os.environ.get('PATH', '')}",
-    )
-    return fake_bin, environment
 
 
 def campaign_configuration(
     context: Context,
     root: Path,
-    fake_bin: Path,
-    forge: Path,
 ) -> dict[str, Any]:
     path = root / "source-config.json"
     host_config(context, path)
@@ -37,8 +29,7 @@ def campaign_configuration(
     value["maxFrameBytes"] = 13_107_200
     value["pools"]["flow"]["capacity"] = 3
     child_env = {
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "FINAL_BAR_FORGE_STATE": str(forge),
+        "PATH": os.environ.get("PATH", ""),
         "XDG_CONFIG_HOME": str(root / "xdg"),
     }
     value["adapters"]["shell"].setdefault("env", {}).update(child_env)
@@ -118,6 +109,24 @@ def nixos_poll_script(context: Context) -> str:
     result = context.command("nix", "eval", "--impure", "--raw", "--expr", expression, timeout=600)
     require(result.returncode == 0, f"could not evaluate NixOS campaign command: {result.stderr[-5000:]}")
     script = Path(result.stdout.strip())
+    derivation = context.command(
+        "nix",
+        "eval",
+        "--impure",
+        "--json",
+        "--expr",
+        f"builtins.getContext ({expression})",
+        timeout=600,
+    )
+    require(
+        derivation.returncode == 0,
+        f"could not resolve NixOS campaign command derivation: {derivation.stderr[-5000:]}",
+    )
+    context_value = derivation.json("campaign poll string context")
+    derivers = [path for path in context_value if path.endswith(".drv")]
+    require(len(derivers) == 1, f"campaign poll command has unexpected Nix context: {context_value!r}")
+    realised = context.command("nix-store", "--realise", derivers[0], timeout=600)
+    require(realised.returncode == 0, f"could not realise NixOS campaign command: {realised.stderr[-5000:]}")
     require(script.is_file(), f"evaluated campaign poll program is missing: {script}")
     return script.read_text(encoding="utf-8")
 
@@ -130,23 +139,23 @@ def nixos_poll_script(context: Context) -> str:
 def campaign_config_locator(context: Context) -> None:
     root = make_case_directory(context, "campaign-config-locator")
     checkout, _ = repository(context, root)
-    manifest = base_manifest(checkout)
-    forge = root / "forge.json"
-    issue_state(forge, manifest)
-    fake_bin, environment = fixture_environment(context, root, forge)
-    configuration = campaign_configuration(context, root, fake_bin, forge)
+    document = base_manifest(checkout)
+    commit_worklist(context, checkout, document)
+    configuration = campaign_configuration(context, root)
     failures: list[str] = []
     script = nixos_poll_script(context)
     if "--config /etc/tally/config.json" not in script:
         failures.append("rendered NixOS poll child omits --config /etc/tally/config.json")
-    with context.daemon(root / "daemon", configuration, extra_env=environment) as daemon:
+    with context.daemon(root / "daemon", configuration) as daemon:
         paused = daemon.tally("queue", "pause", "flow")
         require(paused.returncode == 0, f"could not hold initial child for inspection: {paused.stderr}")
         armed = daemon.tally(
             "campaign",
             "arm",
-            ISSUE_URL,
-            "--allow-test-local-forge",
+            CODE_REPOSITORY,
+            WORKLIST_PATTERN,
+            "--checkout",
+            checkout,
             "--flow",
             context.tally.parent.parent / "share/tally/flows/spec-build.js",
             "--driver",
@@ -155,7 +164,6 @@ def campaign_config_locator(context: Context) -> None:
             daemon.state,
             "--workspace-root",
             root / "workspaces",
-            env=environment,
             timeout=60,
         )
         require(armed.returncode == 0, f"config-locator arm failed: {(armed.stderr or armed.stdout)[-2400:]}")
@@ -188,9 +196,9 @@ def pipeline_manifest(checkout: Path, agent: Path) -> dict[str, Any]:
     # distinguish it from an explicitly empty declaration and derive the
     # owned-paths fallback from the task's committed diff.
     value["tasks"][0].pop("conflictDomains")
-    value["runtimeMaxSec"] = 900
-    value["driverRuntimeMaxSec"] = 180
-    value["agent"] = {
+    value["campaign"]["runtimeMaxSec"] = 900
+    value["campaign"]["driverRuntimeMaxSec"] = 180
+    value["campaign"]["agent"] = {
         "adapter": "shell",
         "argv": ["python3", str(agent)],
         "priority": "low",
@@ -200,7 +208,7 @@ def pipeline_manifest(checkout: Path, agent: Path) -> dict[str, Any]:
         "diagnosisSandboxPolicy": None,
         "model": None,
     }
-    value["gates"] = [
+    value["campaign"]["gates"] = [
         {
             "kind": "command",
             "id": "clean-diff",
@@ -225,12 +233,10 @@ def campaign_full_pipeline(context: Context) -> None:
     copy_executable(SUITE_ROOT / "fixtures/pipeline/agent.py", agent)
     driver_launcher = root / "packaged-driver-launch"
     copy_executable(SUITE_ROOT / "fixtures/pipeline/driver-launch.py", driver_launcher)
-    manifest = pipeline_manifest(checkout, agent)
-    forge = root / "forge.json"
-    issue_state(forge, manifest)
-    fake_bin, environment = fixture_environment(context, root, forge)
+    document = pipeline_manifest(checkout, agent)
+    commit_worklist(context, checkout, document)
     proof = root / "agent-proof.json"
-    configuration = campaign_configuration(context, root, fake_bin, forge)
+    configuration = campaign_configuration(context, root)
     for adapter in ("shell", "spec-build-driver"):
         configuration["adapters"][adapter].setdefault("env", {})[
             "FINAL_BAR_PIPELINE_PROOF"
@@ -245,12 +251,16 @@ def campaign_full_pipeline(context: Context) -> None:
     fallback.parent.mkdir(parents=True)
     fallback.write_text(json.dumps(configuration), encoding="utf-8")
     failures: list[str] = []
-    with context.daemon(root / "daemon", configuration, extra_env=environment) as daemon:
+    completion_refs: dict[str, str] = {}
+    integration_ref = ""
+    with context.daemon(root / "daemon", configuration) as daemon:
         arm = daemon.tally(
             "campaign",
             "arm",
-            ISSUE_URL,
-            "--allow-test-local-forge",
+            CODE_REPOSITORY,
+            WORKLIST_PATTERN,
+            "--checkout",
+            checkout,
             "--flow",
             context.tally.parent.parent / "share/tally/flows/spec-build.js",
             "--driver",
@@ -260,14 +270,22 @@ def campaign_full_pipeline(context: Context) -> None:
             "--workspace-root",
             root / "workspaces",
             "--wait",
-            env=environment,
             timeout=300,
         )
         if arm.returncode != 0:
             failures.append(f"arm/first pass failed: {(arm.stderr or arm.stdout)[-3000:]}")
         for _ in range(8):
-            forge_value = json.loads(forge.read_text(encoding="utf-8"))
-            if forge_value["master"]["state"].lower() == "closed":
+            listed = context.command(
+                "git", "-C", checkout, "ls-remote", "--refs", "origin", "refs/tally/spec-build/v1/*"
+            )
+            completion_refs = {
+                name: target
+                for target, name in (
+                    line.split("\t", 1) for line in listed.stdout.splitlines() if "\t" in line
+                )
+                if name.endswith("/summary/complete")
+            }
+            if completion_refs:
                 break
             polled = daemon.tally(
                 "campaign",
@@ -276,7 +294,6 @@ def campaign_full_pipeline(context: Context) -> None:
                 "--wait",
                 "--state-dir",
                 daemon.state,
-                env=environment,
                 timeout=300,
             )
             if polled.returncode != 0:
@@ -289,7 +306,7 @@ def campaign_full_pipeline(context: Context) -> None:
             authority = json.loads(authorities[0].read_text(encoding="utf-8"))
             graph_digest = authority.get("approvedGraphDigest")
         else:
-            # A successfully closed campaign has already pruned its authority;
+            # A completed campaign may already have removed its authority;
             # recover the admitted digest from durable enqueue evidence.
             text = "\n".join(json.dumps(value) for value in json_values(daemon.state))
             match = re.search(r"sha256:[0-9a-f]{64}", text)
@@ -330,17 +347,53 @@ def campaign_full_pipeline(context: Context) -> None:
         if not proof.is_file():
             failures.append("implementation task never executed")
 
-    fetched = context.command("git", "-C", checkout, "fetch", "--quiet", "origin", "main")
-    if fetched.returncode != 0:
-        failures.append(f"could not fetch integrated result: {fetched.stderr[-1200:]}")
-    shown = context.command("git", "-C", checkout, "show", "origin/main:result.txt")
-    if shown.returncode != 0 or shown.stdout != "final-bar\n":
-        failures.append(f"execute/merge did not land result.txt: {shown.stderr or shown.stdout!r}")
-    forge_value = json.loads(forge.read_text(encoding="utf-8"))
-    if forge_value["master"]["state"].lower() != "closed":
-        failures.append("terminal digest did not close the campaign issue")
-    comments = [item.get("body", "") for item in forge_value.get("postedComments", [])]
-    closing = [body for body in comments if "tally:campaign-complete:v1" in body]
-    if len(closing) != 1 or not re.search(r"sha256:[0-9a-f]{64}", closing[0] if closing else ""):
-        failures.append(f"expected one final campaign digest comment, got {closing!r}")
+        refs = context.command(
+            "git",
+            "-C",
+            checkout,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/tally/",
+        )
+        integration_refs = [
+            line
+            for line in refs.stdout.splitlines()
+            if line.startswith("refs/heads/tally/final-bar-campaign-")
+            and line.endswith("/integration")
+        ]
+        if len(integration_refs) != 1:
+            failures.append(f"expected one local integration ref, got {integration_refs!r}")
+        else:
+            integration_ref = integration_refs[0]
+
+        disarmed = daemon.tally(
+            "campaign",
+            "disarm",
+            CODE_REPOSITORY,
+            WORKLIST_PATTERN,
+            "--state-dir",
+            daemon.state,
+        )
+        if disarmed.returncode != 0:
+            failures.append(f"completed local campaign could not disarm: {disarmed.stderr[-1200:]}")
+        quiescent = daemon.tally("campaign", "quiescent", "--state-dir", daemon.state)
+        if quiescent.returncode != 0:
+            failures.append(f"disarmed local campaign is not quiescent: {quiescent.stderr[-1200:]}")
+
+    if integration_ref:
+        shown = context.command("git", "-C", checkout, "show", f"{integration_ref}:result.txt")
+        if shown.returncode != 0 or shown.stdout != "final-bar\n":
+            failures.append(
+                f"execute/merge did not land result.txt on integration: "
+                f"{shown.stderr or shown.stdout!r}"
+            )
+    if len(completion_refs) != 1:
+        failures.append(f"expected one durable local completion summary, got {completion_refs!r}")
+    else:
+        summary_ref = next(iter(completion_refs))
+        # The ref targets a JSON blob, not a commit; cat-file is the public Git
+        # boundary for reading the exact idempotent local receipt.
+        summary = context.command("git", "-C", checkout, "cat-file", "blob", completion_refs[summary_ref])
+        if summary.returncode != 0 or "tally:campaign-complete:v1" not in summary.stdout:
+            failures.append(f"local completion summary is missing its digest marker: {summary.stderr or summary.stdout!r}")
     require(not failures, "full campaign pipeline failures:\n- " + "\n- ".join(failures))

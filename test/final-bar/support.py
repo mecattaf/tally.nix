@@ -19,6 +19,46 @@ from typing import Any, Callable, Iterator, Sequence
 SUITE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SUITE_ROOT.parents[1]
 
+# The bar is itself commonly launched as a Tally job.  None of that outer
+# executor identity belongs to the disposable daemons below: presenting the
+# outer capability to an inner daemon is both invalid and a false parentage
+# claim.  Keep product/fixture overrides such as TALLY_NIX_STORE_PROGRAM, but
+# clear every environment name installed by the executor before spawning a
+# probe.  Individual cases can still add an intentional value explicitly.
+EXECUTOR_ENVIRONMENT = {
+    "TALLY_ATTEMPT",
+    "TALLY_BRIEF",
+    "TALLY_BRIEF_HASH",
+    "TALLY_CLASS",
+    "TALLY_CREDENTIALS",
+    "TALLY_GATE_MANIFEST",
+    "TALLY_GH_COMMENT_ID",
+    "TALLY_GH_CONTEXT",
+    "TALLY_GH_EVENT_ID",
+    "TALLY_GH_HEAD_SHA",
+    "TALLY_GH_NODE_ID",
+    "TALLY_GH_NUMBER",
+    "TALLY_GH_REPO",
+    "TALLY_GH_TRIGGER_ACTOR",
+    "TALLY_GH_TRIGGER_KIND",
+    "TALLY_GH_TYPE",
+    "TALLY_GH_URL",
+    "TALLY_JOB_ID",
+    "TALLY_JOB_TOKEN",
+    "TALLY_LEASE_EPOCH",
+    "TALLY_NO_ENQUEUE",
+    "TALLY_PARENT",
+    "TALLY_POOL",
+    "TALLY_SOCKET",
+    "TALLY_TASK_REF",
+    "TALLY_TASK_UUID",
+    "TALLY_WORKSPACE_BASE_REV",
+    "TALLY_WORKSPACE_BRANCH",
+    "TALLY_WORKSPACE_PATH",
+    "TALLY_WORKSPACE_REPO",
+    "TALLY_YIELD_HOOK",
+}
+
 
 class ConformanceFailure(AssertionError):
     """The target ran, but observable behavior disagreed with the spec."""
@@ -165,10 +205,18 @@ class Context:
         timeout: float = 120,
         input_text: str | None = None,
     ) -> Completed:
-        return run_process(argv, cwd=cwd, env=env, timeout=timeout, input_text=input_text)
+        return run_process(
+            argv,
+            cwd=cwd,
+            env=self.environment() if env is None else env,
+            timeout=timeout,
+            input_text=input_text,
+        )
 
     def environment(self, **values: os.PathLike[str] | str) -> dict[str, str]:
         env = os.environ.copy()
+        for name in EXECUTOR_ENVIRONMENT:
+            env.pop(name, None)
         env.update({key: os.fspath(value) for key, value in values.items()})
         return env
 
@@ -358,7 +406,10 @@ class Context:
             candidate = self.n_minus_one_tally_override
         else:
             source = self.work / "n-minus-one-source"
-            commit = "84b1bf0d02802c9f8f8008c4384f26c819cfe7b9"
+            # The release immediately before self-contained local arm wrote
+            # schema 3.  Current schema 4 must fail closed in that actual N-1,
+            # because its repository binding gained checkout/base/remote.
+            commit = "1953bb49c80bcdb106299782713aa9292f32bd16"
             cloned = self.command(
                 "git", "clone", "--quiet", "--shared", "--no-checkout", self.target, source,
                 timeout=300,
@@ -459,7 +510,7 @@ class Daemon:
                 "test configuration was rejected by the public config boundary: "
                 + (checked.stderr or checked.stdout)[-4000:]
             )
-        env = os.environ.copy()
+        env = context.environment()
         if extra_env:
             env.update(extra_env)
         log_handle = log.open("w+", encoding="utf-8")
@@ -511,7 +562,7 @@ class Daemon:
         timeout: float = 120,
         env: dict[str, str] | None = None,
     ) -> Completed:
-        merged = os.environ.copy()
+        merged = self.context.environment()
         if env:
             merged.update(env)
         return self.context.command(
