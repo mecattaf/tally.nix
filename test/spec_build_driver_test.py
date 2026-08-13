@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused forge and lifecycle regressions for the spec-build policy driver."""
+"""Focused local-state and lifecycle regressions for the spec-build policy driver."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def repository_config(checkout: Path, forge: str = "local") -> dict[str, str]:
 
 
 def issue() -> dict[str, str]:
-    return {"number": "7", "url": "https://github.com/acme/spec/issues/7"}
+    return {"number": "7", "url": "local://acme/spec/issues/7"}
 
 
 def attempt_receipts(root: Path, campaign: str = "fixture") -> dict[str, object]:
@@ -132,29 +132,6 @@ def local_steering_record(
     }
 
 
-def canonical_graph(
-    manifest: dict[str, object], issues: list[dict[str, object]]
-) -> dict[str, object]:
-    """Build an envelope from an explicitly Rust-shaped canonical fixture."""
-    normalized = DRIVER.canonical_manifest(manifest)
-    references = normalized["tasks"]
-    tasks = [
-        {
-            "number": reference["issue"],
-            "title": issues[index]["title"],
-            "body": issues[index]["body"],
-        }
-        for index, reference in enumerate(references)
-    ]
-    return {
-        "manifest": normalized,
-        "tasks": tasks,
-        "executableDigest": DRIVER.canonical_sha256(
-            {"manifest": normalized, "tasks": tasks}
-        ),
-    }
-
-
 def continuation_spec(events: Path) -> dict[str, object]:
     """The module-declared continuation the Nix campaign module renders."""
     return {
@@ -196,7 +173,7 @@ def admit_file_worklist(
     return DRIVER.action_worklist(
         {
             "repository": "acme/spec",
-            "repositoryConfig": repository_config(checkout, "github"),
+            "repositoryConfig": repository_config(checkout),
             "worklist": "specs/*/tasks.json",
             "maxTasks": max_tasks,
             "maxParallel": max_parallel,
@@ -263,290 +240,6 @@ def sweep_brief(
     if campaign_identity is not None:
         brief["campaignIdentity"] = campaign_identity
     return brief
-
-
-class FakeGitHub:
-    def __init__(self, root: Path, state: dict[str, object]) -> None:
-        self.root = root
-        self.state_path = root / "fake-gh-state.json"
-        self.bin = root / "bin"
-        self.bin.mkdir()
-        self.program = self.bin / "gh"
-        self.state_path.write_text(json.dumps(state), encoding="utf-8")
-        self.program.write_text(
-            f"#!{sys.executable}\n"
-            + textwrap.dedent(
-                """\
-                import json
-                import os
-                from pathlib import Path
-                import sys
-
-                state_path = Path(os.environ["FAKE_GH_STATE"])
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                args = sys.argv[1:]
-                state.setdefault("calls", []).append(args)
-
-                def rest_pull(item):
-                    merged = item.get("state", "MERGED") == "MERGED"
-                    return {
-                        "html_url": item.get("url"),
-                        "body": item.get("body"),
-                        "base": {"ref": item.get("baseRefName")},
-                        "head": {
-                            "ref": item.get("headRefName"),
-                            "sha": item.get("headRefOid"),
-                        },
-                        "merge_commit_sha": (item.get("mergeCommit") or {}).get("oid"),
-                        "merged_at": "2026-08-02T00:00:00Z" if merged else None,
-                        "state": "open" if item.get("state") == "OPEN" else "closed",
-                    }
-
-                def thread(number):
-                    if number == "7":
-                        return state.setdefault("issueComments", [])
-                    return state.setdefault("threadComments", {}).setdefault(number, [])
-
-                if args[:2] == ["pr", "merge"]:
-                    # The real command both advances the base branch and flips
-                    # the pull request; onMerge stands in for the first half so
-                    # the driver's post-merge ancestry proof reads real git.
-                    import subprocess
-
-                    if state.get("onMerge"):
-                        subprocess.run(state["onMerge"], check=True)
-                    view = state.setdefault("prView", {})
-                    view["state"] = "MERGED"
-                    view["mergeCommit"] = {"oid": state.get("mergeCommitOid", "e" * 40)}
-                elif args[:2] == ["pr", "reopen"]:
-                    url = args[2]
-                    for candidate in state.get("pulls", []):
-                        if candidate.get("url") == url:
-                            candidate["state"] = "OPEN"
-                    print(url)
-                elif args[:2] == ["pr", "view"]:
-                    print(json.dumps(state.get("prView", {})))
-                elif args[:2] == ["pr", "create"]:
-                    state.setdefault("createdPullRequests", []).append(args)
-                    number = len(state["createdPullRequests"])
-                    print(f"https://github.com/acme/spec/pull/{number}")
-                elif args[:2] == ["api", "user"]:
-                    print(state.get("actor", "tally-test"))
-                elif args[:2] == ["api", "graphql"]:
-                    if state.get("walkFails"):
-                        print("sub-issue walk unavailable", file=sys.stderr)
-                        state_path.write_text(json.dumps(state), encoding="utf-8")
-                        raise SystemExit(1)
-                    print(json.dumps({
-                        "data": {
-                            "repository": {
-                                "issue": {
-                                    "subIssues": {
-                                        "pageInfo": {
-                                            "hasNextPage": False,
-                                            "endCursor": None,
-                                        },
-                                        "nodes": state.get("walk", []),
-                                    }
-                                }
-                            }
-                        }
-                    }))
-                elif args and args[0] == "api":
-                    endpoint = next(
-                        (item for item in args[1:] if item.startswith("repos/")), ""
-                    )
-                    if endpoint.endswith("/sub_issues?per_page=100"):
-                        print(json.dumps(state.get("subIssues", [])))
-                    elif "/pulls?head=" in endpoint:
-                        query = endpoint.split("/pulls?", 1)[1]
-                        fields = dict(
-                            pair.split("=", 1) for pair in query.split("&") if "=" in pair
-                        )
-                        branch = fields.get("head", "").split(":", 1)[-1]
-                        if fields.get("state") == "all":
-                            source = state.get("pulls", [])
-                        else:
-                            source = list(state.get("merged", []))
-                            source += state.get("byHead", {}).get(branch, [])
-                        print(json.dumps([
-                            rest_pull(item)
-                            for item in source
-                            if item.get("headRefName") == branch
-                        ]))
-                    elif "/comments" in endpoint:
-                        number = endpoint.split("/issues/", 1)[1].split("/", 1)[0]
-                        expected = ["api", "--paginate", "--slurp", endpoint]
-                        if args != expected:
-                            print(
-                                f"fake gh requires recorded comment-list grammar, got {args!r}",
-                                file=sys.stderr,
-                            )
-                            state_path.write_text(json.dumps(state), encoding="utf-8")
-                            raise SystemExit(96)
-                        print(json.dumps([thread(number)]))
-                    elif "/issues/" in endpoint:
-                        number = endpoint.rsplit("/issues/", 1)[1]
-                        if number == "7":
-                            print(json.dumps(state.get("master", {})))
-                        else:
-                            found = next(
-                                (
-                                    candidate
-                                    for candidate in state.get("subIssues", [])
-                                    if str(candidate.get("number")) == number
-                                ),
-                                {"number": int(number), "state": "closed"},
-                            )
-                            print(json.dumps(found))
-                    else:
-                        print(f"unexpected fake gh api endpoint: {endpoint!r}", file=sys.stderr)
-                        state_path.write_text(json.dumps(state), encoding="utf-8")
-                        raise SystemExit(92)
-                elif args[:2] == ["issue", "comment"]:
-                    failures = state.get("commentFailures", 0)
-                    if failures:
-                        state["commentFailures"] = failures - 1
-                        state_path.write_text(json.dumps(state), encoding="utf-8")
-                        print("injected comment failure", file=sys.stderr)
-                        raise SystemExit(93)
-                    number = args[2]
-                    body = args[args.index("--body") + 1]
-                    state.setdefault("comments", []).append(body)
-                    comment_number = len(state["comments"])
-                    url = (
-                        f"https://github.com/acme/spec/issues/{number}"
-                        f"#issuecomment-test-{comment_number}"
-                    )
-                    thread(number).append({
-                        "body": body,
-                        "html_url": url,
-                        "user": {"login": state.get("actor", "tally-test")},
-                    })
-                    print(url)
-                elif args[:2] == ["issue", "edit"]:
-                    if "--body-file" not in args:
-                        print("fake gh requires --body-file for issue edits", file=sys.stderr)
-                        raise SystemExit(94)
-                    argument = args[args.index("--body-file") + 1]
-                    body_file = Path(argument)
-                    if argument == "-" or not body_file.is_file():
-                        print(
-                            f"fake gh requires a real --body-file path, got {argument!r}",
-                            file=sys.stderr,
-                        )
-                        raise SystemExit(95)
-                    body = body_file.read_text(encoding="utf-8")
-                    state.setdefault("bodyFiles", []).append({
-                        "argument": argument,
-                        "body": body,
-                    })
-                    state.setdefault("master", {})["body"] = body
-                    print("https://github.com/acme/spec/issues/7")
-                elif args[:2] == ["issue", "close"]:
-                    number = args[2]
-                    if number == "7":
-                        state.setdefault("master", {})["state"] = "closed"
-                    else:
-                        for candidate in state.get("subIssues", []):
-                            if str(candidate.get("number")) == number:
-                                candidate["state"] = "closed"
-                    print(f"https://github.com/acme/spec/issues/{number}")
-                else:
-                    print(f"unexpected fake gh argv: {args!r}", file=sys.stderr)
-                    state_path.write_text(json.dumps(state), encoding="utf-8")
-                    raise SystemExit(91)
-
-                state_path.write_text(json.dumps(state), encoding="utf-8")
-                """
-            ),
-            encoding="utf-8",
-        )
-        self.program.chmod(0o755)
-        self.old_path: str | None = None
-        self.old_state: str | None = None
-
-    def __enter__(self) -> "FakeGitHub":
-        self.old_path = os.environ.get("PATH")
-        self.old_state = os.environ.get("FAKE_GH_STATE")
-        os.environ["PATH"] = str(self.bin) + os.pathsep + (self.old_path or "")
-        os.environ["FAKE_GH_STATE"] = str(self.state_path)
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        if self.old_path is None:
-            os.environ.pop("PATH", None)
-        else:
-            os.environ["PATH"] = self.old_path
-        if self.old_state is None:
-            os.environ.pop("FAKE_GH_STATE", None)
-        else:
-            os.environ["FAKE_GH_STATE"] = self.old_state
-
-    def state(self) -> dict[str, object]:
-        return json.loads(self.state_path.read_text(encoding="utf-8"))
-
-
-class ForgeNativeReconcileTests(unittest.TestCase):
-    def test_issue_worklist_binds_completion_to_the_observed_base_revision(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root)
-            base_revision = git(checkout, "rev-parse", "HEAD")
-            issue_task = {
-                "id": "task-1",
-                "kind": "implementation",
-                "title": "Task one",
-                "brief": {
-                    "issue": {
-                        "number": "8",
-                        "url": "https://github.com/acme/spec/issues/8",
-                    },
-                    "body": "Implement task one.",
-                },
-                "dependencies": [],
-                "conflictDomains": ["task-1"],
-                "revision": "sha256:" + "b" * 64,
-            }
-            worklist = {
-                "schemaVersion": 1,
-                "repository": "acme/spec",
-                "source": {
-                    "kind": "github-issue",
-                    "url": "https://github.com/acme/spec/issues/7",
-                    "sha256": "sha256:" + "a" * 64,
-                    "revision": base_revision,
-                },
-                "tasks": [issue_task],
-                "config": {
-                    "campaign": "fixture-native",
-                    "repositoryConfig": repository_config(checkout, "github"),
-                    "maxParallel": 1,
-                },
-                "masterBody": "fixture",
-            }
-            with (
-                mock.patch.object(DRIVER, "issue_graph_worklist", return_value=worklist),
-                mock.patch.object(
-                    DRIVER, "merged_github_tasks", return_value=([], [], [])
-                ) as merged,
-                mock.patch.object(DRIVER, "forge_campaign_state", return_value=([], [], None, [])),
-                mock.patch.object(DRIVER, "sync_issue_checkboxes"),
-            ):
-                result = DRIVER.action_reconcile(
-                    {
-                        "repository": "acme/spec",
-                        "issue": issue(),
-                        "worklist": {"kind": "github-issue"},
-                        "campaignGraph": {},
-                    }
-                )
-
-            self.assertEqual(result["source"], worklist["source"])
-            self.assertEqual(result["source"]["revision"], base_revision)
-            self.assertEqual(merged.call_args.args[5], base_revision)
-            self.assertEqual(merged.call_args.kwargs["campaign_id"], "7")
-            self.assertEqual([item["id"] for item in result["frontier"]], ["task-1"])
 
 
 class FakeTally:
@@ -705,26 +398,22 @@ class AttemptReceiptLogTests(unittest.TestCase):
                 self.diagnosis("task-1", 1, "Observed the first failure."),
             )
             path = Path(source["path"])
-            baseline = DRIVER.forge_campaign_state(
-                "acme/spec",
-                {"forge": "local"},
+            baseline = DRIVER.campaign_attempt_state(
+                source,
                 "fixture",
                 "7",
                 {"task-1"},
-                attempt_receipts=source,
             )
             with path.open("ab") as log:
                 log.write(b'{"schemaVersion":1,"sequence":2,"kind":"diagn')
 
             # A crash between write and newline contributes no fact.
             self.assertEqual(
-                DRIVER.forge_campaign_state(
-                    "acme/spec",
-                    {"forge": "local"},
+                DRIVER.campaign_attempt_state(
+                    source,
                     "fixture",
                     "7",
                     {"task-1"},
-                    attempt_receipts=source,
                 ),
                 baseline,
             )
@@ -776,13 +465,11 @@ class AttemptReceiptLogTests(unittest.TestCase):
             for payload in payloads:
                 DRIVER.append_attempt_receipt(source, "fixture", "7", payload)
 
-            diagnoses, retries, escalation, warnings = DRIVER.forge_campaign_state(
-                "acme/spec",
-                {"forge": "local"},
+            diagnoses, retries, escalation, warnings = DRIVER.campaign_attempt_state(
+                source,
                 "fixture",
                 "7",
                 {"task-1"},
-                attempt_receipts=source,
             )
             self.assertEqual(
                 [(record["attempt"], record["diagnosis"]) for record in diagnoses],
@@ -860,8 +547,8 @@ class AttemptReceiptLogTests(unittest.TestCase):
             self.assertEqual(failures, [])
 
 
-class GitHubForgeTests(unittest.TestCase):
-    def test_pull_request_markers_have_one_revision_bearing_grammar(self) -> None:
+class CampaignDriverTests(unittest.TestCase):
+    def test_completion_markers_carry_the_task_revision(self) -> None:
         revision = "sha256:" + "a" * 64
         marker = DRIVER.pull_request_marker("fixture", "7", "task-1", revision)
 
@@ -869,14 +556,6 @@ class GitHubForgeTests(unittest.TestCase):
             marker,
             "<!-- tally:spec-build:v2 campaign=fixture issue=7 task=task-1 "
             f"revision={revision} -->",
-        )
-        self.assertEqual(
-            DRIVER.pull_request_marker_revisions(marker, "fixture", "7", "task-1"),
-            [revision],
-        )
-        self.assertEqual(
-            DRIVER.campaign_marker_prefixes("fixture", "7"),
-            ("<!-- tally:spec-build:v2 campaign=fixture issue=7 task=",),
         )
         with self.assertRaisesRegex(
             DRIVER.DriverError, "revision must be a lowercase SHA-256 identity"
@@ -926,525 +605,6 @@ class GitHubForgeTests(unittest.TestCase):
                 f"revision={implementation['revision']} -->",
             )
 
-    def test_resume_receipt_resets_machine_counters_without_deleting_history(self) -> None:
-        def diagnosis(attempt: int, text: str) -> str:
-            return (
-                f"{DRIVER.diagnosis_marker('fixture', '7', 'task-1', attempt)}\n\n"
-                f"{DRIVER.diagnosis_heading('task-1', attempt)}\n\n{text}"
-            )
-
-        def retry(attempt: int, text: str) -> str:
-            return (
-                f"{DRIVER.retry_marker('fixture', '7', 'task-1', attempt)}\n\n"
-                f"{DRIVER.retry_heading('task-1', attempt)}\n\n{text}"
-            )
-
-        def comment(identifier: int, body: str) -> dict[str, object]:
-            return {
-                "id": identifier,
-                "body": body,
-                "html_url": f"https://github.com/acme/spec/issues/7#issuecomment-{identifier}",
-            }
-
-        comments = [
-            comment(10, diagnosis(1, "Observed the first failed attempt.")),
-            comment(11, diagnosis(2, "Observed the second failed attempt.")),
-            comment(12, retry(1, "adapter transport failed")),
-            comment(13, retry(2, "adapter transport failed again")),
-            comment(14, DRIVER.escalation_marker("fixture", "7") + "\n\n### Escalation"),
-            comment(
-                20,
-                "<!-- tally:spec-build:resume:v1 campaign=fixture issue=7 "
-                "nonce=018f47a0-7b9d-7cc2-92d6-2f7f19f505fd -->\n\n"
-                "### Campaign resumed\n\nPardoned prior receipts.\n\n"
-                "Reason: Corrected the external dependency.",
-            ),
-            comment(21, diagnosis(1, "Observed the first post-resume failure.")),
-        ]
-
-        with mock.patch.object(DRIVER, "github_machine_comments", return_value=comments):
-            diagnoses, retries, escalation, warnings = DRIVER.forge_campaign_state(
-                "acme/spec",
-                {"forge": "github"},
-                "fixture",
-                "7",
-                {"task-1"},
-                {},
-            )
-
-        self.assertEqual(
-            [(item["attempt"], item["diagnosis"]) for item in diagnoses],
-            [(1, "Observed the first post-resume failure.")],
-        )
-        self.assertEqual(retries, [])
-        self.assertIsNone(escalation)
-        self.assertEqual(
-            warnings,
-            [
-                "campaign resume https://github.com/acme/spec/issues/7#issuecomment-20 "
-                "pardoned 5 earlier machine receipt(s)"
-            ],
-        )
-        self.assertEqual(len(comments), 7, "resume must retain the public audit trail")
-
-    def test_scoped_rearm_pardon_resets_only_the_addressed_escalated_task(self) -> None:
-        def diagnosis(identifier: str, attempt: int) -> str:
-            return (
-                f"{DRIVER.diagnosis_marker('fixture', '7', identifier, attempt)}\n\n"
-                f"{DRIVER.diagnosis_heading(identifier, attempt)}\n\n"
-                f"Observed {identifier} attempt {attempt}."
-            )
-
-        def comment(identifier: int, body: str) -> dict[str, object]:
-            return {
-                "id": identifier,
-                "body": body,
-                "html_url": f"https://github.com/acme/spec/issues/7#issuecomment-{identifier}",
-            }
-
-        comments = [
-            comment(10, diagnosis("task-a", 1)),
-            comment(11, diagnosis("task-a", 2)),
-            comment(12, diagnosis("task-b", 1)),
-            comment(13, diagnosis("task-b", 2)),
-            comment(
-                14,
-                DRIVER.escalation_marker("fixture", "7")
-                + "\n\n### Spec-build escalation: frontier quiescent",
-            ),
-            comment(
-                20,
-                "<!-- tally:spec-build:resume:v1 campaign=fixture issue=7 "
-                "nonce=018f47a0-7b9d-7cc2-92d6-2f7f19f505fd tasks=task-a -->\n\n"
-                "### Campaign resumed\n\nPardoned prior receipts for `task-a`.\n\n"
-                "Reason: The amendment added a dependency to task-a.",
-            ),
-        ]
-
-        with mock.patch.object(DRIVER, "github_machine_comments", return_value=comments):
-            diagnoses, retries, escalation, warnings = DRIVER.forge_campaign_state(
-                "acme/spec",
-                {"forge": "github"},
-                "fixture",
-                "7",
-                {"task-a", "task-b"},
-                {},
-            )
-
-        self.assertEqual(
-            [(item["taskId"], item["attempt"]) for item in diagnoses],
-            [("task-b", 1), ("task-b", 2)],
-        )
-        self.assertEqual(retries, [])
-        self.assertEqual(
-            escalation,
-            "https://github.com/acme/spec/issues/7#issuecomment-14",
-            "the unaddressed task must keep the shared escalation live",
-        )
-        self.assertEqual(
-            warnings,
-            [
-                "campaign resume https://github.com/acme/spec/issues/7#issuecomment-20 "
-                "pardoned 2 earlier machine receipt(s) for task(s) 'task-a'"
-            ],
-        )
-
-        only_addressed = [comment for comment in comments if "task-b" not in comment["body"]]
-        with mock.patch.object(
-            DRIVER, "github_machine_comments", return_value=only_addressed
-        ):
-            diagnoses, _, escalation, warnings = DRIVER.forge_campaign_state(
-                "acme/spec",
-                {"forge": "github"},
-                "fixture",
-                "7",
-                {"task-a"},
-                {},
-            )
-        self.assertEqual(diagnoses, [])
-        self.assertIsNone(escalation)
-        self.assertIn("pardoned 3 earlier machine receipt(s)", warnings[0])
-
-    def test_reconcile_requires_exact_marker_and_degrades_unusable_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            worklist = checkout / "specs/campaign/tasks.json"
-            worklist.parent.mkdir(parents=True)
-            third_task = task("task-3", ["task-1"])
-            third_task["conflictDomains"] = ["task-2"]
-            worklist.write_text(
-                json.dumps(
-                    {
-                        "schemaVersion": 1,
-                        "tasks": [
-                            task("task-1"),
-                            task("task-2", ["task-1"]),
-                            third_task,
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            git(checkout, "add", str(worklist.relative_to(checkout)))
-            git(checkout, "commit", "--quiet", "-m", "add worklist")
-            git(checkout, "push", "--quiet", "origin", "main")
-            base_rev = git(checkout, "rev-parse", "HEAD")
-            reconcile_brief = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "worklist": "specs/*/tasks.json",
-                "maxTasks": 3,
-                "maxParallel": 2,
-            }
-            admitted = admit_file_worklist(checkout, max_tasks=3, max_parallel=2)
-            revisions = {item["id"]: item["revision"] for item in admitted["tasks"]}
-            task_1_marker = DRIVER.pull_request_marker(
-                "fixture", "7", "task-1", revisions["task-1"]
-            )
-            task_2_marker = DRIVER.pull_request_marker(
-                "fixture", "7", "task-2", revisions["task-2"]
-            )
-            task_1_branch = DRIVER.stable_publish_branch(
-                "fixture", "7", "task-1", revisions["task-1"]
-            )
-            task_2_branch = DRIVER.stable_publish_branch(
-                "fixture", "7", "task-2", revisions["task-2"]
-            )
-            state = {
-                "merged": [
-                    {
-                        "url": "https://github.com/acme/spec/pull/1",
-                        "body": task_1_marker,
-                        "baseRefName": "main",
-                        "headRefName": task_1_branch,
-                        "mergeCommit": {"oid": base_rev},
-                    },
-                    {
-                        "url": "https://github.com/acme/spec/pull/2",
-                        "body": (
-                            "Spec-build campaign progress for acme/spec#7.\n"
-                            "Task `task-2`: quoted text without an identity marker"
-                        ),
-                        "baseRefName": "main",
-                        "headRefName": task_2_branch,
-                        "mergeCommit": {"oid": "b" * 40},
-                    },
-                    {
-                        "url": "https://github.com/acme/spec/pull/3",
-                        "body": task_2_marker,
-                        "baseRefName": "release",
-                        "headRefName": task_2_branch,
-                        "mergeCommit": {"oid": "c" * 40},
-                    },
-                    {
-                        "url": "https://github.com/acme/spec/pull/4",
-                        "body": DRIVER.pull_request_marker(
-                            "fixture", "7", "unknown-task", "sha256:" + "f" * 64
-                        ),
-                        "baseRefName": "main",
-                        "headRefName": task_2_branch,
-                        "mergeCommit": {"oid": "d" * 40},
-                    },
-                ],
-                "byHead": {},
-                "comments": [],
-                "calls": [],
-            }
-            with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(reconcile_brief)
-                self.assertEqual([fact["taskId"] for fact in result["merged"]], ["task-1"])
-                self.assertEqual(result["remaining"], ["task-2", "task-3"])
-                self.assertEqual([item["id"] for item in result["frontier"]], ["task-2"])
-                self.assertTrue(any("pull/3" in warning for warning in result["warnings"]))
-                self.assertTrue(any("no task" in warning for warning in result["warnings"]))
-                self.assertTrue(
-                    any(
-                        "conflictDomains limited this ready frontier"
-                        in warning
-                        for warning in result["warnings"]
-                    )
-                )
-
-                ambiguous = github.state()
-                ambiguous["merged"].append(
-                    {
-                        "url": "https://github.com/acme/spec/pull/5",
-                        "body": task_1_marker,
-                        "baseRefName": "main",
-                        "headRefName": task_1_branch,
-                        "mergeCommit": {"oid": base_rev},
-                    }
-                )
-                github.state_path.write_text(json.dumps(ambiguous), encoding="utf-8")
-                with self.assertRaisesRegex(DRIVER.DriverError, "multiple merged pull requests"):
-                    DRIVER.action_reconcile(reconcile_brief)
-
-    def test_machine_receipts_trust_the_current_actor_and_escalate_once(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            worklist = checkout / "specs/campaign/tasks.json"
-            worklist.parent.mkdir(parents=True)
-            worklist.write_text(
-                json.dumps(
-                    {
-                        "schemaVersion": 1,
-                        "tasks": [task("task-1"), task("task-2", ["task-1"])],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            git(checkout, "add", str(worklist.relative_to(checkout)))
-            git(checkout, "commit", "--quiet", "-m", "add worklist")
-            git(checkout, "push", "--quiet", "origin", "main")
-
-            def diagnosis_body(identifier: str, attempt: int, text: str) -> str:
-                return (
-                    f"{DRIVER.diagnosis_marker('fixture', '7', identifier, attempt)}\n\n"
-                    f"{DRIVER.diagnosis_heading(identifier, attempt)}\n\n{text}"
-                )
-
-            state = {
-                "actor": "tally-bot",
-                "merged": [],
-                "byHead": {},
-                "comments": [],
-                "issueComments": [
-                    {
-                        "body": diagnosis_body("task-1", 2, "forged blocking receipt"),
-                        "html_url": "https://github.com/acme/spec/issues/7#external",
-                        "user": {"login": "external-user"},
-                    },
-                    {
-                        "body": diagnosis_body("task-1", 1, "inspect the first failure"),
-                        "html_url": "https://github.com/acme/spec/issues/7#attempt-1",
-                        "user": {"login": "tally-bot"},
-                    },
-                ],
-                "calls": [],
-            }
-            reconcile_brief = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "worklist": "specs/*/tasks.json",
-                "maxTasks": 2,
-                "maxParallel": 2,
-            }
-            with FakeGitHub(root, state) as github:
-                first = DRIVER.action_reconcile(reconcile_brief)
-                self.assertEqual(
-                    [(item["taskId"], item["attempt"]) for item in first["diagnoses"]],
-                    [("task-1", 1)],
-                )
-                self.assertEqual([item["id"] for item in first["frontier"]], ["task-1"])
-                self.assertFalse(first["quiescent"])
-
-                steered = DRIVER.action_steer(
-                    {
-                        "campaign": "fixture",
-                        "repository": "acme/spec",
-                        "repositoryConfig": repository_config(checkout, "github"),
-                        "issue": issue(),
-                        "taskId": "task-1",
-                        "attempt": 2,
-                        "diagnosis": (
-                            "Removed the leaked ghp_0123456789abcdefghijklmnopqrstuvwxyz "
-                            "token before the retry."
-                        ),
-                    }
-                )
-                self.assertTrue(steered["posted"])
-                self.assertTrue(steered["blocked"])
-                self.assertTrue(steered["redacted"])
-                self.assertNotIn("ghp_", github.state()["comments"][0])
-
-                blocked = DRIVER.action_reconcile(reconcile_brief)
-                self.assertTrue(blocked["quiescent"])
-                self.assertEqual(blocked["frontier"], [])
-                self.assertEqual(
-                    blocked["blocked"],
-                    [
-                        {"taskId": "task-1", "blockedBy": ["task-1"]},
-                        {"taskId": "task-2", "blockedBy": ["task-1"]},
-                    ],
-                )
-
-                escalated = DRIVER.action_escalate(reconcile_brief)
-                self.assertTrue(escalated["posted"])
-                self.assertEqual(escalated["diagnosisCount"], 2)
-                # The escalation carries a closing summary beside it: the
-                # campaign stopped, so the operator gets the digest of what it
-                # did manage to bind. The digest is published *first*, because
-                # the escalation is what every later pass reads back to decide
-                # this node never runs again -- so a summary that failed after
-                # it could never be retried.
-                self.assertIsNotNone(escalated["summary"])
-                summary_body, escalation_body = github.state()["comments"][-2:]
-                self.assertIn("Campaign closed at frontier quiescence", summary_body)
-                self.assertIn("`task-1`", summary_body)
-                self.assertNotIn("ghp_", summary_body)
-                self.assertIn("Spec-build escalation", escalation_body)
-                repeated = DRIVER.action_escalate(reconcile_brief)
-                self.assertFalse(repeated["posted"])
-                self.assertIsNone(repeated["summary"])
-                self.assertEqual(repeated["comment"], escalated["comment"])
-                # One steering note, one escalation, one closing summary, and
-                # the repeat pass adds nothing.
-                self.assertEqual(len(github.state()["comments"]), 3)
-
-    def test_a_completed_file_worklist_campaign_summarises_and_leaves_the_issue_open(
-        self,
-    ) -> None:
-        """The spec-corpus class gets its digest; tally still never closes that issue.
-
-        A file-worklist campaign's master issue is a projection tally does not
-        own the lifecycle of -- only the forge-native issue graph is closed by
-        the reconciler. Publishing the closing summary there and stopping is
-        the deliberate shape: the operator learns the campaign finished, and
-        the issue stays theirs to close.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            worklist = checkout / "specs/campaign/tasks.json"
-            worklist.parent.mkdir(parents=True)
-            worklist.write_text(
-                json.dumps({"schemaVersion": 1, "tasks": [task("task-1")]}),
-                encoding="utf-8",
-            )
-            git(checkout, "add", str(worklist.relative_to(checkout)))
-            git(checkout, "commit", "--quiet", "-m", "add worklist")
-            git(checkout, "push", "--quiet", "origin", "main")
-            base_rev = git(checkout, "rev-parse", "HEAD")
-            reconcile_brief = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "worklist": "specs/*/tasks.json",
-                "maxTasks": 1,
-                "maxParallel": 1,
-            }
-            admitted_task = admit_file_worklist(
-                checkout, max_tasks=1, max_parallel=1
-            )["tasks"][0]
-            revision = admitted_task["revision"]
-            marker = DRIVER.pull_request_marker(
-                "fixture", "7", admitted_task["id"], revision
-            )
-            state = {
-                "actor": "tally-bot",
-                "merged": [
-                    {
-                        "url": "https://github.com/acme/spec/pull/1",
-                        "body": marker,
-                        "baseRefName": "main",
-                        "headRefName": DRIVER.stable_publish_branch(
-                            "fixture", "7", admitted_task["id"], revision
-                        ),
-                        "mergeCommit": {"oid": base_rev},
-                    }
-                ],
-                "byHead": {},
-                "comments": [],
-                "issueComments": [],
-                "calls": [],
-            }
-            with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(reconcile_brief)
-            self.assertTrue(result["complete"])
-            self.assertIsNotNone(result["closingSummary"])
-            published = github.state()
-            self.assertEqual(len(published["comments"]), 1)
-            self.assertIn("### Campaign complete", published["comments"][0])
-            self.assertIn("tally:campaign-complete:v1", published["comments"][0])
-            self.assertFalse(
-                any(call[:2] == ["issue", "close"] for call in published["calls"]),
-                published["calls"],
-            )
-
-    def test_a_failed_quiescent_summary_leaves_the_whole_act_retryable(self) -> None:
-        """The escalation is the thing every later pass reads back to stop.
-
-        So it must be the *last* thing published on the quiescent path. If the
-        summary went second and failed once -- a rate limit, a transient
-        network error -- the escalation would already be on the issue, every
-        later pass would return early, and the campaign would silently lose the
-        only artifact that says what it managed to bind.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            worklist = checkout / "specs/campaign/tasks.json"
-            worklist.parent.mkdir(parents=True)
-            worklist.write_text(
-                json.dumps({"schemaVersion": 1, "tasks": [task("task-1")]}),
-                encoding="utf-8",
-            )
-            git(checkout, "add", str(worklist.relative_to(checkout)))
-            git(checkout, "commit", "--quiet", "-m", "add worklist")
-            git(checkout, "push", "--quiet", "origin", "main")
-
-            def diagnosis_body(attempt: int) -> str:
-                return (
-                    f"{DRIVER.diagnosis_marker('fixture', '7', 'task-1', attempt)}\n\n"
-                    f"{DRIVER.diagnosis_heading('task-1', attempt)}\n\nsteering {attempt}"
-                )
-
-            state = {
-                "actor": "tally-bot",
-                "merged": [],
-                "byHead": {},
-                "comments": [],
-                "issueComments": [
-                    {
-                        "body": diagnosis_body(attempt),
-                        "html_url": f"https://github.com/acme/spec/issues/7#a{attempt}",
-                        "user": {"login": "tally-bot"},
-                    }
-                    for attempt in (1, 2)
-                ],
-                "calls": [],
-            }
-            reconcile_brief = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "worklist": "specs/*/tasks.json",
-                "maxTasks": 1,
-                "maxParallel": 1,
-            }
-            with FakeGitHub(root, state) as github:
-                published = DRIVER.publish_closing_summary
-                attempts: list[int] = []
-
-                def flaky(*arguments: object, **keywords: object) -> str:
-                    attempts.append(1)
-                    if len(attempts) == 1:
-                        raise DRIVER.DriverError("gh: API rate limit exceeded")
-                    return published(*arguments, **keywords)  # type: ignore[arg-type]
-
-                with mock.patch.object(DRIVER, "publish_closing_summary", flaky):
-                    with self.assertRaisesRegex(DRIVER.DriverError, "rate limit"):
-                        DRIVER.action_escalate(reconcile_brief)
-                    # Nothing was published, so nothing tells a later pass to
-                    # stop: the terminal act is retried whole.
-                    self.assertEqual(github.state()["comments"], [])
-
-                    escalated = DRIVER.action_escalate(reconcile_brief)
-                self.assertEqual(len(attempts), 2)
-                self.assertTrue(escalated["posted"])
-                self.assertIsNotNone(escalated["summary"])
-                summary_body, escalation_body = github.state()["comments"]
-                self.assertIn("Campaign closed at frontier quiescence", summary_body)
-                self.assertIn("Spec-build escalation", escalation_body)
-
     def test_pre_post_refresh_refuses_quiescence_after_the_frontier_reopens(self) -> None:
         """A terminal decision may not publish from its earlier empty-frontier read."""
         brief = {
@@ -1454,7 +614,7 @@ class GitHubForgeTests(unittest.TestCase):
                 "checkout": "/tmp/fixture",
                 "baseBranch": "main",
                 "remote": "origin",
-                "forge": "github",
+                "forge": "local",
             },
             "issue": issue(),
             "worklist": "specs/*/tasks.json",
@@ -1492,261 +652,6 @@ class GitHubForgeTests(unittest.TestCase):
         self.assertEqual(reconcile.call_count, 2)
         publish.assert_not_called()
         run.assert_not_called()
-
-    def test_steering_escalation_and_the_closing_summary_are_always_fresh(self) -> None:
-        """§9.1.3 holds a line: receipts upsert silently, these three never do.
-
-        A sticky comment is invisible to whoever is watching the thread, so the
-        three surfaces that exist to notify the operator must keep creating new
-        comments. None of them may acquire an edit-in-place path.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            worklist = checkout / "specs/campaign/tasks.json"
-            worklist.parent.mkdir(parents=True)
-            worklist.write_text(
-                json.dumps({"schemaVersion": 1, "tasks": [task("task-1")]}),
-                encoding="utf-8",
-            )
-            git(checkout, "add", "specs/campaign/tasks.json")
-            git(checkout, "commit", "--quiet", "-m", "add worklist")
-            git(checkout, "push", "--quiet", "origin", "main")
-            state = {
-                "actor": "tally-bot",
-                "merged": [],
-                "byHead": {},
-                "comments": [],
-                "issueComments": [],
-                "calls": [],
-            }
-            reconcile_brief = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "worklist": "specs/*/tasks.json",
-                "maxTasks": 1,
-                "maxParallel": 1,
-            }
-            with FakeGitHub(root, state) as github:
-                for attempt in (1, 2):
-                    steered = DRIVER.action_steer(
-                        {
-                            "campaign": "fixture",
-                            "repository": "acme/spec",
-                            "repositoryConfig": repository_config(checkout, "github"),
-                            "issue": issue(),
-                            "taskId": "task-1",
-                            "attempt": attempt,
-                            "diagnosis": f"Steered attempt {attempt}.",
-                        }
-                    )
-                    self.assertTrue(steered["posted"])
-                escalated = DRIVER.action_escalate(reconcile_brief)
-                self.assertTrue(escalated["posted"])
-
-                published = github.state()
-                # Two steering notes, one escalation, and the closing summary
-                # that rides with it: four distinct comments, each created
-                # rather than edited.
-                self.assertEqual(len(published["comments"]), 4)
-                self.assertEqual(
-                    len({comment["html_url"] for comment in published["issueComments"]}),
-                    4,
-                )
-                creates = [
-                    call for call in published["calls"] if call[:2] == ["issue", "comment"]
-                ]
-                self.assertEqual(len(creates), 4)
-                self.assertFalse(
-                    any("--edit-last" in call for call in published["calls"])
-                )
-                self.assertFalse(
-                    any(
-                        "updateIssueComment" in argument
-                        for call in published["calls"]
-                        for argument in call
-                    )
-                )
-
-            # The completion summary publishes the same way: create, never
-            # edit, and only once for a given worklist digest.
-            digest = "sha256:" + "a" * 64
-            reconciliation = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "source": {"sha256": digest, "revision": "b" * 40},
-                "baseRevision": "b" * 40,
-                "tasks": [{"id": "task-1", "title": "Task 1"}],
-                "merged": [
-                    {
-                        "taskId": "task-1",
-                        "pullRequest": "https://github.com/acme/spec/pull/4",
-                        "mergeCommit": "c" * 40,
-                    }
-                ],
-                "checkpoints": [],
-                "remaining": [],
-                "diagnoses": [],
-                "retries": [],
-                "deferrals": [],
-                "blocked": [],
-                "anomalies": [],
-                "warnings": [],
-            }
-            posted = subprocess.CompletedProcess(
-                [], 0, "https://github.com/acme/spec/issues/7#issuecomment-1\n", ""
-            )
-            empty = subprocess.CompletedProcess([], 0, "[[]]", "")
-            with mock.patch.object(
-                DRIVER, "run", side_effect=[empty, posted]
-            ) as run:
-                DRIVER.publish_closing_summary(
-                    "acme/spec",
-                    repository_config(checkout, "github"),
-                    "fixture",
-                    "7",
-                    DRIVER.campaign_digest(reconciliation, "complete"),
-                    issue_forge="github",
-                )
-            commands = [call.args[0] for call in run.call_args_list]
-            summary = next(
-                command for command in commands if command[:3] == ["gh", "issue", "comment"]
-            )
-            self.assertIn("Campaign complete", summary[-1])
-            self.assertIn(f"tally:campaign-complete:v1 source={digest}", summary[-1])
-            self.assertIn("https://github.com/acme/spec/pull/4", summary[-1])
-            self.assertFalse(
-                any("--edit-last" in command or "updateIssueComment" in command for command in commands)
-            )
-            # A repeated terminal pass finds its own marker and stays quiet.
-            seen = subprocess.CompletedProcess(
-                [], 0, json.dumps([[{"body": summary[-1]}]]), ""
-            )
-            with mock.patch.object(DRIVER, "run", side_effect=[seen]) as run:
-                DRIVER.publish_closing_summary(
-                    "acme/spec",
-                    repository_config(checkout, "github"),
-                    "fixture",
-                    "7",
-                    DRIVER.campaign_digest(reconciliation, "complete"),
-                    issue_forge="github",
-                )
-            self.assertFalse(
-                any(
-                    call.args[0][:3] == ["gh", "issue", "comment"]
-                    for call in run.call_args_list
-                )
-            )
-
-    def test_worklist_edits_degrade_receipts_instead_of_bricking_the_campaign(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            worklist = checkout / "specs/campaign/tasks.json"
-            worklist.parent.mkdir(parents=True)
-
-            def write_worklist(*identifiers: str) -> None:
-                worklist.write_text(
-                    json.dumps(
-                        {
-                            "schemaVersion": 1,
-                            "tasks": [task(identifier) for identifier in identifiers],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                git(checkout, "add", "specs/campaign/tasks.json")
-                git(checkout, "commit", "--quiet", "-m", "operator: edit the worklist")
-                git(checkout, "push", "--quiet", "origin", "main")
-
-            def diagnosis_body(identifier: str, attempt: int, text: str) -> str:
-                return (
-                    f"{DRIVER.diagnosis_marker('fixture', '7', identifier, attempt)}\n\n"
-                    f"{DRIVER.diagnosis_heading(identifier, attempt)}\n\n{text}"
-                )
-
-            write_worklist("task-1", "task-2")
-            state = {
-                "actor": "tally-bot",
-                "merged": [],
-                "byHead": {},
-                "comments": [],
-                "issueComments": [
-                    {
-                        "body": diagnosis_body("task-2", 1, "first failure"),
-                        "html_url": "https://github.com/acme/spec/issues/7#one",
-                        "user": {"login": "tally-bot"},
-                    },
-                    {
-                        "body": diagnosis_body("task-2", 2, "second failure"),
-                        "html_url": "https://github.com/acme/spec/issues/7#two",
-                        "user": {"login": "tally-bot"},
-                    },
-                ],
-                "calls": [],
-            }
-            reconcile_brief = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "worklist": "specs/*/tasks.json",
-                "maxTasks": 2,
-                "maxParallel": 2,
-            }
-            with FakeGitHub(root, state) as github:
-                blocked = DRIVER.action_reconcile(reconcile_brief)
-                self.assertEqual(
-                    blocked["blocked"], [{"taskId": "task-2", "blockedBy": ["task-2"]}]
-                )
-
-                # The operator renames the diagnosed task between passes.
-                write_worklist("task-1", "task-2-renamed")
-                renamed = DRIVER.action_reconcile(reconcile_brief)
-                self.assertEqual(renamed["diagnoses"], [])
-                self.assertEqual(renamed["blocked"], [])
-                self.assertEqual(
-                    [
-                        warning
-                        for warning in renamed["warnings"]
-                        if "no longer names that task" in warning
-                    ],
-                    [
-                        "dropped machine diagnosis for 'task-2': "
-                        "the worklist no longer names that task",
-                        "dropped machine diagnosis for 'task-2': "
-                        "the worklist no longer names that task",
-                    ],
-                )
-                self.assertEqual(
-                    [item["id"] for item in renamed["frontier"]],
-                    ["task-1", "task-2-renamed"],
-                )
-
-                # An operator who deletes the first receipt leaves a gap, not a halt.
-                write_worklist("task-1", "task-2")
-                gapped_state = github.state()
-                gapped_state["issueComments"] = [gapped_state["issueComments"][1]]
-                github.state_path.write_text(
-                    json.dumps(gapped_state), encoding="utf-8"
-                )
-                gapped = DRIVER.action_reconcile(reconcile_brief)
-                self.assertEqual(gapped["diagnoses"], [])
-                self.assertEqual(gapped["blocked"], [])
-                self.assertIn(
-                    "dropped machine diagnosis for 'task-2' attempt 2: "
-                    "no attempt 1 receipt precedes it",
-                    gapped["warnings"],
-                )
-
-                # Escalation reconciles the same edited worklist. It reaches its
-                # own quiescence check instead of dying on the dropped receipts.
-                with self.assertRaisesRegex(
-                    DRIVER.DriverError, "incomplete empty frontier"
-                ):
-                    DRIVER.action_escalate(reconcile_brief)
 
     def test_machinery_retries_are_bounded_and_spend_no_steering_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1836,319 +741,7 @@ class GitHubForgeTests(unittest.TestCase):
             [],
         )
 
-    def test_forge_native_issue_graph_derives_blocking_and_escalation_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            manifest = {
-                "schemaVersion": 1,
-                "name": "fixture",
-                "repository": repository_config(checkout, "github"),
-                "maxTasks": 2,
-                "maxParallel": 2,
-                "driverRuntimeMaxSec": 900,
-                "runtimeMaxSec": 3600,
-                "pool": "campaign",
-                "mergeMethod": "squash",
-                "agent": {
-                    "adapter": "codex",
-                    "argv": ["read the admitted brief"],
-                    "priority": "low",
-                    "runtimeMaxSec": 900,
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": "danger-full-access",
-                    "diagnosisSandboxPolicy": "read-only",
-                    "model": None,
-                },
-                "steward": None,
-                "gates": [
-                    {
-                        "kind": "command",
-                        "id": "tests",
-                        "preflightArgv": ["true"],
-                        "argv": ["true"],
-                        "runtimeMaxSec": 60,
-                    }
-                ],
-                "tasks": [
-                    {
-                        "id": "task-1",
-                        "kind": "implementation",
-                        "issue": 8,
-                        "dependencies": [],
-                        "conflictDomains": ["src/one"],
-                        "argv": None,
-                        "runtimeMaxSec": None,
-                    },
-                    {
-                        "id": "task-2",
-                        "kind": "implementation",
-                        "issue": 9,
-                        "dependencies": ["task-1"],
-                        "conflictDomains": ["src/two"],
-                        "argv": None,
-                        "runtimeMaxSec": None,
-                    },
-                ],
-            }
-            master_body = (
-                f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
-                f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n\n"
-                f"{DRIVER.WORKLIST_BEGIN}\n\n{DRIVER.WORKLIST_END}\n"
-            )
-
-            def diagnosis_body(attempt: int) -> str:
-                marker = DRIVER.diagnosis_marker("fixture", "7", "task-1", attempt)
-                heading = DRIVER.diagnosis_heading("task-1", attempt)
-                return f"{marker}\n\n{heading}\n\nsteering attempt {attempt}"
-
-            state = {
-                "actor": "tally-bot",
-                "master": {
-                    "number": 7,
-                    "state": "open",
-                    "html_url": "https://github.com/acme/spec/issues/7",
-                    "body": master_body,
-                    "updated_at": "2026-08-01T12:00:00Z",
-                },
-                "subIssues": [
-                    {
-                        "number": 8,
-                        "title": "First task",
-                        "body": "Implement the first task.",
-                        "state": "open",
-                        "html_url": "https://github.com/acme/spec/issues/8",
-                        "updated_at": "2026-08-01T12:00:00Z",
-                    },
-                    {
-                        "number": 9,
-                        "title": "Dependent task",
-                        "body": "Implement the dependent task.",
-                        "state": "open",
-                        "html_url": "https://github.com/acme/spec/issues/9",
-                        "updated_at": "2026-08-01T12:00:00Z",
-                    },
-                ],
-                "merged": [],
-                "byHead": {},
-                "comments": [],
-                "issueComments": [
-                    {
-                        "body": diagnosis_body(1),
-                        "html_url": "https://github.com/acme/spec/issues/7#attempt-1",
-                        "user": {"login": "tally-bot"},
-                    },
-                    {
-                        "body": diagnosis_body(2),
-                        "html_url": "https://github.com/acme/spec/issues/7#attempt-2",
-                        "user": {"login": "tally-bot"},
-                    },
-                ],
-                "calls": [],
-            }
-            graph = canonical_graph(manifest, state["subIssues"])
-            reconcile_brief = {
-                "repository": "acme/spec",
-                "issue": issue(),
-                "worklist": {
-                    "kind": "github-issue",
-                    "graphDigest": graph["executableDigest"],
-                },
-                # Receipt evidence carried by the arm alongside the canonical
-                # envelope must remain an admitted, non-executable member.
-                "armedManifest": graph["manifest"],
-                "campaignGraph": graph,
-            }
-            with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(reconcile_brief)
-                self.assertEqual(result["campaign"], "fixture")
-                self.assertTrue(result["quiescent"])
-                self.assertEqual(result["frontier"], [])
-                self.assertEqual(
-                    result["blocked"],
-                    [
-                        {"taskId": "task-1", "blockedBy": ["task-1"]},
-                        {"taskId": "task-2", "blockedBy": ["task-1"]},
-                    ],
-                )
-                self.assertNotIn("reconcileCommand", result["config"])
-                self.assertIn("#8 — First task", github.state()["master"]["body"])
-
-                escalated = DRIVER.action_escalate(reconcile_brief)
-                self.assertTrue(escalated["posted"])
-                self.assertEqual(escalated["diagnosisCount"], 2)
-                # Closing summary first, escalation second.
-                summary_body, escalation_body = github.state()["comments"]
-                self.assertIn("Campaign closed at frontier quiescence", summary_body)
-                self.assertIn("frontier quiescent", escalation_body)
-
-    def test_pr_reopen_progress_and_one_pass_continuation_use_fake_gh(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root)
-            revision = "sha256:" + "a" * 64
-            branch = DRIVER.stable_publish_branch(
-                "fixture", "7", "task-1", revision
-            )
-            marker = DRIVER.pull_request_marker("fixture", "7", "task-1", revision)
-            head = "a" * 40
-            state = {
-                "pulls": [
-                    {
-                        "url": "https://github.com/acme/spec/pull/7",
-                        "body": marker,
-                        "baseRefName": "main",
-                        "headRefName": branch,
-                        "headRefOid": head,
-                        "state": "CLOSED",
-                    }
-                ],
-                "comments": [],
-                "calls": [],
-            }
-            data = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "issue": issue(),
-                "task": {**task("task-1"), "revision": revision},
-                "workspace": {"publishBranch": branch},
-            }
-            with FakeGitHub(root, state) as github:
-                url = DRIVER.github_pull_request(
-                    data,
-                    {"baseBranch": "main"},
-                    checkout,
-                    head,
-                    DRIVER.template_narration(data["task"]),
-                )
-                self.assertEqual(url, "https://github.com/acme/spec/pull/7")
-                self.assertEqual(github.state()["pulls"][0]["state"], "OPEN")
-
-                DRIVER.github_merge_checkbox_repair(data)
-                DRIVER.github_merge_checkbox_repair(data)
-                events = root / "events"
-                continued = DRIVER.action_continue(
-                    {
-                        "campaign": "fixture",
-                        "repository": "acme/spec",
-                        "repositoryConfig": repository_config(checkout, "github"),
-                        "issue": issue(),
-                        "runId": "pass-1",
-                        "continuation": continuation_spec(events),
-                        "brief": {"campaign": "fixture", "runId": "pass-1"},
-                    }
-                )
-                self.assertTrue(continued["created"])
-                self.assertIsNone(continued["receipt"])
-                self.assertEqual(
-                    continued["dedupKey"],
-                    f"campaign-continuation:acme/spec:7:{continued['runId']}",
-                )
-                payload = json.loads(Path(continued["event"]).read_text(encoding="utf-8"))
-                self.assertEqual(payload["source"], "events-dir")
-                self.assertEqual(payload["adapter"], "shell")
-                self.assertEqual(payload["pool"], ["flow", "fixture-campaign"])
-                self.assertEqual(payload["priority"], "low")
-                self.assertEqual(payload["evidence"], ["exit:0"])
-                self.assertEqual(payload["submission"], {"mode": "full"})
-                self.assertEqual(payload["runtimeMaxSec"], 600)
-                self.assertFalse(payload["noEnqueue"])
-                self.assertEqual(payload["dedupKey"], continued["dedupKey"])
-                self.assertEqual(payload["brief"]["runId"], continued["runId"])
-                self.assertEqual(payload["brief"]["campaign"], "fixture")
-
-                final_state = github.state()
-                # The machine's note-to-self is process, and process belongs in
-                # the journal. A merging pass now leaves no public comment at
-                # all: the per-merge progress comment is gone, and a task with
-                # no sub-issue has no checkbox to repair either.
-                self.assertEqual(final_state["comments"], [])
-                self.assertEqual(
-                    sum(call[:2] == ["issue", "comment"] for call in final_state["calls"]),
-                    0,
-                )
-                self.assertEqual(
-                    sum(call[:2] == ["pr", "reopen"] for call in final_state["calls"]),
-                    1,
-                )
-
-    def test_marker_only_pull_request_title_is_explicit(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root)
-            base = git(checkout, "rev-parse", "HEAD")
-            revision = "sha256:" + "a" * 64
-            data = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "issue": issue(),
-                "task": {**task("task-1"), "revision": revision},
-                "workspace": {
-                    "baseRev": base,
-                    "publishBranch": DRIVER.stable_publish_branch(
-                        "fixture", "7", "task-1", revision
-                    ),
-                },
-            }
-            config = DRIVER.repo_config(repository_config(checkout, "github"))
-            with FakeGitHub(root, {"pulls": [], "calls": []}) as github:
-                url = DRIVER.github_pull_request(
-                    data,
-                    config,
-                    checkout,
-                    base,
-                    DRIVER.template_narration(data["task"]),
-                )
-
-            self.assertEqual(url, "https://github.com/acme/spec/pull/1")
-            created = github.state()["createdPullRequests"][0]
-            title = created[created.index("--title") + 1]
-            self.assertEqual(title, "[marker] task-1: Task task-1")
-
-    def test_continuation_event_is_derived_bounded_and_idempotent(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root)
-            events = root / "events"
-            brief = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "runId": "pass-2",
-                "continuation": continuation_spec(events),
-                "brief": None,
-            }
-            with FakeGitHub(root, {"comments": [], "calls": []}) as github:
-                first = DRIVER.action_continue(dict(brief))
-                second = DRIVER.action_continue(dict(brief))
-                self.assertEqual(github.state()["comments"], [])
-                self.assertEqual(github.state()["calls"], [])
-            # One pass derives exactly one successor identity, and re-running
-            # the node cannot mint a second event while the first is undrained.
-            self.assertEqual(first["runId"], second["runId"])
-            self.assertEqual(first["event"], second["event"])
-            self.assertTrue(first["created"])
-            self.assertFalse(second["created"])
-            self.assertEqual(
-                [entry.name for entry in sorted(events.iterdir())],
-                [Path(first["event"]).name],
-            )
-            payload = json.loads(Path(first["event"]).read_text(encoding="utf-8"))
-            self.assertNotIn("brief", payload)
-            self.assertTrue(Path(first["event"]).name.endswith(".json"))
-            self.assertFalse(Path(first["event"]).name.endswith(".enqueue.json"))
-            self.assertLess(
-                len(Path(first["event"]).read_bytes()),
-                DRIVER.MAX_CONTINUATION_EVENT_BYTES,
-            )
-            # The successor identity chains, so consecutive passes never
-            # collide on one dedup key.
-            third = DRIVER.action_continue(dict(brief, runId=first["runId"]))
-            self.assertNotEqual(third["runId"], first["runId"])
-            self.assertNotEqual(third["dedupKey"], first["dedupKey"])
-
-    def test_local_forge_continuation_keeps_its_durable_receipt(self) -> None:
+    def test_continuation_keeps_its_durable_local_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
@@ -2172,7 +765,7 @@ class GitHubForgeTests(unittest.TestCase):
                 f"/continuation/{continued['runId']}",
             )
             listed = git(checkout, "ls-remote", "origin", reference)
-            self.assertTrue(listed, "the local forge kept no continuation receipt")
+            self.assertTrue(listed, "the local repository kept no continuation receipt")
             blob = git(checkout, "cat-file", "blob", listed.split()[0])
             self.assertEqual(
                 json.loads(blob),
@@ -2193,7 +786,7 @@ class GitHubForgeTests(unittest.TestCase):
             base = {
                 "campaign": "fixture",
                 "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
+                "repositoryConfig": repository_config(checkout),
                 "issue": issue(),
                 "runId": "pass-4",
                 "brief": None,
@@ -2212,1188 +805,6 @@ class GitHubForgeTests(unittest.TestCase):
                     )
                 )
             self.assertFalse((root / "events").exists())
-
-    def test_issue_graph_digest_is_admitted_and_preserves_checkpoint_kind(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            checkout, _ = initialize_repository(Path(temporary), remote=True)
-            manifest = {
-                "schemaVersion": 1,
-                "name": "fixture",
-                "repository": repository_config(checkout, "github"),
-                "maxTasks": 64,
-                "maxParallel": 1,
-                "driverRuntimeMaxSec": 900,
-                "runtimeMaxSec": 86_400,
-                "pool": "campaign",
-                "mergeMethod": "squash",
-                "agent": {
-                    "adapter": "codex",
-                    "argv": [
-                        "Read the file whose path is in the TALLY_BRIEF environment variable "
-                        "and execute the mission it contains. That brief is your complete "
-                        "instruction set."
-                    ],
-                    "priority": "low",
-                    "runtimeMaxSec": 14_400,
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": "danger-full-access",
-                    "diagnosisSandboxPolicy": "read-only",
-                    "model": None,
-                },
-                "steward": None,
-                "gates": [
-                    {
-                        "kind": "command",
-                        "id": "tests",
-                        "preflightArgv": ["true"],
-                        "argv": ["true"],
-                        "runtimeMaxSec": 900,
-                    }
-                ],
-                "tasks": [
-                    {
-                        "id": "build",
-                        "kind": "implementation",
-                        "issue": 8,
-                        "dependencies": [],
-                        "argv": None,
-                        "runtimeMaxSec": None,
-                    },
-                    {
-                        "id": "verify",
-                        "kind": "checkpoint",
-                        "issue": 9,
-                        "dependencies": ["build"],
-                        "argv": ["true"],
-                        "runtimeMaxSec": 30,
-                    },
-                ],
-            }
-            issues = [
-                {
-                    "number": 8,
-                    "title": "Build",
-                    "body": "Implement the admitted change.",
-                    "state": "open",
-                    "html_url": "https://github.com/acme/spec/issues/8",
-                },
-                {
-                    "number": 9,
-                    "title": "Verify",
-                    "body": "Run the admitted automated barrier.",
-                    "state": "open",
-                    "html_url": "https://github.com/acme/spec/issues/9",
-                },
-            ]
-            graph = canonical_graph(manifest, issues)
-            digest = graph["executableDigest"]
-            master = {
-                "number": 7,
-                "state": "open",
-                "html_url": "https://github.com/acme/spec/issues/7",
-                "body": (
-                    f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
-                    f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n"
-                ),
-            }
-            brief = {
-                "repository": "acme/spec",
-                "issue": issue(),
-                "worklist": {"kind": "github-issue", "graphDigest": digest},
-                "armedManifest": graph["manifest"],
-                "campaignGraph": graph,
-            }
-            with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
-                worklist = DRIVER.issue_graph_worklist(brief)
-            self.assertEqual([task["kind"] for task in worklist["tasks"]], ["implementation", "checkpoint"])
-            self.assertNotIn("conflictDomains", graph["manifest"]["tasks"][0])
-            self.assertNotIn("conflictDomains", worklist["tasks"][0])
-            self.assertNotIn("conflictDomains", worklist["tasks"][1])
-            self.assertEqual(worklist["tasks"][1]["argv"], ["true"])
-            self.assertRegex(worklist["tasks"][0]["revision"], r"^sha256:[0-9a-f]{64}$")
-            self.assertEqual(
-                worklist["source"]["revision"],
-                git(checkout, "rev-parse", "origin/main"),
-            )
-
-            # The public receipt boundary predates campaignGraph. A caller
-            # carrying the normalized manifest and its admitted graph digest
-            # must recover the same executable projection without applying a
-            # second table of manifest defaults.
-            manifest_only = dict(brief)
-            manifest_only.pop("campaignGraph")
-            with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
-                recovered = DRIVER.issue_graph_worklist(manifest_only)
-            self.assertEqual(recovered["config"], worklist["config"])
-            self.assertEqual(recovered["tasks"], worklist["tasks"])
-            self.assertNotIn("conflictDomains", recovered["tasks"][0])
-
-            for present, domains in (
-                (False, None),
-                (True, []),
-                (True, ["src"]),
-            ):
-                variant_manifest = json.loads(json.dumps(manifest))
-                if present:
-                    variant_manifest["tasks"][0]["conflictDomains"] = domains
-                else:
-                    variant_manifest["tasks"][0].pop("conflictDomains", None)
-                variant_graph = canonical_graph(variant_manifest, issues)
-                variant_brief = {
-                    "repository": "acme/spec",
-                    "issue": issue(),
-                    "worklist": {
-                        "kind": "github-issue",
-                        "graphDigest": variant_graph["executableDigest"],
-                    },
-                    "armedManifest": variant_graph["manifest"],
-                }
-                with mock.patch.object(
-                    DRIVER, "github_json", side_effect=[master, issues]
-                ):
-                    projected = DRIVER.issue_graph_worklist(variant_brief)
-                if present:
-                    self.assertEqual(projected["tasks"][0]["conflictDomains"], domains)
-                else:
-                    self.assertNotIn("conflictDomains", projected["tasks"][0])
-
-            # Rust refetched and normalized immediately before dispatch. A
-            # forge edit racing after that point is mutable state, not a second
-            # executable contract for Python to normalize.
-            changed = [dict(candidate) for candidate in issues]
-            changed[0]["title"] = "Edited after Rust dispatched"
-            changed[0]["body"] = "Edited after Rust dispatched."
-            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
-                carried = DRIVER.issue_graph_worklist(brief)
-            self.assertEqual(carried["tasks"][0]["title"], "Build")
-            self.assertEqual(
-                carried["tasks"][0]["brief"]["body"],
-                "Implement the admitted change.",
-            )
-            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
-                with self.assertRaisesRegex(
-                    DRIVER.DriverError, "internal campaign contract violation"
-                ):
-                    DRIVER.issue_graph_worklist(manifest_only)
-
-            corrupted = json.loads(json.dumps(brief))
-            corrupted["campaignGraph"]["tasks"][0]["body"] = "not what Rust hashed"
-            with self.assertRaisesRegex(
-                DRIVER.DriverError, "internal campaign contract violation"
-            ):
-                DRIVER.issue_graph_worklist(corrupted)
-
-            divergent_receipt = json.loads(json.dumps(brief))
-            divergent_receipt["armedManifest"]["name"] = "not-the-carried-graph"
-            with self.assertRaisesRegex(
-                DRIVER.DriverError, "armedManifest does not match campaignGraph.manifest"
-            ):
-                DRIVER.issue_graph_worklist(divergent_receipt)
-
-            invalid_evidence = json.loads(json.dumps(brief))
-            invalid_evidence["armedManifest"] = "not an object"
-            with self.assertRaisesRegex(
-                DRIVER.DriverError, "armedManifest must be an object or null"
-            ):
-                DRIVER.issue_graph_worklist(invalid_evidence)
-
-    def test_merged_pr_completion_is_bound_to_task_revision(self) -> None:
-        revision = "sha256:" + "1" * 64
-        task_value = {"id": "task-1", "kind": "implementation", "revision": revision}
-        branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
-        candidate = {
-            "html_url": "https://github.com/acme/spec/pull/8",
-            "body": DRIVER.pull_request_marker("fixture", "7", "task-1", revision),
-            "base": {"ref": "main"},
-            "head": {"ref": branch, "sha": "c" * 40},
-            "merge_commit_sha": "a" * 40,
-            "merged_at": "2026-08-02T00:00:00Z",
-            "state": "closed",
-        }
-
-        def listed(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess([], 0, json.dumps([candidate]), "")
-
-        with mock.patch.object(DRIVER, "run", side_effect=listed):
-            facts, restamps, _ = DRIVER.merged_github_tasks(
-                "acme/spec", {}, "fixture", "7", "main", None, [task_value]
-            )
-            self.assertEqual(facts[0]["revision"], revision)
-            self.assertEqual(restamps, [])
-            task_value["revision"] = "sha256:" + "2" * 64
-            stale, restamps, warnings = DRIVER.merged_github_tasks(
-                "acme/spec", {}, "fixture", "7", "main", None, [task_value]
-            )
-            self.assertEqual(stale, [])
-            # A branch-scoped degraded read cannot discover historical proof;
-            # re-stamping is admitted only by the task's native sub-issue walk.
-            self.assertEqual(restamps, [])
-            self.assertTrue(any("pull/8" in warning for warning in warnings))
-
-    def test_the_walk_binds_completion_to_the_admitted_task_revision(self) -> None:
-        """A stale-revision pull request is only a source for a new marker.
-
-        The walk narrows where candidates come from; it never widens what
-        counts. A pull request linked to the task's own sub-issue, merged, and
-        on the right base and head still does not complete the current task
-        revision; it admits the deterministic re-stamp lane instead.
-        """
-        revision = "sha256:" + "1" * 64
-        task_value = {
-            "id": "task-1",
-            "kind": "implementation",
-            "revision": revision,
-            "brief": {
-                "issue": {
-                    "number": "8",
-                    "url": "https://github.com/acme/spec/issues/8",
-                }
-            },
-        }
-        branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
-        walk = {
-            8: {
-                "number": 8,
-                # A task pull request carries `Closes #<sub-issue>`, so the
-                # forge state after a merge is closed, not open.
-                "state": "closed",
-                "url": "https://github.com/acme/spec/issues/8",
-                "comments": [],
-                "pullRequests": [
-                    {
-                        "url": "https://github.com/acme/spec/pull/8",
-                        "body": DRIVER.pull_request_marker(
-                            "fixture", "7", "task-1", revision
-                        ),
-                        "merged": True,
-                        "baseRefName": "main",
-                        "headRefName": branch,
-                        "mergeCommit": {"oid": "a" * 40},
-                    },
-                    {
-                        "url": "https://github.com/acme/spec/pull/9",
-                        "body": DRIVER.pull_request_marker(
-                            "fixture", "7", "task-1", revision
-                        ),
-                        "merged": False,
-                        "baseRefName": "main",
-                        "headRefName": branch,
-                        "mergeCommit": {"oid": "b" * 40},
-                    },
-                ],
-            }
-        }
-        facts, restamps, warnings = DRIVER.merged_github_tasks(
-            "acme/spec", {}, "fixture", "7", "main", None, [task_value], walk
-        )
-        self.assertEqual([fact["taskId"] for fact in facts], ["task-1"])
-        self.assertEqual(facts[0]["revision"], revision)
-        self.assertEqual(restamps, [])
-        self.assertEqual(warnings, [])
-
-        # The graph was edited after that pull request merged: the task now
-        # carries a different revision, so its stable branch and marker moved.
-        stale_task = dict(task_value, revision="sha256:" + "2" * 64)
-        stale, restamps, warnings = DRIVER.merged_github_tasks(
-            "acme/spec", {}, "fixture", "7", "main", None, [stale_task], walk
-        )
-        self.assertEqual(stale, [])
-        self.assertEqual(
-            restamps,
-            [
-                {
-                    "taskId": "task-1",
-                    "pullRequest": "https://github.com/acme/spec/pull/8",
-                    "mergeCommit": "a" * 40,
-                    "revision": revision,
-                }
-            ],
-        )
-        self.assertEqual(warnings, [])
-
-    def test_restamp_refuses_a_stale_marker_without_valid_merged_proof(self) -> None:
-        old_revision = "sha256:" + "1" * 64
-        current_revision = "sha256:" + "2" * 64
-        task_value = {
-            "id": "task-1",
-            "kind": "implementation",
-            "revision": current_revision,
-            "brief": {
-                "issue": {
-                    "number": "8",
-                    "url": "https://github.com/acme/spec/issues/8",
-                }
-            },
-        }
-        candidate = {
-            "url": "https://github.com/acme/spec/pull/8",
-            "body": DRIVER.pull_request_marker(
-                "fixture", "7", "task-1", old_revision
-            ),
-            "merged": True,
-            "baseRefName": "main",
-            # The marker names the old revision, but the PR does not use the
-            # stable branch derived from it. The ordinary oracle must refuse
-            # it before the agent-free path can see a fact.
-            "headRefName": "untrusted/head",
-            "mergeCommit": {"oid": "a" * 40},
-        }
-        walk = {
-            8: {
-                "number": 8,
-                "state": "closed",
-                "url": "https://github.com/acme/spec/issues/8",
-                "comments": [],
-                "pullRequests": [candidate],
-            }
-        }
-        merged, restamps, warnings = DRIVER.merged_github_tasks(
-            "acme/spec", {}, "fixture", "7", "main", None, [task_value], walk
-        )
-        self.assertEqual(merged, [])
-        self.assertEqual(restamps, [])
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("not stable branch", warnings[0])
-
-    def test_issue_campaign_checkbox_repair_and_closeout_are_separate(self) -> None:
-        tasks = [
-            {
-                "id": "first",
-                "title": "First task",
-                "brief": {
-                    "issue": {
-                        "number": "2",
-                        "url": "https://github.com/acme/spec/issues/2",
-                    }
-                },
-            },
-            {
-                "id": "second",
-                "title": "Second task",
-                "brief": {
-                    "issue": {
-                        "number": "3",
-                        "url": "https://github.com/acme/spec/issues/3",
-                    }
-                },
-            },
-        ]
-        body = (
-            "operator prose\n"
-            f"{DRIVER.WORKLIST_BEGIN}\n\nold projection\n\n"
-            f"{DRIVER.WORKLIST_END}\n"
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with FakeGitHub(
-                root,
-                {"master": {"body": body, "state": "open"}, "calls": []},
-            ) as github:
-                DRIVER.sync_issue_checkboxes("acme/spec", "1", body, tasks, {"first"})
-            published = github.state()
-        edited = published["master"]["body"]
-        self.assertIn("- [x] <!-- tally:campaign-task:v1 id=first -->", edited)
-        self.assertIn("- [ ] <!-- tally:campaign-task:v1 id=second -->", edited)
-        self.assertTrue(edited.startswith("operator prose\n"))
-        self.assertEqual(len(published["bodyFiles"]), 1)
-        body_file = published["bodyFiles"][0]
-        self.assertNotEqual(body_file["argument"], "-")
-        self.assertEqual(body_file["body"], edited)
-        self.assertFalse(Path(body_file["argument"]).exists())
-
-        completed = subprocess.CompletedProcess([], 0, "", "")
-        with mock.patch.object(
-            DRIVER,
-            "github_json",
-            side_effect=[{"state": "open"}, {"state": "closed"}],
-        ), mock.patch.object(DRIVER, "run", return_value=completed) as run:
-            DRIVER.close_completed_issue_campaign("acme/spec", "1", tasks)
-        commands = [call.args[0] for call in run.call_args_list]
-        self.assertIn(["gh", "issue", "close", "2", "--repo", "acme/spec"], commands)
-        self.assertNotIn(["gh", "issue", "close", "3", "--repo", "acme/spec"], commands)
-        self.assertIn(["gh", "issue", "close", "1", "--repo", "acme/spec"], commands)
-        # Closing is closing. The summary comment is the closing summary's job,
-        # published before this runs.
-        self.assertFalse(
-            any(command[:3] == ["gh", "issue", "comment"] for command in commands)
-        )
-
-
-class NativeSubIssueTests(unittest.TestCase):
-    """The native read path: one walk, per-task threads, no written projection."""
-
-    MANIFEST_TASKS = [
-        {
-            "id": "task-1",
-            "kind": "implementation",
-            "issue": 8,
-            "dependencies": [],
-            "conflictDomains": ["src/one"],
-            "argv": None,
-            "runtimeMaxSec": None,
-        },
-        {
-            "id": "task-2",
-            "kind": "implementation",
-            "issue": 9,
-            "dependencies": [],
-            "conflictDomains": ["src/two"],
-            "argv": None,
-            "runtimeMaxSec": None,
-        },
-    ]
-
-    def manifest(self, checkout: Path, forge: str = "github") -> dict[str, object]:
-        return {
-            "schemaVersion": 1,
-            "name": "fixture",
-            "repository": repository_config(checkout, forge),
-            "maxTasks": 2,
-            "maxParallel": 2,
-            "driverRuntimeMaxSec": 900,
-            "runtimeMaxSec": 3600,
-            "pool": "campaign",
-            "mergeMethod": "squash",
-            "agent": {
-                "adapter": "codex",
-                "argv": ["read the admitted brief"],
-                "priority": "low",
-                "runtimeMaxSec": 900,
-                "approvalPolicy": "never",
-                "sandboxPolicy": "danger-full-access",
-                "diagnosisSandboxPolicy": "read-only",
-                "model": None,
-            },
-            "steward": None,
-            "gates": [
-                {
-                    "kind": "command",
-                    "id": "tests",
-                    "preflightArgv": ["true"],
-                    "argv": ["true"],
-                    "runtimeMaxSec": 60,
-                }
-            ],
-            "tasks": self.MANIFEST_TASKS,
-        }
-
-    def subissues(self) -> list[dict[str, object]]:
-        return [
-            {
-                "number": number,
-                "title": f"Task {index + 1}",
-                "body": f"Implement task {index + 1}.",
-                "state": "open",
-                "html_url": f"https://github.com/acme/spec/issues/{number}",
-                "updated_at": "2026-08-01T12:00:00Z",
-            }
-            for index, number in enumerate((8, 9))
-        ]
-
-    def fixture(
-        self, checkout: Path, forge: str = "github"
-    ) -> tuple[dict[str, object], dict[str, object]]:
-        manifest = self.manifest(checkout, forge)
-        subissues = self.subissues()
-        master_body = (
-            f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
-            f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n\n"
-            f"{DRIVER.WORKLIST_BEGIN}\n\n{DRIVER.WORKLIST_END}\n"
-        )
-        graph = canonical_graph(manifest, subissues)
-        digest = graph["executableDigest"]
-        state = {
-            "actor": "tally-bot",
-            "master": {
-                "number": 7,
-                "state": "open",
-                "html_url": "https://github.com/acme/spec/issues/7",
-                "body": master_body,
-                "updated_at": "2026-08-01T12:00:00Z",
-            },
-            "subIssues": subissues,
-            "walk": [self.walk_node(8), self.walk_node(9)],
-            "comments": [],
-            "issueComments": [],
-            "calls": [],
-        }
-        brief = {
-            "campaignIdentity": CAMPAIGN_ID,
-            "repository": "acme/spec",
-            "issue": issue(),
-            "worklist": {"kind": "github-issue", "graphDigest": digest},
-            "armedManifest": graph["manifest"],
-            "campaignGraph": graph,
-            "capabilities": {"subIssueWalk": True},
-        }
-        return state, brief
-
-    def test_task_revision_survives_an_unrelated_graph_edit(self) -> None:
-        manifest = DRIVER.canonical_manifest(self.manifest(Path("/srv/fixture")))
-        content = {
-            "number": 8,
-            "title": "Task 1",
-            "body": "Implement task 1.",
-        }
-        revision = DRIVER.task_completion_revision(
-            manifest, manifest["tasks"][0], content
-        )
-
-        edited = json.loads(json.dumps(manifest))
-        edited["maxTasks"] = 3
-        edited["maxParallel"] = 3
-        edited["tasks"][1]["dependencies"] = ["task-1"]
-        edited["tasks"].append(
-            {
-                "id": "task-3",
-                "kind": "implementation",
-                "issue": 10,
-                "dependencies": ["task-2"],
-                "conflictDomains": ["src/three"],
-                "argv": None,
-                "runtimeMaxSec": None,
-            }
-        )
-        self.assertEqual(
-            DRIVER.task_completion_revision(edited, edited["tasks"][0], content),
-            revision,
-        )
-
-        own_edit = dict(content, body="Implement the edited task 1.")
-        self.assertNotEqual(
-            DRIVER.task_completion_revision(manifest, manifest["tasks"][0], own_edit),
-            revision,
-        )
-
-    @staticmethod
-    def walk_node(
-        number: int,
-        *,
-        state: str = "OPEN",
-        pulls: list[dict[str, object]] | None = None,
-        comments: list[dict[str, object]] | None = None,
-        truncated: bool = False,
-        comments_truncated: bool = False,
-    ) -> dict[str, object]:
-        return {
-            "number": number,
-            "state": state,
-            "url": f"https://github.com/acme/spec/issues/{number}",
-            "closedByPullRequestsReferences": {
-                "pageInfo": {"hasNextPage": truncated},
-                "nodes": pulls or [],
-            },
-            # `last:` returns the newest comments, so an exhausted window drops
-            # the oldest: `hasPreviousPage`, not `hasNextPage`.
-            "comments": {
-                "pageInfo": {"hasPreviousPage": comments_truncated},
-                "nodes": comments or [],
-            },
-        }
-
-    @staticmethod
-    def merged_pull(url: str, body: str, branch: str, oid: str) -> dict[str, object]:
-        return {
-            "url": url,
-            "body": body,
-            "merged": True,
-            "baseRefName": "main",
-            "headRefName": branch,
-            "mergeCommit": {"oid": oid},
-        }
-
-    @staticmethod
-    def machine_comment(number: int, body: str) -> dict[str, object]:
-        return {
-            "url": f"https://github.com/acme/spec/issues/{number}#machine",
-            "body": body,
-            "author": {"login": "tally-bot"},
-        }
-
-    def test_completed_native_campaign_with_armed_evidence_summarizes_then_closes(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-            base_revision = git(checkout, "rev-parse", "origin/main")
-            completed_walk = []
-            graph = brief["campaignGraph"]
-            for task, subissue, reference, content in zip(
-                self.MANIFEST_TASKS,
-                state["subIssues"],
-                graph["manifest"]["tasks"],
-                graph["tasks"],
-                strict=True,
-            ):
-                revision = DRIVER.task_completion_revision(
-                    graph["manifest"], reference, content
-                )
-                branch = DRIVER.stable_publish_branch(
-                    "fixture", CAMPAIGN_ID, task["id"], revision
-                )
-                marker = DRIVER.pull_request_marker(
-                    "fixture", "7", task["id"], revision
-                )
-                completed_walk.append(
-                    self.walk_node(
-                        task["issue"],
-                        state="CLOSED",
-                        pulls=[
-                            self.merged_pull(
-                                f"https://github.com/acme/spec/pull/{task['issue']}",
-                                marker,
-                                branch,
-                                base_revision,
-                            )
-                        ],
-                    )
-                )
-                subissue["state"] = "closed"
-            state["walk"] = completed_walk
-
-            with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(brief)
-
-            self.assertTrue(result["complete"])
-            self.assertIsNotNone(result["closingSummary"])
-            published = github.state()
-            self.assertEqual(published["master"]["state"], "closed")
-            self.assertEqual(len(published["comments"]), 1)
-            self.assertIn("tally:campaign-complete:v1", published["comments"][0])
-            self.assertIn("### Campaign complete", published["comments"][0])
-            close_calls = [
-                call for call in published["calls"] if call[:2] == ["issue", "close"]
-            ]
-            self.assertEqual(close_calls, [["issue", "close", "7", "--repo", "acme/spec"]])
-
-    def test_degraded_terminal_closeout_uses_a_real_body_file(self) -> None:
-        """A recorder may treat --body-file's value strictly as a path."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-            base_revision = git(checkout, "rev-parse", "origin/main")
-            brief["capabilities"] = {"subIssueWalk": False}
-            state["merged"] = []
-            graph = brief["campaignGraph"]
-            for task, reference, content in zip(
-                self.MANIFEST_TASKS,
-                graph["manifest"]["tasks"],
-                graph["tasks"],
-                strict=True,
-            ):
-                revision = DRIVER.task_completion_revision(
-                    graph["manifest"], reference, content
-                )
-                branch = DRIVER.stable_publish_branch(
-                    "fixture", CAMPAIGN_ID, task["id"], revision
-                )
-                state["merged"].append(
-                    {
-                        "url": f"https://github.com/acme/spec/pull/{task['issue']}",
-                        "body": DRIVER.pull_request_marker(
-                            "fixture", "7", task["id"], revision
-                        ),
-                        "baseRefName": "main",
-                        "headRefName": branch,
-                        "headRefOid": base_revision,
-                        "mergeCommit": {"oid": base_revision},
-                        "state": "MERGED",
-                    }
-                )
-
-            with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(brief)
-
-            self.assertTrue(result["complete"])
-            published = github.state()
-            self.assertEqual(published["master"]["state"], "closed")
-            self.assertEqual(len(published["comments"]), 1)
-            self.assertIn("tally:campaign-complete:v1", published["comments"][0])
-            self.assertEqual(len(published["bodyFiles"]), 1)
-            body_file = published["bodyFiles"][0]
-            self.assertNotEqual(body_file["argument"], "-")
-            self.assertFalse(Path(body_file["argument"]).exists())
-            self.assertIn("- [x]", body_file["body"])
-            close_calls = [
-                call for call in published["calls"] if call[:2] == ["issue", "close"]
-            ]
-            self.assertEqual(
-                close_calls,
-                [
-                    ["issue", "close", "8", "--repo", "acme/spec"],
-                    ["issue", "close", "9", "--repo", "acme/spec"],
-                    ["issue", "close", "7", "--repo", "acme/spec"],
-                ],
-            )
-
-    def test_native_local_code_forge_posts_digest_on_github_master(self) -> None:
-        """The code merge backend does not own the forge-native campaign thread."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout, "local")
-            brief["attemptReceipts"] = attempt_receipts(root)
-            digest = brief["campaignGraph"]["executableDigest"]
-            base_revision = git(checkout, "rev-parse", "origin/main")
-            config = DRIVER.repo_config(repository_config(checkout, "local"))
-            DRIVER.ensure_integration_branch(
-                config, "fixture", CAMPAIGN_ID, base_revision
-            )
-            integration_tip = base_revision
-            graph = brief["campaignGraph"]
-            for task, reference, content in zip(
-                self.MANIFEST_TASKS,
-                graph["manifest"]["tasks"],
-                graph["tasks"],
-                strict=True,
-            ):
-                revision = DRIVER.task_completion_revision(
-                    graph["manifest"], reference, content
-                )
-                branch = DRIVER.stable_publish_branch(
-                    "fixture", CAMPAIGN_ID, task["id"], revision
-                )
-                marker = DRIVER.pull_request_marker(
-                    "fixture", "7", task["id"], revision
-                )
-                git(
-                    checkout,
-                    "commit",
-                    "--quiet",
-                    "--allow-empty",
-                    "-m",
-                    f"fixture: integrate {task['id']}",
-                    "-m",
-                    marker,
-                )
-                integration_tip = git(checkout, "rev-parse", "HEAD")
-                git(
-                    checkout,
-                    "update-ref",
-                    f"refs/heads/{branch}",
-                    integration_tip,
-                )
-            git(
-                checkout,
-                "update-ref",
-                f"refs/heads/{DRIVER.integration_branch('fixture', CAMPAIGN_ID)}",
-                integration_tip,
-                base_revision,
-            )
-
-            with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(brief)
-
-            self.assertTrue(result["complete"])
-            self.assertEqual(
-                result["closingSummary"],
-                "https://github.com/acme/spec/issues/7#issuecomment-test-1",
-            )
-            published = github.state()
-            self.assertEqual(published["master"]["state"], "closed")
-            self.assertEqual(len(published["comments"]), 1)
-            comment = published["comments"][0]
-            self.assertIn("tally:campaign-complete:v1", comment)
-            self.assertIn(f"source={digest}", comment)
-            self.assertRegex(comment, r"sha256:[0-9a-f]{64}")
-            comment_calls = [
-                call for call in published["calls"] if call[:2] == ["issue", "comment"]
-            ]
-            comment_reads = [
-                call
-                for call in published["calls"]
-                if any("/comments?per_page=100" in argument for argument in call)
-            ]
-            self.assertEqual(
-                comment_reads,
-                [
-                    [
-                        "api",
-                        "--paginate",
-                        "--slurp",
-                        "repos/acme/spec/issues/7/comments?per_page=100",
-                    ]
-                ],
-            )
-            self.assertEqual(len(comment_calls), 1)
-            self.assertEqual(comment_calls[0][2], "7")
-            self.assertIn("--body", comment_calls[0])
-            self.assertNotIn("--body-file", comment_calls[0])
-            master_close = ["issue", "close", "7", "--repo", "acme/spec"]
-            self.assertLess(
-                published["calls"].index(comment_calls[0]),
-                published["calls"].index(master_close),
-            )
-            local_summaries = DRIVER.local_remote_refs(
-                DRIVER.repo_config(repository_config(checkout)),
-                f"{DRIVER.local_state_prefix('fixture', '7')}/summary/*",
-            )
-            self.assertEqual(local_summaries, {})
-
-    def test_a_hand_closed_sub_issue_is_an_anomaly_not_completion(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-            state["walk"] = [self.walk_node(8, state="CLOSED"), self.walk_node(9)]
-            with FakeGitHub(root, state) as github:
-                result = DRIVER.action_reconcile(brief)
-            self.assertEqual(result["merged"], [])
-            self.assertIn("task-1", result["remaining"])
-            self.assertIn("task-1", [task["id"] for task in result["frontier"]])
-            self.assertEqual(
-                result["anomalies"],
-                [
-                    {
-                        "kind": "closed-without-merged-proof",
-                        "taskId": "task-1",
-                        "issue": "8",
-                        "url": "https://github.com/acme/spec/issues/8",
-                        "detail": (
-                            "sub-issue #8 is closed but task 'task-1' holds no "
-                            "revision-valid merged pull request; closing a "
-                            "sub-issue by hand does not complete a task"
-                        ),
-                    }
-                ],
-            )
-            # Native mode writes no projection at all: no comment, and the
-            # master's checkbox list is left exactly as authored.
-            final = github.state()
-            self.assertEqual(final["comments"], [])
-            self.assertEqual(final["master"]["body"], state["master"]["body"])
-
-    def test_the_campaigns_own_closure_is_a_restamp_not_an_anomaly(self) -> None:
-        """A graph edit must not turn every merged task into operator error.
-
-        A task pull request carries `Closes #<sub-issue>`, so the campaign
-        closes its own sub-issue as it merges. If that task later acquires a
-        new revision, its durable old merge admits a deterministic re-stamp;
-        the campaign-authored closure is still not a hand-closure anomaly.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-            base_revision = git(checkout, "rev-parse", "origin/main")
-            old_revision = "sha256:" + "1" * 64
-            pre_edit = DRIVER.pull_request_marker(
-                "fixture", "7", "task-1", old_revision
-            )
-            state["walk"] = [
-                self.walk_node(
-                    8,
-                    state="CLOSED",
-                    pulls=[
-                        self.merged_pull(
-                            "https://github.com/acme/spec/pull/8",
-                            pre_edit,
-                            DRIVER.stable_publish_branch(
-                                "fixture", CAMPAIGN_ID, "task-1", old_revision
-                            ),
-                            base_revision,
-                        )
-                    ],
-                ),
-                # Task 2's sub-issue was closed by a human: no pull request of
-                # this campaign's ever touched it.
-                self.walk_node(9, state="CLOSED"),
-            ]
-            with FakeGitHub(root, state):
-                result = DRIVER.action_reconcile(brief)
-            self.assertEqual(result["merged"], [])
-            self.assertEqual(sorted(result["remaining"]), ["task-1", "task-2"])
-            self.assertEqual(
-                [anomaly["taskId"] for anomaly in result["anomalies"]], ["task-2"]
-            )
-            self.assertEqual(
-                result["restamps"],
-                [
-                    {
-                        "taskId": "task-1",
-                        "pullRequest": "https://github.com/acme/spec/pull/8",
-                        "mergeCommit": base_revision,
-                        "revision": old_revision,
-                    }
-                ],
-            )
-            self.assertEqual(result["warnings"], [])
-
-    def test_a_truncated_reference_page_fails_the_pass(self) -> None:
-        """`first:` returns the oldest references, so truncation drops the newest.
-
-        Reading past that would let the walk narrow what counts as proof — the
-        one thing the issue says it must never do — and the task would then be
-        re-dispatched into a publish node that hits its own merged pull request.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-            state["walk"] = [self.walk_node(8, truncated=True), self.walk_node(9)]
-            with FakeGitHub(root, state):
-                with self.assertRaisesRegex(
-                    DRIVER.DriverError, "truncated reference page"
-                ):
-                    DRIVER.action_reconcile(brief)
-
-    def test_machine_receipts_follow_the_task_sub_issue_thread(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-
-            def diagnosis(task_id: str, attempt: int) -> str:
-                marker = DRIVER.diagnosis_marker("fixture", "7", task_id, attempt)
-                heading = DRIVER.diagnosis_heading(task_id, attempt)
-                return f"{marker}\n\n{heading}\n\nsteering for {task_id}"
-
-            state["walk"] = [
-                self.walk_node(
-                    8, comments=[self.machine_comment(8, diagnosis("task-1", 1))]
-                ),
-                self.walk_node(9),
-            ]
-            # A pre-#307 receipt for the same task still sits on the master.
-            state["issueComments"] = [
-                {
-                    "body": diagnosis("task-1", 1),
-                    "html_url": "https://github.com/acme/spec/issues/7#legacy",
-                    "user": {"login": "tally-bot"},
-                }
-            ]
-            with FakeGitHub(root, state):
-                result = DRIVER.action_reconcile(brief)
-            # The thread copy is the one the fact points at, and the master copy
-            # of the same attempt is counted once, not twice.
-            self.assertEqual(
-                [(item["taskId"], item["comment"]) for item in result["diagnoses"]],
-                [("task-1", "https://github.com/acme/spec/issues/8#machine")],
-            )
-            self.assertTrue(
-                any(
-                    "duplicate machine diagnosis for 'task-1' attempt 1 on the "
-                    "master thread" in warning
-                    for warning in result["warnings"]
-                ),
-                result["warnings"],
-            )
-
-    def test_a_master_receipt_recorded_before_the_thread_still_counts(self) -> None:
-        """#334 item 6: an upgraded campaign keeps its diagnosis/retry ledger.
-
-        A campaign armed before the sub-issue walk capability records its
-        receipts on the master. Re-arming into the native projection moves
-        where new receipts are posted; discarding the old ones reset each
-        task's attempt counters, which bought one extra agent attempt and
-        re-posted a public comment that had already been made.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-
-            def diagnosis(task_id: str, attempt: int) -> str:
-                marker = DRIVER.diagnosis_marker("fixture", "7", task_id, attempt)
-                heading = DRIVER.diagnosis_heading(task_id, attempt)
-                return f"{marker}\n\n{heading}\n\nsteering for {task_id}"
-
-            state["walk"] = [self.walk_node(8), self.walk_node(9)]
-            state["issueComments"] = [
-                {
-                    "body": diagnosis("task-1", 1),
-                    "html_url": "https://github.com/acme/spec/issues/7#legacy",
-                    "user": {"login": "tally-bot"},
-                }
-            ]
-            with FakeGitHub(root, state):
-                result = DRIVER.action_reconcile(brief)
-            self.assertEqual(
-                [(item["taskId"], item["attempt"], item["comment"]) for item in result["diagnoses"]],
-                [("task-1", 1, "https://github.com/acme/spec/issues/7#legacy")],
-            )
-            self.assertTrue(
-                any(
-                    "counted a master-thread machine diagnosis for 'task-1' "
-                    "attempt 1" in warning
-                    for warning in result["warnings"]
-                ),
-                result["warnings"],
-            )
-
-    def test_a_truncated_comment_window_is_reported_not_refused(self) -> None:
-        """#334 item 1: `comments(last: 100)` silently dropped the oldest.
-
-        These comments are machine-authored-filtered and feed the diagnosis and
-        retry ledger, not steering -- the steering read is the CLI's own walk.
-        So the warning has to name the consequence that actually follows here: a
-        task's oldest receipts fall out of the ledger and its attempt budget can
-        reset, which is #334 item 6's harm arriving through a second door. A
-        long thread must not halt the campaign, so it is reported, not refused.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state, brief = self.fixture(checkout)
-            state["walk"] = [
-                self.walk_node(8, comments_truncated=True),
-                self.walk_node(9),
-            ]
-            with FakeGitHub(root, state):
-                result = DRIVER.action_reconcile(brief)
-            self.assertTrue(
-                any(
-                    "campaign sub-issue #8 carries more than 100 comments" in warning
-                    and "receipt ledger" in warning
-                    and "attempt budget" in warning
-                    for warning in result["warnings"]
-                ),
-                result["warnings"],
-            )
-            # It must not send an operator looking for a lost steering comment:
-            # steering does not come from this walk.
-            self.assertTrue(
-                all(
-                    "steering read" not in warning for warning in result["warnings"]
-                ),
-                result["warnings"],
-            )
-            self.assertNotIn(
-                True,
-                [
-                    "campaign sub-issue #9 carries more than" in warning
-                    for warning in result["warnings"]
-                ],
-            )
-
-    def test_steering_and_retry_receipts_post_on_the_task_thread(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            state = {"actor": "tally-bot", "comments": [], "calls": []}
-            base = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "repositoryConfig": repository_config(checkout, "github"),
-                "issue": issue(),
-                "taskId": "task-1",
-                "capabilities": {"subIssueWalk": True},
-                "taskIssue": {
-                    "number": "8",
-                    "url": "https://github.com/acme/spec/issues/8",
-                },
-            }
-            with FakeGitHub(root, state) as github:
-                steered = DRIVER.action_steer(
-                    {**base, "attempt": 1, "diagnosis": "Narrowed the failing gate."}
-                )
-                retried = DRIVER.action_retry(
-                    {**base, "stage": "prep", "detail": "the lane vanished"}
-                )
-                # Reading the same thread back returns exactly what was posted,
-                # so a retry brief sees its own task's steering history.
-                replayed = DRIVER.action_steer(
-                    {**base, "attempt": 1, "diagnosis": "Narrowed the failing gate."}
-                )
-            self.assertTrue(steered["posted"])
-            self.assertTrue(retried["posted"])
-            self.assertFalse(replayed["posted"])
-            self.assertEqual(replayed["comment"], steered["comment"])
-            final = github.state()
-            self.assertEqual(
-                [call[2] for call in final["calls"] if call[:2] == ["issue", "comment"]],
-                ["8", "8"],
-            )
-            self.assertEqual(final.get("issueComments", []), [])
-            self.assertEqual(len(final["threadComments"]["8"]), 2)
-
-    def test_a_merging_pass_posts_no_progress_comment_in_native_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            git(checkout, "switch", "--quiet", "-c", "feature")
-            (checkout / "feature.txt").write_text("feature\n", encoding="utf-8")
-            git(checkout, "add", "feature.txt")
-            git(checkout, "commit", "--quiet", "-m", "feature")
-            head = git(checkout, "rev-parse", "HEAD")
-            git(checkout, "push", "--quiet", "origin", "feature")
-            git(checkout, "switch", "--quiet", "main")
-            git(checkout, "merge", "--quiet", "--no-ff", "--no-edit", "feature")
-            merge_commit = git(checkout, "rev-parse", "HEAD")
-            git(checkout, "push", "--quiet", "origin", "main")
-
-            master_body = (
-                f"{DRIVER.WORKLIST_BEGIN}\n"
-                f"- [ ] {DRIVER.TASK_MARKER_PREFIX}task-1 --> #8 — Task 1\n"
-                f"{DRIVER.WORKLIST_END}\n"
-            )
-            state = {
-                "actor": "tally-bot",
-                "master": {"number": 7, "state": "open", "body": master_body},
-                "prView": {
-                    "state": "MERGED",
-                    "mergeCommit": {"oid": merge_commit},
-                    "baseRefName": "main",
-                    "headRefName": "feature",
-                    "headRefOid": head,
-                },
-                "comments": [],
-                "calls": [],
-            }
-            data = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "issue": issue(),
-                "task": {
-                    **task("task-1"),
-                    "title": "Task 1",
-                    "brief": {
-                        "issue": {
-                            "number": "8",
-                            "url": "https://github.com/acme/spec/issues/8",
-                        },
-                        "body": "Implement task 1.",
-                    },
-                },
-            }
-            config = DRIVER.repo_config(repository_config(checkout, "github"))
-            integration = {
-                "pullRequest": "https://github.com/acme/spec/pull/1",
-                "branch": "feature",
-                "baseRev": git(checkout, "rev-parse", "origin/main"),
-                "head": head,
-            }
-            with FakeGitHub(root, state) as github:
-                DRIVER.merge_github(
-                    data,
-                    config,
-                    integration,
-                    {"subIssueWalk": True},
-                    "merge",
-                    DRIVER.template_narration(data["task"]),
-                )
-                native = github.state()
-                self.assertEqual(native["comments"], [])
-                self.assertIn("- [ ] ", native["master"]["body"])
-
-                DRIVER.merge_github(
-                    data,
-                    config,
-                    integration,
-                    {"subIssueWalk": False},
-                    "merge",
-                    DRIVER.template_narration(data["task"]),
-                )
-                degraded = github.state()
-                self.assertEqual(degraded["comments"], [])
-                self.assertIn(
-                    f"- [x] {DRIVER.TASK_MARKER_PREFIX}task-1 -->",
-                    degraded["master"]["body"],
-                )
-
 
 class LaneLifecycleTests(unittest.TestCase):
     def test_fresh_lane_cuts_serialize_on_the_checkout_git_metadata(self) -> None:
@@ -3446,112 +857,6 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertEqual(failures, [])
             self.assertTrue(worktree.is_dir())
 
-    def test_validated_completion_is_restamped_as_an_agent_free_marker(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            base = git(checkout, "rev-parse", "origin/main")
-            current_revision = "sha256:" + "2" * 64
-            source_revision = "sha256:" + "1" * 64
-            brief = prep_brief(checkout, root / "workspaces", "restamp-pass")
-            brief["task"]["revision"] = current_revision
-            prepared = DRIVER.action_prep(brief)
-
-            restamped = DRIVER.action_restamp(
-                {
-                    "task": brief["task"],
-                    "completion": {
-                        "taskId": "task-1",
-                        "pullRequest": "https://github.com/acme/spec/pull/8",
-                        "mergeCommit": base,
-                        "revision": source_revision,
-                    },
-                    "workspace": prepared,
-                }
-            )
-            worktree = Path(prepared["worktreePath"])
-            self.assertNotEqual(restamped["head"], prepared["baseRev"])
-            self.assertEqual(
-                git(worktree, "rev-list", "--count", f"{prepared['baseRev']}..HEAD"),
-                "1",
-            )
-            self.assertEqual(
-                git(worktree, "diff", "--name-only", prepared["baseRev"], "HEAD"),
-                "",
-            )
-            self.assertIn(
-                "chore(campaign): re-stamp completion",
-                git(worktree, "log", "-1", "--format=%B"),
-            )
-
-            ownership = DRIVER.action_ownership(
-                {
-                    "task": brief["task"],
-                    "domainsRequired": True,
-                    "repositoryConfig": repository_config(checkout, "github"),
-                    "workspace": prepared,
-                }
-            )
-            self.assertEqual(ownership["ownedPaths"], [])
-            delta = DRIVER.action_tree_delta(
-                {
-                    "task": brief["task"],
-                    "workspace": prepared,
-                    "ownedPaths": ownership["ownedPaths"],
-                }
-            )
-            self.assertEqual(delta["checkedPaths"], 0)
-
-            with FakeGitHub(root, {"pulls": [], "calls": []}) as github:
-                publication = DRIVER.action_publish(
-                    {
-                        "campaign": "fixture",
-                        "campaignIdentity": CAMPAIGN_ID,
-                        "repository": "acme/spec",
-                        "repositoryConfig": repository_config(checkout, "github"),
-                        "issue": issue(),
-                        "runId": "restamp-pass",
-                        "workspaceRoot": str(root / "workspaces"),
-                        "task": brief["task"],
-                        "domainsRequired": True,
-                        "gates": [
-                            {
-                                "kind": "command",
-                                "id": "tests",
-                                "preflightArgv": ["true"],
-                                "argv": ["true"],
-                                "runtimeMaxSec": 60,
-                            }
-                        ],
-                        "steward": None,
-                        "workspace": prepared,
-                        "constraints": [],
-                    }
-                )
-            self.assertEqual(publication["head"], restamped["head"])
-            self.assertEqual(
-                publication["pullRequest"],
-                f"local://acme/spec/{prepared['publishBranch']}",
-            )
-            self.assertEqual(
-                git(checkout, "rev-parse", prepared["publishBranch"]),
-                restamped["head"],
-            )
-            self.assertNotEqual(
-                command(
-                    "git",
-                    "-C",
-                    str(checkout),
-                    "ls-remote",
-                    "--exit-code",
-                    "origin",
-                    f"refs/heads/{prepared['publishBranch']}",
-                    check=False,
-                ).returncode,
-                0,
-            )
-            self.assertNotIn("createdPullRequests", github.state())
-
     def test_publish_posts_bounded_redacted_worker_findings_or_stays_silent(self) -> None:
         agent_task_uuid = "019fecc0-bbad-7153-969b-51174cf064ca"
         secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
@@ -3572,13 +877,6 @@ class LaneLifecycleTests(unittest.TestCase):
                 campaign_task = {
                     **task("task-1"),
                     "revision": "sha256:" + "a" * 64,
-                    "brief": {
-                        "issue": {
-                            "number": "8",
-                            "url": "https://github.com/acme/spec/issues/8",
-                        },
-                        "body": "Implement task 1 and report the judgement.",
-                    },
                 }
                 prepared_brief = prep_brief(
                     checkout,
@@ -3592,102 +890,48 @@ class LaneLifecycleTests(unittest.TestCase):
                 git(worktree, "add", "task-1")
                 git(worktree, "commit", "--quiet", "-m", "implement task 1")
 
-                state = {
-                    "actor": "tally-bot",
-                    "pulls": [],
-                    "comments": [],
-                    "calls": [],
-                }
-                with FakeGitHub(root, state) as github:
-                    publication = DRIVER.action_publish(
-                        {
-                            "campaign": "fixture",
-                            "campaignIdentity": CAMPAIGN_ID,
-                            "repository": "acme/spec",
-                            "repositoryConfig": repository_config(checkout, "github"),
-                            "issue": issue(),
-                            "runId": f"findings-{name}",
-                            "workspaceRoot": str(root / "workspaces"),
-                            "task": campaign_task,
-                            "domainsRequired": True,
-                            "gates": [],
-                            "steward": None,
-                            "workspace": prepared,
-                            "constraints": [],
-                            "workerFindings": findings,
-                            "capabilities": {"subIssueWalk": True},
-                            "taskIssue": campaign_task["brief"]["issue"],
-                        }
-                    )
-                    published = github.state()
+                config = repository_config(checkout)
+                publication = DRIVER.action_publish(
+                    {
+                        "campaign": "fixture",
+                        "campaignIdentity": CAMPAIGN_ID,
+                        "repository": "acme/spec",
+                        "repositoryConfig": config,
+                        "issue": issue(),
+                        "runId": f"findings-{name}",
+                        "workspaceRoot": str(root / "workspaces"),
+                        "task": campaign_task,
+                        "domainsRequired": True,
+                        "gates": [],
+                        "steward": None,
+                        "workspace": prepared,
+                        "constraints": [],
+                        "workerFindings": findings,
+                    }
+                )
+                ref = (
+                    f"{DRIVER.local_state_prefix('fixture', '7')}/findings/"
+                    f"task-1/{agent_task_uuid}"
+                )
 
                 if findings is None:
-                    self.assertEqual(published["comments"], [])
-                    self.assertFalse(
-                        any(call[:2] == ["issue", "comment"] for call in published["calls"])
-                    )
+                    self.assertEqual(DRIVER.local_remote_refs(config, ref), {})
                     continue
 
-                self.assertEqual(len(published["comments"]), 1)
-                comment = published["comments"][0]
-                marker = DRIVER.worker_findings_marker(
-                    "fixture", "7", "task-1", agent_task_uuid
-                )
-                self.assertTrue(comment.startswith(marker + "\n\n### Worker findings"))
+                receipt = DRIVER.read_local_blob(config, ref)
+                self.assertEqual(receipt["kind"], "worker-findings")
+                comment = receipt["body"]
+                self.assertTrue(comment.startswith("### Worker findings"))
                 self.assertIn("[redacted sensitive diagnosis line]", comment)
                 self.assertIn(DRIVER.WORKER_FINDINGS_TRUNCATION.strip(), comment)
                 self.assertNotIn(secret, comment)
                 self.assertLessEqual(
                     len(comment.encode("utf-8")), DRIVER.MAX_WORKER_FINDINGS_BYTES
                 )
-                comment_calls = [
-                    call
-                    for call in published["calls"]
-                    if call[:2] == ["issue", "comment"]
-                ]
-                self.assertEqual([call[2] for call in comment_calls], ["8"])
                 self.assertEqual(
                     publication["pullRequest"],
                     f"local://acme/spec/{prepared['publishBranch']}",
                 )
-                self.assertNotIn("createdPullRequests", published)
-
-    def test_marker_only_lane_passes_the_marker_safe_changelog_gate(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            (checkout / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
-            git(checkout, "add", "CHANGELOG.md")
-            git(checkout, "commit", "--quiet", "-m", "add changelog")
-            git(checkout, "push", "--quiet", "origin", "main")
-            base = git(checkout, "rev-parse", "origin/main")
-            current_revision = "sha256:" + "2" * 64
-            brief = prep_brief(checkout, root / "workspaces", "changelog-marker-pass")
-            brief["task"]["revision"] = current_revision
-            prepared = DRIVER.action_prep(brief)
-
-            DRIVER.action_restamp(
-                {
-                    "task": brief["task"],
-                    "completion": {
-                        "taskId": "task-1",
-                        "pullRequest": "https://github.com/acme/spec/pull/8",
-                        "mergeCommit": base,
-                        "revision": "sha256:" + "1" * 64,
-                    },
-                    "workspace": prepared,
-                }
-            )
-            worktree = Path(prepared["worktreePath"])
-            gated = command(
-                "sh",
-                "-euc",
-                MARKER_SAFE_CHANGELOG_PREDICATE,
-                cwd=worktree,
-                check=False,
-            )
-
-            self.assertEqual(gated.returncode, 0, gated.stderr)
 
     def test_content_lane_without_a_changelog_touch_fails_the_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3714,139 +958,6 @@ class LaneLifecycleTests(unittest.TestCase):
             )
 
             self.assertEqual(gated.returncode, 1, gated.stderr)
-
-    def test_a_lane_base_that_left_the_witnessed_worklist_history_fails_closed(
-        self,
-    ) -> None:
-        """Worklist and worktrees must come from one history.
-
-        The reconciler witnesses the worklist at a revision; prep fetches later
-        and cuts the lane from whatever the remote base points at then. A
-        rewound or force-replaced remote silently produced lanes from a history
-        the witnessed worklist never described. Checkpoint lanes already
-        refused exactly this; implementation lanes now do too, and the ordinary
-        fast-forward case is unchanged.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            workspace_root = root / "workspaces"
-            witnessed = git(checkout, "rev-parse", "HEAD")
-
-            # The ordinary case: base moved forward from the witnessed
-            # revision, so the lane descends from the worklist's history.
-            (checkout / "moved-on.txt").write_text("main moved\n", encoding="utf-8")
-            git(checkout, "add", "moved-on.txt")
-            git(checkout, "commit", "--quiet", "-m", "main: independent change")
-            git(checkout, "push", "--quiet", "origin", "main")
-            prepared = DRIVER.action_prep(
-                prep_brief(
-                    checkout,
-                    workspace_root,
-                    "coherent-pass",
-                    forge="github",
-                    source_revision=witnessed,
-                )
-            )
-            self.assertTrue(Path(prepared["worktreePath"]).is_dir())
-
-            # The remote is force-replaced with an unrelated history. The
-            # witnessed revision is no longer an ancestor of the base, so no
-            # lane may be cut from it.
-            replacement = root / "replacement"
-            replacement.mkdir()
-            command("git", "init", "--quiet", "--initial-branch=main", str(replacement))
-            git(replacement, "config", "user.name", "Tally Test")
-            git(replacement, "config", "user.email", "tally-test@invalid")
-            (replacement / "other.go").write_text("other\n", encoding="utf-8")
-            git(replacement, "add", "other.go")
-            git(replacement, "commit", "--quiet", "-m", "unrelated root")
-            git(replacement, "remote", "add", "origin", git(checkout, "remote", "get-url", "origin"))
-            git(replacement, "push", "--quiet", "--force", "origin", "main")
-
-            with self.assertRaises(DRIVER.DriverError) as raised:
-                DRIVER.action_prep(
-                    prep_brief(
-                        checkout,
-                        workspace_root,
-                        "rewound-pass",
-                        forge="github",
-                        source_revision=witnessed,
-                    )
-                )
-            self.assertIn(
-                "does not descend from the witnessed worklist revision",
-                str(raised.exception),
-            )
-
-    def test_the_resume_door_refuses_a_lane_the_fresh_cut_door_would_refuse(self) -> None:
-        """A prep retry inside one flow run took the resume path and skipped the check.
-
-        The already-prepared early return sat before the fetch and before the
-        worklist/worktree coherence check, so a prep node re-run that straddled
-        a remote force-replacement handed back the stale lane and its stale
-        baseRev with no error at all: the resume door bypassed the fail-closed
-        guard the fresh-cut door has.
-        """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            checkout, _ = initialize_repository(root, remote=True)
-            workspace_root = root / "workspaces"
-            witnessed = git(checkout, "rev-parse", "HEAD")
-
-            prepared = DRIVER.action_prep(
-                prep_brief(
-                    checkout,
-                    workspace_root,
-                    "resumed-pass",
-                    forge="github",
-                    source_revision=witnessed,
-                )
-            )
-            self.assertTrue(Path(prepared["worktreePath"]).is_dir())
-            # A second call inside the same run resumes the lane it just cut.
-            resumed = DRIVER.action_prep(
-                prep_brief(
-                    checkout,
-                    workspace_root,
-                    "resumed-pass",
-                    forge="github",
-                    source_revision=witnessed,
-                )
-            )
-            self.assertEqual(resumed, prepared)
-
-            replacement = root / "replacement"
-            replacement.mkdir()
-            command("git", "init", "--quiet", "--initial-branch=main", str(replacement))
-            git(replacement, "config", "user.name", "Tally Test")
-            git(replacement, "config", "user.email", "tally-test@invalid")
-            (replacement / "other.go").write_text("other\n", encoding="utf-8")
-            git(replacement, "add", "other.go")
-            git(replacement, "commit", "--quiet", "-m", "unrelated root")
-            git(
-                replacement,
-                "remote",
-                "add",
-                "origin",
-                git(checkout, "remote", "get-url", "origin"),
-            )
-            git(replacement, "push", "--quiet", "--force", "origin", "main")
-
-            with self.assertRaises(DRIVER.DriverError) as raised:
-                DRIVER.action_prep(
-                    prep_brief(
-                        checkout,
-                        workspace_root,
-                        "resumed-pass",
-                        forge="github",
-                        source_revision=witnessed,
-                    )
-                )
-            self.assertIn(
-                "does not descend from the witnessed worklist revision",
-                str(raised.exception),
-            )
 
     def test_local_prep_uses_integration_after_the_remote_worklist_diverges(
         self,
@@ -4178,7 +1289,7 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertIn("different lane identity", str(raised.exception))
             self.assertIn("campaign", str(raised.exception))
 
-    def test_local_forge_closing_summary_is_a_durable_blob(self) -> None:
+    def test_closing_summary_is_a_durable_local_blob(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
@@ -4215,7 +1326,7 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertEqual(digest["blocked"][0]["attempts"], 2)
             self.assertEqual(digest["outstanding"], [])
             receipt = DRIVER.publish_closing_summary(
-                "acme/spec", config, "fixture", "7", digest, issue_forge="local"
+                "acme/spec", config, "fixture", "7", digest
             )
             self.assertTrue(receipt.endswith("/summary/quiescent"))
             ref = receipt.split("acme/spec/", 1)[1]
@@ -4233,7 +1344,6 @@ class LaneLifecycleTests(unittest.TestCase):
                     "fixture",
                     "7",
                     digest,
-                    issue_forge="local",
                 ),
                 receipt,
             )
@@ -5038,9 +2148,9 @@ class NarrationValidatorTests(unittest.TestCase):
                 },
                 "managed campaign marker",
             ),
-            # A pull-request body is executable on GitHub. The node appends its
-            # own `Closes #<sub-issue>`; a narrator that proposes one is
-            # proposing to close an issue the campaign never named.
+            # Release narration can become public projection prose. A narrator
+            # that proposes a closing keyword is claiming authority over an
+            # issue the release renderer did not name.
             "closing-keyword-in-body": (
                 {
                     "type": "feat",
@@ -5519,14 +2629,9 @@ class LocalSteeringRecheckTests(unittest.TestCase):
                 ],
             )
 
-            with mock.patch.object(
-                DRIVER,
-                "github_json",
-                side_effect=AssertionError("local recheck must not call gh"),
-            ):
-                result = DRIVER.action_steering_recheck(
-                    self.brief(source, [prepared])
-                )
+            result = DRIVER.action_steering_recheck(
+                self.brief(source, [prepared])
+            )
 
             self.assertEqual(
                 result["authorizedComments"],
@@ -5616,7 +2721,7 @@ class SteeringGrammarTests(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def posted_blob(
+    def receipt_record(
         self, config: dict[str, object], steered: dict[str, object]
     ) -> dict[str, object]:
         sequence = int(str(steered["comment"]).rsplit("/", 1)[1])
@@ -5624,11 +2729,11 @@ class SteeringGrammarTests(unittest.TestCase):
         records = DRIVER.read_attempt_receipts(source, "fixture", "7")
         return records[sequence - 1]
 
-    def posted_body(self, config: dict[str, object], steered: dict[str, object]) -> str:
-        blob = self.posted_blob(config, steered)
+    def receipt_body(self, config: dict[str, object], steered: dict[str, object]) -> str:
+        blob = self.receipt_record(config, steered)
         return str(blob.get("diagnosis", blob.get("reason")))
 
-    def test_a_grammar_rejected_excerpt_is_published_as_machine_steering(self) -> None:
+    def test_a_grammar_rejected_excerpt_is_recorded_as_machine_steering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
@@ -5642,7 +2747,7 @@ class SteeringGrammarTests(unittest.TestCase):
             )
             self.assertTrue(steered["posted"])
             self.assertEqual(steered["kind"], "diagnosis")
-            blob = self.posted_blob(DRIVER.repo_config(config), steered)
+            blob = self.receipt_record(DRIVER.repo_config(config), steered)
             self.assertEqual(blob["kind"], "diagnosis")
             body = str(blob["diagnosis"])
             self.assertIn("grammar-rejected", body)
@@ -5650,15 +2755,13 @@ class SteeringGrammarTests(unittest.TestCase):
             self.assertIn("Redacted proposal excerpt:", body)
             self.assertIn("[redacted-token]", body)
             self.assertNotIn(secret, body)
-            published_reason, _, _ = DRIVER.diagnosis_rejection_reason(body, None)
-            self.assertIsNone(published_reason)
-            diagnoses, retries, _, _ = DRIVER.forge_campaign_state(
-                "acme/spec",
-                DRIVER.repo_config(config),
+            recorded_reason, _, _ = DRIVER.diagnosis_rejection_reason(body, None)
+            self.assertIsNone(recorded_reason)
+            diagnoses, retries, _, _ = DRIVER.campaign_attempt_state(
+                attempt_receipts(root),
                 "fixture",
                 "7",
                 {"task-1"},
-                attempt_receipts=attempt_receipts(root),
             )
             self.assertEqual(len(diagnoses), 1)
             self.assertEqual(retries, [])
@@ -5682,7 +2785,7 @@ class SteeringGrammarTests(unittest.TestCase):
                     gateEvidence={"id": "gate:forbid-secrets", "detail": detail},
                 )
             )
-            body = self.posted_body(DRIVER.repo_config(config), omitted)
+            body = self.receipt_body(DRIVER.repo_config(config), omitted)
             self.assertEqual(omitted["kind"], "diagnosis")
             self.assertIn("grammar-rejected", body)
             self.assertIn("omits the failing check id", body)
@@ -5712,7 +2815,7 @@ class SteeringGrammarTests(unittest.TestCase):
                     gateEvidence={"id": "gate:forbid-secrets", "detail": detail},
                 )
             )
-            body = self.posted_body(DRIVER.repo_config(config), steered)
+            body = self.receipt_body(DRIVER.repo_config(config), steered)
             reason, _, _ = DRIVER.diagnosis_rejection_reason(
                 diagnosis, {"id": "gate:forbid-secrets", "detail": detail}
             )
@@ -5726,9 +2829,9 @@ class BreachSteeringTests(unittest.TestCase):
     """#386's breach-abort surface, pinned. Round-1 F3 and F5.
 
     The eval mutated `breach = False` and dropped the witnessed evidence from
-    the posted comment; every suite stayed green both times, so the whole
+    the durable receipt; every suite stayed green both times, so the whole
     downstream of `failureClass` returning `"breach"` was unpinned. These
-    tests run `action_steer` against the local-forge harness as a real
+    tests run `action_steer` against the local repository harness as a real
     process would.
     """
 
@@ -5765,7 +2868,7 @@ class BreachSteeringTests(unittest.TestCase):
             and record["attempt"] == attempt
         )
 
-    def test_a_breach_posts_both_receipts_in_one_call_and_blocks(self) -> None:
+    def test_a_breach_records_both_receipts_in_one_call_and_blocks(self) -> None:
         """Kills MUT-4: a breach handled as an ordinary one-attempt gate-fail.
 
         Attempt 2 must exist as of this single call, because the reconciler's
@@ -5790,25 +2893,23 @@ class BreachSteeringTests(unittest.TestCase):
                 self.assertEqual(blob["kind"], "diagnosis")
                 self.assertEqual(blob["attempt"], attempt)
             # And the reconciler reads them back as a blocking pair.
-            diagnoses, _, _, _ = DRIVER.forge_campaign_state(
-                "acme/spec",
-                config,
+            diagnoses, _, _, _ = DRIVER.campaign_attempt_state(
+                attempt_receipts(root),
                 "fixture",
                 "7",
                 {"task-1"},
-                attempt_receipts=attempt_receipts(root),
             )
             self.assertEqual(
                 [(item["taskId"], item["attempt"]) for item in diagnoses],
                 [("task-1", 1), ("task-1", 2)],
             )
 
-    def test_the_offending_paths_are_witnessed_in_the_posted_breach_body(self) -> None:
-        """Kills MUT-3b: the witnessed evidence dropped from the comment.
+    def test_the_offending_paths_are_witnessed_in_the_recorded_breach_body(self) -> None:
+        """Kills MUT-3b: the witnessed evidence dropped from the receipt.
 
         The gate's own failure message naming the paths is already pinned;
         this pins the other surface the issue requires — the paths reaching
-        the comment a human actually opens.
+        the durable record folded by the next pass.
         """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5831,7 +2932,7 @@ class BreachSteeringTests(unittest.TestCase):
         A gate that could not judge a pass -- no ownership, no declared
         domains, no allowlist -- aborts the lane for the same reason a breach
         does, but it has established nothing about what the agent wrote. The
-        posted receipt is the operator's record, so it must say which one
+        durable receipt is the operator's record, so it must say which one
         happened, and the breach sentence must not appear over a refusal.
         """
         with tempfile.TemporaryDirectory() as temporary:
@@ -5861,7 +2962,7 @@ class BreachSteeringTests(unittest.TestCase):
                 self.assertIn("No out-of-allowlist change has been established", body)
                 self.assertIn("will not be retried", body)
                 # The #386 sentence claims a write was found. It must not be
-                # published over a verdict that found nothing.
+                # recorded over a verdict that found nothing.
                 self.assertNotIn("permission breach found", body)
 
     def test_an_unknown_abort_reason_is_refused(self) -> None:
@@ -5888,7 +2989,7 @@ class BreachSteeringTests(unittest.TestCase):
         """Round-1 F3: the breach path ran no validation at all.
 
         The same prose the ordinary path refuses outright was redacted,
-        bounded and posted verbatim. Now it is refused identically — and
+        bounded and recorded verbatim. Now it is refused identically — and
         refusing it must replace the prose without swallowing the breach.
         """
         bad = "fix it now!!! this lane is a disaster and I will not explain why"
@@ -5910,14 +3011,14 @@ class BreachSteeringTests(unittest.TestCase):
             self.assertIn("secrets/leak.pem", body)
 
     def test_the_composed_breach_body_respects_the_public_length_bound(self) -> None:
-        """The ordinary path bounds what it posts; the breach path must too.
+        """The ordinary path bounds what it records; the breach path must too.
 
         Concatenating two separately bounded strings gave ~2x the bound. The
         squeeze falls on the steward's prose, never on the evidence.
         """
         # The largest diagnosis the input validator admits. Composed with the
         # label and the evidence it overflows, which is the case that used to
-        # post ~2x the bound.
+        # record ~2x the bound.
         lead = "Investigated the writes. "
         prose = lead + ("x" * (DRIVER.MAX_DIAGNOSIS_CHARS - len(lead)))
         self.assertEqual(len(prose), DRIVER.MAX_DIAGNOSIS_CHARS)
@@ -6340,178 +3441,6 @@ class SquashMergeTests(unittest.TestCase):
                 [merge_commit],
             )
             self.assertNotEqual(merge_commit, head)
-
-    def github_state(
-        self, branch: str, head: str, merge_commit: str, on_merge: list[str]
-    ) -> dict[str, object]:
-        return {
-            "prView": {
-                "state": "OPEN",
-                "baseRefName": "main",
-                "headRefName": branch,
-                "headRefOid": head,
-            },
-            "mergeCommitOid": merge_commit,
-            "onMerge": on_merge,
-            "master": {
-                "body": (
-                    "<!-- tally:campaign-worklist:v1 -->\n"
-                    f"- [ ] {DRIVER.TASK_MARKER_PREFIX}task-1 -->\n"
-                    "<!-- tally:campaign-worklist:v1:end -->"
-                )
-            },
-            "comments": [],
-            "issueComments": [],
-            "calls": [],
-        }
-
-    def integration_commit(self, checkout: Path, branch: str, method: str) -> str:
-        """The commit the forge would mint, staged on a side branch."""
-        git(checkout, "switch", "--quiet", "-c", f"forge-{method}", "origin/main")
-        if method == "squash":
-            git(checkout, "merge", "--quiet", "--squash", f"origin/{branch}")
-            git(checkout, "commit", "--quiet", "-m", "feat(fixture): deliver the first task")
-        else:
-            git(checkout, "merge", "--quiet", "--no-ff", "--no-edit", f"origin/{branch}")
-        minted = git(checkout, "rev-parse", "HEAD")
-        git(checkout, "switch", "--quiet", "main")
-        return minted
-
-    def test_github_squash_passes_the_validated_message_and_proves_the_merge_commit(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            checkout, _ = initialize_repository(root, remote=True)
-            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
-            head = self.publish_branch(checkout, branch)
-            git(checkout, "push", "--quiet", "origin", f"{head}:refs/heads/{branch}")
-            squash = self.integration_commit(checkout, branch, "squash")
-            config = DRIVER.repo_config(repository_config(checkout, "github"))
-            data = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "issue": issue(),
-                "task": task("task-1"),
-                "workspace": {"publishBranch": branch},
-            }
-            integration = {
-                "taskId": "task-1",
-                "branch": branch,
-                "baseRev": git(checkout, "rev-parse", "origin/main"),
-                "head": head,
-                "pullRequest": "https://github.com/acme/spec/pull/1",
-            }
-            narration = {
-                "source": "steward",
-                "subject": "feat(fixture): deliver the first task",
-                "body": "Steward-authored body.",
-            }
-            state = self.github_state(
-                branch,
-                head,
-                squash,
-                ["git", "-C", str(checkout), "push", "--quiet", "origin",
-                 f"{squash}:refs/heads/main"],
-            )
-            with FakeGitHub(root, state) as github:
-                merged = DRIVER.merge_github(
-                    data, config, integration, {"subIssueWalk": True}, "squash", narration
-                )
-            self.assertEqual(merged, squash)
-            # The squash commit is on base and the task head is not: the
-            # pre-squash assertion would have failed this successful merge.
-            self.assertEqual(
-                command(
-                    "git", "-C", str(checkout), "merge-base", "--is-ancestor",
-                    squash, "origin/main", check=False,
-                ).returncode,
-                0,
-            )
-            self.assertNotEqual(
-                command(
-                    "git", "-C", str(checkout), "merge-base", "--is-ancestor",
-                    head, "origin/main", check=False,
-                ).returncode,
-                0,
-            )
-            merge_calls = [
-                call for call in github.state()["calls"] if call[:2] == ["pr", "merge"]
-            ]
-            self.assertEqual(len(merge_calls), 1)
-            self.assertIn("--squash", merge_calls[0])
-            self.assertNotIn("--merge", merge_calls[0])
-            self.assertEqual(
-                merge_calls[0][merge_calls[0].index("--subject") + 1],
-                "feat(fixture): deliver the first task",
-            )
-            self.assertEqual(
-                merge_calls[0][merge_calls[0].index("--body") + 1],
-                "Steward-authored body.",
-            )
-            self.assertEqual(
-                merge_calls[0][merge_calls[0].index("--match-head-commit") + 1], head
-            )
-
-    def test_github_merge_method_keeps_the_pre_squash_argv_and_assertion(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            checkout, _ = initialize_repository(root, remote=True)
-            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
-            head = self.publish_branch(checkout, branch)
-            git(checkout, "push", "--quiet", "origin", f"{head}:refs/heads/{branch}")
-            minted = self.integration_commit(checkout, branch, "merge")
-            config = DRIVER.repo_config(repository_config(checkout, "github"))
-            data = {
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "issue": issue(),
-                "task": task("task-1"),
-                "workspace": {"publishBranch": branch},
-            }
-            integration = {
-                "taskId": "task-1",
-                "branch": branch,
-                "baseRev": git(checkout, "rev-parse", "origin/main"),
-                "head": head,
-                "pullRequest": "https://github.com/acme/spec/pull/1",
-            }
-            state = self.github_state(
-                branch,
-                head,
-                minted,
-                ["git", "-C", str(checkout), "push", "--quiet", "origin",
-                 f"{minted}:refs/heads/main"],
-            )
-            with FakeGitHub(root, state) as github:
-                merged = DRIVER.merge_github(
-                    data,
-                    config,
-                    integration,
-                    {"subIssueWalk": True},
-                    "merge",
-                    DRIVER.template_narration(task("task-1")),
-                )
-            self.assertEqual(merged, minted)
-            merge_calls = [
-                call for call in github.state()["calls"] if call[:2] == ["pr", "merge"]
-            ]
-            self.assertEqual(
-                merge_calls,
-                [
-                    [
-                        "pr",
-                        "merge",
-                        "https://github.com/acme/spec/pull/1",
-                        "--repo",
-                        "acme/spec",
-                        "--merge",
-                        "--match-head-commit",
-                        head,
-                    ]
-                ],
-            )
-
 
 class AssistedByTrailerTests(unittest.TestCase):
     NARRATION = {

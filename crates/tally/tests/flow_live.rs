@@ -2662,7 +2662,7 @@ async fn retry_cancellation_cap_and_partial_failure_are_live_end_to_end() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs() {
+async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs() {
     let _environment = ENVIRONMENT_LOCK.lock().await;
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -2836,7 +2836,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "repository": "acme/spec",
                     "issue": {
                         "number": "7",
-                        "url": "https://github.com/acme/spec/issues/7"
+                        "url": "local://acme/spec/specs/*/tasks.json"
                     },
                     "runId": run_id,
                     "repositories": {
@@ -4113,7 +4113,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(replay_failure["error"]["code"], "campaign-replay-refused");
             assert_eq!(
                 replay_failure["error"]["details"]["recovery"],
-                "post a fresh campaign mention"
+                "start a fresh reconcile pass"
             );
             let replayed = runner_events(&replay, "node-submitted");
             assert_eq!(replayed.len(), 1);
@@ -4265,7 +4265,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let quiescent_summary_oid = quiescent_summary_ref
                 .split_whitespace()
                 .next()
-                .expect("local forge omitted the quiescent closing summary");
+                .expect("local repository omitted the quiescent closing summary");
             let quiescent_summary: Value = serde_json::from_str(&fixture_git(
                 &checkout,
                 &["cat-file", "blob", quiescent_summary_oid],
@@ -4680,7 +4680,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(
                 recovered_value["reconciled"]["retries"][0]["taskId"],
                 "task-2b",
-                "the retry receipt is a durable forge fact"
+                "the retry receipt is durable local state"
             );
             assert_eq!(
                 recovered_value["reconciled"]["diagnoses"]
@@ -4705,7 +4705,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
 
             // task-5 is beyond what the fixture agent implements, so both its
             // implementation and its diagnosis die. A steering lane that throws
-            // must still leave the campaign a mention to resume from.
+            // must still leave the campaign a durable continuation to resume from.
             let halted = runner(
                 &config_path,
                 &daemon_paths.socket,
@@ -4843,7 +4843,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let complete_summary_oid = complete_summary_ref
                 .split_whitespace()
                 .next()
-                .expect("local forge omitted the completion closing summary");
+                .expect("local repository omitted the completion closing summary");
             let complete_summary: Value = serde_json::from_str(&fixture_git(
                 &checkout,
                 &["cat-file", "blob", complete_summary_oid],
@@ -4875,7 +4875,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
 }
 
 /// The events-dir continuation is the campaign's whole self-re-entry path, so
-/// this proves the loop end to end without a forge: the packaged driver writes
+/// this proves the local loop end to end: the packaged driver writes
 /// one bounded payload, the daemon's drain admits it, and a second identical
 /// drop -- the shape a `tally-campaign-poll.timer` race produces -- resolves to
 /// an attach against the live job instead of a second pass.
@@ -4886,8 +4886,17 @@ async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicat
         .run_until(async {
             let temp = tempfile::tempdir().unwrap();
             let checkout = temp.path().join("checkout");
+            let remote = temp.path().join("remote.git");
             fs::create_dir_all(&checkout).unwrap();
+            fixture_git(
+                temp.path(),
+                &["init", "--bare", "--initial-branch=main", "remote.git"],
+            );
             fixture_git(&checkout, &["init", "--initial-branch=main"]);
+            fixture_git(
+                &checkout,
+                &["remote", "add", "origin", remote.to_str().unwrap()],
+            );
 
             let mut config = config();
             config.pools.insert(
@@ -4919,11 +4928,11 @@ async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicat
                         "checkout": checkout,
                         "baseBranch": "main",
                         "remote": "origin",
-                        "forge": "github"
+                        "forge": "local"
                     },
                     "issue": {
                         "number": "7",
-                        "url": "https://github.com/acme/spec/issues/7"
+                        "url": "local://acme/spec/issues/7"
                     },
                     "runId": "pass-1",
                     "continuation": {
@@ -4939,26 +4948,10 @@ async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicat
             )
             .unwrap();
 
-            // A GitHub-forge continuation must never reach the forge, so the
-            // only `gh` on the driver's PATH refuses to run.
-            let stub_dir = temp.path().join("bin");
-            fs::create_dir_all(&stub_dir).unwrap();
-            shell_program::install(
-                &stub_dir.join("gh"),
-                "#!/bin/sh\necho 'gh must not be reachable from a continuation' >&2\nexit 91\n",
-            );
-            let stubbed_path = {
-                let mut value = OsString::from(&stub_dir);
-                value.push(":");
-                value.push(std::env::var_os("PATH").unwrap_or_default());
-                value
-            };
-
             let run_continue = || {
                 let output = StdCommand::new("python3")
                     .arg(repository_fixture("drivers/spec_build_driver.py"))
                     .arg("continue")
-                    .env("PATH", &stubbed_path)
                     .env("TALLY_BRIEF", &brief_path)
                     .output()
                     .unwrap();
@@ -4977,7 +4970,10 @@ async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicat
 
             let first = run_continue();
             assert_eq!(first["created"], true);
-            assert_eq!(first["receipt"], Value::Null);
+            assert!(first["receipt"]
+                .as_str()
+                .unwrap()
+                .contains("/continuation/"));
             let event_path = PathBuf::from(first["event"].as_str().unwrap());
             assert_eq!(event_path.parent().unwrap(), events_dir);
             let payload: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();

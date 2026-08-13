@@ -1,14 +1,12 @@
 // Generic, stateless spec-repository build reconciler.
 //
-// Every invocation witnesses current forge state, selects one dependency-ready
-// and conflict-disjoint frontier, advances those tasks in isolated worktrees,
-// and exits. Merged pull requests, content-bound checkpoint refs, machine
-// diagnosis comments, and the one escalation marker are durable forge facts;
-// every invocation starts from those facts instead of a prior runner's
-// witnessed prefix.
+// Every invocation witnesses local campaign state, selects one
+// dependency-ready and conflict-disjoint frontier, advances those tasks in
+// isolated worktrees, and exits. Integration commits, content-bound checkpoint
+// refs, and append-only attempt receipts are the durable facts each pass folds.
 export const meta = {
   name: "spec-build",
-  description: "Reconcile one witnessed spec-build frontier against durable forge state",
+  description: "Reconcile one witnessed spec-build frontier against durable local state",
   pools: ["campaign-agent", "campaign-control"],
   argsSchema: {
     type: "object",
@@ -108,6 +106,92 @@ export const meta = {
             additionalProperties: false
           }
         ]
+      },
+      canonicalCampaignManifest: {
+        type: "object",
+        required: [
+          "schemaVersion",
+          "name",
+          "repository",
+          "maxTasks",
+          "maxParallel",
+          "driverRuntimeMaxSec",
+          "runtimeMaxSec",
+          "pool",
+          "mergeMethod",
+          "agent",
+          "steward",
+          "gates",
+          "tasks"
+        ],
+        properties: {
+          schemaVersion: { const: 1 },
+          name: {
+            type: "string",
+            maxLength: 80,
+            pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          },
+          repository: {
+            type: "object",
+            required: ["checkout", "baseBranch", "remote", "forge"],
+            properties: {
+              checkout: { type: "string", pattern: "^/" },
+              baseBranch: { type: "string", minLength: 1 },
+              remote: {
+                type: "string",
+                maxLength: 80,
+                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              forge: { const: "local" }
+            },
+            additionalProperties: false
+          },
+          maxTasks: { type: "integer", minimum: 1, maximum: 100 },
+          maxParallel: { type: "integer", minimum: 1, maximum: 100 },
+          driverRuntimeMaxSec: { type: "integer", minimum: 1 },
+          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
+          pool: {
+            type: "string",
+            maxLength: 80,
+            pattern: "^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|campaign/(?!\\.{1,2}/)[A-Za-z0-9_.-]+/(?!\\.{1,2}$)[A-Za-z0-9_.-]+)$"
+          },
+          mergeMethod: { enum: ["merge", "squash"] },
+          agent: { $ref: "#/$defs/canonicalAgent" },
+          steward: { $ref: "#/$defs/canonicalSteward" },
+          gates: {
+            type: "array",
+            minItems: 1,
+            maxItems: 16,
+            items: { $ref: "#/$defs/canonicalGate" }
+          },
+          tasks: {
+            type: "array",
+            minItems: 1,
+            maxItems: 100,
+            items: {
+              type: "object",
+              required: [
+                "id",
+                "kind",
+                "issue",
+                "dependencies",
+                "argv",
+                "runtimeMaxSec"
+              ],
+              properties: {
+                id: { type: "string" },
+                kind: { enum: ["implementation", "checkpoint"] },
+                issue: { type: "integer" },
+                dependencies: { type: "array" },
+                conflictDomains: { type: "array" },
+                argv: { type: ["array", "null"] },
+                runtimeMaxSec: { type: ["integer", "null"] }
+              },
+              additionalProperties: false
+            }
+          }
+        },
+        additionalProperties: false
       }
     },
     required: [
@@ -132,105 +216,15 @@ export const meta = {
         type: "string",
         pattern: "^[0-9a-fA-F-]{36}$"
       },
-      // The normalized #433 receipt. Current arm dispatches also carry the
-      // complete graph below; direct compatibility briefs may use this member
-      // with graphDigest and let the driver reconstruct a verified envelope.
-      armedManifest: { type: ["object", "null"] },
-      // The complete normalized graph Rust admitted and hashed. The flow
-      // forwards this versioned envelope unchanged to the packaged driver.
+      // campaign.rs still carries its already-admitted graph while the flow
+      // consumes the committed local worklist. The graph supplies execution
+      // configuration only; its issue-shaped task projection never reaches
+      // the driver.
       campaignGraph: {
         type: "object",
         required: ["manifest", "tasks", "executableDigest"],
         properties: {
-          manifest: {
-            type: "object",
-            required: [
-              "schemaVersion",
-              "name",
-              "repository",
-              "maxTasks",
-              "maxParallel",
-              "driverRuntimeMaxSec",
-              "runtimeMaxSec",
-              "pool",
-              "mergeMethod",
-              "agent",
-              "steward",
-              "gates",
-              "tasks"
-            ],
-            properties: {
-              schemaVersion: { const: 1 },
-              name: {
-                type: "string",
-                maxLength: 80,
-                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
-              },
-              repository: {
-                type: "object",
-                required: ["checkout", "baseBranch", "remote", "forge"],
-                properties: {
-                  checkout: { type: "string", pattern: "^/" },
-                  baseBranch: { type: "string", minLength: 1 },
-                  remote: {
-                    type: "string",
-                    maxLength: 80,
-                    pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
-                  },
-                  forge: { enum: ["github", "local"] }
-                },
-                additionalProperties: false
-              },
-              maxTasks: { type: "integer", minimum: 1, maximum: 100 },
-              maxParallel: { type: "integer", minimum: 1, maximum: 100 },
-              driverRuntimeMaxSec: { type: "integer", minimum: 1 },
-              runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
-              pool: {
-                type: "string",
-                maxLength: 80,
-                // Configured runner names keep the ordinary pool alphabet.
-                // Repository campaign mutexes are instead defined entirely by
-                // their exact campaign/OWNER/REPO namespace name.
-                pattern: "^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|campaign/(?!\\.{1,2}/)[A-Za-z0-9_.-]+/(?!\\.{1,2}$)[A-Za-z0-9_.-]+)$"
-              },
-              mergeMethod: { enum: ["merge", "squash"] },
-              agent: { $ref: "#/$defs/canonicalAgent" },
-              steward: { $ref: "#/$defs/canonicalSteward" },
-              gates: {
-                type: "array",
-                minItems: 1,
-                maxItems: 16,
-                items: { $ref: "#/$defs/canonicalGate" }
-              },
-              tasks: {
-                type: "array",
-                minItems: 1,
-                maxItems: 100,
-                items: {
-                  type: "object",
-                  required: [
-                    "id",
-                    "kind",
-                    "issue",
-                    "dependencies",
-                    "argv",
-                    "runtimeMaxSec"
-                  ],
-                  properties: {
-                    id: { type: "string" },
-                    kind: { enum: ["implementation", "checkpoint"] },
-                    issue: { type: "integer" },
-                    dependencies: { type: "array" },
-                    conflictDomains: { type: "array" },
-                    argv: { type: ["array", "null"] },
-                    runtimeMaxSec: { type: ["integer", "null"] }
-                  },
-                  additionalProperties: false
-                }
-              }
-            },
-            additionalProperties: false
-          },
+          manifest: { $ref: "#/$defs/canonicalCampaignManifest" },
           tasks: {
             type: "array",
             minItems: 1,
@@ -250,6 +244,12 @@ export const meta = {
         },
         additionalProperties: false
       },
+      // These three fields are ignored compatibility cargo from the current
+      // Rust dispatch envelope. No authorization, capability decision, or
+      // worklist reconstruction consults them.
+      armedManifest: { type: ["object", "null"] },
+      allowedActors: { type: "array" },
+      capabilities: { type: "object" },
       repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
       // The two-repository seam. Each names an entry of `repositories`. A
       // campaign that sets none of them resolves every coordinate to
@@ -277,6 +277,8 @@ export const meta = {
             checkout: { type: "string", pattern: "^/" },
             baseBranch: { type: "string", pattern: "^[A-Za-z0-9._/+-]+$" },
             remote: { type: "string", pattern: "^[A-Za-z0-9._-]+$" },
+            // Retained as inert module-contract data. Execution no longer
+            // branches on this value; every driver action is local.
             forge: { enum: ["github", "local"] }
           },
           additionalProperties: false
@@ -289,7 +291,9 @@ export const meta = {
             type: "object",
             required: ["kind", "graphDigest"],
             properties: {
-              kind: { const: "github-issue" },
+              // Opaque transport spelling retained by campaign.rs. The flow
+              // binds the committed file pattern from the local issue URL.
+              kind: { type: "string", minLength: 1 },
               graphDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
             },
             additionalProperties: false
@@ -386,23 +390,7 @@ export const meta = {
         },
         additionalProperties: false
       },
-      // Legacy forge authority retained for the surrounding campaign paths;
-      // local steering authorization uses `localActor` exclusively.
-      allowedActors: {
-        type: "array",
-        minItems: 1,
-        maxItems: 100,
-        uniqueItems: true,
-        items: {
-          type: "string",
-          minLength: 1,
-          maxLength: 39,
-          pattern: "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
-        }
-      },
       // Task-addressed steering, keyed by stable task ID for local sources.
-      // The pre-local file-worklist branch keeps accepting issue-number keys
-      // until its forge projection is removed later in the shift.
       taskSteering: {
         type: "object",
         maxProperties: 100,
@@ -424,22 +412,12 @@ export const meta = {
           }
         }
       },
-      // What the arm-time probe found this forge can serve. Absent means
-      // degraded: checkbox projection, per-branch pull-request lookup.
-      capabilities: {
-        type: "object",
-        required: ["subIssueWalk"],
-        properties: {
-          subIssueWalk: { type: "boolean" }
-        },
-        additionalProperties: false
-      },
       // How the merge node integrates a task. Absent means the campaign
       // default, `squash`: the footprint a campaign should leave behind is one
       // conventional commit per task, not a merge commit with a template message.
       mergeMethod: { enum: ["merge", "squash"] },
-      // Both module-declared and forge-native paths carry the normalized
-      // contract; the driver never fills these members in.
+      // The module carries the normalized execution contract; the driver
+      // never fills these members in.
       steward: { $ref: "#/$defs/canonicalSteward" },
       agent: { $ref: "#/$defs/canonicalAgent" },
       gates: {
@@ -459,44 +437,32 @@ export const meta = {
           "maxParallel",
           "agent",
           "gates"
-        ]
+        ],
+        properties: { worklist: { type: "string", minLength: 1 } }
       },
       {
         required: [
           "campaignIdentity",
           "campaignGraph",
           "steering",
-          "allowedActors",
-          "tally"
+          "localActor",
+          "steeringSource"
         ],
-        // The compatibility corpus predates task-addressed local steering. A
-        // canonical dispatch that supplies that map must supply both halves of
-        // the new closed source authority; either half alone is always invalid.
-        allOf: [
-          {
-            if: { required: ["taskSteering"] },
-            then: { required: ["localActor", "steeringSource"] }
-          },
-          {
-            if: { required: ["localActor"] },
-            then: { required: ["steeringSource"] }
-          },
-          {
-            if: { required: ["steeringSource"] },
-            then: { required: ["localActor"] }
-          }
-        ],
-        properties: {
-          worklist: {
-            type: "object",
-            required: ["kind", "graphDigest"],
-            properties: {
-              kind: { const: "github-issue" },
-              graphDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
-            },
-            additionalProperties: false
-          }
-        }
+        properties: { worklist: { type: "object" } }
+      }
+    ],
+    allOf: [
+      {
+        if: { required: ["taskSteering"] },
+        then: { required: ["localActor", "steeringSource"] }
+      },
+      {
+        if: { required: ["localActor"] },
+        then: { required: ["steeringSource"] }
+      },
+      {
+        if: { required: ["steeringSource"] },
+        then: { required: ["localActor"] }
       }
     ],
     additionalProperties: false
@@ -633,97 +599,22 @@ const checkpointTaskSchema = {
   additionalProperties: false
 };
 
-const issueTaskSchema = {
-  type: "object",
-  required: ["id", "kind", "title", "brief", "dependencies", "revision"],
-  properties: {
-    id: taskIdSchema,
-    kind: { const: "implementation" },
-    title: { type: "string", minLength: 1, maxLength: 300 },
-    brief: {
-      type: "object",
-      required: ["issue", "body"],
-      properties: {
-        issue: {
-          type: "object",
-          required: ["number", "url"],
-          properties: {
-            number: { type: "string", pattern: "^[1-9][0-9]*$" },
-            url: { type: "string", minLength: 1 }
-          },
-          additionalProperties: false
-        },
-        body: { type: "string", minLength: 1, maxLength: 64000 }
-      },
-      additionalProperties: false
-    },
-    dependencies: { type: "array", items: taskIdSchema },
-    conflictDomains: stringList,
-    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
-  },
-  additionalProperties: false
-};
-
-const issueCheckpointTaskSchema = {
-  type: "object",
-  required: [
-    "id",
-    "kind",
-    "title",
-    "brief",
-    "argv",
-    "runtimeMaxSec",
-    "dependencies",
-    "revision"
-  ],
-  properties: {
-    id: taskIdSchema,
-    kind: { const: "checkpoint" },
-    title: { type: "string", minLength: 1, maxLength: 300 },
-    brief: issueTaskSchema.properties.brief,
-    argv: {
-      type: "array",
-      minItems: 1,
-      items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
-    },
-    runtimeMaxSec: { type: "integer", minimum: 1 },
-    dependencies: { type: "array", items: taskIdSchema },
-    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
-  },
-  additionalProperties: false
-};
-
 const taskSchema = {
-  oneOf: [implementationTaskSchema, checkpointTaskSchema, issueTaskSchema, issueCheckpointTaskSchema]
+  oneOf: [implementationTaskSchema, checkpointTaskSchema]
 };
 
 const sourceSchema = {
-  oneOf: [
-    {
-      type: "object",
-      required: ["path", "sha256", "revision"],
-      properties: {
-        path: { type: "string", minLength: 1 },
-        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
-        revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
-        // Present only when the worklist was read from a spec repository
-        // that is not the repository the campaign lands its work on.
-        repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" }
-      },
-      additionalProperties: false
-    },
-    {
-      type: "object",
-      required: ["kind", "url", "sha256", "revision"],
-      properties: {
-        kind: { const: "github-issue" },
-        url: { type: "string", minLength: 1 },
-        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
-        revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
-      },
-      additionalProperties: false
-    }
-  ]
+  type: "object",
+  required: ["path", "sha256", "revision"],
+  properties: {
+    path: { type: "string", minLength: 1 },
+    sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+    revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    // Present only when the worklist was read from a spec repository
+    // that is not the repository the campaign lands its work on.
+    repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" }
+  },
+  additionalProperties: false
 };
 
 const mergedFactSchema = {
@@ -747,47 +638,6 @@ const checkpointFactSchema = {
     // visible tag receipts stay honored.
     ref: { type: "string", pattern: "^refs/(tags/)?tally/spec-build/v1/" },
     revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
-  },
-  additionalProperties: false
-};
-
-const effectiveConfigSchema = {
-  type: "object",
-  required: [
-    "campaign",
-    "repositoryConfig",
-    "maxParallel",
-    "mergeMethod",
-    "agent",
-    "gates"
-  ],
-  properties: {
-    campaign: {
-      type: "string",
-      maxLength: 80,
-      pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
-    },
-    repositoryConfig: {
-      type: "object",
-      required: ["checkout", "baseBranch", "remote", "forge"],
-      properties: {
-        checkout: { type: "string", pattern: "^/" },
-        baseBranch: { type: "string", minLength: 1 },
-        remote: { type: "string", minLength: 1 },
-        forge: { enum: ["github", "local"] }
-      },
-      additionalProperties: false
-    },
-    maxParallel: { type: "integer", minimum: 1, maximum: 128 },
-    mergeMethod: { enum: ["merge", "squash"] },
-    agent: canonicalCampaignAgentSchema,
-    steward: canonicalCampaignStewardSchema,
-    gates: {
-      type: "array",
-      minItems: 1,
-      maxItems: 16,
-      items: canonicalCampaignGateSchema
-    }
   },
   additionalProperties: false
 };
@@ -831,22 +681,6 @@ const deferralFactSchema = {
   additionalProperties: false
 };
 
-// A sub-issue closed with no revision-valid merged pull request. Closure is
-// human-clickable and therefore proves nothing; the task stays incomplete and
-// the closure is surfaced loudly instead of being filed as a warning.
-const anomalyFactSchema = {
-  type: "object",
-  required: ["kind", "taskId", "issue", "url", "detail"],
-  properties: {
-    kind: { const: "closed-without-merged-proof" },
-    taskId: taskIdSchema,
-    issue: { type: "string", pattern: "^[1-9][0-9]*$" },
-    url: { type: "string", minLength: 1 },
-    detail: { type: "string", minLength: 1, maxLength: 2000 }
-  },
-  additionalProperties: false
-};
-
 const blockedFactSchema = {
   type: "object",
   required: ["taskId", "blockedBy"],
@@ -872,7 +706,6 @@ const reconcileSchema = {
     "baseRevision",
     "tasks",
     "merged",
-    "restamps",
     "checkpoints",
     "remaining",
     "frontier",
@@ -883,7 +716,6 @@ const reconcileSchema = {
     "quiescent",
     "escalation",
     "complete",
-    "anomalies",
     "warnings",
     "closingSummary"
   ],
@@ -906,9 +738,6 @@ const reconcileSchema = {
       items: taskSchema
     },
     merged: { type: "array", items: mergedFactSchema },
-    // Prior-revision facts admitted only for deterministic marker lanes. They
-    // are not completion facts for the current revision.
-    restamps: { type: "array", items: mergedFactSchema },
     checkpoints: { type: "array", items: checkpointFactSchema },
     remaining: { type: "array", items: taskIdSchema },
     frontier: { type: "array", maxItems: 128, items: taskSchema },
@@ -919,12 +748,10 @@ const reconcileSchema = {
     quiescent: { type: "boolean" },
     escalation: { type: ["string", "null"], minLength: 1 },
     complete: { type: "boolean" },
-    anomalies: { type: "array", maxItems: 128, items: anomalyFactSchema },
     warnings: stringList,
     // Where the completion path published this campaign's closing summary, or
     // null on any pass that was not the terminal one.
-    closingSummary: { type: ["string", "null"], minLength: 1 },
-    config: effectiveConfigSchema
+    closingSummary: { type: ["string", "null"], minLength: 1 }
   },
   additionalProperties: false
 };
@@ -989,18 +816,6 @@ const workspaceSchema = {
     branch: { type: "string", minLength: 1 },
     publishBranch: { type: "string", minLength: 1 },
     worktreePath: { type: "string", pattern: "^/" }
-  },
-  additionalProperties: false
-};
-
-const restampResultSchema = {
-  type: "object",
-  required: ["taskId", "head", "revision", "completion"],
-  properties: {
-    taskId: taskIdSchema,
-    head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
-    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
-    completion: mergedFactSchema
   },
   additionalProperties: false
 };
@@ -1121,9 +936,8 @@ const checkpointCompletionSchema = {
   additionalProperties: false
 };
 
-// The validated publication text: what the pull request says and what the
-// squash commit will say. `source` records whether the steward authored it or
-// the deterministic template did.
+// The validated text the integration commit will carry. `source` records
+// whether the steward authored it or the deterministic template did.
 const narrationSchema = {
   type: "object",
   required: ["source", "subject", "body"],
@@ -1136,7 +950,7 @@ const narrationSchema = {
 };
 
 // The validator transcript. Observability only: it is journaled with the
-// publish node's result and never reaches the forge.
+// publish node's result and never leaves local campaign state.
 const narrationAttemptsSchema = {
   type: "array",
   maxItems: 2,
@@ -1345,8 +1159,8 @@ const escalationSchema = {
   properties: {
     posted: { type: "boolean" },
     comment: { type: "string", minLength: 1 },
-    // The closing summary posted beside the escalation, reflecting partial
-    // state. Null only when this pass found an escalation already posted.
+    // The closing summary recorded beside the escalation, reflecting partial
+    // state. Null only when this pass found an escalation already recorded.
     summary: { type: ["string", "null"], minLength: 1 },
     diagnosisCount: { type: "integer", minimum: 1, maximum: 256 },
     retryCount: { type: "integer", minimum: 0, maximum: 256 }
@@ -1450,6 +1264,69 @@ function repositoryConfigFor(repository) {
     throw error;
   }
   return configured;
+}
+
+// Normalize both admitted entry points onto the local file-worklist contract.
+// Direct module invocations already carry that contract. campaign.rs currently
+// carries the admitted manifest beside an opaque selector, while its local
+// issue URL retains the committed worklist pattern. The issue task projection
+// is intentionally ignored: the driver reads and validates the pinned file.
+function campaignInputs() {
+  if (args.campaignGraph === undefined) {
+    return {
+      campaign: args.campaign,
+      repositoryConfig: args.repositories[codeRepository],
+      worklist: args.worklist,
+      maxTasks: args.maxTasks,
+      maxParallel: args.maxParallel,
+      mergeMethod: args.mergeMethod || "squash",
+      postFailureEvidence: args.postFailureEvidence === true,
+      postFailureStderr: args.postFailureStderr === true,
+      agent: diagnosisSandboxed(args.agent),
+      steward: args.steward || null,
+      gates: args.gates
+    };
+  }
+
+  const graph = args.campaignGraph;
+  if (args.worklist.graphDigest !== graph.executableDigest) {
+    const error = new Error(
+      "campaign selector digest does not match the admitted local campaign graph"
+    );
+    error.name = "SpecBuildConfigurationError";
+    error.code = "campaign-graph-digest-mismatch";
+    throw error;
+  }
+  const localPrefix = `local://${args.repository}/`;
+  if (!args.issue.url.startsWith(localPrefix)) {
+    const error = new Error(
+      `campaign issue URL must carry the local worklist pattern under ${localPrefix}`
+    );
+    error.name = "SpecBuildConfigurationError";
+    error.code = "local-worklist-url-invalid";
+    throw error;
+  }
+  const worklist = args.issue.url.slice(localPrefix.length);
+  if (worklist.length === 0) {
+    const error = new Error("campaign issue URL carries an empty local worklist pattern");
+    error.name = "SpecBuildConfigurationError";
+    error.code = "local-worklist-url-invalid";
+    throw error;
+  }
+  const manifest = graph.manifest;
+  return {
+    campaign: manifest.name,
+    repositoryConfig: manifest.repository,
+    worklist,
+    maxTasks: manifest.maxTasks,
+    maxParallel: manifest.maxParallel,
+    mergeMethod: manifest.mergeMethod,
+    postFailureEvidence: false,
+    postFailureStderr: false,
+    agent: diagnosisSandboxed(manifest.agent),
+    steward: manifest.steward,
+    gates: manifest.gates
+  };
 }
 
 // The seam block a brief carries. Omitted entirely when the campaign is
@@ -1645,13 +1522,13 @@ function failureClass(reconciliation, failure) {
   // #386: an out-of-allowlist tree delta is a breach, not a gate-fail -- the
   // write already happened, so it is not redoable the way a red gate is.
   // Routed separately from "work" so it never buys a retried dispatch; see
-  // the `steerable`/breach-tagging split below, which posts it through the
+  // the `steerable`/breach-tagging split below, which records it through the
   // existing diagnosis ledger already blocked at attempt 2.
   if (stage === "treeDelta") {
     return "breach";
   }
   // #424: the gate refusing to judge a pass is not the same event as the gate
-  // catching a write, and must not be posted under the other one's sentence.
+  // catching a write, and must not be recorded under the other one's sentence.
   // It is priced the same -- a gate verdict, never the agent's fault, never a
   // steering attempt -- and it aborts the lane for the same reason: nothing
   // downstream can certify a worktree no allowlist covers.
@@ -1672,17 +1549,15 @@ function failureClass(reconciliation, failure) {
 
 function preparedSteering(task) {
   const comments = authorizedComments(task);
-  const origin = args.steeringSource === undefined
-    ? { thread: taskThread(task) || args.issue }
-    : {
-        source: {
-          kind: "local-jsonl",
-          registrationId: args.steeringSource.registrationId,
-          path: args.steeringSource.logPath,
-          preparedCursor: args.steeringSource.preparedCursor,
-          recheckedCursor: args.steeringSource.preparedCursor
-        }
-      };
+  const origin = args.steeringSource === undefined ? {} : {
+    source: {
+      kind: "local-jsonl",
+      registrationId: args.steeringSource.registrationId,
+      path: args.steeringSource.logPath,
+      preparedCursor: args.steeringSource.preparedCursor,
+      recheckedCursor: args.steeringSource.preparedCursor
+    }
+  };
   return {
     taskId: task.id,
     authorizedComments: comments,
@@ -1696,33 +1571,6 @@ function preparedSteering(task) {
   };
 }
 
-function restampFor(reconciliation, task) {
-  const matches = reconciliation.restamps.filter(fact => fact.taskId === task.id);
-  if (matches.length > 1) {
-    const error = new Error(`multiple re-stamp facts claim task ${task.id}`);
-    error.name = "SpecBuildInvariantError";
-    error.code = "multiple-restamp-facts";
-    throw error;
-  }
-  return matches.length === 1 ? matches[0] : null;
-}
-
-function restampBrief(task, prepared, completion) {
-  return {
-    schemaVersion: 1,
-    mission: `Re-stamp completion for ${task.id} from its validated durable merged-pull-request fact. This is a deterministic marker lane: no implementation or narration agent is dispatched, and no repository content may change.`,
-    campaign: {
-      name: effective.campaign,
-      repository: codeRepository,
-      issue: args.issue,
-      runId: args.runId
-    },
-    task,
-    workspace: prepared,
-    completion
-  };
-}
-
 function implementationBrief(task, prepared, reconciliation, attemptSteering) {
   const ownershipBoundary = !Array.isArray(task.conflictDomains)
     ? "This serial task omits conflictDomains. Ownership will certify its committed paths, and the tree-delta gate will allow exactly those owned paths after ownership runs."
@@ -1731,9 +1579,7 @@ function implementationBrief(task, prepared, reconciliation, attemptSteering) {
       : "The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them.";
   return {
     schemaVersion: 1,
-    mission: task.brief
-      ? `Implement only forge task ${task.id}: ${task.title}. The exact admitted task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, read another task issue, or fetch issue comments; deterministic campaign nodes own those operations. ${ownershipBoundary} Treat only steering.authorizedComments and steering.machineDiagnoses below as steering. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
-      : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. ${ownershipBoundary} Before changing code, read the cited spec sections and style references. Read the campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
+    mission: `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, merge, or read another task from the worklist; deterministic campaign nodes own those operations. ${ownershipBoundary} Before changing code, read the cited spec sections and style references. Treat only steering.authorizedComments and steering.machineDiagnoses below as steering. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
     campaign: {
       name: effective.campaign,
       repository: codeRepository,
@@ -1742,34 +1588,19 @@ function implementationBrief(task, prepared, reconciliation, attemptSteering) {
     },
     task,
     workspace: prepared,
-    steering: task.brief
-      ? {
-          channel: "locally-authorized-snapshot",
-          authorizedComments: attemptSteering.authorizedComments,
-          // This task brief is the immutable attempt receipt. Keeping both ID
-          // sets here makes a late comment auditable without changing the
-          // comment object the agent consumes.
-          attemptReceipt: attemptSteering.receipt,
-          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
-        }
-      : {
-          // The steering channel is the campaign thread, which is not
-          // necessarily the repository the agent is working in.
-          channel: "github-issue-comments",
-          repository: issueRepository,
-          issueNumber: args.issue.number,
-          issueUrl: args.issue.url,
-          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
-        }
+    steering: {
+      channel: "locally-authorized-snapshot",
+      authorizedComments: attemptSteering.authorizedComments,
+      attemptReceipt: attemptSteering.receipt,
+      machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+    }
   };
 }
 
 function checkpointBrief(task, prepared, reconciliation) {
   return {
     schemaVersion: 1,
-    mission: task.brief
-      ? `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the admitted issue graph. Do not fetch issue comments; treat only steering.authorizedComments and steering.machineDiagnoses below as steering. Do not modify the repository.`
-      : `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the worklist. Read the campaign issue comments and the machineDiagnoses below as the durable failure history for this retry. Do not modify the repository.`,
+    mission: `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the worklist. Treat only steering.authorizedComments and steering.machineDiagnoses below as the durable failure history for this retry. Do not modify the repository.`,
     campaign: {
       name: effective.campaign,
       repository: codeRepository,
@@ -1778,21 +1609,11 @@ function checkpointBrief(task, prepared, reconciliation) {
     },
     task,
     workspace: prepared,
-    steering: task.brief
-      ? {
-          channel: "locally-authorized-snapshot",
-          authorizedComments: authorizedComments(task),
-          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
-        }
-      : {
-          // The steering channel is the campaign thread, which is not
-          // necessarily the repository the agent is working in.
-          channel: "github-issue-comments",
-          repository: issueRepository,
-          issueNumber: args.issue.number,
-          issueUrl: args.issue.url,
-          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
-        }
+    steering: {
+      channel: "locally-authorized-snapshot",
+      authorizedComments: authorizedComments(task),
+      machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+    }
   };
 }
 
@@ -1821,48 +1642,19 @@ function applyAgentPolicies(spec, sandboxPolicy = effective.agent.sandboxPolicy)
   return spec;
 }
 
-// The arm-time capability record travels with every brief that reads or
-// writes a forge surface, so one pass never mixes native and degraded
-// projections. Absent means degraded.
-function withCapabilities(brief) {
-  if (args.capabilities === undefined) {
-    return brief;
-  }
-  return { ...brief, capabilities: args.capabilities };
-}
-
-function nativeSubIssues() {
-  return args.capabilities !== undefined && args.capabilities.subIssueWalk === true;
-}
-
-// Task T's machine receipts belong on T's own sub-issue thread. Without that
-// capability, or without a sub-issue, they stay on the master.
-function taskThread(task) {
-  if (!nativeSubIssues() || !task.brief) {
-    return null;
-  }
-  return task.brief.issue;
-}
-
 // Campaign-wide local records reach every task; a task-addressed record
-// reaches only that task. The task ID survives every forge projection change.
+// reaches only that stable task ID.
 function authorizedComments(task) {
   const master = args.steering || [];
   if (args.taskSteering === undefined) {
     return master;
   }
-  const thread = taskThread(task);
-  const key = args.steeringSource === undefined && thread !== null
-    ? thread.number
-    : task.id;
-  return master.concat(args.taskSteering[key] || []);
+  return master.concat(args.taskSteering[task.id] || []);
 }
 
 function reconciledProjection(reconciliation) {
   return {
-    anomalies: reconciliation.anomalies,
     merged: reconciliation.merged,
-    restamps: reconciliation.restamps,
     checkpoints: reconciliation.checkpoints,
     remaining: reconciliation.remaining,
     frontier: reconciliation.frontier.map(task => task.id),
@@ -1993,7 +1785,7 @@ async function sweepCampaign(repositoryConfig) {
     error.details = {
       campaign: effective.campaign,
       disposition: sweepNode.disposition,
-      recovery: "post a fresh campaign mention"
+      recovery: "start a fresh reconcile pass"
     };
     throw error;
   }
@@ -2017,98 +1809,53 @@ function sweepDeferral(sweepNode) {
 }
 
 (async () => {
-  const forgeNative = typeof args.worklist === "object";
-  if (forgeNative && seamSplit) {
-    // A forge-native campaign *is* its issue: worklist, briefs and receipts
-    // are all that one thread, so there is no second repository to bind.
-    const error = new Error("a forge-native campaign cannot span repositories");
-    error.name = "SpecBuildConfigurationError";
-    error.code = "forge-native-two-repo";
-    throw error;
-  }
+  const inputs = campaignInputs();
   if (seamSplit) {
-    // Fail before the first node rather than at the first read.
     repositoryConfigFor(codeRepository);
     repositoryConfigFor(specRepository);
     repositoryConfigFor(issueRepository);
   }
-  campaignTaskIdentity = args.campaignIdentity || args.campaign;
-  if (!forgeNative) {
-    const configuredGateIds = [];
-    for (const gate of args.gates) {
-      if (configuredGateIds.indexOf(gate.id) !== -1) {
-        const error = new Error(`campaign gate id ${gate.id} is duplicated`);
-        error.name = "SpecBuildConfigurationError";
-        error.code = "duplicate-gate-id";
-        throw error;
-      }
-      configuredGateIds.push(gate.id);
+  campaignTaskIdentity = args.campaignIdentity || inputs.campaign;
+  effective = inputs;
+  const configuredGateIds = [];
+  for (const gate of effective.gates) {
+    if (configuredGateIds.indexOf(gate.id) !== -1) {
+      const error = new Error(`campaign gate id ${gate.id} is duplicated`);
+      error.name = "SpecBuildConfigurationError";
+      error.code = "duplicate-gate-id";
+      throw error;
     }
+    configuredGateIds.push(gate.id);
   }
-  effective = forgeNative
-    ? null
-    : {
-        campaign: args.campaign,
-        repositoryConfig: args.repositories[codeRepository],
-        maxParallel: args.maxParallel,
-        mergeMethod: args.mergeMethod || "squash",
-        postFailureEvidence: args.postFailureEvidence === true,
-        postFailureStderr: args.postFailureStderr === true,
-        agent: diagnosisSandboxed(args.agent),
-        steward: args.steward || null,
-        gates: args.gates
-      };
-  const campaignName = args.campaign || args.campaignGraph.manifest.name;
   const captureRootSuffix = "/capture/archive";
   const tallyStateRoot = args.captureRoot.slice(0, -captureRootSuffix.length);
-  // Attempt counters are local canonical state, not repository objects. Every
-  // driver node receives the same closed coordinate derived from the daemon
-  // state root already carried for checkpoint captures.
   attemptReceipts = {
     schemaVersion: 1,
     kind: "local-jsonl",
-    path: `${tallyStateRoot}/campaigns/attempt-receipts/${campaignName}/attempt-receipts-v1.jsonl`
+    path: `${tallyStateRoot}/campaigns/attempt-receipts/${effective.campaign}/attempt-receipts-v1.jsonl`
   };
-  let sweepNode = null;
-  if (!forgeNative) {
-    if (!effective.repositoryConfig) {
-      const error = new Error(`campaign repository ${codeRepository} is not configured`);
-      error.name = "SpecBuildConfigurationError";
-      error.code = "repository-not-configured";
-      throw error;
-    }
-    sweepNode = await sweepCampaign(effective.repositoryConfig);
-    const deferred = sweepDeferral(sweepNode);
-    if (deferred !== null) {
-      return deferred;
-    }
+  if (!effective.repositoryConfig) {
+    const error = new Error(`campaign repository ${codeRepository} is not configured`);
+    error.name = "SpecBuildConfigurationError";
+    error.code = "repository-not-configured";
+    throw error;
   }
-  const reconcileBrief = forgeNative
-    ? withCapabilities({
-        campaignIdentity: campaignTaskIdentity,
-        repository: codeRepository,
-        issue: args.issue,
-        worklist: args.worklist,
-        attemptReceipts,
-        // Forward the already-normalized executable contract unchanged.
-        campaignGraph: args.campaignGraph,
-        // Preserve the additive receipt evidence when the producer carried
-        // it; absence remains absence for briefs armed before #433.
-        ...(args.armedManifest === undefined
-          ? {}
-          : { armedManifest: args.armedManifest })
-      })
-    : withSeam({
-        campaign: args.campaign,
-        campaignIdentity: campaignTaskIdentity,
-        repository: codeRepository,
-        repositoryConfig: args.repositories[codeRepository],
-        issue: args.issue,
-        worklist: args.worklist,
-        maxTasks: args.maxTasks,
-        maxParallel: args.maxParallel,
-        attemptReceipts
-      });
+  const sweepNode = await sweepCampaign(effective.repositoryConfig);
+  const deferred = sweepDeferral(sweepNode);
+  if (deferred !== null) {
+    return deferred;
+  }
+  const reconcileBrief = withSeam({
+    campaign: effective.campaign,
+    campaignIdentity: campaignTaskIdentity,
+    repository: codeRepository,
+    repositoryConfig: effective.repositoryConfig,
+    issue: args.issue,
+    worklist: inputs.worklist,
+    maxTasks: inputs.maxTasks,
+    maxParallel: inputs.maxParallel,
+    attemptReceipts
+  });
   const reconciliationNode = await driverNode(
     "reconcile",
     reconcileBrief,
@@ -2120,41 +1867,7 @@ function sweepDeferral(sweepNode) {
     null
   );
   const reconciliation = reconciliationNode.result;
-  if (forgeNative) {
-    effective = {
-      ...reconciliation.config,
-      // Forge-native campaigns carry no public-failure publication grant.
-      // Absence is the conservative default; a future forge-native surface
-      // must add an explicit admitted switch before excerpts can leave local
-      // state.
-      postFailureEvidence: false,
-      postFailureStderr: false
-    };
-  }
-  if (!effective || !effective.repositoryConfig) {
-    const error = new Error(`campaign repository ${codeRepository} is not configured`);
-    error.name = "SpecBuildConfigurationError";
-    error.code = "repository-not-configured";
-    throw error;
-  }
   const repositoryConfig = effective.repositoryConfig;
-  const gateIds = [];
-  for (const gate of effective.gates) {
-    if (gateIds.indexOf(gate.id) !== -1) {
-      const error = new Error(`campaign gate id ${gate.id} is duplicated`);
-      error.name = "SpecBuildConfigurationError";
-      error.code = "duplicate-gate-id";
-      throw error;
-    }
-    gateIds.push(gate.id);
-  }
-  if (forgeNative) {
-    sweepNode = await sweepCampaign(repositoryConfig);
-    const deferred = sweepDeferral(sweepNode);
-    if (deferred !== null) {
-      return deferred;
-    }
-  }
   const domainsRequired = effective.maxParallel > 1;
 
   if (reconciliation.complete) {
@@ -2210,14 +1923,13 @@ function sweepDeferral(sweepNode) {
       escalation
     };
   }
-  // A merged campaign PR is the durable proof that an earlier pass cleared
-  // admission. Until that first merge exists, every fresh pass gates a
+  // A marked integration commit is the durable proof that an earlier pass
+  // cleared admission. Until that first merge exists, every fresh pass gates a
   // separate pristine-base lane and cleans it before any agent can start.
   const commandGates = effective.gates.filter(gate => gate.kind === "command");
   if (
     !reconciliation.complete &&
     reconciliation.merged.length === 0 &&
-    reconciliation.restamps.length === 0 &&
     commandGates.length > 0
   ) {
     const preflightTask = reconciliation.frontier.find(task => task.kind === "implementation");
@@ -2312,10 +2024,8 @@ function sweepDeferral(sweepNode) {
       runId: args.runId,
       workspaceRoot: args.workspaceRoot,
       task,
-      // A lane forks from the code history the reconciler witnessed. For a
-      // local campaign that is its integration branch, which advances without
-      // moving the shared remote base; GitHub campaigns still witness their
-      // remote base branch here.
+      // A lane forks from the local integration history the reconciler
+      // witnessed; that branch advances without moving the shared remote base.
       sourceRevision: reconciliation.baseRevision
     };
     const prepared = await driverNode(
@@ -2364,37 +2074,19 @@ function sweepDeferral(sweepNode) {
       };
       const recorded = await driverNode(
         "checkpoint",
-        withCapabilities(
-          withSeam(
-            seamSplit
-              ? {
-                  campaign: effective.campaign,
-                  campaignIdentity: campaignTaskIdentity,
-                  repository: codeRepository,
-                  repositoryConfig,
-                  issue: args.issue,
-                  task,
-                  source: reconciliation.source,
-                  baseRevision: reconciliation.baseRevision,
-                  workspace: prepared.result,
-                  captureRoot: args.captureRoot,
-                  execution
-                }
-                : {
-                  campaign: effective.campaign,
-                  campaignIdentity: campaignTaskIdentity,
-                  repository: codeRepository,
-                  repositoryConfig,
-                  issue: args.issue,
-                  task,
-                  source: reconciliation.source,
-                  baseRevision: reconciliation.baseRevision,
-                  workspace: prepared.result,
-                  captureRoot: args.captureRoot,
-                  execution
-                }
-          )
-        ),
+        withSeam({
+          campaign: effective.campaign,
+          campaignIdentity: campaignTaskIdentity,
+          repository: codeRepository,
+          repositoryConfig,
+          issue: args.issue,
+          task,
+          source: reconciliation.source,
+          baseRevision: reconciliation.baseRevision,
+          workspace: prepared.result,
+          captureRoot: args.captureRoot,
+          execution
+        }),
         `checkpoint-record-${task.id}`,
         `checkpoint-record-${task.id}`,
         checkpointCompletionSchema,
@@ -2452,198 +2144,163 @@ function sweepDeferral(sweepNode) {
       return { task, prepared: prepared.result, checkpoint: recorded.result };
     }
 
-    const completion = restampFor(reconciliation, task);
     let taskBrief = null;
     let assistedBy = null;
     let workerFindings = null;
-    if (completion !== null) {
-      taskBrief = restampBrief(task, prepared.result, completion);
-      const restamped = await driverNode(
-        "restamp",
+    const prepSteering = preparedSteering(task);
+    let attemptSteering = prepSteering;
+    if (args.steeringSource !== undefined) {
+      const recheckBrief = {
+        campaign: effective.campaign,
+        campaignIdentity: args.campaignIdentity,
+        taskId: task.id,
+        localActor: args.localActor,
+        steeringSource: args.steeringSource,
+        preparedComments: prepSteering.authorizedComments
+      };
+      // The append-only source is read once after lane preparation and
+      // immediately before adapter admission. The prepared cursor plus this
+      // fresh high-water read preserve the existing union/late-ID receipt;
+      // both reads stay within the local append-only source.
+      const recheckedSteering = await driverNode(
+        "steeringRecheck",
+        recheckBrief,
+        `steering-recheck-${task.id}`,
+        `steering-recheck-${task.id}`,
+        steeringRecheckSchema,
+        null,
+        true,
+        taskRef
+      );
+      if (!nodePassed(recheckedSteering)) {
+        const failedTaskBrief = implementationBrief(
+          task,
+          prepared.result,
+          reconciliation,
+          prepSteering
+        );
+        return {
+          task,
+          prepared: prepared.result,
+          failure: taskFailure(
+            task,
+            "steering:recheck",
+            recheckedSteering,
+            failedTaskBrief,
+            [],
+            prepared.result,
+            prepared.result.baseRev
+          )
+        };
+      }
+      attemptSteering = recheckedSteering.result;
+    }
+    taskBrief = implementationBrief(
+      task,
+      prepared.result,
+      reconciliation,
+      attemptSteering
+    );
+    const agentSpec = applyAgentPolicies({
+      argv: effective.agent.argv,
+      adapter: effective.agent.adapter,
+      pools: ["campaign-agent"],
+      priority: effective.agent.priority,
+      workspace,
+      evidence: ["exit:0"],
+      brief: taskBrief,
+      key: `agent-${task.id}`,
+      label: `agent-${task.id}`,
+      taskRef
+    });
+    const agent = await job(agentSpec, { settle: true });
+    if (agent.result !== undefined) {
+      workerFindings = {
+        taskUuid: agent.taskUuid,
+        // The live client decodes JSON-looking final messages for structured
+        // result consumers. Findings are a text channel, so retain that
+        // value in its deterministic JSON spelling when decoding occurred.
+        message:
+          typeof agent.result === "string"
+            ? agent.result
+            : JSON.stringify(agent.result)
+      };
+    }
+    if (agent.verdict !== "pass") {
+      // #424: the pass still runs the tree-delta gate before it ends. A
+      // failing agent is the single most likely context for a rogue write and
+      // it was the one context this gate was silent in: the lane used to
+      // return here, and the next pass's `prep` re-snapshotted the worktree
+      // with the stray write already in it, so nothing could ever see it
+      // again. `ownership` never ran, so the gate has no certified
+      // `ownedPaths` and only a declared allowlist can govern.
+      //
+      // The stage is chosen from what this lane already knows, so the receipt
+      // it produces is true either way: a task that declares conflictDomains
+      // can only fail this node by breaching them, and an admitted serial task
+      // that omits them is unjudgeable because ownership did not run. Both
+      // implementation schema arms preserve that omission into this call.
+      const declaresDomains = Array.isArray(task.conflictDomains);
+      const strayStage = declaresDomains ? "treeDelta" : "treeDelta:ungated";
+      const strayDelta = await driverNode(
+        "treeDelta",
         {
           task,
-          completion,
-          workspace: prepared.result
+          workspace: prepared.result,
+          ownershipRan: false
         },
-        `restamp-${task.id}`,
-        `restamp-${task.id}`,
-        restampResultSchema,
+        `tree-delta-${task.id}`,
+        `tree-delta-${task.id}`,
+        treeDeltaSchema,
         workspace,
         true,
         taskRef
       );
-      if (!nodePassed(restamped)) {
+      if (!nodePassed(strayDelta)) {
         return {
           task,
           prepared: prepared.result,
           failure: taskFailure(
             task,
-            "restamp",
-            restamped,
+            strayStage,
+            strayDelta,
             taskBrief,
-            [],
+            [
+              {
+                phase: "treeDelta",
+                gateId: "tree-delta",
+                kind: "treeDelta",
+                node: strayDelta
+              }
+            ],
             prepared.result,
             prepared.result.baseRev
           )
         };
       }
-    } else {
-      const prepSteering = preparedSteering(task);
-      let attemptSteering = prepSteering;
-      if (task.brief && args.steeringSource !== undefined) {
-        const recheckBrief = {
-          campaign: effective.campaign,
-          campaignIdentity: args.campaignIdentity,
-          taskId: task.id,
-          localActor: args.localActor,
-          steeringSource: args.steeringSource,
-          preparedComments: prepSteering.authorizedComments
-        };
-        // The append-only source is read once after lane preparation and
-        // immediately before adapter admission. The prepared cursor plus this
-        // fresh high-water read preserve the existing union/late-ID receipt;
-        // neither read touches a forge or invokes gh.
-        const recheckedSteering = await driverNode(
-          "steeringRecheck",
-          recheckBrief,
-          `steering-recheck-${task.id}`,
-          `steering-recheck-${task.id}`,
-          steeringRecheckSchema,
-          null,
-          true,
-          taskRef
-        );
-        if (!nodePassed(recheckedSteering)) {
-          const failedTaskBrief = implementationBrief(
-            task,
-            prepared.result,
-            reconciliation,
-            prepSteering
-          );
-          return {
-            task,
-            prepared: prepared.result,
-            failure: taskFailure(
-              task,
-              "steering:recheck",
-              recheckedSteering,
-              failedTaskBrief,
-              [],
-              prepared.result,
-              prepared.result.baseRev
-            )
-          };
-        }
-        attemptSteering = recheckedSteering.result;
-      }
-      taskBrief = implementationBrief(
+      return {
         task,
-        prepared.result,
-        reconciliation,
-        attemptSteering
-      );
-      const agentSpec = applyAgentPolicies({
-        argv: effective.agent.argv,
-        adapter: effective.agent.adapter,
-        pools: ["campaign-agent"],
-        priority: effective.agent.priority,
-        workspace,
-        evidence: ["exit:0"],
-        brief: taskBrief,
-        key: `agent-${task.id}`,
-        label: `agent-${task.id}`,
-        taskRef
-      });
-      const agent = await job(agentSpec, { settle: true });
-      if (agent.result !== undefined) {
-        workerFindings = {
-          taskUuid: agent.taskUuid,
-          // The live client decodes JSON-looking final messages for structured
-          // result consumers. Findings are a text channel, so retain that
-          // value in its deterministic JSON spelling when decoding occurred.
-          message:
-            typeof agent.result === "string"
-              ? agent.result
-              : JSON.stringify(agent.result)
-        };
-      }
-      if (agent.verdict !== "pass") {
-        // #424: the pass still runs the tree-delta gate before it ends. A
-        // failing agent is the single most likely context for a rogue write and
-        // it was the one context this gate was silent in: the lane used to
-        // return here, and the next pass's `prep` re-snapshotted the worktree
-        // with the stray write already in it, so nothing could ever see it
-        // again. `ownership` never ran, so the gate has no certified
-        // `ownedPaths` and only a declared allowlist can govern.
-        //
-        // The stage is chosen from what this lane already knows, so the receipt
-        // it produces is true either way: a task that declares conflictDomains
-        // can only fail this node by breaching them, and an admitted serial task
-        // that omits them is unjudgeable because ownership did not run. Both
-        // implementation schema arms preserve that omission into this call.
-        const declaresDomains = Array.isArray(task.conflictDomains);
-        const strayStage = declaresDomains ? "treeDelta" : "treeDelta:ungated";
-        const strayDelta = await driverNode(
-          "treeDelta",
-          {
-            task,
-            workspace: prepared.result,
-            ownershipRan: false
-          },
-          `tree-delta-${task.id}`,
-          `tree-delta-${task.id}`,
-          treeDeltaSchema,
-          workspace,
-          true,
-          taskRef
-        );
-        if (!nodePassed(strayDelta)) {
-          return {
-            task,
-            prepared: prepared.result,
-            failure: taskFailure(
-              task,
-              strayStage,
-              strayDelta,
-              taskBrief,
-              [
-                {
-                  phase: "treeDelta",
-                  gateId: "tree-delta",
-                  kind: "treeDelta",
-                  node: strayDelta
-                }
-              ],
-              prepared.result,
-              prepared.result.baseRev
-            )
-          };
-        }
-        return {
+        prepared: prepared.result,
+        failure: taskFailure(
           task,
-          prepared: prepared.result,
-          failure: taskFailure(
-            task,
-            "agent",
-            agent,
-            taskBrief,
-            [],
-            prepared.result,
-            prepared.result.baseRev
-          )
-        };
-      }
-      assistedBy =
-        agent.model === undefined || agent.model === null
-          ? null
-          : {
-              adapter: effective.agent.adapter,
-              model: agent.model,
-              taskUuid: agent.taskUuid,
-              witnessSeq: agent.witnessSeq
-            };
+          "agent",
+          agent,
+          taskBrief,
+          [],
+          prepared.result,
+          prepared.result.baseRev
+        )
+      };
     }
-
+    assistedBy =
+      agent.model === undefined || agent.model === null
+        ? null
+        : {
+            adapter: effective.agent.adapter,
+            model: agent.model,
+            taskUuid: agent.taskUuid,
+            witnessSeq: agent.witnessSeq
+          };
     const ownership = await driverNode(
       "ownership",
       {
@@ -2753,7 +2410,7 @@ function sweepDeferral(sweepNode) {
       }
     }
 
-    const publishBrief = withCapabilities(withSeam({
+    const publishBrief = withSeam({
       campaign: effective.campaign,
       campaignIdentity: campaignTaskIdentity,
       repository: codeRepository,
@@ -2764,18 +2421,11 @@ function sweepDeferral(sweepNode) {
       task,
       domainsRequired,
       gates: effective.gates,
-      // A re-stamp is deterministic machinery all the way through: its local
-      // layer uses the validated template rather than spending a narration
-      // turn.
-      steward: completion === null ? effective.steward || null : null,
+      steward: effective.steward || null,
       workspace: prepared.result,
       constraints: constraintResults,
       workerFindings
-    }));
-    const findingsThread = taskThread(task);
-    if (findingsThread !== null) {
-      publishBrief.taskIssue = findingsThread;
-    }
+    });
     const publication = await driverNode(
       "publish",
       publishBrief,
@@ -2806,7 +2456,6 @@ function sweepDeferral(sweepNode) {
       prepared: prepared.result,
       publication: publication.result,
       // Who assisted this task, straight off the settled implementation node.
-      // A deterministic re-stamp has no such node and therefore no trailer.
       assistedBy,
       constraints: constraintResults,
       taskBrief,
@@ -2924,7 +2573,7 @@ function sweepDeferral(sweepNode) {
 
     const merge = await driverNode(
       "merge",
-      withCapabilities({
+      {
         campaign: effective.campaign,
         campaignIdentity: campaignTaskIdentity,
         repository: codeRepository,
@@ -2938,7 +2587,7 @@ function sweepDeferral(sweepNode) {
         assistedBy: lane.assistedBy || null,
         workspace: lane.prepared,
         integration: integration.result
-      }),
+      },
       `merge-${task.id}`,
       `merge-${task.id}`,
       mergeSchema,
@@ -2987,9 +2636,9 @@ function sweepDeferral(sweepNode) {
     if (kind === "work") {
       steerable.push(failure);
     } else if (kind === "breach") {
-      // #386: shares the diagnose-and-post pipeline below (the path list
+      // #386: shares the diagnose-and-record pipeline below (the path list
       // still reaches the steward's diagnose slot) but never the retry
-      // budget -- `steerBrief.breach` makes the driver post both the
+      // budget -- `steerBrief.breach` makes the driver record both the
       // attempt-1 and attempt-2 diagnosis receipts atomically, so the task
       // is permanently blocked as of this pass rather than steered once and
       // retried.
@@ -2997,10 +2646,10 @@ function sweepDeferral(sweepNode) {
       steerable.push(failure);
     } else if (kind === "ungated") {
       // #424: the gate could not judge this pass at all. It takes the breach
-      // routing -- both receipts posted at once, lane aborted, no steering
+      // routing -- both receipts recorded at once, lane aborted, no steering
       // attempt spent as if the agent were at fault -- but it is tagged
       // separately, because "wrote outside its authorized paths" is not what
-      // happened and the posted receipt must not say it did.
+      // happened and the recorded receipt must not say it did.
       failure.breach = true;
       failure.ungated = true;
       steerable.push(failure);
@@ -3017,7 +2666,7 @@ function sweepDeferral(sweepNode) {
   const retryOutcomes = await parallel(
     machineryFaults.map(failure => () => (async () => {
       const task = failure.task;
-      const retryBrief = withCapabilities(withSeam({
+      const retryBrief = withSeam({
         campaign: effective.campaign,
         repository: codeRepository,
         repositoryConfig,
@@ -3029,7 +2678,7 @@ function sweepDeferral(sweepNode) {
           failure.node && failure.node.error ? failure.node.error : failure.node,
           1500
         )
-      }));
+      });
       if (
         task.kind === "checkpoint" &&
         failure.node &&
@@ -3040,10 +2689,6 @@ function sweepDeferral(sweepNode) {
           postFailureEvidence: effective.postFailureEvidence,
           postFailureStderr: effective.postFailureStderr
         };
-      }
-      const retryThread = taskThread(task);
-      if (retryThread !== null) {
-        retryBrief.taskIssue = retryThread;
       }
       const recorded = await driverNode(
         "retry",
@@ -3190,9 +2835,9 @@ function sweepDeferral(sweepNode) {
       const attempt = previousDiagnoses.length + 1;
       // #386: a breach carries its own deterministic evidence -- the paths
       // the tree-delta gate named in its own failure -- straight into the
-      // posted receipt, so the offending paths are witnessed regardless of
+      // durable receipt, so the offending paths are witnessed regardless of
       // what the steward's diagnosis says.
-      const steerBrief = withCapabilities(withSeam({
+      const steerBrief = withSeam({
         campaign: effective.campaign,
         repository: codeRepository,
         repositoryConfig,
@@ -3210,13 +2855,13 @@ function sweepDeferral(sweepNode) {
                 2000
               ),
               // #424: which abort this is. The driver composes a different
-              // label sentence for each, because the receipt is published to
-              // the campaign thread and must claim exactly what happened --
+              // label sentence for each, because the local receipt must claim
+              // exactly what happened --
               // a gate that could not judge is not a gate that caught a write.
               ...(failure.ungated ? { abortReason: "tree-delta-ungated" } : {})
             }
           : {})
-      }));
+      });
       if (
         task.kind === "checkpoint" &&
         failure.node &&
@@ -3227,10 +2872,6 @@ function sweepDeferral(sweepNode) {
           postFailureEvidence: effective.postFailureEvidence,
           postFailureStderr: effective.postFailureStderr
         };
-      }
-      const steerThread = taskThread(task);
-      if (steerThread !== null) {
-        steerBrief.taskIssue = steerThread;
       }
       const steering = await driverNode(
         "steer",
@@ -3269,11 +2910,7 @@ function sweepDeferral(sweepNode) {
   }
 
   // The continuation is written even when the steering lane threw. A transient
-  // adapter fault must not leave the campaign stopped with neither steering nor
-  // a mention to resume from. Both campaign classes take this node: a
-  // forge-native pass re-enters through a registry scan carrying no brief, a
-  // module-declared pass re-enters through its own flow-run argv, whose brief
-  // is this pass's arguments under a derived run identity.
+  // adapter fault must not leave the campaign stopped with no local successor.
   let continuation = null;
   if (advanced) {
     const continued = await driverNode(
@@ -3285,7 +2922,7 @@ function sweepDeferral(sweepNode) {
         issue: args.issue,
         runId: args.runId,
         continuation: args.continuation,
-        brief: forgeNative ? null : args
+        brief: args
       }),
       "continue",
       "spec-build-continue",

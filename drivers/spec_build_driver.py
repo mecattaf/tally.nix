@@ -31,34 +31,6 @@ TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 REPOSITORY = re.compile(r"^[^/ \t]+/[^/ \t]+$")
 GIT_OID = re.compile(r"^[0-9a-f]{40,64}$")
-CAMPAIGN_BEGIN = "<!-- tally:campaign:v1 -->"
-CAMPAIGN_END = "<!-- tally:campaign:v1:end -->"
-WORKLIST_BEGIN = "<!-- tally:campaign-worklist:v1 -->"
-WORKLIST_END = "<!-- tally:campaign-worklist:v1:end -->"
-TASK_MARKER_PREFIX = "<!-- tally:campaign-task:v1 id="
-SYSTEM_COMMENT_PREFIX = "<!-- tally:spec-build:"
-DIAGNOSIS_MARKER = re.compile(
-    r"^<!-- tally:spec-build:diagnosis:v1 "
-    r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
-    r"issue=([1-9][0-9]*) "
-    r"task=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?) "
-    r"attempt=([12]) -->$"
-)
-RETRY_MARKER = re.compile(
-    r"^<!-- tally:spec-build:retry:v1 "
-    r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
-    r"issue=([1-9][0-9]*) "
-    r"task=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?) "
-    r"attempt=([12]) -->$"
-)
-RESUME_MARKER = re.compile(
-    r"^<!-- tally:spec-build:resume:v1 "
-    r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
-    r"issue=([1-9][0-9]*) "
-    r"nonce=([0-9a-fA-F-]{36})"
-    r"(?: tasks=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
-    r"(?:,[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*))? -->$"
-)
 # A campaign machinery fault is not evidence that the task's work is wrong, so
 # it buys a retry instead of a steering attempt. The budget is bounded and read
 # back from durable campaign state: past it, the fault is treated as a failed
@@ -68,8 +40,8 @@ MAX_RETRY_CHARS = 2_000
 ATTEMPT_RECEIPTS_SCHEMA_VERSION = 1
 ATTEMPT_RECEIPTS_FILE = "attempt-receipts-v1.jsonl"
 MAX_ATTEMPT_RECEIPTS_LOG_BYTES = 128 * 1024 * 1024
-# A worker's final message is a public finding, not an unbounded transcript.
-# The bound covers the complete rendered comment, including its machine marker.
+# A worker's final message is a durable finding, not an unbounded transcript.
+# The bound covers the complete local receipt after redaction.
 MAX_WORKER_FINDINGS_BYTES = 8 * 1024
 WORKER_FINDINGS_TRUNCATION = "\n[... worker findings truncated after redaction ...]"
 # Checkpoint output is retained for diagnosis, not as a second unbounded raw
@@ -131,8 +103,8 @@ NARRATION_BODY_LINE_MAX = 100
 NARRATION_REASON_MAX = 200
 NARRATION_ATTEMPTS = 2
 # `Assisted-by: <adapter>:<model> (tally:<taskUuid> witness:<seq>)`. The exact
-# formatting the gh producer already publishes; the trailer is a pointer into
-# the witness, never the proof (§7). Reject a narrator that proposes one: the
+# established trailer format; the trailer is a pointer into the witness, never
+# the proof (§7). Reject a narrator that proposes one: the
 # provenance line is the node's authority, not the model's.
 ASSISTED_BY_PREFIX = "Assisted-by:"
 # Git matches trailer keys case-insensitively, so `assisted-by:` is the same
@@ -150,14 +122,10 @@ UUID_TEXT = re.compile(
 # proposing to forge campaign state, so its proposal is refused outright — the
 # same line the worklist reader holds when a body repeats a managed marker.
 MANAGED_MARKER_PREFIX = "<!-- tally:"
-# A pull-request body is executable on GitHub: a closing keyword in a merged
-# body, or in a commit message that lands on the default branch, closes the
-# issue it names, and an @mention notifies a person or a whole team. The
-# narration is spliced into both surfaces, so a proposal carrying either is
-# proposing to mutate public forge state the campaign never named. The node
-# appends its own `Closes #<sub-issue>` at `github_pull_request`; that
-# authority belongs to the node, not to the model. A bare `#<n>` cross
-# reference stays allowed: it backlinks and notifies nobody.
+# Release narration can become both commit prose and public projection prose.
+# Closing keywords and mentions carry side effects there, so neither belongs
+# to the model-authored slot. A bare `#<n>` cross reference stays allowed: it
+# backlinks and notifies nobody.
 NARRATION_CLOSING_KEYWORD = re.compile(
     r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*"
     r"(?:\#\d+|GH-\d+|[\w.-]+/[\w.-]+\#\d+|https?://\S+/(?:issues|pull)/\d+)"
@@ -340,9 +308,7 @@ def canonical_json(value: Any) -> str:
 
 
 def json_type(value: Any) -> str:
-    """The JSON type name of a canonical value, with `bool` told apart from
-    `integer` (Python subclasses the former into the latter, but canonical
-    JSON keeps `true` and `1` distinct)."""
+    """Return a canonical JSON type, distinguishing booleans from integers."""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -361,21 +327,7 @@ def json_type(value: Any) -> str:
 
 
 def first_divergent_canonical_path(armed: Any, live: Any, prefix: str = "") -> str | None:
-    """The first canonical path at which two values disagree, or None if equal.
-
-    Walks canonical JSON key order (sorted keys), so the answer is
-    deterministic and identical to the order `canonical_sha256` hashes. (#433)
-
-    What it publishes, stated exactly, because a receipt that under-states its
-    own reach is worse than one that says nothing. The answer is a path plus a
-    shape: `absent-in-armed`/`present-in-live`, a JSON type name, an array
-    length, or the bare fact that a scalar differs. It is never a value. A path
-    segment is a manifest key name or an array index, so a key an operator
-    chose -- a gate id, a task id, a steward environment variable's NAME --
-    can appear; the string, number or path stored under it cannot. Task titles
-    and bodies are outside the manifest, and this walk is only ever given the
-    two manifests, so operator prose never reaches it at all.
-    """
+    """Describe the first canonical shape divergence without exposing values."""
     where = prefix or "<root>"
     if isinstance(armed, dict) and isinstance(live, dict):
         for key in sorted(set(armed) | set(live)):
@@ -411,20 +363,9 @@ def graph_digest_mismatch_receipt(
     admitted_digest: str,
     live_digest: str,
 ) -> str:
-    """The reconcile digest-mismatch receipt, with the evidence to act on it.
-
-    Prints BOTH digests in the `sha256:` form the arm CLI uses, and the first
-    divergent canonical path from a canonical-key-order walk of the armed
-    manifest against the live normalized one (#433). The walk reports presence
-    and shape only — never values — because canonical values can carry operator
-    content (task bodies). The gate's verdict is unchanged: it still refuses
-    and tells the operator to inspect and re-arm; this only stops the receipt
-    starving them of the evidence. If no armed manifest was recorded (a
-    campaign armed before this existed), the path is said to be unavailable
-    rather than invented.
-    """
+    """Render bounded local graph-divergence evidence without manifest values."""
     lines = [
-        "live issue executable graph does not match the armed digest; "
+        "live local executable graph does not match the armed digest; "
         "inspect it and explicitly re-arm",
         f"armed digest: {admitted_digest}",
         f"live digest: {live_digest}",
@@ -478,22 +419,6 @@ def run(
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         fail(f"command {command!r} exited {result.returncode}: {detail}")
     return result
-
-
-def run_gh_body_file(
-    command: list[str], body: str
-) -> subprocess.CompletedProcess[str]:
-    """Invoke a gh body-file mutation with a real, private temporary file.
-
-    GitHub CLI accepts `-` as an instruction to read stdin, but record/replay
-    adapters resolve the value of `--body-file` as the filename it advertises.
-    A named file is valid for both surfaces and keeps the mutation independent
-    of a CLI-specific stdin convention.
-    """
-    with tempfile.TemporaryDirectory(prefix="tally-gh-body-") as temporary:
-        body_file = Path(temporary) / "body.md"
-        body_file.write_text(body, encoding="utf-8")
-        return run([*command, "--body-file", str(body_file)])
 
 
 def run_bytes(
@@ -552,9 +477,9 @@ def repo_config(value: Any) -> dict[str, Any]:
         fail("repositoryConfig.forge must be github or local")
     git(checkout, "rev-parse", "--git-dir")
     return {
-        # Forge-native campaign checkouts arrive filesystem-canonical from
-        # Rust. Keep that admitted identity instead of independently resolving
-        # a second spelling at the consumer boundary.
+        # Campaign checkouts arrive filesystem-canonical from Rust. Keep that
+        # admitted identity instead of independently resolving a second
+        # spelling at the consumer boundary.
         "checkout": checkout,
         "baseBranch": base_branch,
         "remote": remote,
@@ -563,13 +488,12 @@ def repo_config(value: Any) -> dict[str, Any]:
 
 
 # A campaign has three repository coordinates. `repository` and
-# `repositoryConfig` are the *code* coordinate: where lanes are cut, publish
-# branches live, pull requests are opened, and merges land. A spec-corpus
-# campaign may read its worklist from a second repository and keep its campaign
-# issue -- and therefore its machine receipts -- on a third. Both are optional
-# and both default inward: spec falls back to code, issue falls back to spec. A
-# campaign that configures neither resolves all three to the same pair, so
-# every read and write happens exactly where it did before this seam existed.
+# `repositoryConfig` are the *code* coordinate: where lanes, stable task
+# branches, and integration commits live. A spec-corpus campaign may read its
+# worklist from a second repository and keep its local summary and findings
+# refs on a third. Both are optional and both default inward: spec falls back
+# to code, receipt storage falls back to spec. A campaign that configures
+# neither resolves all three to the same pair.
 SEAM_COORDINATES = ("specRepository", "issueRepository")
 
 
@@ -1132,14 +1056,6 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def github_json(arguments: list[str], context: str) -> Any:
-    viewed = run(["gh", *arguments])
-    try:
-        return json.loads(viewed.stdout)
-    except json.JSONDecodeError as error:
-        fail(f"{context} returned invalid JSON: {error}")
-
-
 def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
     """The commitlint-shaped grammar check on one steward proposal.
 
@@ -1482,7 +1398,11 @@ def canonical_task_references(
 
 
 def canonical_manifest(value: Any) -> dict[str, Any]:
-    """Exact decoder for the normalized manifest carried by Rust."""
+    """Exact decoder for the normalized manifest carried by Rust.
+
+    This pure contract mirror remains until the scheduled driver port removes
+    the cross-language contract corpus. It is not a worklist or forge decoder.
+    """
     fields = {
         "schemaVersion",
         "name",
@@ -1543,13 +1463,7 @@ def canonical_manifest(value: Any) -> dict[str, Any]:
 
 
 def canonical_campaign_graph(value: Any) -> dict[str, Any]:
-    """Decode the graph Rust already normalized and hashed.
-
-    This is an integrity boundary, not a second manifest admission path. The
-    detailed grammar belongs to `tally_core::campaign_contract`; the packaged
-    driver checks the versioned envelope and consumes its canonical members
-    without applying defaults or rewriting paths.
-    """
+    """Decode and verify the pure graph corpus emitted by Rust."""
     graph = object_complete(
         value,
         {"manifest", "tasks", "executableDigest"},
@@ -1592,70 +1506,6 @@ def canonical_campaign_graph(value: Any) -> dict[str, Any]:
     }
 
 
-def canonical_manifest_config(
-    manifest: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Project canonical members into the driver's executable configuration."""
-    repository = manifest["repository"]
-    references = manifest["tasks"]
-    config = {
-        "campaign": manifest["name"],
-        "repositoryConfig": {
-            "checkout": repository["checkout"],
-            "baseBranch": repository["baseBranch"],
-            "remote": repository["remote"],
-            "forge": repository["forge"],
-        },
-        "maxParallel": manifest["maxParallel"],
-        "mergeMethod": manifest["mergeMethod"],
-        "agent": manifest["agent"],
-        "steward": manifest["steward"],
-        "gates": manifest["gates"],
-    }
-    return config, references
-
-
-FORGE_NATIVE_RECONCILE_FIELDS = {
-    "campaignIdentity",
-    "repository",
-    "issue",
-    "worklist",
-    "campaignGraph",
-    "attemptReceipts",
-    # The normalized #433 receipt is also the compatibility form of the
-    # public arm/driver boundary. When campaignGraph is absent, its immutable
-    # task members are recovered from the native issue graph and the complete
-    # envelope must reproduce worklist.graphDigest before it can execute.
-    "armedManifest",
-}
-
-
-def task_completion_revision(
-    manifest: dict[str, Any],
-    reference: dict[str, Any],
-    content: dict[str, Any],
-) -> str:
-    """Identity for one task proof, narrower than whole-graph admission.
-
-    Rust admits the complete graph with one digest. Completion must survive an
-    unrelated graph edit, so its revision covers only this task and the global
-    execution policy capable of changing the meaning of its proof.
-    """
-    return canonical_sha256(
-        {
-            "contractVersion": 1,
-            "campaign": manifest["name"],
-            "repository": manifest["repository"],
-            "mergeMethod": manifest["mergeMethod"],
-            "agent": manifest["agent"],
-            "steward": manifest["steward"],
-            "gates": manifest["gates"],
-            "task": reference,
-            "content": content,
-        }
-    )
-
-
 def file_task_completion_revision(
     repository: str,
     source: dict[str, str],
@@ -1680,209 +1530,6 @@ def file_task_completion_revision(
     )
 
 
-def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
-    data = object_exact(
-        brief, FORGE_NATIVE_RECONCILE_FIELDS, "reconcile brief"
-    )
-    repository = required_string(data.get("repository"), "repository")
-    if not REPOSITORY.fullmatch(repository):
-        fail("repository must use owner/name form")
-    issue = campaign_issue(data.get("issue"))
-    expected_url = f"https://github.com/{repository}/issues/{issue['number']}"
-    if issue["url"] != expected_url:
-        fail("campaign issue URL does not match repository and issue number")
-    selector = object_exact(data.get("worklist"), {"kind", "graphDigest"}, "worklist")
-    if selector.get("kind") != "github-issue":
-        fail("forge-native worklist.kind must equal github-issue")
-    admitted_digest = required_string(selector.get("graphDigest"), "worklist.graphDigest")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", admitted_digest):
-        fail("worklist.graphDigest must be a lowercase SHA-256 identity")
-    carried_graph = data.get("campaignGraph")
-    canonical = (
-        None if carried_graph is None else canonical_campaign_graph(carried_graph)
-    )
-    carried_manifest = data.get("armedManifest")
-    if carried_manifest is not None and not isinstance(carried_manifest, dict):
-        fail("reconcile brief.armedManifest must be an object or null")
-    armed_manifest = (
-        None if carried_manifest is None else canonical_manifest(carried_manifest)
-    )
-    if canonical is None and armed_manifest is None:
-        fail("reconcile brief requires campaignGraph or armedManifest")
-    if canonical is not None and canonical["executableDigest"] != admitted_digest:
-        fail(
-            "internal campaign contract violation: worklist.graphDigest does not "
-            "match campaignGraph.executableDigest"
-        )
-    if (
-        canonical is not None
-        and armed_manifest is not None
-        and canonical["manifest"] != armed_manifest
-    ):
-        fail(
-            "internal campaign contract violation: armedManifest does not match "
-            "campaignGraph.manifest"
-        )
-    normalized_manifest = (
-        canonical["manifest"] if canonical is not None else armed_manifest
-    )
-    assert normalized_manifest is not None
-    config, references = canonical_manifest_config(normalized_manifest)
-    master = github_json(
-        ["api", f"repos/{repository}/issues/{issue['number']}"],
-        "campaign master issue",
-    )
-    if not isinstance(master, dict) or master.get("pull_request") is not None:
-        fail("campaign master locator did not resolve to an issue")
-    if master.get("html_url") != expected_url:
-        fail("campaign master issue must be canonical")
-    master_state = master.get("state")
-    if master_state not in {"open", "closed"}:
-        fail("campaign master issue has an unknown state")
-    master_closed = master_state == "closed"
-    body = master.get("body")
-    if not isinstance(body, str) and not (master_closed and canonical is not None):
-        fail("campaign master issue has no body")
-    # Current Rust dispatches carry the complete canonical graph. Once that
-    # canonical master is closed, its mutable task projection is irrelevant:
-    # synthesize only the deterministic locators needed by the result shape
-    # and do not let a stale sub-issue read turn completion back into failure.
-    subissues = (
-        [
-            {
-                "number": task["number"],
-                "title": task["title"],
-                "body": task["body"],
-                "state": "closed",
-                "html_url": f"https://github.com/{repository}/issues/{task['number']}",
-            }
-            for task in canonical["tasks"]
-        ]
-        if master_closed and canonical is not None
-        else github_json(
-            [
-                "api",
-                f"repos/{repository}/issues/{issue['number']}/sub_issues?per_page=100",
-            ],
-            "campaign sub-issues",
-        )
-    )
-    if not isinstance(subissues, list):
-        fail("campaign sub-issues response must be an array")
-    by_number: dict[int, dict[str, Any]] = {}
-    for index, candidate in enumerate(subissues):
-        if not isinstance(candidate, dict):
-            fail(f"campaign sub-issues[{index}] must be an object")
-        number = candidate.get("number")
-        if (
-            not isinstance(number, int)
-            or isinstance(number, bool)
-            or number < 1
-            or number in by_number
-        ):
-            fail("campaign sub-issues must have unique positive issue numbers")
-        if candidate.get("pull_request") is not None:
-            fail(f"campaign sub-issue #{number} is a pull request")
-        if candidate.get("state") not in {"open", "closed"}:
-            fail(f"campaign sub-issue #{number} has an unknown state")
-        by_number[number] = candidate
-    expected_numbers = {reference["issue"] for reference in references}
-    if set(by_number) != expected_numbers:
-        fail("campaign manifest task issues and native sub-issues differ")
-    if canonical is None:
-        # `armedManifest` is already normalized by Rust. This branch applies
-        # no defaults and rewrites no paths: it supplies only the immutable
-        # issue content omitted by the compatibility receipt, then routes the
-        # reconstructed envelope through the same exact decoder and digest
-        # integrity check as a carried campaignGraph.
-        canonical = canonical_campaign_graph(
-            {
-                "manifest": normalized_manifest,
-                "tasks": [
-                    {
-                        "number": reference["issue"],
-                        "title": by_number[reference["issue"]].get("title"),
-                        "body": by_number[reference["issue"]].get("body"),
-                    }
-                    for reference in references
-                ],
-                "executableDigest": admitted_digest,
-            }
-        )
-    tasks: list[dict[str, Any]] = []
-    canonical_tasks = canonical["tasks"]
-    if len(canonical_tasks) != len(references):
-        fail(
-            "internal campaign contract violation: canonical manifest task count "
-            "does not match canonical issue content"
-        )
-    for index, reference in enumerate(references):
-        candidate = by_number[reference["issue"]]
-        admitted_task = canonical_tasks[index]
-        if admitted_task["number"] != reference["issue"]:
-            fail(
-                "internal campaign contract violation: canonical manifest task order "
-                "does not match canonical issue content"
-            )
-        title = admitted_task["title"]
-        task_body = admitted_task["body"]
-        task_url = required_string(candidate.get("html_url"), f"task {reference['id']} URL")
-        expected_task_url = f"https://github.com/{repository}/issues/{reference['issue']}"
-        if task_url != expected_task_url:
-            fail(f"task {reference['id']} issue URL is not canonical")
-        common = {
-            "id": reference["id"],
-            "kind": reference["kind"],
-            "title": title,
-            "brief": {
-                "issue": {"number": str(reference["issue"]), "url": task_url},
-                "body": task_body,
-            },
-            "dependencies": reference["dependencies"],
-        }
-        if reference["kind"] == "implementation":
-            if "conflictDomains" in reference:
-                common["conflictDomains"] = reference["conflictDomains"]
-        else:
-            common["argv"] = reference["argv"]
-            common["runtimeMaxSec"] = reference["runtimeMaxSec"]
-        tasks.append(common)
-    for task, reference, content in zip(
-        tasks, references, canonical_tasks, strict=True
-    ):
-        task["revision"] = task_completion_revision(
-            normalized_manifest, reference, content
-        )
-    repository_config = repo_config(config["repositoryConfig"])
-    checkout = repository_config["checkout"]
-    remote = repository_config["remote"]
-    git(checkout, "fetch", "--prune", "--no-tags", remote)
-    source_revision = git(
-        checkout,
-        "rev-parse",
-        "--verify",
-        f"{remote}/{repository_config['baseBranch']}^{{commit}}",
-    ).stdout.strip()
-    return {
-        "schemaVersion": 1,
-        "repository": repository,
-        "source": {
-            "kind": "github-issue",
-            "url": expected_url,
-            "sha256": admitted_digest,
-            "revision": source_revision,
-        },
-        "tasks": tasks,
-        "config": config,
-        "masterBody": body if isinstance(body, str) else "",
-        # A poll may have admitted this pass from an open snapshot immediately
-        # before the terminal reconciler closed the issue. Keep that race a
-        # schema-valid completion instead of turning the driver's accurate
-        # closed-state observation into a FlowResultError.
-        "masterClosed": master_closed,
-    }
-
-
 def campaign_issue(value: Any) -> dict[str, str]:
     issue = object_exact(value, {"number", "url"}, "issue")
     number = required_string(issue.get("number"), "issue.number")
@@ -1890,85 +1537,6 @@ def campaign_issue(value: Any) -> dict[str, str]:
         fail("issue.number must be a positive decimal string")
     url = required_string(issue.get("url"), "issue.url")
     return {"number": number, "url": url}
-
-
-def subissue_number(task: dict[str, Any]) -> int:
-    """The native sub-issue that carries this task's identity and thread."""
-    brief = task.get("brief")
-    issue = brief.get("issue") if isinstance(brief, dict) else None
-    number = issue.get("number") if isinstance(issue, dict) else None
-    if not isinstance(number, str) or not number.isdigit() or number.startswith("0"):
-        fail(f"task {task.get('id')!r} carries no native sub-issue number")
-    return int(number)
-
-
-def campaign_capabilities(value: Any) -> dict[str, bool]:
-    capabilities = object_exact(value, {"subIssueWalk"}, "capabilities")
-    return {
-        "subIssueWalk": required_bool(
-            capabilities.get("subIssueWalk"), "capabilities.subIssueWalk"
-        )
-    }
-
-
-def take_capabilities(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, bool]]:
-    """Split the arm-time capability record off an action brief.
-
-    Every action validates its brief against an exact key set, and a campaign
-    armed before the sub-issue probe existed carries no record at all. Absent
-    means degraded, which is the conservative direction: the checkbox
-    projection and the per-branch pull-request lookup, exactly as before native
-    sub-issues. Re-arming is what turns the native walk on.
-    """
-    if not isinstance(brief, dict) or "capabilities" not in brief:
-        return brief, {"subIssueWalk": False}
-    rest = {key: value for key, value in brief.items() if key != "capabilities"}
-    return rest, campaign_capabilities(brief["capabilities"])
-
-
-def diagnosis_marker(campaign: str, issue_number: str, task_id: str, attempt: int) -> str:
-    return (
-        "<!-- tally:spec-build:diagnosis:v1 "
-        f"campaign={campaign} issue={issue_number} task={task_id} attempt={attempt} -->"
-    )
-
-
-def diagnosis_heading(task_id: str, attempt: int) -> str:
-    return f"### Machine steering for `{task_id}` (attempt {attempt}/2)"
-
-
-def worker_findings_marker(
-    campaign: str,
-    issue_number: str,
-    task_id: str,
-    agent_task_uuid: str,
-) -> str:
-    return (
-        "<!-- tally:spec-build:worker-findings:v1 "
-        f"campaign={campaign} issue={issue_number} task={task_id} "
-        f"agent={agent_task_uuid} -->"
-    )
-
-
-def retry_marker(campaign: str, issue_number: str, task_id: str, attempt: int) -> str:
-    return (
-        "<!-- tally:spec-build:retry:v1 "
-        f"campaign={campaign} issue={issue_number} task={task_id} attempt={attempt} -->"
-    )
-
-
-def retry_heading(task_id: str, attempt: int) -> str:
-    return (
-        f"### Machine retry for `{task_id}` "
-        f"(campaign fault {attempt}/{MAX_MACHINE_RETRIES})"
-    )
-
-
-def escalation_marker(campaign: str, issue_number: str) -> str:
-    return (
-        "<!-- tally:spec-build:escalation:v1 "
-        f"campaign={campaign} issue={issue_number} -->"
-    )
 
 
 SECRET_TOKEN_PREFIXES = (
@@ -2111,11 +1679,11 @@ def normalized_worker_findings(value: Any) -> dict[str, str] | None:
     return {"taskUuid": task_uuid.lower(), "message": message}
 
 
-def bound_worker_findings_comment(prefix: str, text: str) -> str:
-    """Bound the complete UTF-8 comment without splitting a code point."""
+def bound_worker_findings(prefix: str, text: str) -> str:
+    """Bound the complete UTF-8 receipt without splitting a code point."""
     prefix_bytes = prefix.encode("utf-8")
     if len(prefix_bytes) >= MAX_WORKER_FINDINGS_BYTES:
-        fail("worker findings marker exceeds its public comment bound")
+        fail("worker findings marker exceeds its receipt bound")
     available = MAX_WORKER_FINDINGS_BYTES - len(prefix_bytes)
     encoded = text.encode("utf-8")
     if len(encoded) <= available:
@@ -2125,7 +1693,7 @@ def bound_worker_findings_comment(prefix: str, text: str) -> str:
     clipped = encoded[:width].decode("utf-8", errors="ignore").rstrip()
     body = prefix + clipped + WORKER_FINDINGS_TRUNCATION
     if len(body.encode("utf-8")) > MAX_WORKER_FINDINGS_BYTES:
-        fail("worker findings comment escaped its public byte bound")
+        fail("worker findings escaped its receipt byte bound")
     return body
 
 
@@ -2410,54 +1978,6 @@ def bound_public_diagnosis(value: str) -> str:
     return value[:width].rstrip() + PUBLIC_DIAGNOSIS_TRUNCATION
 
 
-def github_actor() -> str:
-    return required_string(
-        run(["gh", "api", "user", "--jq", ".login"]).stdout.strip(),
-        "authenticated GitHub actor",
-    )
-
-
-def machine_authored(comments: list[Any], actor: str) -> list[dict[str, Any]]:
-    return [
-        candidate
-        for candidate in comments
-        if isinstance(candidate, dict)
-        and isinstance(candidate.get("user"), dict)
-        and isinstance(candidate["user"].get("login"), str)
-        and candidate["user"]["login"].casefold() == actor.casefold()
-    ]
-
-
-def github_issue_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
-    """Read one issue's comments through the recorder-stable paginated grammar."""
-    viewed = run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            "--slurp",
-            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
-        ]
-    )
-    try:
-        pages = json.loads(viewed.stdout)
-    except json.JSONDecodeError as error:
-        fail(f"gh issue comments returned invalid JSON: {error}")
-    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-        fail("gh issue comments pagination must return arrays")
-    return [
-        candidate
-        for page in pages
-        for candidate in page
-        if isinstance(candidate, dict)
-    ]
-
-
-def github_machine_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
-    actor = github_actor()
-    return machine_authored(github_issue_comments(repository, issue_number), actor)
-
-
 def state_scope(campaign: str, issue_number: str) -> str:
     return hashlib.sha256(f"{campaign}\0{issue_number}".encode()).hexdigest()[:24]
 
@@ -2473,7 +1993,7 @@ def local_remote_refs(config: dict[str, Any], pattern: str) -> dict[str, str]:
     for line in viewed.stdout.splitlines():
         fields = line.split("\t", 1)
         if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40,64}", fields[0]):
-            fail("local forge returned a malformed state ref")
+            fail("the campaign remote returned a malformed state ref")
         refs[fields[1]] = fields[0]
     return refs
 
@@ -2485,9 +2005,9 @@ def read_local_blob(config: dict[str, Any], ref: str) -> dict[str, Any]:
     try:
         value = json.loads(content)
     except json.JSONDecodeError as error:
-        fail(f"local forge state {ref!r} is invalid JSON: {error}")
+        fail(f"local campaign state {ref!r} is invalid JSON: {error}")
     if not isinstance(value, dict):
-        fail(f"local forge state {ref!r} must contain an object")
+        fail(f"local campaign state {ref!r} must contain an object")
     return value
 
 
@@ -2501,7 +2021,7 @@ def write_local_blob(
     checkout: Path = config["checkout"]
     object_id = required_string(
         git(checkout, "hash-object", "-w", "--stdin", input_text=rendered).stdout.strip(),
-        "local forge state object",
+        "local campaign state object",
     )
     git(checkout, "push", "--quiet", config["remote"], f"{object_id}:{ref}")
     return True, value
@@ -2953,184 +2473,17 @@ def append_attempt_receipt(
             os.close(descriptor)
 
 
-def forge_campaign_state(
-    repository: str,
-    config: dict[str, Any],
+def campaign_attempt_state(
+    source: Any,
     campaign: str,
     issue_number: str,
     task_ids: set[str] | None = None,
-    threads: dict[str, list[dict[str, Any]]] | None = None,
-    attempt_receipts: Any = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, list[str]]:
-    warnings: list[str] = []
-    if config["forge"] != "github":
-        if attempt_receipts is None:
-            fail("attemptReceipts is required for a local campaign")
-        records = read_attempt_receipts(attempt_receipts, campaign, issue_number)
-        return fold_attempt_receipts(
-            _events_from_local_records(records, campaign), task_ids, warnings
-        )
-
-    threaded = set(threads or {})
-    counted: set[tuple[str, str, int, int]] = set()
-    events: list[dict[str, Any]] = []
-    master_comments = github_machine_comments(repository, issue_number)
-    pardon_generations: list[tuple[int, set[str] | None]] = []
-    for comment in master_comments:
-        body = comment.get("body")
-        if not isinstance(body, str) or not body:
-            continue
-        match = RESUME_MARKER.fullmatch(body.splitlines()[0])
-        if match is None or match.group(1) != campaign or match.group(2) != issue_number:
-            continue
-        identity = comment.get("id", comment.get("databaseId"))
-        if not isinstance(identity, int) or isinstance(identity, bool) or identity < 1:
-            fail("campaign resume receipt carries no stable GitHub comment id")
-        scoped = match.group(4)
-        pardon_generations.append(
-            (identity, None if scoped is None else set(scoped.split(",")))
-        )
-    has_pardon = bool(pardon_generations)
-    fallback_sequence = 0
-
-    def event_sequence(comment: dict[str, Any], context: str) -> int:
-        nonlocal fallback_sequence
-        value = comment.get("id", comment.get("databaseId"))
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-        if has_pardon:
-            fail(f"{context} carries no stable GitHub comment id")
-        fallback_sequence += 1
-        return fallback_sequence
-
-    def ingest(comments: list[dict[str, Any]], *, surface: str | None) -> None:
-        expected_escalation = escalation_marker(campaign, issue_number)
-        for comment in comments:
-            body = comment.get("body")
-            if not isinstance(body, str) or not body:
-                continue
-            first_line = body.splitlines()[0]
-            resume = RESUME_MARKER.fullmatch(first_line) if surface is None else None
-            if resume is not None:
-                marker_campaign, marker_issue, nonce, scoped_tasks = resume.groups()
-                if marker_campaign != campaign or marker_issue != issue_number:
-                    continue
-                try:
-                    uuid.UUID(nonce)
-                except ValueError:
-                    fail("campaign resume marker carries an invalid nonce")
-                if "\n\n### Campaign resumed\n\n" not in body or "\n\nReason: " not in body:
-                    fail("campaign resume receipt has malformed content")
-                tasks = None if scoped_tasks is None else scoped_tasks.split(",")
-                if tasks is not None and len(tasks) != len(set(tasks)):
-                    fail("campaign resume receipt repeats a scoped task")
-                events.append(
-                    {
-                        "sequence": event_sequence(comment, "campaign resume receipt"),
-                        "kind": "pardon",
-                        "tasks": tasks,
-                        "comment": required_string(
-                            comment.get("html_url"), "campaign resume receipt URL"
-                        ),
-                        "boundaryLabel": "resume",
-                    }
-                )
-                continue
-            match = DIAGNOSIS_MARKER.fullmatch(first_line)
-            retry_match = None if match is not None else RETRY_MARKER.fullmatch(first_line)
-            if match is not None or retry_match is not None:
-                kind = "diagnosis" if match is not None else "retry"
-                marker_campaign, marker_issue, task_id, attempt_text = (
-                    match or retry_match
-                ).groups()
-                if marker_campaign != campaign or marker_issue != issue_number:
-                    continue
-                if surface is not None and task_id != surface:
-                    warnings.append(
-                        f"ignored a machine {kind} for {task_id!r} found on the "
-                        f"sub-issue thread of {surface!r}"
-                    )
-                    continue
-                attempt = int(attempt_text)
-                identity = event_sequence(comment, "campaign machine receipt")
-                generation = max(
-                    (
-                        boundary
-                        for boundary, tasks in pardon_generations
-                        if boundary < identity
-                        and (tasks is None or task_id in tasks)
-                    ),
-                    default=0,
-                )
-                where = (
-                    "master thread"
-                    if surface is None
-                    else f"sub-issue thread of {surface!r}"
-                )
-                counted_identity = (kind, task_id, attempt, generation)
-                if counted_identity in counted:
-                    warnings.append(
-                        f"ignored a duplicate machine {kind} for {task_id!r} attempt "
-                        f"{attempt} on the {where}: the ledger counts one receipt "
-                        "per attempt"
-                    )
-                    continue
-                counted.add(counted_identity)
-                if surface is None and task_id in threaded:
-                    warnings.append(
-                        f"counted a master-thread machine {kind} for {task_id!r} "
-                        f"attempt {attempt}, recorded before that task owned a "
-                        "sub-issue thread"
-                    )
-                heading = (
-                    diagnosis_heading(task_id, attempt)
-                    if kind == "diagnosis"
-                    else retry_heading(task_id, attempt)
-                )
-                prefix = f"{first_line}\n\n{heading}\n\n"
-                if not body.startswith(prefix):
-                    fail(f"machine {kind} for {task_id!r} has malformed content")
-                payload = "diagnosis" if kind == "diagnosis" else "reason"
-                events.append(
-                    {
-                        "sequence": identity,
-                        "kind": kind,
-                        "taskId": task_id,
-                        "attempt": attempt,
-                        "comment": required_string(
-                            comment.get("html_url"), f"machine {kind} comment URL"
-                        ),
-                        payload: required_text(
-                            body[len(prefix) :],
-                            f"machine {kind} for {task_id!r}",
-                            MAX_DIAGNOSIS_CHARS
-                            if kind == "diagnosis"
-                            else MAX_RETRY_CHARS,
-                        ),
-                    }
-                )
-            elif surface is None and first_line == expected_escalation:
-                events.append(
-                    {
-                        "sequence": event_sequence(
-                            comment, "campaign escalation receipt"
-                        ),
-                        "kind": "escalation",
-                        "comment": required_string(
-                            comment.get("html_url"),
-                            "machine escalation comment URL",
-                        ),
-                    }
-                )
-
-    # Task threads win duplicate identity, while stable comment IDs restore the
-    # global chronology before the shared ordered fold runs.
-    for task_id in sorted(threaded):
-        ingest(threads[task_id], surface=task_id)
-    ingest(master_comments, surface=None)
-    events.sort(key=lambda event: event["sequence"])
-    return fold_attempt_receipts(events, task_ids, warnings)
-
+    """Fold the campaign's local append-only attempt receipts."""
+    records = read_attempt_receipts(source, campaign, issue_number)
+    return fold_attempt_receipts(
+        _events_from_local_records(records, campaign), task_ids, []
+    )
 
 def task_revision(task: dict[str, Any]) -> str | None:
     value = task.get("revision")
@@ -3153,24 +2506,6 @@ def pull_request_marker(
         "<!-- tally:spec-build:v2 "
         f"campaign={campaign} issue={issue_number} task={task_id} revision={revision} -->"
     )
-
-
-def pull_request_marker_revisions(
-    body: str, campaign: str, issue_number: str, task_id: str
-) -> list[str]:
-    """Every exact marker revision this body carries for one campaign task.
-
-    A re-stamp may reason from an older marker only after the candidate has
-    come through the task's own sub-issue walk. Parsing the revision here lets
-    the ordinary completion validator derive the matching historical branch;
-    the marker itself still proves nothing.
-    """
-    prefix = (
-        "<!-- tally:spec-build:v2 "
-        f"campaign={campaign} issue={issue_number} task={task_id} revision="
-    )
-    pattern = re.compile(re.escape(prefix) + r"(sha256:[0-9a-f]{64}) -->")
-    return list(dict.fromkeys(match.group(1) for match in pattern.finditer(body)))
 
 
 def checkpoint_identity(
@@ -3225,441 +2560,6 @@ def remote_ref_oid(checkout: Path, remote: str, reference: str) -> str | None:
     ):
         fail(f"remote ref lookup for {reference!r} returned malformed output")
     return fields[0]
-
-
-SUBISSUE_WALK_QUERY = """
-query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
-  repository(owner: $owner, name: $name) {
-    issue(number: $number) {
-      subIssues(first: 50, after: $cursor) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          number
-          state
-          url
-          closedByPullRequestsReferences(first: 20, includeClosedPrs: true) {
-            pageInfo { hasNextPage }
-            nodes {
-              url
-              body
-              merged
-              baseRefName
-              headRefName
-              mergeCommit { oid }
-              repository { nameWithOwner }
-            }
-          }
-          comments(last: 100) {
-            pageInfo { hasPreviousPage }
-            nodes { databaseId url body author { login } }
-          }
-        }
-      }
-    }
-  }
-}
-"""
-# The parent's sub-issue ceiling is 100 and `tally campaign project` caps a
-# manifest at that number, so two pages of 50 always cover an admitted graph.
-# A third page means the parent grew outside the campaign and the pass refuses
-# to reason from a partial walk.
-MAX_SUBISSUE_WALK_PAGES = 2
-# `first:` returns the oldest references, so a truncated page drops the newest
-# closing pull request — the one most likely to be the current proof. Silently
-# reading past that would let the walk narrow what counts as proof, which is
-# the one thing it must never do, so a full page fails the pass instead.
-MAX_SUBISSUE_PULL_REQUESTS = 20
-# `last:` returns the newest comments, so a truncated window drops the oldest.
-# These comments are machine-authored-filtered below and feed the diagnosis and
-# retry ledger, not steering: the steering read is the CLI's own walk. So the
-# consequence of exhausting *this* window is that a task's oldest receipts fall
-# out of the ledger and its attempt counters reset -- exactly the harm #334
-# item 6 closed, arriving through a second door. Unlike the reference page it
-# is not a proof surface, and a thread long enough to exhaust it is ordinary
-# human discussion that must not halt a campaign, so it is reported rather than
-# refused.
-MAX_SUBISSUE_COMMENTS = 100
-
-
-def subissue_walk(
-    repository: str, issue_number: str
-) -> tuple[dict[int, dict[str, Any]], list[str]]:
-    """Read every sub-issue of the campaign parent in one bounded query.
-
-    This narrows *where* completion candidates come from — a pull request has
-    to be linked to the task's own sub-issue — and never what counts as proof.
-    `pullRequest.merged` plus the revision-bound body marker plus the existing
-    base/head/merge-commit validation remain the whole oracle.
-    """
-    owner, _, name = repository.partition("/")
-    actor = github_actor()
-    nodes: dict[int, dict[str, Any]] = {}
-    warnings: list[str] = []
-    cursor: str | None = None
-    for _ in range(MAX_SUBISSUE_WALK_PAGES):
-        arguments = [
-            "api",
-            "graphql",
-            "-f",
-            f"query={SUBISSUE_WALK_QUERY}",
-            "-F",
-            f"owner={owner}",
-            "-F",
-            f"name={name}",
-            "-F",
-            f"number={issue_number}",
-        ]
-        if cursor is not None:
-            arguments.extend(["-F", f"cursor={cursor}"])
-        payload = github_json(arguments, "campaign sub-issue walk")
-        if not isinstance(payload, dict):
-            fail("campaign sub-issue walk did not return an object")
-        connection = payload.get("data")
-        for key in ("repository", "issue", "subIssues"):
-            connection = connection.get(key) if isinstance(connection, dict) else None
-        if not isinstance(connection, dict):
-            fail("campaign sub-issue walk returned no sub-issue connection")
-        page = connection.get("nodes")
-        if not isinstance(page, list):
-            fail("campaign sub-issue walk returned a malformed node list")
-        for index, candidate in enumerate(page):
-            if not isinstance(candidate, dict):
-                fail(f"campaign sub-issue walk node {index} is not an object")
-            number = candidate.get("number")
-            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-                fail("campaign sub-issue walk returned an invalid sub-issue number")
-            if number in nodes:
-                fail(f"campaign sub-issue walk repeated sub-issue #{number}")
-            state = candidate.get("state")
-            if state not in {"OPEN", "CLOSED"}:
-                fail(f"campaign sub-issue #{number} has an unknown state")
-            pulls = []
-            references = candidate.get("closedByPullRequestsReferences")
-            reference_nodes = (
-                references.get("nodes") if isinstance(references, dict) else None
-            )
-            if not isinstance(reference_nodes, list):
-                fail(f"campaign sub-issue #{number} returned malformed pull requests")
-            reference_page = (
-                references.get("pageInfo") if isinstance(references, dict) else None
-            )
-            if not isinstance(reference_page, dict):
-                fail(f"campaign sub-issue #{number} returned no reference page information")
-            if reference_page.get("hasNextPage") is True:
-                fail(
-                    f"campaign sub-issue #{number} links more than "
-                    f"{MAX_SUBISSUE_PULL_REQUESTS} closing pull requests; the walk refuses "
-                    "to read completion from a truncated reference page"
-                )
-            for reference in reference_nodes:
-                if not isinstance(reference, dict):
-                    fail(f"campaign sub-issue #{number} returned a malformed reference")
-                pulls.append(reference)
-            comments = candidate.get("comments")
-            comment_nodes = comments.get("nodes") if isinstance(comments, dict) else None
-            if not isinstance(comment_nodes, list):
-                fail(f"campaign sub-issue #{number} returned malformed comments")
-            comment_page = comments.get("pageInfo") if isinstance(comments, dict) else None
-            if not isinstance(comment_page, dict):
-                fail(f"campaign sub-issue #{number} returned no comment page information")
-            if comment_page.get("hasPreviousPage") is True:
-                warnings.append(
-                    f"campaign sub-issue #{number} carries more than "
-                    f"{MAX_SUBISSUE_COMMENTS} comments; the receipt ledger reads only "
-                    f"the newest {MAX_SUBISSUE_COMMENTS}, so a diagnosis or retry receipt "
-                    "older than that no longer counts and this task's attempt budget "
-                    "may have reset"
-                )
-            machine: list[dict[str, Any]] = []
-            for comment in comment_nodes:
-                if not isinstance(comment, dict):
-                    fail(f"campaign sub-issue #{number} returned a malformed comment")
-                author = comment.get("author")
-                login = author.get("login") if isinstance(author, dict) else None
-                machine.append(
-                    {
-                        "id": comment.get("databaseId"),
-                        "body": comment.get("body"),
-                        "html_url": comment.get("url"),
-                        "user": {"login": login} if isinstance(login, str) else None,
-                    }
-                )
-            nodes[number] = {
-                "number": number,
-                "state": "closed" if state == "CLOSED" else "open",
-                "url": candidate.get("url"),
-                "pullRequests": pulls,
-                "comments": machine_authored(machine, actor),
-            }
-        page_info = connection.get("pageInfo")
-        if not isinstance(page_info, dict):
-            fail("campaign sub-issue walk returned no page information")
-        if page_info.get("hasNextPage") is not True:
-            return nodes, warnings
-        cursor = required_string(page_info.get("endCursor"), "sub-issue walk cursor")
-    fail(
-        "campaign parent carries more sub-issues than the 100-task cap admits; "
-        "the walk refuses to reconcile from a partial page"
-    )
-    raise AssertionError("unreachable")
-
-
-def normalized_pull_request(value: Any) -> dict[str, Any] | None:
-    """Project a REST pull request onto the field names the walk returns."""
-    if not isinstance(value, dict):
-        return None
-    base = value.get("base")
-    head = value.get("head")
-    merged = isinstance(value.get("merged_at"), str)
-    state = value.get("state")
-    return {
-        "url": value.get("html_url"),
-        "body": value.get("body"),
-        "merged": merged,
-        "state": "MERGED" if merged else str(state).upper(),
-        "baseRefName": base.get("ref") if isinstance(base, dict) else None,
-        "headRefName": head.get("ref") if isinstance(head, dict) else None,
-        "headRefOid": head.get("sha") if isinstance(head, dict) else None,
-        "mergeCommit": {"oid": value.get("merge_commit_sha")},
-    }
-
-
-def pull_requests_by_head(
-    repository: str, branch: str, state: str, limit: int
-) -> list[dict[str, Any]]:
-    """Look a campaign's stable publish branch up directly on the forge.
-
-    The stable head ref is a durable lookup key. Reading through it, rather
-    than through a forge-wide recent-pull-request scan, is what keeps campaign
-    proof from ageing out of a window nobody controls.
-    """
-    owner, _, _ = repository.partition("/")
-    listed = github_json(
-        [
-            "api",
-            f"repos/{repository}/pulls?head={owner}:{branch}"
-            f"&state={state}&per_page={limit}",
-        ],
-        f"pull requests for {branch!r}",
-    )
-    if not isinstance(listed, list):
-        fail(f"pull request lookup for {branch!r} must return an array")
-    candidates = []
-    for value in listed:
-        candidate = normalized_pull_request(value)
-        if candidate is not None:
-            # This read is scoped to one repository by construction; naming it
-            # lets the completion path apply one rule to both read paths.
-            candidate["repository"] = {"nameWithOwner": repository}
-            candidates.append(candidate)
-    return candidates
-
-
-def campaign_marker_prefixes(campaign: str, issue_number: str) -> tuple[str, ...]:
-    """The pull-request marker this campaign writes, revision-blind.
-
-    Matching the prefix identifies a pull request as *this campaign's own work*
-    without saying anything about whether it still proves a task. That is a
-    different question from completion, and conflating the two is what made an
-    ordinary graph edit look like operator error.
-    """
-    return (
-        f"<!-- tally:spec-build:v2 campaign={campaign} issue={issue_number} task=",
-    )
-
-
-def merged_github_tasks(
-    repository: str,
-    config: dict[str, Any],
-    campaign: str,
-    issue_number: str,
-    base_branch: str,
-    base_rev: str | None,
-    tasks: list[dict[str, Any]],
-    walk: dict[int, dict[str, Any]] | None = None,
-    *,
-    campaign_id: str | None = None,
-) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
-    # The issue-keyed spelling remains readable for compatibility callers;
-    # current flows supply the armed campaign identity explicitly.
-    branch_identity = issue_number if campaign_id is None else campaign_id
-    facts: list[dict[str, str]] = []
-    restamps: list[dict[str, str]] = []
-    warnings: list[str] = []
-    claimed_urls: set[str] = set()
-    markers = {
-        task["id"]: pull_request_marker(
-            campaign, issue_number, task["id"], task_revision(task)
-        )
-        for task in tasks
-        if task["kind"] == "implementation"
-    }
-    revisions = {task["id"]: task_revision(task) for task in tasks}
-    prefixes = campaign_marker_prefixes(campaign, issue_number)
-
-    def unnamed_marker_warning(candidate: dict[str, Any]) -> str | None:
-        # A pull request carrying this campaign's marker for a revision the
-        # witnessed worklist no longer names is proof of nothing. Naming it is
-        # how a stale pre-edit pull request stays visible without counting.
-        body = candidate.get("body")
-        if not isinstance(body, str):
-            return None
-        if not any(prefix in body for prefix in prefixes):
-            return None
-        if any(marker in body for marker in markers.values()):
-            return None
-        url = candidate.get("url")
-        identity = url if isinstance(url, str) and url else "an unidentifiable pull request"
-        return (
-            f"ignored {identity}: its campaign marker names no task in the witnessed worklist"
-        )
-
-    def candidate_key(candidate: dict[str, Any]) -> str:
-        url = candidate.get("url")
-        if isinstance(url, str) and url:
-            return f"url:{url}"
-        return "json:" + json.dumps(candidate, sort_keys=True, default=str)
-
-    def validated_candidate(
-        candidate: dict[str, Any], task_id: str, revision: str | None
-    ) -> tuple[dict[str, str] | None, str | None]:
-        branch = stable_publish_branch(campaign, branch_identity, task_id, revision)
-        url_value = candidate.get("url")
-        url = url_value if isinstance(url_value, str) and url_value else "unidentifiable PR"
-        problems: list[str] = []
-        if not isinstance(url_value, str) or not url_value or any(ord(char) < 32 for char in url_value):
-            problems.append("has no valid URL")
-        # With one repository this was implied. Once the task sub-issue lives
-        # somewhere else, `closedByPullRequestsReferences` hands back whatever
-        # repository referenced it, so completion asserts the pull request is
-        # on the campaign's own code repository. This narrows where proof may
-        # come from; it never widens what counts as proof.
-        origin = candidate.get("repository")
-        name_with_owner = origin.get("nameWithOwner") if isinstance(origin, dict) else None
-        if name_with_owner is not None and name_with_owner != repository:
-            problems.append(
-                f"lives on {name_with_owner!r}, not campaign code repository {repository!r}"
-            )
-        if candidate.get("baseRefName") != base_branch:
-            problems.append(
-                f"targets {candidate.get('baseRefName')!r}, not base {base_branch!r}"
-            )
-        if candidate.get("headRefName") != branch:
-            problems.append(
-                f"uses head {candidate.get('headRefName')!r}, not stable branch {branch!r}"
-            )
-        commit = candidate.get("mergeCommit")
-        oid = commit.get("oid") if isinstance(commit, dict) else None
-        if not isinstance(oid, str) or not GIT_OID.fullmatch(oid):
-            problems.append("has no valid merge commit")
-        elif base_rev is not None and git(
-            config["checkout"],
-            "merge-base",
-            "--is-ancestor",
-            oid,
-            base_rev,
-            check=False,
-        ).returncode:
-            problems.append(
-                f"has merge commit {oid} outside witnessed base {base_rev}"
-            )
-        if problems:
-            return None, f"ignored {url} for task {task_id!r}: {'; '.join(problems)}"
-        return {
-            "taskId": task_id,
-            "pullRequest": url_value,
-            "mergeCommit": oid,
-            **({"revision": revision} if revision is not None else {}),
-        }, None
-
-    for task in tasks:
-        if task["kind"] != "implementation":
-            continue
-        marker = markers[task["id"]]
-        revision = revisions[task["id"]]
-        branch = stable_publish_branch(campaign, branch_identity, task["id"], revision)
-        if walk is None:
-            candidates = pull_requests_by_head(repository, branch, "closed", 20)
-        else:
-            node = walk.get(subissue_number(task))
-            if node is None:
-                fail(
-                    f"campaign sub-issue walk returned no sub-issue for task {task['id']!r}"
-                )
-            candidates = node["pullRequests"]
-        # A closed pull request that never merged proves nothing, in either
-        # read path: `merged` stays the only completion oracle.
-        candidates = [
-            candidate for candidate in candidates if candidate.get("merged") is True
-        ]
-
-        valid: list[dict[str, str]] = []
-        stale_valid: list[dict[str, str]] = []
-        seen_candidates: set[str] = set()
-        for candidate in candidates:
-            key = candidate_key(candidate)
-            if key in seen_candidates:
-                continue
-            seen_candidates.add(key)
-            body = candidate.get("body")
-            if not isinstance(body, str):
-                warning = unnamed_marker_warning(candidate)
-                if warning is not None:
-                    warnings.append(warning)
-                continue
-            if marker in body:
-                fact, warning = validated_candidate(candidate, task["id"], revision)
-                if warning is not None:
-                    warnings.append(warning)
-                if fact is not None:
-                    valid.append(fact)
-                continue
-
-            # Only the native task-thread walk exposes a bounded history whose
-            # relationship to this task is forge-authenticated. A global or
-            # branch-scoped search is not widened to find re-stamp evidence.
-            # Each historical marker is put through the exact same
-            # repository/base/head/merge-commit validator as a current one;
-            # the only changed input is the revision used to derive its head.
-            stale_revisions = (
-                [
-                    candidate_revision
-                    for candidate_revision in pull_request_marker_revisions(
-                        body, campaign, issue_number, task["id"]
-                    )
-                    if candidate_revision != revision
-                ]
-                if walk is not None and revision is not None
-                else []
-            )
-            if stale_revisions:
-                for candidate_revision in stale_revisions:
-                    fact, warning = validated_candidate(
-                        candidate, task["id"], candidate_revision
-                    )
-                    if warning is not None:
-                        warnings.append(warning)
-                    if fact is not None:
-                        stale_valid.append(fact)
-                continue
-            warning = unnamed_marker_warning(candidate)
-            if warning is not None:
-                warnings.append(warning)
-        if len(valid) > 1:
-            fail(f"multiple merged pull requests claim campaign task {task['id']!r}")
-        # The walk requests `first:`, so its candidate order is oldest first.
-        # Repeated task edits may leave several valid historical facts; use the
-        # newest one as the source without pretending any of them completes the
-        # current revision.
-        fact = valid[0] if valid else (stale_valid[-1] if stale_valid else None)
-        if fact is None:
-            continue
-        url = fact["pullRequest"]
-        if url in claimed_urls:
-            fail(f"merged pull request {url} claims more than one campaign task")
-        claimed_urls.add(url)
-        (facts if valid else restamps).append(fact)
-    return facts, restamps, list(dict.fromkeys(warnings))
 
 
 def campaign_branch_prefix(campaign: str, campaign_id: str) -> str:
@@ -3854,89 +2754,13 @@ def task_conflicts(task: dict[str, Any], selected: list[dict[str, Any]]) -> bool
     )
 
 
-def sync_issue_checkboxes(
-    repository: str,
-    issue_number: str,
-    body: str,
-    tasks: list[dict[str, Any]],
-    completed_ids: set[str],
-) -> None:
-    start_index = body.find(WORKLIST_BEGIN)
-    if start_index < 0:
-        fail(f"campaign master issue is missing {WORKLIST_BEGIN}")
-    content_start = start_index + len(WORKLIST_BEGIN)
-    end_index = body.find(WORKLIST_END, content_start)
-    if end_index < 0:
-        fail(f"campaign master issue is missing {WORKLIST_END}")
-    if body.find(WORKLIST_BEGIN, content_start) >= 0 or body.find(
-        WORKLIST_END, end_index + len(WORKLIST_END)
-    ) >= 0:
-        fail("campaign master issue repeats a worklist marker")
-    lines = [""]
-    for task in tasks:
-        state = "x" if task["id"] in completed_ids else " "
-        title = task["title"].replace("\r", " ").replace("\n", " ")
-        lines.append(
-            f"- [{state}] {TASK_MARKER_PREFIX}{task['id']} --> "
-            f"#{task['brief']['issue']['number']} — {title}"
-        )
-    lines.append("")
-    content = "\n".join(lines)
-    updated = body[:content_start] + content + body[end_index:]
-    if updated != body:
-        run_gh_body_file(
-            [
-                "gh",
-                "issue",
-                "edit",
-                issue_number,
-                "--repo",
-                repository,
-            ],
-            updated,
-        )
-
-
-def close_completed_issue_campaign(
-    repository: str,
-    issue_number: str,
-    tasks: list[dict[str, Any]],
-) -> None:
-    """Close every open task sub-issue, then the campaign issue itself.
-
-    The closing summary is published before this runs, so a reader who opens
-    the closed issue finds the digest as its last comment.
-    """
-    for task in tasks:
-        task_issue = campaign_issue(task["brief"].get("issue"))
-        viewed = github_json(
-            ["api", f"repos/{repository}/issues/{task_issue['number']}"],
-            f"campaign task issue {task['id']}",
-        )
-        if not isinstance(viewed, dict):
-            fail(f"campaign task issue {task['id']} did not return an object")
-        if viewed.get("state") == "open":
-            run(
-                [
-                    "gh",
-                    "issue",
-                    "close",
-                    task_issue["number"],
-                    "--repo",
-                    repository,
-                ]
-            )
-    run(["gh", "issue", "close", issue_number, "--repo", repository])
-
-
 def closing_summary_marker(
     campaign: str, issue_number: str, outcome: str, source_sha256: str
 ) -> str:
     """The idempotence marker one terminal outcome's summary carries.
 
-    Completion keeps the pre-summary `campaign-complete` marker: the summary
-    took over that comment rather than adding a second one beside it, so a
-    campaign still ends with exactly one machine comment before it closes.
+    Completion keeps the pre-summary `campaign-complete` marker so existing
+    local receipts and the release renderer share one idempotence key.
     """
     if outcome == "complete":
         return f"<!-- tally:campaign-complete:v1 source={source_sha256} -->"
@@ -3949,10 +2773,10 @@ def closing_summary_marker(
 def campaign_digest(reconciliation: dict[str, Any], outcome: str) -> dict[str, Any]:
     """One run-scoped digest of a campaign's terminal state.
 
-    Every field is a projection of facts this pass already witnessed -- merged
-    pull requests, checkpoint receipts, diagnosis and retry receipts read back
-    from the forge, and the reconciler's own set arithmetic. Nothing here reads
-    or writes a state store the campaign did not already have.
+    Every field is a projection of facts this pass already witnessed -- local
+    merges, checkpoint refs, append-only attempt receipts, and the reconciler's
+    own set arithmetic. Nothing here reads or writes a second coordination
+    surface.
     """
     titles = {task["id"]: task["title"] for task in reconciliation["tasks"]}
     merged_ids = {fact["taskId"] for fact in reconciliation["merged"]}
@@ -4023,7 +2847,6 @@ def campaign_digest(reconciliation: dict[str, Any], outcome: str) -> dict[str, A
             for retry in reconciliation["retries"]
         ],
         "deferrals": [deferral["taskId"] for deferral in reconciliation["deferrals"]],
-        "anomalies": [anomaly["detail"] for anomaly in reconciliation["anomalies"]],
         "warnings": list(reconciliation["warnings"]),
     }
 
@@ -4169,10 +2992,6 @@ def render_campaign_summary(digest: dict[str, Any]) -> str:
             )
         )
         lines.append("")
-    if digest["anomalies"]:
-        lines.extend(["#### Anomalies", ""])
-        lines.extend(summary_rows(digest["anomalies"], lambda detail: f"- {detail}"))
-        lines.append("")
     if digest["warnings"]:
         lines.extend(["#### Reconciler warnings", ""])
         lines.extend(
@@ -4190,65 +3009,28 @@ def publish_closing_summary(
     campaign: str,
     issue_number: str,
     digest: dict[str, Any],
-    *,
-    issue_forge: str,
 ) -> str:
-    """Post one closing summary on the terminal path that produced this digest.
-
-    Always a fresh comment, never an upsert: a summary the operator does not
-    get notified about is not a summary. The marker makes a repeated terminal
-    pass idempotent rather than chatty. The issue forge is explicit because a
-    forge-native GitHub campaign may merge code through the local forge.
-    """
-    if issue_forge not in {"github", "local"}:
-        fail("campaign closing summary issue forge must be github or local")
+    """Record one idempotent closing summary in local campaign state."""
     outcome = digest["outcome"]
     marker = closing_summary_marker(
         campaign, issue_number, outcome, digest["source"]["sha256"]
     )
     body = f"{marker}\n\n{render_campaign_summary(digest)}"
     if len(body) > 60_000:
-        fail("campaign closing summary exceeds the bounded GitHub comment size")
-    if issue_forge == "github":
-        comments = github_issue_comments(repository, issue_number)
-        if any(
-            marker in comment["body"]
-            for comment in comments
-            if isinstance(comment.get("body"), str)
-        ):
-            return f"https://github.com/{repository}/issues/{issue_number}"
-        posted = run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                issue_number,
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-        return required_string(
-            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
-            "campaign closing summary comment URL",
-        )
+        fail("campaign closing summary exceeds 60,000 characters")
     ref = f"{local_state_prefix(campaign, issue_number)}/summary/{outcome}"
-    write_local_blob(
-        config,
-        ref,
-        {
-            "schemaVersion": 1,
-            "kind": "closing-summary",
-            "campaign": campaign,
-            "issueNumber": issue_number,
-            "outcome": outcome,
-            "body": body,
-        },
-    )
+    expected = {
+        "schemaVersion": 1,
+        "kind": "closing-summary",
+        "campaign": campaign,
+        "issueNumber": issue_number,
+        "outcome": outcome,
+        "body": body,
+    }
+    _, observed = write_local_blob(config, ref, expected)
+    if observed != expected:
+        fail(f"local campaign summary {ref!r} disagrees with this outcome")
     return f"local://{repository}/{ref}"
-
-
 def parallelism_warnings(
     ready: list[dict[str, Any]], frontier: list[dict[str, Any]], max_parallel: int
 ) -> list[str]:
@@ -4344,206 +3126,68 @@ def checkpoint_deferrals(
     return deferrals
 
 
-def closed_by_this_campaign(node: dict[str, Any], prefixes: tuple[str, ...]) -> bool:
-    """Did this campaign's own merged pull request close the sub-issue?
-
-    A task PR carries `Closes #<sub-issue>`, so the campaign closes its own
-    sub-issues as it merges. When this task or global execution policy later
-    changes its revision, that merged pull request stops completing the current
-    task — but the closure it caused is still the campaign's, not a human's.
-    The marker prefix is revision-blind on purpose: it answers "did we do
-    this?", which is exactly the question the anomaly must not get wrong.
-    """
-    for candidate in node["pullRequests"]:
-        body = candidate.get("body")
-        if candidate.get("merged") is True and isinstance(body, str):
-            if any(prefix in body for prefix in prefixes):
-                return True
-    return False
-
-
-def closed_subissue_anomalies(
-    walk: dict[int, dict[str, Any]],
-    tasks: list[dict[str, Any]],
-    completed_ids: set[str],
-    prefixes: tuple[str, ...],
-) -> list[dict[str, Any]]:
-    """A sub-issue closed *by hand* with no merged proof is a loud anomaly.
-
-    A sub-issue is human-clickable, so closure carries no authority at all;
-    `pullRequest.merged` (or the checkpoint completion ref) stays the only
-    oracle. The task remains incomplete and the closure is surfaced rather than
-    filed as a reconciler warning nobody reads.
-
-    A closure the campaign caused itself is not that signal. An older valid
-    task revision leaves the sub-issue closed while the current revision waits
-    for its deterministic re-stamp. Reporting that as operator error would
-    fire the loudest surface on the campaign's own documented workflow exactly
-    when the board most needs to stay readable.
-    """
-    anomalies: list[dict[str, Any]] = []
-    for task in tasks:
-        if task["id"] in completed_ids:
-            continue
-        node = walk.get(subissue_number(task))
-        if node is None or node["state"] != "closed":
-            continue
-        if closed_by_this_campaign(node, prefixes):
-            continue
-        anomalies.append(
-            {
-                "kind": "closed-without-merged-proof",
-                "taskId": task["id"],
-                "issue": str(node["number"]),
-                "url": task["brief"]["issue"]["url"],
-                "detail": (
-                    f"sub-issue #{node['number']} is closed but task {task['id']!r} "
-                    "holds no revision-valid merged pull request; closing a sub-issue "
-                    "by hand does not complete a task"
-                ),
-            }
-        )
-    return anomalies
-
-
 def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
-    brief, capabilities = take_capabilities(brief)
-    forge_native = isinstance(brief.get("worklist"), dict)
-    if forge_native:
-        # A forge-native campaign *is* its issue: the worklist, the briefs, and
-        # the receipts are all that one thread. There is no second repository
-        # to bind, and pretending otherwise would put the worklist somewhere
-        # the campaign cannot read it.
-        for name in SEAM_COORDINATES:
-            if brief.get(name) is not None:
-                fail(f"a forge-native campaign cannot carry {name}")
-        data = object_exact(
-            brief, FORGE_NATIVE_RECONCILE_FIELDS, "reconcile brief"
-        )
-        worklist = issue_graph_worklist(data)
-        campaign = worklist["config"]["campaign"]
-        issue = campaign_issue(data.get("issue"))
-        repository = worklist["repository"]
-        config = repo_config(worklist["config"]["repositoryConfig"])
-        max_parallel = worklist["config"]["maxParallel"]
-        coordinates = campaign_coordinates({}, repository, config)
-    else:
-        fields = {
-            "campaign",
-            "campaignIdentity",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "worklist",
-            "maxTasks",
-            "maxParallel",
-        }
-        if "attemptReceipts" in brief:
-            fields.add("attemptReceipts")
-        data = object_exact(
+    data = object_exact(
+        brief,
+        seam_fields(
             brief,
-            seam_fields(
-                brief,
-                fields,
-            ),
-            "reconcile brief",
-        )
-        campaign = required_string(data.get("campaign"), "campaign")
-        if not COMPONENT.fullmatch(campaign):
-            fail("campaign is not a safe component")
-        issue = campaign_issue(data.get("issue"))
-        worklist = action_worklist(
             {
-                "repository": data.get("repository"),
-                "repositoryConfig": data.get("repositoryConfig"),
-                "worklist": data.get("worklist"),
-                "maxTasks": data.get("maxTasks"),
-                "maxParallel": data.get("maxParallel"),
-                **carried_coordinates(data),
-            }
-        )
-        repository = worklist["repository"]
-        config = repo_config(data.get("repositoryConfig"))
-        max_parallel = data["maxParallel"]
-        coordinates = campaign_coordinates(data, repository, config)
+                "campaign",
+                "campaignIdentity",
+                "repository",
+                "repositoryConfig",
+                "issue",
+                "worklist",
+                "maxTasks",
+                "maxParallel",
+                "attemptReceipts",
+            },
+        ),
+        "reconcile brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    issue = campaign_issue(data.get("issue"))
+    worklist = action_worklist(
+        {
+            "repository": data.get("repository"),
+            "repositoryConfig": data.get("repositoryConfig"),
+            "worklist": data.get("worklist"),
+            "maxTasks": data.get("maxTasks"),
+            "maxParallel": data.get("maxParallel"),
+            **carried_coordinates(data),
+        }
+    )
+    repository = worklist["repository"]
+    config = repo_config(data.get("repositoryConfig"))
+    max_parallel = data.get("maxParallel", 1)
+    coordinates = campaign_coordinates(data, repository, config)
     code = coordinates["code"]
     issue_target = coordinates["issue"]
     source_revision = required_string(
         worklist["source"].get("revision"), "worklist source revision"
     )
-    # The worklist's pinned revision witnesses the *spec* history. Everything
-    # downstream -- merged pull requests, checkpoint receipts, lane bases -- is
-    # anchored in the *code* history. With one repository those are the same
-    # commit and this costs no extra fetch.
+    # The worklist revision witnesses the spec history; the integration branch
+    # is the code-history anchor consumed by every merge and checkpoint.
     base_rev = (
         source_revision
         if same_repository(coordinates["spec"], code)
         else observed_base_revision(code["config"])
     )
     local_campaign_id = campaign_id(data)
-    if config["forge"] != "github":
-        base_rev = ensure_integration_branch(
-            code["config"], campaign, local_campaign_id, base_rev
-        )
-    if forge_native and worklist.get("masterClosed") is True:
-        return {
-            "schemaVersion": 1,
-            "campaign": campaign,
-            "repository": repository,
-            "source": worklist["source"],
-            "baseRevision": base_rev,
-            "tasks": worklist["tasks"],
-            "merged": [],
-            "restamps": [],
-            "checkpoints": [],
-            "remaining": [],
-            "frontier": [],
-            "diagnoses": [],
-            "retries": [],
-            "deferrals": [],
-            "blocked": [],
-            "quiescent": False,
-            "escalation": None,
-            "complete": True,
-            "anomalies": [],
-            "warnings": [],
-            "closingSummary": None,
-            "config": worklist["config"],
-        }
-    # One bounded walk per pass feeds both halves of the forge read: which
-    # pull requests may be considered, and which machine receipts each task
-    # thread carries.
-    walked = (
-        subissue_walk(issue_target["repository"], issue["number"])
-        if forge_native and config["forge"] == "github" and capabilities["subIssueWalk"]
-        else None
+    base_rev = ensure_integration_branch(
+        code["config"], campaign, local_campaign_id, base_rev
     )
-    walk = None if walked is None else walked[0]
-    walk_warnings = [] if walked is None else walked[1]
-    if config["forge"] == "github":
-        merged, restamps, warnings = merged_github_tasks(
-            code["repository"],
-            code["config"],
-            campaign,
-            issue["number"],
-            code["config"]["baseBranch"],
-            base_rev,
-            worklist["tasks"],
-            walk,
-            campaign_id=local_campaign_id,
-        )
-    else:
-        merged = merged_local_tasks(
-            code["repository"],
-            code["config"],
-            campaign,
-            local_campaign_id,
-            issue["number"],
-            base_rev,
-            worklist["tasks"],
-        )
-        restamps = []
-        warnings = []
+    merged = merged_local_tasks(
+        code["repository"],
+        code["config"],
+        campaign,
+        local_campaign_id,
+        issue["number"],
+        base_rev,
+        worklist["tasks"],
+    )
     checkpoints = completed_checkpoint_tasks(
         code["config"],
         campaign,
@@ -4554,38 +3198,13 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         base_rev,
     )
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
-    restamp_ids = {fact["taskId"] for fact in restamps}
     task_ids = {task["id"] for task in worklist["tasks"]}
-    anomalies = (
-        closed_subissue_anomalies(
-            walk,
-            worklist["tasks"],
-            completed_ids,
-            campaign_marker_prefixes(campaign, issue["number"]),
-        )
-        if walk is not None
-        else []
-    )
-    threads = (
-        {
-            task["id"]: walk[subissue_number(task)]["comments"]
-            for task in worklist["tasks"]
-            if subissue_number(task) in walk
-        }
-        if walk is not None
-        else None
-    )
-    diagnoses, retries, escalation, state_warnings = forge_campaign_state(
-        issue_target["repository"],
-        issue_target["config"],
+    diagnoses, retries, escalation, warnings = campaign_attempt_state(
+        data.get("attemptReceipts"),
         campaign,
         issue["number"],
         task_ids,
-        threads,
-        data.get("attemptReceipts"),
     )
-    warnings.extend(walk_warnings)
-    warnings.extend(state_warnings)
     order = {task["id"]: index for index, task in enumerate(worklist["tasks"])}
     diagnoses.sort(key=lambda item: (order[item["taskId"]], item["attempt"]))
     retries.sort(key=lambda item: (order[item["taskId"]], item["attempt"]))
@@ -4593,9 +3212,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     direct_blocked = {
         diagnosis["taskId"]
         for diagnosis in diagnoses
-        if diagnosis["attempt"] == 2
-        and diagnosis["taskId"] not in completed_ids
-        and diagnosis["taskId"] not in restamp_ids
+        if diagnosis["attempt"] == 2 and diagnosis["taskId"] not in completed_ids
     }
     blocked_by: dict[str, set[str]] = {}
     blocked: list[dict[str, Any]] = []
@@ -4605,7 +3222,9 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             roots.update(blocked_by.get(dependency, set()))
         blocked_by[task["id"]] = roots
         if task["id"] not in completed_ids and roots:
-            blocked.append({"taskId": task["id"], "blockedBy": sorted(roots, key=order.get)})
+            blocked.append(
+                {"taskId": task["id"], "blockedBy": sorted(roots, key=order.get)}
+            )
     blocked_ids = {fact["taskId"] for fact in blocked}
     ready = [
         task
@@ -4613,10 +3232,10 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         if task["id"] not in blocked_ids
         and all(dependency in completed_ids for dependency in task["dependencies"])
     ]
-    deferrals = checkpoint_deferrals(worklist["tasks"], remaining, completed_ids, blocked_ids)
+    deferrals = checkpoint_deferrals(
+        worklist["tasks"], remaining, completed_ids, blocked_ids
+    )
     deferred_ids = {deferral["taskId"] for deferral in deferrals}
-    # A checkpoint whose verdict can still be changed by unrelated outstanding
-    # work never displaces that work from a bounded frontier.
     ready.sort(key=lambda task: task["id"] in deferred_ids)
     frontier: list[dict[str, Any]] = []
     for task in ready:
@@ -4624,34 +3243,15 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             break
         if not task_conflicts(task, frontier):
             frontier.append(task)
-    if forge_native and walk is None:
-        # Native sub-issues make the parent's own progress bar the projection,
-        # so tally stops writing one. Without that capability the recomputed
-        # checkbox list is still the only progress a reader gets.
-        sync_issue_checkboxes(
-            issue_target["repository"],
-            issue["number"],
-            worklist["masterBody"],
-            worklist["tasks"],
-            completed_ids,
-        )
     warnings.extend(parallelism_warnings(ready, frontier, max_parallel))
     result: dict[str, Any] = {
         "schemaVersion": 1,
         "campaign": campaign,
         "repository": repository,
         "source": worklist["source"],
-        # The code history this pass reasoned from: the integration tip for a
-        # local campaign, or the remote code base for a GitHub campaign. The
-        # worklist revision remains an independent source witness.
         "baseRevision": base_rev,
         "tasks": worklist["tasks"],
         "merged": merged,
-        # A prior revision's merge remains evidence only for this deterministic
-        # marker lane. It is deliberately absent from `completed_ids`: current
-        # dependencies do not advance until the new revision's own pull
-        # request comes back through the ordinary completion oracle.
-        "restamps": restamps,
         "checkpoints": checkpoints,
         "remaining": [task["id"] for task in remaining],
         "frontier": frontier,
@@ -4662,38 +3262,18 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "quiescent": bool(remaining) and not frontier,
         "escalation": escalation,
         "complete": not remaining,
-        "anomalies": anomalies,
         "warnings": warnings,
         "closingSummary": None,
     }
-    if forge_native:
-        result["config"] = worklist["config"]
     if not remaining:
-        # Completion is one of the campaign's two terminal outcomes, so the
-        # digest is rendered here, inside the node that already owned closing
-        # the issue. No new flow node exists for it.
         result["closingSummary"] = publish_closing_summary(
             issue_target["repository"],
             issue_target["config"],
             campaign,
             issue["number"],
             campaign_digest(result, "complete"),
-            # The forge-native worklist selector is itself a GitHub issue
-            # boundary. Its code repository may still use the local merge
-            # backend under --allow-test-local-forge.
-            issue_forge=(
-                "github" if forge_native else issue_target["config"]["forge"]
-            ),
         )
-        if forge_native:
-            close_completed_issue_campaign(
-                issue_target["repository"],
-                issue["number"],
-                worklist["tasks"],
-            )
     return result
-
-
 def action_diff(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(brief, {"repositoryConfig", "workspace"}, "diff brief")
     repo_config(data.get("repositoryConfig"))
@@ -4767,47 +3347,6 @@ def action_diff(brief: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def steering_thread(
-    repository: str,
-    config: dict[str, Any],
-    data: dict[str, Any],
-    capabilities: dict[str, bool],
-    task_id: str,
-) -> tuple[str, dict[str, list[dict[str, Any]]] | None]:
-    """Where this task's machine receipts are posted and read back.
-
-    A native campaign gives every task its own sub-issue thread: the diagnosis
-    for task T lands on T's sub-issue and T's retry brief reads it back from
-    there. The master stays the campaign-wide channel.
-    """
-    thread = steering_thread_issue(data, capabilities)
-    task_issue = data.get("taskIssue")
-    if not capabilities["subIssueWalk"] or task_issue is None:
-        return thread["number"], None
-    if config["forge"] != "github":
-        return thread["number"], None
-    return thread["number"], {
-        task_id: github_machine_comments(repository, thread["number"])
-    }
-
-
-def steering_thread_issue(
-    data: dict[str, Any], capabilities: dict[str, bool]
-) -> dict[str, str]:
-    """Resolve the one human/machine thread owned by this task.
-
-    Native campaigns use the task's sub-issue. A campaign armed without that
-    capability keeps the historical master-thread projection. Keeping this
-    routing in one helper means receipt reads, receipt writes, and the
-    pre-dispatch steering re-check cannot silently choose different doors.
-    """
-    issue = campaign_issue(data.get("issue"))
-    task_issue = data.get("taskIssue")
-    if not capabilities["subIssueWalk"] or task_issue is None:
-        return issue
-    return campaign_issue(task_issue)
-
-
 def local_actor(value: Any, context: str) -> str:
     """Validate the actor frozen into authority schema v3 at arm time."""
     if (
@@ -4876,11 +3415,6 @@ def authorized_steering_comments(
     seen: set[int] = set()
     for index, candidate in enumerate(comments):
         comment = steering_comment(candidate, f"{context}[{index}]")
-        # Preserve the historical contains-marker exclusion as a second check
-        # behind the writer. A hand-edited receipt record still cannot become
-        # an instruction merely because the transport moved off the forge.
-        if SYSTEM_COMMENT_PREFIX in comment["body"]:
-            continue
         if comment["author"] != allowed_actor:
             continue
         if comment["id"] in seen:
@@ -5110,8 +3644,6 @@ def action_steering_recheck(brief: dict[str, Any]) -> dict[str, Any]:
         comment = steering_comment(value, f"preparedComments[{index}]")
         if comment["author"] != actor:
             fail("preparedComments contains an actor outside local authority")
-        if SYSTEM_COMMENT_PREFIX in comment["body"]:
-            fail("preparedComments contains a system receipt")
         if comment["id"] > source["preparedCursor"]:
             fail("preparedComments contains an ID beyond the prepared cursor")
         expected_url = (
@@ -5206,8 +3738,8 @@ def diagnosis_fallback_note(
 
     Deterministic and never model-authored -- built only from the driver's
     own rejection reason and the gate evidence it was already given -- and
-    itself outcome-first shaped, so it survives being posted in the same
-    comment the rejected diagnosis would have occupied. The rejected prose is
+    itself outcome-first shaped, so it survives being recorded in the same
+    receipt the rejected diagnosis would have occupied. The rejected prose is
     an explicitly marked excerpt, not prose admitted through the grammar.
     """
     note = (
@@ -5228,11 +3760,8 @@ def diagnosis_fallback_note(
     return note
 
 
-def publish_worker_findings(
-    data: dict[str, Any],
-    capabilities: dict[str, bool],
-) -> str | None:
-    """Publish one captured implementation result on its campaign thread."""
+def publish_worker_findings(data: dict[str, Any]) -> str | None:
+    """Record one redacted implementation result in local campaign state."""
     findings = normalized_worker_findings(data.get("workerFindings"))
     if findings is None:
         return None
@@ -5256,58 +3785,13 @@ def publish_worker_findings(
     task_id = required_string(task.get("id"), "task.id")
     if not TASK_ID.fullmatch(task_id):
         fail("task.id is not safe")
-    thread = steering_thread_issue(data, capabilities)
-    marker = worker_findings_marker(
-        campaign,
-        issue["number"],
-        task_id,
-        findings["taskUuid"],
-    )
     public_text, _ = redact_public_text(findings["message"])
     prefix = (
-        f"{marker}\n\n### Worker findings\n\n"
+        "### Worker findings\n\n"
         "_Captured from the implementation worker's final message; "
         "redacted and bounded by tally._\n\n"
     )
-    body = bound_worker_findings_comment(prefix, public_text)
-
-    if config["forge"] == "github":
-        matching = [
-            comment
-            for comment in github_machine_comments(repository, thread["number"])
-            if isinstance(comment.get("body"), str)
-            and comment["body"].splitlines()
-            and comment["body"].splitlines()[0] == marker
-        ]
-        if len(matching) > 1:
-            fail(f"worker findings for agent {findings['taskUuid']} were posted more than once")
-        if matching:
-            existing = matching[0]
-            if existing["body"] != body:
-                fail(
-                    f"worker findings for agent {findings['taskUuid']} disagree with the existing comment"
-                )
-            return required_string(
-                existing.get("html_url", existing.get("url")),
-                "worker findings comment URL",
-            )
-        posted = run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                thread["number"],
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-        return required_string(
-            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
-            "worker findings comment URL",
-        )
-
+    body = bound_worker_findings(prefix, public_text)
     ref = (
         f"{local_state_prefix(campaign, issue['number'])}/findings/"
         f"{task_id}/{findings['taskUuid']}"
@@ -5324,53 +3808,23 @@ def publish_worker_findings(
     }
     _, observed = write_local_blob(config, ref, expected)
     if observed != expected:
-        fail(f"local forge worker findings {ref!r} disagree with this attempt")
+        fail(f"local campaign worker findings {ref!r} disagree with this attempt")
     return f"local://{repository}/{ref}"
 
 
-def post_diagnosis_comment(
-    config: dict[str, Any],
-    repository: str,
-    thread_number: str,
+def record_diagnosis(
+    source: Any,
     campaign: str,
     issue_number: str,
     task_id: str,
     attempt: int,
-    heading: str,
     text: str,
-    attempt_receipts: Any = None,
 ) -> str:
-    """Post one machine receipt, GitHub or the local log, and return its address.
-
-    GitHub reads receipts back by parsing the marker and heading off the
-    first lines of the comment body; the local campaign reads structured fields
-    from its ordered JSONL, so only `text` -- never the marker-prefixed body --
-    is stored. Both the ordinary steering path and the breach path (#386,
-    which posts up to two of these in one action) share this.
-    """
-    if config["forge"] == "github":
-        marker = diagnosis_marker(campaign, issue_number, task_id, attempt)
-        body = f"{marker}\n\n{heading}\n\n{text}"
-        posted = run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                thread_number,
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-        return required_string(
-            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
-            "machine diagnosis comment URL",
-        )
-    if attempt_receipts is None:
-        fail("attemptReceipts is required for a local diagnosis")
+    """Append one structured diagnosis receipt and return its local address."""
+    if source is None:
+        fail("attemptReceipts is required for a diagnosis")
     _, receipt = append_attempt_receipt(
-        attempt_receipts,
+        source,
         campaign,
         issue_number,
         {
@@ -5382,8 +3836,6 @@ def post_diagnosis_comment(
         },
     )
     return receipt["comment"]
-
-
 def diagnosis_rejection_reason(
     diagnosis: str, gate_evidence: Any
 ) -> tuple[str | None, str | None, str | None]:
@@ -5405,10 +3857,7 @@ def validated_diagnosis(diagnosis: str, gate_evidence: Any) -> str:
     Total: returns either the diagnosis unchanged or a deterministic,
     grammar-compliant note naming the one reason it was refused. Both the
     ordinary steering path and #386's breach path run it, so the same bad
-    diagnosis is refused identically on both. A breach branch that returned
-    before this ran was the round-1 F3 hole: unvalidated steward prose went
-    straight into a public forge comment on the single most severe campaign
-    event, holding #385's own guarantee open from inside the same lane.
+    diagnosis is refused identically on both local receipt paths.
     """
     reason, required_id, required_path = diagnosis_rejection_reason(
         diagnosis, gate_evidence
@@ -5440,16 +3889,15 @@ ABORT_REASONS = {
 
 
 def breach_note(diagnosis: str, detail_text: str, reason: str = "tree-delta-breach") -> str:
-    """The posted lane-abort body: a deterministic label plus witnessed evidence.
+    """The recorded lane-abort body: a deterministic label plus witnessed evidence.
 
     #386: an out-of-allowlist delta aborts the lane -- a breach, not a
     gate-fail, because the write already happened and gates are for redoable
     work. The offending paths must be witnessed regardless of what the model
     wrote, so the driver's own tree-delta detail is always appended verbatim
     rather than merely required as a substring the model might paraphrase
-    away. The heading stays `diagnosis_heading`'s ordinary shape -- the forge
-    read-back parses that exact prefix -- so the abort identifies itself
-    through this leading sentence instead of a second heading grammar.
+    away. The abort identifies itself through this leading sentence instead of
+    a second heading grammar.
 
     #424: `reason` selects which leading sentence. Both abort and both are
     priced identically; only one of them is a claim that a write happened, and
@@ -5466,15 +3914,15 @@ def breach_note(diagnosis: str, detail_text: str, reason: str = "tree-delta-brea
 def bounded_breach_note(
     diagnosis: str, detail_text: str, reason: str = "tree-delta-breach"
 ) -> str:
-    """`breach_note` held to the same public bound the ordinary path keeps.
+    """`breach_note` held to the same durable bound the ordinary path keeps.
 
-    The ordinary steering path posts `bound_public_diagnosis(diagnosis)`, so
-    a breach must not post ~2x that just because it concatenates two bounded
+    The ordinary steering path records `bound_public_diagnosis(diagnosis)`, so
+    a breach must not record ~2x that just because it concatenates two bounded
     strings. The squeeze is deliberately asymmetric: the label sentence and
     the witnessed evidence are driver-authored and load-bearing -- the
     offending paths live in the evidence -- so the steward's elastic prose is
     what gives way, rather than truncating the paths off the end of the one
-    comment that exists to name them.
+    receipt that exists to name them.
     """
     composed = breach_note(diagnosis, detail_text, reason)
     overflow = len(composed) - MAX_DIAGNOSIS_CHARS
@@ -5488,7 +3936,6 @@ def bounded_breach_note(
 
 
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
-    brief, capabilities = take_capabilities(brief)
     fields = {
         "campaign",
         "repository",
@@ -5497,13 +3944,10 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         "taskId",
         "attempt",
         "diagnosis",
+        "attemptReceipts",
     }
-    if "taskIssue" in brief:
-        fields.add("taskIssue")
     if "checkpointCapture" in brief:
         fields.add("checkpointCapture")
-    if "attemptReceipts" in brief:
-        fields.add("attemptReceipts")
     if "gateEvidence" in brief:
         fields.add("gateEvidence")
     if "breach" in brief:
@@ -5519,13 +3963,9 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     code_repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(code_repository):
         fail("repository must use owner/name form")
-    # A machine receipt is campaign state, so it is posted where the campaign
-    # thread lives, not where the code is.
-    target = campaign_coordinates(
+    campaign_coordinates(
         data, code_repository, repo_config(data.get("repositoryConfig"))
-    )["issue"]
-    repository = target["repository"]
-    config = target["config"]
+    )
     issue = campaign_issue(data.get("issue"))
     task_id = required_string(data.get("taskId"), "taskId")
     if not TASK_ID.fullmatch(task_id):
@@ -5548,17 +3988,11 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     abort_reason = data.get("abortReason", "tree-delta-breach")
     if abort_reason not in ABORT_REASONS:
         fail("abortReason is not a declared lane-abort reason")
-    thread_number, threads = steering_thread(
-        repository, config, data, capabilities, task_id
-    )
-    existing, _, _, _ = forge_campaign_state(
-        repository,
-        config,
+    existing, _, _, _ = campaign_attempt_state(
+        data.get("attemptReceipts"),
         campaign,
         issue["number"],
         None,
-        threads,
-        data.get("attemptReceipts"),
     )
     task_receipts = [receipt for receipt in existing if receipt["taskId"] == task_id]
 
@@ -5590,9 +4024,9 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         )
         diagnosis, redacted_diagnosis = redact_public_text(diagnosis)
         diagnosis = bound_public_diagnosis(diagnosis)
-        # #385's content contract governs this comment too. Rejection replaces
+        # #385's content contract governs this receipt too. Rejection replaces
         # the steward's prose with the durable fallback note and nothing more:
-        # the breach still aborts, still posts both receipts, and still
+        # the breach still aborts, still records both receipts, and still
         # witnesses its paths, because the label sentence and the evidence
         # below are the node's own and never the model's to lose.
         diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
@@ -5612,17 +4046,13 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         for post_attempt in (1, 2):
             if any(receipt["attempt"] == post_attempt for receipt in task_receipts):
                 continue
-            posted_comment = post_diagnosis_comment(
-                config,
-                repository,
-                thread_number,
+            posted_comment = record_diagnosis(
+                data.get("attemptReceipts"),
                 campaign,
                 issue["number"],
                 task_id,
                 post_attempt,
-                diagnosis_heading(task_id, post_attempt),
                 composed,
-                data.get("attemptReceipts"),
             )
         return {
             "kind": "diagnosis",
@@ -5669,17 +4099,13 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         capture_note,
         MAX_DIAGNOSIS_CHARS,
     )
-    comment = post_diagnosis_comment(
-        config,
-        repository,
-        thread_number,
+    comment = record_diagnosis(
+        data.get("attemptReceipts"),
         campaign,
         issue["number"],
         task_id,
         attempt,
-        diagnosis_heading(task_id, attempt),
         diagnosis,
-        data.get("attemptReceipts"),
     )
     return {
         "kind": "diagnosis",
@@ -5700,7 +4126,6 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     read back from durable campaign state like every other campaign fact; once
     it is spent the caller must treat the next fault as a failed attempt.
     """
-    brief, capabilities = take_capabilities(brief)
     fields = {
         "campaign",
         "repository",
@@ -5709,13 +4134,10 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
         "taskId",
         "stage",
         "detail",
+        "attemptReceipts",
     }
-    if "taskIssue" in brief:
-        fields.add("taskIssue")
     if "checkpointCapture" in brief:
         fields.add("checkpointCapture")
-    if "attemptReceipts" in brief:
-        fields.add("attemptReceipts")
     data = object_exact(brief, seam_fields(brief, fields), "retry brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -5723,11 +4145,9 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     code_repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(code_repository):
         fail("repository must use owner/name form")
-    target = campaign_coordinates(
+    campaign_coordinates(
         data, code_repository, repo_config(data.get("repositoryConfig"))
-    )["issue"]
-    repository = target["repository"]
-    config = target["config"]
+    )
     issue = campaign_issue(data.get("issue"))
     task_id = required_string(data.get("taskId"), "taskId")
     if not TASK_ID.fullmatch(task_id):
@@ -5736,17 +4156,11 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z][a-z0-9:._-]{0,63}", stage):
         fail("stage is not a safe campaign stage name")
     detail = required_text(data.get("detail"), "detail", MAX_RETRY_CHARS)
-    thread_number, threads = steering_thread(
-        repository, config, data, capabilities, task_id
-    )
-    _, existing, _, _ = forge_campaign_state(
-        repository,
-        config,
+    _, existing, _, _ = campaign_attempt_state(
+        data.get("attemptReceipts"),
         campaign,
         issue["number"],
         None,
-        threads,
-        data.get("attemptReceipts"),
     )
     spent = len([receipt for receipt in existing if receipt["taskId"] == task_id])
     if spent >= MAX_MACHINE_RETRIES:
@@ -5777,47 +4191,25 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     if len(reason) > MAX_RETRY_CHARS:
         reason = reason[: MAX_RETRY_CHARS - 3].rstrip() + "..."
     reason = required_text(reason, "retry reason", MAX_RETRY_CHARS)
-    marker = retry_marker(campaign, issue["number"], task_id, attempt)
-    body = f"{marker}\n\n{retry_heading(task_id, attempt)}\n\n{reason}"
-    if config["forge"] == "github":
-        posted = run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                thread_number,
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-        comment = required_string(
-            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
-            "machine retry comment URL",
-        )
-    else:
-        if data.get("attemptReceipts") is None:
-            fail("attemptReceipts is required for a local retry")
-        created, receipt = append_attempt_receipt(
-            data["attemptReceipts"],
-            campaign,
-            issue["number"],
-            {
-                "kind": "retry",
-                "taskId": task_id,
-                "attempt": attempt,
-                "reason": reason,
-                "redaction": PUBLIC_REDACTION,
-            },
-        )
-        comment = receipt["comment"]
+    created, receipt = append_attempt_receipt(
+        data.get("attemptReceipts"),
+        campaign,
+        issue["number"],
+        {
+            "kind": "retry",
+            "taskId": task_id,
+            "attempt": attempt,
+            "reason": reason,
+            "redaction": PUBLIC_REDACTION,
+        },
+    )
+    comment = receipt["comment"]
     return {
         "taskId": task_id,
         "attempt": attempt,
         "comment": comment,
         "exhausted": attempt == MAX_MACHINE_RETRIES,
-        "posted": created if config["forge"] != "github" else True,
+        "posted": created,
         "redacted": redacted,
     }
 
@@ -5828,37 +4220,25 @@ def compact_summary(value: str, maximum: int = 64) -> str:
 
 
 def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
-    capability_brief = brief
-    brief, _ = take_capabilities(brief)
-    forge_native = isinstance(brief.get("worklist"), dict)
-    if forge_native:
-        data = object_exact(
+    data = object_exact(
+        brief,
+        seam_fields(
             brief,
-            FORGE_NATIVE_RECONCILE_FIELDS,
-            "escalate brief",
-        )
-    else:
-        fields = {
-            "campaign",
-            "campaignIdentity",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "worklist",
-            "maxTasks",
-            "maxParallel",
-        }
-        if "attemptReceipts" in brief:
-            fields.add("attemptReceipts")
-        data = object_exact(
-            brief,
-            seam_fields(
-                brief,
-                fields,
-            ),
-            "escalate brief",
-        )
-    reconciliation = action_reconcile(capability_brief)
+            {
+                "campaign",
+                "campaignIdentity",
+                "repository",
+                "repositoryConfig",
+                "issue",
+                "worklist",
+                "maxTasks",
+                "maxParallel",
+                "attemptReceipts",
+            },
+        ),
+        "escalate brief",
+    )
+    reconciliation = action_reconcile(brief)
     if reconciliation["complete"] or not reconciliation["quiescent"]:
         fail("campaign escalation requires an incomplete empty frontier")
     if reconciliation["escalation"] is not None:
@@ -5875,7 +4255,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
     # once more at the publication boundary. A stale quiescent digest is worse
     # than a failed node: the marked escalation would make every later pass
     # believe the campaign had stopped even though work was now dispatchable.
-    refreshed = action_reconcile(capability_brief)
+    refreshed = action_reconcile(brief)
     if refreshed["complete"] or not refreshed["quiescent"]:
         fail(
             "campaign quiescence changed during the pre-post durable refresh; "
@@ -5892,14 +4272,10 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
     reconciliation = refreshed
     campaign = required_string(reconciliation.get("campaign"), "campaign")
     issue = campaign_issue(data.get("issue"))
-    config_value = (
-        reconciliation["config"]["repositoryConfig"]
-        if forge_native
-        else data.get("repositoryConfig")
-    )
-    # Escalation is campaign-wide state: it belongs on the campaign thread.
     target = campaign_coordinates(
-        data, reconciliation["repository"], repo_config(config_value)
+        data,
+        reconciliation["repository"],
+        repo_config(data.get("repositoryConfig")),
     )["issue"]
     repository = target["repository"]
     config = target["config"]
@@ -5909,8 +4285,6 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         if fact["taskId"] in fact["blockedBy"]
     ]
     lines = [
-        escalation_marker(campaign, issue["number"]),
-        "",
         "### Spec-build escalation: frontier quiescent",
         "",
         "The worklist is incomplete and no unblocked task is dispatchable.",
@@ -5948,11 +4322,11 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         )
     body = "\n".join(lines)
     if len(body) > 60_000:
-        fail("machine escalation exceeds the bounded GitHub comment size")
+        fail("machine escalation exceeds 60,000 characters")
     # Quiescence is the campaign's other terminal outcome, and the escalation
-    # is what proves it was reached: every later pass reads that comment back
-    # and stops before this node runs again. So the digest is published first,
-    # exactly as the completion path publishes before it closes the issue. A
+    # is what proves it was reached: every later pass reads that receipt back
+    # and stops before this node runs again. So the digest is recorded first,
+    # exactly as the completion path records its terminal receipt. A
     # summary that failed after the escalation had landed could never be
     # retried; a summary that fails before it means the whole terminal act is
     # retried on the next pass, and the marker makes the retry idempotent.
@@ -5962,40 +4336,19 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         campaign,
         issue["number"],
         campaign_digest(reconciliation, "quiescent"),
-        issue_forge=config["forge"],
     )
-    if config["forge"] == "github":
-        posted = run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                issue["number"],
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-        comment = required_string(
-            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
-            "machine escalation comment URL",
-        )
-    else:
-        if data.get("attemptReceipts") is None:
-            fail("attemptReceipts is required for a local escalation")
-        created, receipt = append_attempt_receipt(
-            data["attemptReceipts"],
-            campaign,
-            issue["number"],
-            {
-                "kind": "escalation",
-                "body": body,
-            },
-        )
-        comment = receipt["comment"]
+    created, receipt = append_attempt_receipt(
+        data.get("attemptReceipts"),
+        campaign,
+        issue["number"],
+        {
+            "kind": "escalation",
+            "body": body,
+        },
+    )
+    comment = receipt["comment"]
     return {
-        "posted": created if config["forge"] != "github" else True,
+        "posted": created,
         "comment": comment,
         "summary": summary,
         "diagnosisCount": len(reconciliation["diagnoses"]),
@@ -6126,8 +4479,8 @@ def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
         fail("repository must use owner/name form")
-    # The dedup key is campaign identity and stays anchored to the code
-    # coordinate; only the durable receipt follows the campaign thread.
+    # The dedup key stays anchored to the code coordinate; the durable
+    # continuation receipt uses the configured local receipt store.
     target = campaign_coordinates(
         data, repository, repo_config(data.get("repositoryConfig"))
     )["issue"]
@@ -6144,24 +4497,19 @@ def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
         next_brief = dict(next_brief)
         next_brief["runId"] = next_run_id
     created, path = write_continuation_event(spec, dedup_key, next_brief)
-    # The events directory is forge-independent, so a GitHub campaign posts no
-    # comment at all. A local-forge campaign keeps its durable blob receipt:
-    # the fixture suite reads continuation facts back from the forge.
-    receipt = None
-    if config["forge"] != "github":
-        ref = f"{local_state_prefix(campaign, issue['number'])}/continuation/{next_run_id}"
-        expected = {
-            "schemaVersion": 1,
-            "kind": "continuation",
-            "campaign": campaign,
-            "issueNumber": issue["number"],
-            "runId": run_id,
-            "dedupKey": dedup_key,
-        }
-        _, observed = write_local_blob(config, ref, expected)
-        if observed != expected:
-            fail(f"local forge continuation {ref!r} disagrees with this pass")
-        receipt = f"local://{target['repository']}/{ref}"
+    ref = f"{local_state_prefix(campaign, issue['number'])}/continuation/{next_run_id}"
+    expected = {
+        "schemaVersion": 1,
+        "kind": "continuation",
+        "campaign": campaign,
+        "issueNumber": issue["number"],
+        "runId": run_id,
+        "dedupKey": dedup_key,
+    }
+    _, observed = write_local_blob(config, ref, expected)
+    if observed != expected:
+        fail(f"local campaign continuation {ref!r} disagrees with this pass")
+    receipt = f"local://{target['repository']}/{ref}"
     return {
         "event": str(path),
         "dedupKey": dedup_key,
@@ -7065,30 +5413,16 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     remote_tip = git(
         checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}"
     ).stdout.strip()
-    # `sourceRevision` is the code-history revision reconciliation witnessed.
-    # For GitHub that is the remote base. For a local campaign it is the
-    # integration tip, which intentionally advances while the remote base does
-    # not. The remote still establishes repository continuity and seeds first
-    # use; the local branch supplies the lane base and the race witness.
-    if config["forge"] == "github":
-        if git(
-            checkout,
-            "merge-base",
-            "--is-ancestor",
-            identity["sourceRevision"],
-            remote_tip,
-            check=False,
-        ).returncode:
-            fail("prepared lane base does not descend from the witnessed worklist revision")
-        base_tip = remote_tip
-    else:
-        base_tip = ensure_integration_branch(
-            config,
-            identity["campaign"],
-            identity["campaignId"],
-            remote_tip,
-            identity["sourceRevision"],
-        )
+    # The remote establishes repository continuity and seeds first use; the
+    # integration branch is the witnessed lane base and may advance locally
+    # while the remote base remains unchanged.
+    base_tip = ensure_integration_branch(
+        config,
+        identity["campaign"],
+        identity["campaignId"],
+        remote_tip,
+        identity["sourceRevision"],
+    )
 
     resumed = worktree_call(
         worktrees.resume, checkout, worktree, expected, required=("baserev",)
@@ -7160,129 +5494,6 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         "branch": branch,
         "publishBranch": publish_branch,
         "worktreePath": str(worktree),
-    }
-
-
-def action_restamp(brief: dict[str, Any]) -> dict[str, Any]:
-    """Create the empty commit that carries a new completion marker.
-
-    The source fact is selected by `merged_github_tasks`, through the ordinary
-    merged-PR validator. This node rechecks the git half of that fact against
-    the prepared lane before it acts. It changes no tree content; ownership,
-    tree-delta, configured gates, publication, rebase, and merge remain the
-    same nodes a substantive implementation traverses.
-    """
-    data = object_exact(brief, {"task", "completion", "workspace"}, "restamp brief")
-    task = data.get("task")
-    if not isinstance(task, dict):
-        fail("restamp task must be an object")
-    task_id = required_string(task.get("id"), "restamp task.id")
-    if not TASK_ID.fullmatch(task_id):
-        fail("restamp task.id is not safe")
-    revision = task_revision(task)
-    if revision is None:
-        fail("restamp task must carry a revision")
-
-    completion = object_exact(
-        data.get("completion"),
-        {"taskId", "pullRequest", "mergeCommit", "revision"},
-        "restamp completion",
-    )
-    if (
-        required_string(completion.get("taskId"), "restamp completion.taskId")
-        != task_id
-    ):
-        fail("restamp completion.taskId does not match task.id")
-    pull_request = required_string(
-        completion.get("pullRequest"), "restamp completion.pullRequest", 2_000
-    )
-    merge_commit = full_git_oid(
-        completion.get("mergeCommit"), "restamp completion.mergeCommit"
-    )
-    source_revision = completion.get("revision")
-    if source_revision is not None:
-        source_revision = required_string(
-            source_revision, "restamp completion.revision"
-        )
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_revision):
-            fail("restamp completion.revision must be a lowercase SHA-256 identity")
-        if source_revision == revision:
-            fail("restamp completion already names the current task revision")
-
-    workspace = object_exact(
-        data.get("workspace"),
-        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
-        "restamp workspace",
-    )
-    if required_string(workspace.get("taskId"), "restamp workspace.taskId") != task_id:
-        fail("restamp workspace.taskId does not match task.id")
-    base_rev = full_git_oid(workspace.get("baseRev"), "restamp workspace.baseRev")
-    branch = required_string(workspace.get("branch"), "restamp workspace.branch")
-    required_string(workspace.get("publishBranch"), "restamp workspace.publishBranch")
-    worktree = Path(
-        required_string(workspace.get("worktreePath"), "restamp workspace.worktreePath")
-    )
-    if not worktree.is_absolute() or not worktree.is_dir():
-        fail("restamp workspace.worktreePath must be an absolute existing directory")
-    git(worktree, "rev-parse", "--git-dir")
-    if git(worktree, "branch", "--show-current").stdout.strip() != branch:
-        fail("restamp worktree is not on its prepared branch")
-    if git(worktree, "status", "--porcelain").stdout:
-        fail("restamp worktree carries uncommitted changes")
-    if git(
-        worktree,
-        "merge-base",
-        "--is-ancestor",
-        merge_commit,
-        base_rev,
-        check=False,
-    ).returncode:
-        fail("restamp completion merge commit is outside the prepared base")
-
-    head = git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
-    if git(
-        worktree, "merge-base", "--is-ancestor", base_rev, head, check=False
-    ).returncode:
-        fail("restamp lane head is not descended from its prepared base")
-    touched = changed_paths_in_history(worktree, base_rev, head, include_deletions=True)
-    if touched:
-        fail("restamp lane history changes repository content")
-    if head == base_rev:
-        message = (
-            "chore(campaign): re-stamp completion\n\n"
-            f"Task: {task_id}\n"
-            f"Task-revision: {revision}\n"
-            f"Source-merge: {merge_commit}\n"
-        )
-        git(
-            worktree,
-            "-c",
-            "user.name=tally spec-build",
-            "-c",
-            "user.email=tally-spec-build@invalid",
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "--no-verify",
-            "--file",
-            "-",
-            input_text=message,
-        )
-        head = git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
-    if git(
-        worktree, "diff", "--quiet", base_rev, head, "--", check=False
-    ).returncode != 0:
-        fail("restamp commit changes repository content")
-    return {
-        "taskId": task_id,
-        "head": head,
-        "revision": revision,
-        "completion": {
-            "taskId": task_id,
-            "pullRequest": pull_request,
-            "mergeCommit": merge_commit,
-            **({"revision": source_revision} if source_revision is not None else {}),
-        },
     }
 
 
@@ -7433,7 +5644,7 @@ def reject_merge_commits(worktree: Path, union_base: str, head: str) -> None:
 
 
 def current_base_revision(worktree: Path, config: dict[str, Any]) -> str:
-    """The base branch tip, taken from the forge rather than from a local ref.
+    """The base branch tip, taken from the remote rather than a local ref.
 
     A lane worktree is a linked worktree of the campaign checkout, so
     `refs/remotes/<remote>/<baseBranch>` lives in the shared common Git
@@ -8051,7 +6262,6 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
                 "domainsRequired",
                 "gates",
                 "steward",
-                "taskIssue",
                 "workerFindings",
             }
         )
@@ -8084,124 +6294,7 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
     return data, config, worktree
 
 
-def github_pull_request(
-    data: dict[str, Any],
-    config: dict[str, Any],
-    worktree: Path,
-    head: str,
-    narration: dict[str, Any],
-) -> str:
-    repository = required_string(data.get("repository"), "repository")
-    workspace = data["workspace"]
-    branch = workspace["publishBranch"]
-    task = data["task"]
-    issue = campaign_issue(data.get("issue"))
-    marker = pull_request_marker(
-        required_string(data.get("campaign"), "campaign"),
-        issue["number"],
-        task["id"],
-        task_revision(task),
-    )
-    candidates = pull_requests_by_head(repository, branch, "all", 2)
-    if len(candidates) > 1:
-        fail(f"multiple pull requests use stable task branch {branch!r}")
-    if candidates:
-        candidate = candidates[0]
-        url = required_string(candidate.get("url"), "existing pull request URL")
-        if candidate.get("headRefName") != branch:
-            fail(f"pull request {url} does not use expected head branch {branch!r}")
-        if candidate.get("baseRefName") != config["baseBranch"]:
-            fail(
-                f"pull request {url} does not target expected base "
-                f"{config['baseBranch']!r}"
-            )
-        if candidate.get("headRefOid") != head:
-            fail(f"pull request {url} does not expose the just-published head")
-        body = candidate.get("body")
-        if not isinstance(body, str) or marker not in body:
-            fail(f"pull request {url} lacks this campaign task's identity marker")
-        state = candidate.get("state")
-        if state == "CLOSED":
-            run(["gh", "pr", "reopen", url, "--repo", repository])
-        elif state != "OPEN":
-            fail(f"pull request {url} is unexpectedly {state!r}")
-        return url
-    campaign = required_string(data.get("campaign"), "campaign")
-    task_ref = f"{campaign}/{task['id']}"
-    # Every `owner/name#<n>` this body writes resolves in the repository it
-    # names, so both the campaign back-reference and the closing keyword are
-    # rendered against the repository the campaign issue actually lives on.
-    # For an unsplit campaign that is the pull request's own repository and
-    # every line below is byte-identical to the pre-seam one.
-    issue_repository = campaign_coordinates(data, repository, config)["issue"][
-        "repository"
-    ]
-    qualifier = "" if issue_repository == repository else issue_repository
-    closes = ""
-    if isinstance(task.get("brief"), dict):
-        task_issue = campaign_issue(task["brief"].get("issue"))
-        # `#<n>` alone resolves inside the pull request's own repository. Where
-        # the task sub-issue lives somewhere else that reference names a
-        # different issue, or none at all, and the merge silently closes
-        # nothing -- the probe recorded on #321 shows exactly that. So a split
-        # campaign emits the full `owner/name#<n>` form, which GitHub does
-        # honour across repositories. No campaign shape that can currently be
-        # split carries task sub-issues, so this branch is staged rather than
-        # exercised; see the seam section of doc/src/flows/campaigns.md.
-        closes = f"\n\nCloses {qualifier}#{task_issue['number']}"
-    # Steward prose leads; the managed marker and the campaign's own identity
-    # lines are appended by this node and are never model-authored. With no
-    # steward the narration is the template and this body is byte-identical to
-    # the pre-steward one.
-    prose = f"{narration['body']}\n\n" if narration["body"] else ""
-    body = (
-        f"{marker}\n"
-        f"{prose}"
-        f"Spec-build campaign progress for {issue_repository}#{issue['number']}.\n\n"
-        f"Task `{task['id']}`: {task['title']}\n\n"
-        f"Task ref: `{task_ref}`\n\n"
-        f"Witnessed gates are the merge criterion. Campaign issue: {issue['url']}\n"
-        f"Head: `{head}`"
-        f"{closes}"
-    )
-    delta = git(
-        worktree,
-        "diff",
-        "--quiet",
-        full_git_oid(workspace["baseRev"], "workspace.baseRev"),
-        head,
-        "--",
-        check=False,
-    )
-    if delta.returncode not in {0, 1}:
-        fail("could not determine whether the published task is a marker-only change")
-    title = narration["subject"]
-    if delta.returncode == 0:
-        title = f"[marker] {title}"
-    created = run(
-        [
-            "gh",
-            "pr",
-            "create",
-            "--repo",
-            repository,
-            "--base",
-            config["baseBranch"],
-            "--head",
-            branch,
-            "--title",
-            title,
-            "--body",
-            body,
-        ],
-        cwd=worktree,
-    )
-    url = created.stdout.strip().splitlines()[-1] if created.stdout.strip() else ""
-    return required_string(url, "created pull request URL")
-
-
 def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
-    brief, capabilities = take_capabilities(brief)
     data, config, worktree = publication_identity(brief, "publish")
     constraints = normalize_constraint_results(data.get("constraints"), "publish constraints")
     enforce_configured_gates(
@@ -8248,7 +6341,7 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
     # The implementation has now passed the same identity, ownership, and gate
     # checks that authorize the stable local snapshot. Retain its report before
     # that snapshot is advanced; an exact marker makes a retry idempotent.
-    publish_worker_findings(data, capabilities)
+    publish_worker_findings(data)
     expected_branch = stable_publish_branch(
         required_string(data.get("campaign"), "campaign"),
         identity,
@@ -8753,191 +6846,7 @@ def merge_local(
     return merge_commit
 
 
-def merge_github(
-    data: dict[str, Any],
-    config: dict[str, Any],
-    integration: dict[str, Any],
-    capabilities: dict[str, bool],
-    method: str,
-    narration: dict[str, Any],
-    trailer: str | None = None,
-) -> str:
-    repository = required_string(data.get("repository"), "repository")
-    url = required_string(integration.get("pullRequest"), "integration.pullRequest")
-    checkout: Path = config["checkout"]
-    git(checkout, "fetch", "--prune", config["remote"])
-    base_ref = f"{config['remote']}/{config['baseBranch']}"
-    branch_ref = f"{config['remote']}/{integration['branch']}"
-    current_base = git(checkout, "rev-parse", f"{base_ref}^{{commit}}").stdout.strip()
-    current_head = git(checkout, "rev-parse", f"{branch_ref}^{{commit}}").stdout.strip()
-    if current_base != integration["baseRev"]:
-        fail("remote base moved after the rebased head was gated")
-    if current_head != integration["head"]:
-        fail("published branch moved after the rebased head was gated")
-    viewed = run(
-        [
-            "gh",
-            "pr",
-            "view",
-            url,
-            "--repo",
-            repository,
-            "--json",
-            "state,mergeCommit,baseRefName,headRefName,headRefOid",
-        ]
-    )
-    state = json.loads(viewed.stdout)
-    if state.get("baseRefName") != config["baseBranch"]:
-        fail(f"pull request {url} changed base branch before merge")
-    if state.get("headRefName") != integration["branch"]:
-        fail(f"pull request {url} changed head branch before merge")
-    if state.get("headRefOid") != integration["head"]:
-        fail(f"pull request {url} changed head commit before merge")
-    if state.get("state") != "MERGED":
-        command = [
-            "gh",
-            "pr",
-            "merge",
-            url,
-            "--repo",
-            repository,
-            f"--{method}",
-            "--match-head-commit",
-            integration["head"],
-        ]
-        if method == "squash":
-            # The squash message is the validated narration, passed explicitly
-            # rather than left to whatever GitHub would assemble from the
-            # working commits. `--body` is sent even when empty so the default
-            # commit-list body is never substituted.
-            command += [
-                "--subject",
-                narration["subject"],
-                "--body",
-                merge_commit_body(narration, trailer),
-            ]
-        run(command)
-        viewed = run(
-            ["gh", "pr", "view", url, "--repo", repository, "--json", "state,mergeCommit"]
-        )
-        state = json.loads(viewed.stdout)
-    if state.get("state") != "MERGED":
-        fail(f"pull request {url} did not reach MERGED")
-    merge_commit = (state.get("mergeCommit") or {}).get("oid")
-    merge_commit = required_string(merge_commit, "pull request merge commit")
-    if method == "squash":
-        full_git_oid(merge_commit, "pull request merge commit")
-    git(checkout, "fetch", "--prune", config["remote"])
-    # A squash mints a commit whose parent is the base tip, so the task head it
-    # replaced is never an ancestor of the base and the pre-squash assertion
-    # would fail on every successful merge. The merge commit itself is the
-    # squash-compatible proof, and it is the same oid the read path already
-    # validates against the witnessed base.
-    contained = merge_commit if method == "squash" else integration["head"]
-    if (
-        git(
-            checkout,
-            "merge-base",
-            "--is-ancestor",
-            contained,
-            f"{config['remote']}/{config['baseBranch']}",
-            check=False,
-        ).returncode
-        != 0
-    ):
-        if method == "squash":
-            fail(
-                f"current remote base does not contain squash merge commit {merge_commit}"
-            )
-        fail("current remote base does not contain the merged task head")
-    if not capabilities["subIssueWalk"]:
-        github_merge_checkbox_repair(data)
-    return merge_commit
-
-
-def github_checkpoint_progress_comment(
-    data: dict[str, Any],
-    reference: str,
-    revision: str,
-    source_sha256: str,
-    repository: str | None = None,
-) -> None:
-    """The degraded checkpoint projection: one comment plus the checkbox.
-
-    Suppressed wherever the sub-issue walk is available, for the same reason
-    the per-merge comment is: the parent renders its own progress.
-    """
-    if repository is None:
-        repository = required_string(data.get("repository"), "repository")
-    campaign = required_string(data.get("campaign"), "campaign")
-    issue = campaign_issue(data.get("issue"))
-    task = data["task"]
-    task_id = task["id"]
-    marker = (
-        "<!-- tally:spec-build:checkpoint:v1 "
-        f"campaign={campaign} issue={issue['number']} checkpoint={task_id} "
-        f"source={source_sha256} revision={revision} passed -->"
-    )
-    comments = github_issue_comments(repository, issue["number"])
-    if not any(
-        marker in comment["body"]
-        for comment in comments
-        if isinstance(comment.get("body"), str)
-    ):
-        body = (
-            f"{marker}\n"
-            f"Automated checkpoint `{task_id}` ({task['title']}) passed at `{revision}`.\n\n"
-            f"Task ref: `{campaign}/{task_id}`\n\n"
-            f"Completion ref: `{reference}`"
-        )
-        run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                issue["number"],
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-    issue_view = github_json(
-        ["api", f"repos/{repository}/issues/{issue['number']}"],
-        "campaign issue",
-    )
-    issue_body = issue_view.get("body") if isinstance(issue_view, dict) else None
-    if not isinstance(issue_body, str):
-        fail("campaign issue has no body while recording checkpoint progress")
-    task_marker = f"{TASK_MARKER_PREFIX}{task_id} -->"
-    updated_lines: list[str] = []
-    found = False
-    for line in issue_body.splitlines(keepends=True):
-        if task_marker in line:
-            if found:
-                fail(f"campaign worklist repeats task marker {task_id!r}")
-            found = True
-            line = re.sub(r"^- \[[ xX]\]", "- [x]", line)
-        updated_lines.append(line)
-    if not found:
-        fail(f"campaign worklist lacks task marker {task_id!r}")
-    updated_body = "".join(updated_lines)
-    if updated_body != issue_body:
-        run_gh_body_file(
-            [
-                "gh",
-                "issue",
-                "edit",
-                issue["number"],
-                "--repo",
-                repository,
-            ],
-            updated_body,
-        )
-
-
 def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
-    brief, capabilities = take_capabilities(brief)
     fields = {
         "campaign",
         "campaignIdentity",
@@ -8964,7 +6873,7 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         fail("repository must use owner/name form")
     issue = campaign_issue(data.get("issue"))
     config = repo_config(data.get("repositoryConfig"))
-    coordinates = campaign_coordinates(data, repository, config)
+    campaign_coordinates(data, repository, config)
     task = object_exact(
         data.get("task"),
         {
@@ -8986,32 +6895,20 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     argv(task.get("argv"), "checkpoint task.argv")
     positive_integer(task.get("runtimeMaxSec"), "checkpoint task.runtimeMaxSec")
     string_list(task.get("dependencies"), "checkpoint task.dependencies")
-    revision = task_revision(task)
     source_value = data.get("source")
-    if isinstance(source_value, dict) and source_value.get("kind") == "github-issue":
-        source = object_exact(
-            source_value, {"kind", "url", "sha256", "revision"}, "source"
+    # `repository` is present exactly when the worklist was read from a spec
+    # repository that is not the code repository.
+    artifact_fields = {"path", "sha256", "revision"}
+    if isinstance(source_value, dict) and "repository" in source_value:
+        artifact_fields.add("repository")
+    source = object_exact(source_value, artifact_fields, "source")
+    required_string(source.get("path"), "source.path")
+    if "repository" in source:
+        source_repository = required_string(
+            source.get("repository"), "source.repository"
         )
-        required_string(source.get("url"), "source.url")
-        if revision is None:
-            fail("issue-backed checkpoint task must carry its admitted revision")
-    else:
-        # `repository` is present exactly when the worklist was read from a
-        # spec repository that is not the code repository. The reconciler
-        # forwards its witness verbatim, so this node has to admit the same
-        # shape the reconciler emits -- refusing it made every checkpoint task
-        # in every split campaign fail permanently.
-        artifact_fields = {"path", "sha256", "revision"}
-        if isinstance(source_value, dict) and "repository" in source_value:
-            artifact_fields.add("repository")
-        source = object_exact(source_value, artifact_fields, "source")
-        required_string(source.get("path"), "source.path")
-        if "repository" in source:
-            source_repository = required_string(
-                source.get("repository"), "source.repository"
-            )
-            if not REPOSITORY.fullmatch(source_repository):
-                fail("source.repository must use owner/name form")
+        if not REPOSITORY.fullmatch(source_repository):
+            fail("source.repository must use owner/name form")
     source_sha256 = required_string(source.get("sha256"), "source.sha256")
     source_revision = required_string(source.get("revision"), "source.revision")
     if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):
@@ -9072,7 +6969,7 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     remote = config["remote"]
     git(checkout, "fetch", "--prune", "--no-tags", remote)
     integration_identity = data.get("campaignIdentity")
-    uses_integration = config["forge"] != "github" and integration_identity is not None
+    uses_integration = integration_identity is not None
     if uses_integration:
         current_base = required_integration_revision(
             config,
@@ -9138,14 +7035,6 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
             f"branch has already advanced to {current_base}: the receipt cannot complete "
             "the task and the base branch is moving faster than this checkpoint runs"
         )
-    if config["forge"] == "github" and not capabilities["subIssueWalk"]:
-        github_checkpoint_progress_comment(
-            data,
-            reference,
-            base_rev,
-            source_sha256,
-            coordinates["issue"]["repository"],
-        )
     result = {"taskId": task_id, "ref": reference, "revision": base_rev}
     if capture is not None:
         result.update(
@@ -9159,59 +7048,7 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def github_merge_checkbox_repair(data: dict[str, Any]) -> None:
-    """Tick this task's worklist checkbox on the master issue.
-
-    The degraded projection only. A campaign whose forge serves the sub-issue
-    walk renders progress from the parent's own `subIssuesSummary`, so tally
-    writes neither this checkbox nor the per-merge progress comment that used
-    to accompany it.
-    """
-    repository = required_string(data.get("repository"), "repository")
-    issue = campaign_issue(data.get("issue"))
-    issue_number = issue["number"]
-    task = data.get("task")
-    if not isinstance(task, dict):
-        fail("task must be an object")
-    task_id = required_string(task.get("id"), "task.id")
-    if not isinstance(task.get("brief"), dict):
-        return
-    issue_view = github_json(
-        ["api", f"repos/{repository}/issues/{issue_number}"],
-        "campaign issue",
-    )
-    issue_body = issue_view.get("body") if isinstance(issue_view, dict) else None
-    if not isinstance(issue_body, str):
-        fail("campaign issue has no body while recording merge progress")
-    task_marker = f"{TASK_MARKER_PREFIX}{task_id} -->"
-    updated_lines: list[str] = []
-    found_line = False
-    for line in issue_body.splitlines(keepends=True):
-        if task_marker in line:
-            if found_line:
-                fail(f"campaign worklist repeats task marker {task_id!r}")
-            found_line = True
-            line = re.sub(r"^- \[[ xX]\]", "- [x]", line)
-        updated_lines.append(line)
-    if not found_line:
-        fail(f"campaign worklist lacks task marker {task_id!r}")
-    updated_body = "".join(updated_lines)
-    if updated_body != issue_body:
-        run_gh_body_file(
-            [
-                "gh",
-                "issue",
-                "edit",
-                issue_number,
-                "--repo",
-                repository,
-            ],
-            updated_body,
-        )
-
-
 def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
-    brief, capabilities = take_capabilities(brief)
     data, config, worktree = publication_identity(brief, "merge")
     integration = object_exact(
         data.get("integration"),
@@ -9260,14 +7097,9 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         fail("integration.taskId does not match workspace.taskId")
     if integration["branch"] != data["workspace"]["publishBranch"]:
         fail("integration.branch does not match workspace.publishBranch")
-    if config["forge"] == "github":
-        merge_commit = merge_github(
-            data, config, integration, capabilities, method, narration, trailer
-        )
-    else:
-        merge_commit = merge_local(
-            data, config, integration, method, narration, trailer
-        )
+    merge_commit = merge_local(
+        data, config, integration, method, narration, trailer
+    )
     return {
         "taskId": task_id,
         "head": head,
@@ -9295,7 +7127,6 @@ def main() -> int:
             "continue",
             "preflight",
             "prep",
-            "restamp",
             "cleanup",
             "ownership",
             "treeDelta",
@@ -9320,7 +7151,6 @@ def main() -> int:
         "continue": action_continue,
         "preflight": action_preflight,
         "prep": action_prep,
-        "restamp": action_restamp,
         "ownership": action_ownership,
         "treeDelta": action_tree_delta,
         "constraint": action_constraint,
