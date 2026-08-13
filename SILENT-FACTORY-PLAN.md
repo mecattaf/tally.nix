@@ -764,13 +764,15 @@ Part 3's chapter 3–5 prose was written against a tree that chapter 2 rewrote:
   that ε2's C-lane deletes. Building the renderer in Python first would be
   writing code that is about to die (D34's own logic) — so the release surface
   is Rust-native from the start (§7.5).
-- The module-declared campaign is discovered by
-  `local_campaign_declaration_from_document` (crates/tally/src/cli/campaign.rs
-  1733–1894) scanning the rendered config for an **enabled `kind:"gh"`
-  producer named `campaign-<name>`** whose `enqueue.brief` carries the
-  worklist. Deleting `mkCampaignProducer` without re-homing that declaration
-  bricks arming — the single most load-bearing fact in the tree, found
-  independently by both design proposers. ε1's `P1` re-homes it first.
+- The module-declared campaign was discovered by
+  `local_campaign_declaration_from_document` scanning the rendered config for
+  an **enabled `kind:"gh"` producer named `campaign-<name>`** whose
+  `enqueue.brief` carries the worklist — the single most load-bearing fact in
+  the tree, found independently by both design proposers. The operator
+  rejected per-campaign host configuration outright, so **D77** (landed
+  out-of-band before ε0, see §7.7) deleted that mechanism: arm is
+  self-contained, campaign policy lives in the worklist's `campaign` section,
+  and ε1's `P1` shrinks to deleting the now-vestigial nix rendering.
 - The `campaignPoll` units (nix/modules/nixos.nix:665–719,
   home-manager.nix:591–647) are the local heartbeat and **survive**; Part 3's
   "delete campaignPoll" prose is wrong.
@@ -785,14 +787,17 @@ Part 3's chapter 3–5 prose was written against a tree that chapter 2 rewrote:
 ## 7.2 The epsilon structure
 
 Three stages, two deploys. One campaign identity: repository
-`mecattaf/tally.nix`, worklist `silent-factory-worklists/epsilon.json`,
-declared as `services.tally.campaigns.epsilon` in the operator's dotfiles.
-The committed content of `epsilon.json` is replaced between stages, only at
-registry quiescence; each stage's exact bytes are pinned by its completion
-receipt hash and recoverable from git history (D73).
+`mecattaf/tally.nix`, worklist `silent-factory-worklists/epsilon.json`. No
+host configuration names the campaign (D77): the worklist's own `campaign`
+section carries the policy, and arm is
+`tally campaign arm mecattaf/tally.nix silent-factory-worklists/epsilon.json`
+run from the checkout. The committed content of `epsilon.json` is replaced
+between stages, only at registry quiescence; each stage's exact bytes are
+pinned by its completion receipt hash and recoverable from git history (D73).
 
 1. **deploy-1** (done 2026-08-13): pin `52eff4db`, gitAi host key removed,
-   quiescence guards on deploy admission and activation.
+   quiescence guards on deploy admission and activation. A follow-up pin
+   bump carrying D77 precedes ε0 arming.
 2. **ε0 — shakedown** (3 tasks + gate, §7.3): the first-ever local-mode
    campaign. Three real, small, disjoint repairs that double as the checklist
    for local arm/steer/correction/completion semantics.
@@ -858,13 +863,13 @@ watch); observe completion/disarm semantics and the terminal operator signal.
 Near-serial and honestly so — `conflictDomains` overlap, not `maxParallel`,
 is the binding constraint. Tasks (anchors verified at `bea5c47d`–`52eff4db`):
 
-- **P1 `campaign-declaration-first-class`** — render campaigns as a
-  first-class section of the config document and repoint the reader
-  (campaign.rs 1733–1894); delete `mkCampaignProducer` and the
-  forge-native-only option set it consumed. The raw-JSON reader survives the
-  Rust deletions; only the nix deletion depends on P1. Seam criterion per
-  F19/F20: module-rendered document fixture → declaration found → graph
-  built. Everything gh-ward depends on P1.
+- **P1 `campaign-nix-surface-retire`** — delete the now-vestigial module
+  campaign rendering that D77 obsoleted: `mkCampaignProducer`,
+  `mkCampaignFlow`, `mkCampaignArgs`, the `services.tally.campaigns` option
+  set with its forge-native-only fields, and the module-layer contract
+  assertions over them. Nothing reads these post-D77; the seam criterion is
+  that arm/resume/poll behavior is byte-identical before and after (the D77
+  test suite is the oracle). Everything gh-ward still runs after P1.
 - **P2 `delete-gh-inbound-core`** — gh_intake.rs (2,105 LOC), gh_decision.rs
   (739), orphan.rs (339), the gh arms of engine/validate/config, build-effect
   and pool-reachability kinds (D57 grep executed: dotfiles AND sodimo-os
@@ -961,12 +966,13 @@ after ε1 merges. Three genuinely disjoint lanes (`maxParallel 3`):
 - **D73** — Worklist authority for all epsilon stages is the single committed
   file `silent-factory-worklists/epsilon.json`; content replaced only at
   registry quiescence; stage bytes pinned by completion-receipt hashes.
-- **D74** — Module gate set for the epsilon campaign: `driver-suite`
-  (`python3 test/spec_build_driver_test.py`), `cargo-tests`
+- **D74** (amended by D77) — Per-lane gate set for the epsilon campaign:
+  `driver-suite` (`python3 test/spec_build_driver_test.py`), `cargo-tests`
   (`nix develop --command cargo test --workspace`), `flake-eval`
-  (`nix flake check --no-build`) — fixed at the declaration activation;
-  final-bar rides the chapter checkpoints instead of the per-lane gate list
-  (it was broken on base at ε0 authoring time, and a command gate's argv is
+  (`nix flake check --no-build`) — declared in the worklist's `campaign`
+  section, so changing gates is a worklist commit, never a deploy; final-bar
+  rides the chapter checkpoints instead of the per-lane gate list (it was
+  broken on base at ε0 authoring time, and a command gate's argv is
   witnessed on the pristine base).
 - **D75** — Panel open questions resolved to defaults:
   `agency_nightly_driver.py` and `campaign_worktrees.py` are grandfathered
@@ -976,3 +982,15 @@ after ε1 merges. Three genuinely disjoint lanes (`maxParallel 3`):
   `maxParallel 3`.
 - **D76** — Codex replaces Claude Opus as both the campaign agent adapter and
   the out-of-band repair worker for all epsilon stages.
+- **D77** — Self-contained arm (operator ruling, 2026-08-13): per-campaign
+  host configuration is forbidden. The worklist document owns campaign
+  policy in an optional closed `campaign` section (name, maxTasks,
+  maxParallel, mergeMethod, runtimes, agent, steward, gates — an armable
+  campaign must declare 1–16 gates); adapter names resolve against the host
+  adapter catalog; the flow and driver default to the packaged assets beside
+  the tally binary; the campaign mutex is the reserved minted
+  `campaign/<owner>/<repo>` pool; the checkout comes from `--checkout`/cwd
+  and is recorded in the registration (authority v4), which resume and poll
+  then read. The config-document declaration scan is deleted. Landed
+  out-of-band by a Codex worker before ε0 armed; the module's campaign
+  rendering became vestigial and P1 deletes it.
