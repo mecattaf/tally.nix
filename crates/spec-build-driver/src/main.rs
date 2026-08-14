@@ -1,8 +1,5 @@
-use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
@@ -13,15 +10,6 @@ mod json;
 mod path;
 mod sha256;
 mod worktrees;
-
-const PY_FALLBACK_ENV: &str = "SPEC_BUILD_PY_FALLBACK";
-const DEFAULT_PY_FALLBACK: &str = match option_env!("SPEC_BUILD_PY_FALLBACK") {
-    Some(path) => path,
-    None => concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../drivers/spec_build_driver.py"
-    ),
-};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Action {
@@ -65,12 +53,6 @@ enum Action {
     Merge,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Handler {
-    Native,
-    PythonFallback,
-}
-
 impl Action {
     const fn as_str(self) -> &'static str {
         match self {
@@ -95,30 +77,6 @@ impl Action {
             Self::Merge => "merge",
         }
     }
-
-    const fn handler(self) -> Handler {
-        match self {
-            Self::SteeringRecheck
-            | Self::Steer
-            | Self::Retry
-            | Self::Escalate
-            | Self::Continue
-            | Self::Preflight
-            | Self::Ownership
-            | Self::TreeDelta
-            | Self::Constraint
-            | Self::Checkpoint
-            | Self::Publish
-            | Self::Merge => Handler::PythonFallback,
-            Self::Worklist
-            | Self::Sweep
-            | Self::Reconcile
-            | Self::Diff
-            | Self::Prep
-            | Self::Cleanup
-            | Self::Rebase => Handler::Native,
-        }
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -131,52 +89,27 @@ struct Cli {
     action: Action,
 }
 
-fn fallback_path(override_path: Option<OsString>) -> OsString {
-    override_path.unwrap_or_else(|| OsString::from(DEFAULT_PY_FALLBACK))
-}
-
-fn fallback_command(path: &OsStr, action: Action) -> Command {
-    let mut command = Command::new(path);
-    command.arg(action.as_str());
-    command
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.action.handler() {
-        Handler::Native => match actions::load_brief()
-            .and_then(|brief| actions::dispatch(cli.action.as_str(), &brief))
-        {
-            Ok(result) => {
-                let written = writeln!(
-                    io::stdout().lock(),
-                    "TALLY_FINAL_MESSAGE={}",
-                    result.stringify()
-                );
-                if let Err(error) = written {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "spec-build-driver: cannot emit final message: {error}"
-                    );
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(error) => {
-                let _ = writeln!(io::stderr().lock(), "spec-build-driver: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Handler::PythonFallback => {
-            let fallback = fallback_path(std::env::var_os(PY_FALLBACK_ENV));
-            let error = fallback_command(&fallback, cli.action).exec();
-            let _write_result = writeln!(
-                io::stderr().lock(),
-                "spec-build-driver: could not exec Python fallback {} for action {}: {error}",
-                Path::new(&fallback).display(),
-                cli.action.as_str()
+    match actions::load_brief().and_then(|brief| actions::dispatch(cli.action.as_str(), &brief)) {
+        Ok(result) => {
+            let written = writeln!(
+                io::stdout().lock(),
+                "TALLY_FINAL_MESSAGE={}",
+                result.stringify()
             );
+            if let Err(error) = written {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "spec-build-driver: cannot emit final message: {error}"
+                );
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "spec-build-driver: {error}");
             ExitCode::FAILURE
         }
     }
@@ -184,11 +117,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
-
     use clap::{CommandFactory, Parser, ValueEnum};
 
-    use super::{fallback_command, fallback_path, Action, Cli, Handler, DEFAULT_PY_FALLBACK};
+    use super::{Action, Cli};
 
     const ACTION_NAMES: [&str; 19] = [
         "worklist",
@@ -223,36 +154,7 @@ mod tests {
                 .action;
             assert_eq!(parsed, *variant);
             assert_eq!(parsed.as_str(), expected_name);
-            let expected_handler = match expected_name {
-                "worklist" | "sweep" | "reconcile" | "diff" | "prep" | "cleanup" | "rebase" => {
-                    Handler::Native
-                }
-                _ => Handler::PythonFallback,
-            };
-            assert_eq!(parsed.handler(), expected_handler);
         }
-    }
-
-    #[test]
-    fn the_worktree_and_pure_fold_actions_are_native() {
-        let native: Vec<_> = Action::value_variants()
-            .iter()
-            .copied()
-            .filter(|action| action.handler() == Handler::Native)
-            .map(Action::as_str)
-            .collect();
-        assert_eq!(
-            native,
-            [
-                "worklist",
-                "sweep",
-                "reconcile",
-                "diff",
-                "prep",
-                "cleanup",
-                "rebase"
-            ]
-        );
     }
 
     #[test]
@@ -266,22 +168,5 @@ mod tests {
         for action in ACTION_NAMES {
             assert!(help.contains(action), "help omitted action {action}");
         }
-    }
-
-    #[test]
-    fn the_environment_override_wins_over_the_compiled_default() {
-        let override_path = OsString::from("/custom/spec-build-driver.py");
-        assert_eq!(fallback_path(Some(override_path.clone())), override_path);
-        assert_eq!(fallback_path(None), OsString::from(DEFAULT_PY_FALLBACK));
-    }
-
-    #[test]
-    fn fallback_receives_only_the_selected_action() {
-        let command = fallback_command(OsStr::new("/driver.py"), Action::TreeDelta);
-        assert_eq!(command.get_program(), OsStr::new("/driver.py"));
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            [OsStr::new("treeDelta")]
-        );
     }
 }

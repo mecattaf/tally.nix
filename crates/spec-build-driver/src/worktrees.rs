@@ -552,11 +552,44 @@ pub(crate) fn read_snapshot(worktree: &Path) -> Result<Option<BTreeMap<String, S
     Ok(Some(snapshot))
 }
 
+pub(crate) fn clear_snapshot(worktree: &Path) -> Result<()> {
+    let path = snapshot_path(worktree)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn change_set_delta(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<(String, &'static str)> {
+    let paths: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let before_hash = before.get(&path);
+            let after_hash = after.get(&path);
+            if before_hash == after_hash {
+                return None;
+            }
+            let kind = match (before_hash, after_hash) {
+                (None, Some(_)) => "appeared",
+                (Some(_), None) => "disappeared",
+                (Some(_), Some(_)) => "changed",
+                (None, None) => unreachable!(),
+            };
+            Some((path, kind))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        add, change_set_fingerprint, read_identity, remove, validate_identity, write_identity,
-        PreparationLock,
+        add, change_set_delta, change_set_fingerprint, read_identity, remove, validate_identity,
+        write_identity, PreparationLock,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -690,5 +723,28 @@ mod tests {
         let second = change_set_fingerprint(&lane).unwrap();
         assert_ne!(first["untracked.txt"], second["untracked.txt"]);
         remove(&repository.checkout, &lane, Some("lane/fingerprint")).unwrap();
+    }
+
+    #[test]
+    fn worktrees_change_set_delta_classifies_each_transition() {
+        let before = BTreeMap::from([
+            ("changed.txt".to_owned(), "old".to_owned()),
+            ("gone.txt".to_owned(), "old".to_owned()),
+            ("same.txt".to_owned(), "same".to_owned()),
+        ]);
+        let after = BTreeMap::from([
+            ("appeared.txt".to_owned(), "new".to_owned()),
+            ("changed.txt".to_owned(), "new".to_owned()),
+            ("same.txt".to_owned(), "same".to_owned()),
+        ]);
+
+        assert_eq!(
+            change_set_delta(&before, &after),
+            vec![
+                ("appeared.txt".to_owned(), "appeared"),
+                ("changed.txt".to_owned(), "changed"),
+                ("gone.txt".to_owned(), "disappeared"),
+            ]
+        );
     }
 }

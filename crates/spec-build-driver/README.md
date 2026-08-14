@@ -1,17 +1,14 @@
 # spec-build-driver
 
-The Rust campaign driver is being ported one action at a time behind the
-existing driver contract: one action argument, a brief named by `TALLY_BRIEF`,
-and one `TALLY_FINAL_MESSAGE=` JSON line on success.
+The Rust campaign driver implements the existing driver contract: one action
+argument, a brief named by `TALLY_BRIEF`, and one `TALLY_FINAL_MESSAGE=` JSON
+line on success.
 
-`worklist`, `sweep`, `reconcile`, `diff`, `prep`, `rebase`, and `cleanup` run
-natively. This includes strict worklist witnessing and campaign-policy
-validation, durable reconciliation and summary folds shared with `tally-core`,
-dead-lane sweeping, diff capture, and linked-worktree mechanics. The remaining
-actions are dispatched to the Python driver while the port proceeds. Set
-`SPEC_BUILD_PY_FALLBACK` to override that driver's executable path. The Nix
-package compiles the packaged Python driver path in as the default, while a
-workspace build defaults to the checked-out `drivers/spec_build_driver.py`.
+All campaign actions run natively. This includes strict worklist witnessing
+and campaign-policy validation, durable reconciliation and summary folds shared
+with `tally-core`, steering and attempt receipts, checkpoint capture,
+publication gates, conflict-domain enforcement, and linked-worktree merge and
+cleanup mechanics.
 
 The flow argument contract is typed in `src/flow_args.rs`. Its derived JSON
 Schema is checked byte-for-byte against the pure-literal `meta.argsSchema` in
