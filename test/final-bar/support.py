@@ -12,7 +12,6 @@ import signal
 import subprocess
 import tempfile
 import time
-import re
 from typing import Any, Callable, Iterator, Sequence
 
 
@@ -188,7 +187,6 @@ class Context:
     n_minus_one_tally_override: Path | None = None
     _tally: Path | None = field(default=None, init=False)
     _driver: Path | None = field(default=None, init=False)
-    _driver_script: Path | None = field(default=None, init=False)
     _presets: dict[str, Any] | None = field(default=None, init=False)
     _core_test_binary: Path | None = field(default=None, init=False)
     _n_minus_one_tally: Path | None = field(default=None, init=False)
@@ -260,30 +258,6 @@ class Context:
                 raise HarnessError(f"packaged spec-build driver is missing: {candidate}")
             self._driver = candidate
         return self._driver
-
-    @property
-    def driver_script(self) -> Path:
-        """The immutable Python payload behind the packaged driver wrapper."""
-        if self._driver_script is not None:
-            return self._driver_script
-        driver = self.driver
-        try:
-            text = driver.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            raise HarnessError(f"cannot inspect packaged driver launcher {driver}: {error}") from error
-        if driver.name.endswith(".py"):
-            candidate = driver
-        else:
-            matches = re.findall(r"(/nix/store/[^\s\"']+/spec_build_driver\.py)", text)
-            if len(matches) != 1:
-                raise HarnessError(
-                    "packaged driver wrapper did not identify exactly one immutable Python payload"
-                )
-            candidate = Path(matches[0])
-        if not candidate.is_file():
-            raise HarnessError(f"packaged driver payload is missing: {candidate}")
-        self._driver_script = candidate
-        return candidate
 
     @property
     def presets(self) -> dict[str, Any]:

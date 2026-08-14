@@ -237,8 +237,8 @@ def campaign_full_pipeline(context: Context) -> None:
         configuration["adapters"][adapter].setdefault("env", {})[
             "FINAL_BAR_PIPELINE_PROOF"
         ] = str(proof)
-    configuration["adapters"]["spec-build-driver"]["env"]["FINAL_BAR_DRIVER_SCRIPT"] = str(
-        context.driver_script
+    configuration["adapters"]["spec-build-driver"]["env"]["FINAL_BAR_DRIVER"] = str(
+        context.driver
     )
     # Keep a fallback copy only so a non-conforming current initial child can
     # continue far enough to illuminate downstream edges. The argv assertion

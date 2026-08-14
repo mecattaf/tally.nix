@@ -738,10 +738,11 @@ fn rust_spec_build_driver() -> PathBuf {
         "Rust spec-build driver is missing at {}; run the workspace tests so Cargo builds its integration target",
         driver.display()
     );
-    assert_ne!(
-        driver,
-        repository_fixture("drivers/spec_build_driver.py"),
-        "the Rust seam must not resolve to the Python fallback"
+    let expected_name = format!("spec-build-driver{}", std::env::consts::EXE_SUFFIX);
+    assert_eq!(
+        driver.file_name().and_then(|name| name.to_str()),
+        Some(expected_name.as_str()),
+        "the Rust seam must resolve to the canonical driver executable"
     );
     driver
 }

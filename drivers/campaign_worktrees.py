@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""One worktree manager for both campaign drivers.
+"""One worktree manager for the grandfathered agency-nightly driver.
 
-`spec_build_driver.py` and `agency_nightly_driver.py` used to carry two
+The retired spec-build driver and `agency_nightly_driver.py` used to carry two
 incompatible implementations of the same job: create a lane, resume the one
 that is already there, prove it belongs to the configured checkout, and clean
 it up. They disagreed about what "already there" means and they recorded lane
@@ -19,6 +19,9 @@ self-consistent enumeration.
 
 Nothing here posts, publishes, or decides policy. Callers translate
 `WorktreeError` into their own driver vocabulary.
+
+Retirement issue: `agency-nightly-rust-port` — port this module and
+`agency_nightly_driver.py` to Rust together.
 """
 
 from __future__ import annotations
