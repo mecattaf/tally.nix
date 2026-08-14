@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::process::{Command as ProcessCommand, Stdio};
 
-use chrono::{DateTime, SecondsFormat};
+use chrono::{DateTime, SecondsFormat, TimeDelta};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,14 +53,19 @@ const LOCAL_ALLOWED_ACTOR: &str = "local";
 const RELEASE_PLAN_SCHEMA_VERSION: u32 = 1;
 const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
 const RELEASE_ARTIFACTS_SCHEMA_VERSION: u32 = 1;
+const RELEASE_PROBE_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const RELEASE_SUMMARY_SCHEMA_VERSION: u32 = 1;
 const MAX_RELEASE_REGISTRATION_BYTES: u64 = 1024 * 1024;
 const MAX_RELEASE_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_RELEASE_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RELEASE_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RELEASE_FORGE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RELEASE_RECORD_FILE: &str = "release-record-v1.json";
 const RELEASE_NOTES_FILE: &str = "release-notes.md";
 const RELEASE_ARTIFACTS_FILE: &str = "release-artifacts-v1.json";
+const RELEASE_PROBE_RECEIPT_FILE: &str = "probe-receipt-v1.json";
+const RELEASE_PROBE_PREFIX: &str = "tally-probe-";
+const RELEASE_PROBE_TTL_DAYS: i64 = 7;
 const COMPLETE_SUMMARY_MARKER_PREFIX: &str = "<!-- tally:campaign-complete:v1 source=";
 
 #[derive(Debug, Clone)]
@@ -483,6 +488,36 @@ struct CampaignReleaseExecutionReceipt {
     skipped_steps: Vec<&'static str>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CampaignReleaseProbeRepository {
+    name_with_owner: String,
+    created_at: DateTime<Utc>,
+    is_fork: bool,
+    is_private: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseProbeReceipt {
+    schema_version: u32,
+    mode: &'static str,
+    status: &'static str,
+    source_repository: String,
+    probe_repository: String,
+    version: String,
+    started_at: String,
+    completed_at: String,
+    expired_repositories_deleted: usize,
+    repository_created: bool,
+    release_complete: bool,
+    teardown_complete: bool,
+    release_record: PathBuf,
+    receipt: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CampaignReleaseArtifactsV1<'a> {
@@ -543,6 +578,7 @@ fn run_campaign_release(args: CampaignReleaseArgs) -> Result<()> {
         code_repository,
         worklist_pattern,
         plan: plan_only,
+        probe,
         gh_program,
         state_dir,
     } = args;
@@ -558,6 +594,18 @@ fn run_campaign_release(args: CampaignReleaseArgs) -> Result<()> {
         outln!("{}", serde_json::to_string(&plan)?);
         outln!();
         outln!("{}", render_campaign_release_human(&plan).trim_end());
+    } else if probe {
+        let config = CampaignReleaseExecutionConfig::resolve(gh_program)?;
+        let registration =
+            read_release_registration(&state_dir, &code_repository, &worklist_pattern)?;
+        if registration.registration_id != plan.registration_id {
+            bail!(
+                "campaign registration changed while preparing the release probe; render the probe again"
+            );
+        }
+        let receipt =
+            execute_campaign_release_probe(&state_dir, &registration.checkout, &plan, &config)?;
+        outln!("{}", serde_json::to_string(&receipt)?);
     } else {
         let config = CampaignReleaseExecutionConfig::resolve(gh_program)?;
         let receipt = execute_campaign_release(&state_dir, &plan, &config)?;
@@ -572,13 +620,21 @@ fn execute_campaign_release(
     config: &CampaignReleaseExecutionConfig,
 ) -> Result<CampaignReleaseExecutionReceipt> {
     let directory = campaign_release_directory(state_dir, &plan.registration_id)?;
-    fs::create_dir_all(&directory).with_context(|| {
+    execute_campaign_release_in_directory(&directory, plan, config)
+}
+
+fn execute_campaign_release_in_directory(
+    directory: &Path,
+    plan: &CampaignReleasePlan,
+    config: &CampaignReleaseExecutionConfig,
+) -> Result<CampaignReleaseExecutionReceipt> {
+    fs::create_dir_all(directory).with_context(|| {
         format!(
             "cannot create campaign release directory {}",
             directory.display()
         )
     })?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).with_context(|| {
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).with_context(|| {
         format!(
             "cannot secure campaign release directory {}",
             directory.display()
@@ -604,7 +660,7 @@ fn execute_campaign_release(
     FileExt::lock_exclusive(&lock)
         .with_context(|| format!("cannot lock campaign release state {}", lock_path.display()))?;
 
-    let execution = execute_campaign_release_locked(&directory, plan, config);
+    let execution = execute_campaign_release_locked(directory, plan, config);
     let unlock = FileExt::unlock(&lock).with_context(|| {
         format!(
             "cannot unlock campaign release state {}",
@@ -693,6 +749,394 @@ fn campaign_release_directory(state_dir: &Path, registration_id: &str) -> Result
     uuid::Uuid::parse_str(registration_id)
         .context("campaign release registration ID is not a UUID")?;
     Ok(state_dir.join("campaigns/releases").join(registration_id))
+}
+
+fn execute_campaign_release_probe(
+    state_dir: &Path,
+    checkout: &Path,
+    plan: &CampaignReleasePlan,
+    config: &CampaignReleaseExecutionConfig,
+) -> Result<CampaignReleaseProbeReceipt> {
+    let started_at = Utc::now();
+    let probe_repository =
+        campaign_release_probe_repository(&plan.repository, started_at, uuid::Uuid::now_v7())?;
+    let (_, probe_name) =
+        validate_campaign_release_probe_repository(&plan.repository, &probe_repository)?;
+    let release_directory = campaign_release_directory(state_dir, &plan.registration_id)?;
+    let probes_directory = release_directory.join("probes");
+    fs::create_dir_all(&probes_directory).with_context(|| {
+        format!(
+            "cannot create campaign release probe directory {}",
+            probes_directory.display()
+        )
+    })?;
+    fs::set_permissions(&probes_directory, fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "cannot secure campaign release probe directory {}",
+                probes_directory.display()
+            )
+        },
+    )?;
+    let directory = probes_directory.join(probe_name);
+    fs::create_dir(&directory).with_context(|| {
+        format!(
+            "cannot create unique campaign release probe directory {}",
+            directory.display()
+        )
+    })?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "cannot secure campaign release probe directory {}",
+            directory.display()
+        )
+    })?;
+
+    let source = directory.join(".source");
+    let receipt_path = directory.join(RELEASE_PROBE_RECEIPT_FILE);
+    let release_record = directory.join(RELEASE_RECORD_FILE);
+    let mut expired_repositories_deleted = 0;
+    let mut repository_created = false;
+    let mut release_complete = false;
+    let mut teardown_complete = false;
+
+    let lifecycle = (|| -> Result<()> {
+        expired_repositories_deleted =
+            sweep_expired_campaign_release_probes(config, &plan.repository, started_at)?;
+        prepare_campaign_release_probe_source(checkout, &plan.revision, &source)?;
+        create_campaign_release_probe_repository(
+            config,
+            &plan.repository,
+            &probe_repository,
+            &source,
+        )?;
+        repository_created = true;
+
+        let mut probe_plan = plan.clone();
+        probe_plan.repository = probe_repository.clone();
+        execute_campaign_release_in_directory(&directory, &probe_plan, config)?;
+        release_complete = true;
+        Ok(())
+    })();
+
+    let source_cleanup = match fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(&source).with_context(|| {
+                format!(
+                    "cannot remove local campaign release probe source {}",
+                    source.display()
+                )
+            })
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "local campaign release probe source {} is not a real directory",
+            source.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot inspect local campaign release probe source {}",
+                source.display()
+            )
+        }),
+    };
+
+    let teardown = if repository_created {
+        delete_campaign_release_probe_repository(
+            config,
+            &plan.repository,
+            &probe_repository,
+            "tearing down the campaign release probe repository",
+        )
+        .map(|()| {
+            teardown_complete = true;
+        })
+    } else {
+        Ok(())
+    };
+
+    let mut failures = Vec::new();
+    if let Err(error) = lifecycle {
+        failures.push(compact_text(&format!("{error:#}")));
+    }
+    if let Err(error) = source_cleanup {
+        failures.push(compact_text(&format!("{error:#}")));
+    }
+    if let Err(error) = teardown {
+        failures.push(compact_text(&format!("{error:#}")));
+    }
+    let passed = failures.is_empty() && repository_created && release_complete && teardown_complete;
+    let failure = (!failures.is_empty()).then(|| failures.join("; "));
+    let receipt = CampaignReleaseProbeReceipt {
+        schema_version: RELEASE_PROBE_RECEIPT_SCHEMA_VERSION,
+        mode: "probe",
+        status: if passed { "passed" } else { "failed" },
+        source_repository: plan.repository.clone(),
+        probe_repository: probe_repository.clone(),
+        version: plan.version.clone(),
+        started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        completed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        expired_repositories_deleted,
+        repository_created,
+        release_complete,
+        teardown_complete,
+        release_record,
+        receipt: receipt_path.clone(),
+        failure,
+    };
+    write_campaign_release_probe_receipt(&directory, &receipt_path, &receipt)?;
+    if !passed {
+        bail!(
+            "campaign release probe {} failed: {}; receipt written to {}",
+            probe_repository,
+            receipt.failure.as_deref().unwrap_or("incomplete lifecycle"),
+            receipt_path.display()
+        );
+    }
+    Ok(receipt)
+}
+
+fn campaign_release_probe_repository(
+    source_repository: &str,
+    now: DateTime<Utc>,
+    nonce: uuid::Uuid,
+) -> Result<String> {
+    let (owner, _) = source_repository
+        .split_once('/')
+        .ok_or_else(|| invalid("campaign release source must use OWNER/REPO form"))?;
+    let nonce = nonce.simple().to_string();
+    let short = &nonce[nonce.len() - 8..];
+    let repository = format!(
+        "{owner}/{RELEASE_PROBE_PREFIX}{}-{short}",
+        now.format("%Y%m%d")
+    );
+    validate_campaign_release_probe_repository(source_repository, &repository)?;
+    Ok(repository)
+}
+
+fn validate_campaign_release_probe_repository<'a>(
+    source_repository: &str,
+    probe_repository: &'a str,
+) -> Result<(&'a str, &'a str)> {
+    let source_owner = source_repository
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .ok_or_else(|| invalid("campaign release source must use OWNER/REPO form"))?;
+    let (owner, name) = probe_repository
+        .split_once('/')
+        .ok_or_else(|| invalid("campaign release probe target must use OWNER/REPO form"))?;
+    let Some(suffix) = name.strip_prefix(RELEASE_PROBE_PREFIX) else {
+        return Err(invalid(format!(
+            "campaign release probe target must use the {RELEASE_PROBE_PREFIX}<date>-<short> prefix"
+        )));
+    };
+    let Some((date, short)) = suffix.split_once('-') else {
+        return Err(invalid(
+            "campaign release probe target must use tally-probe-<date>-<short> form",
+        ));
+    };
+    let valid_date = date.len() == 8
+        && date.bytes().all(|byte| byte.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(date, "%Y%m%d").is_ok();
+    let valid_short = (6..=16).contains(&short.len())
+        && short
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !owner.eq_ignore_ascii_case(source_owner)
+        || !valid_date
+        || !valid_short
+        || short.contains('-')
+    {
+        return Err(invalid(format!(
+            "campaign release probe target must match {source_owner}/{RELEASE_PROBE_PREFIX}<date>-<short>"
+        )));
+    }
+    parse_repository(probe_repository)?;
+    Ok((owner, name))
+}
+
+fn sweep_expired_campaign_release_probes(
+    config: &CampaignReleaseExecutionConfig,
+    source_repository: &str,
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let (owner, _) = source_repository
+        .split_once('/')
+        .ok_or_else(|| invalid("campaign release source must use OWNER/REPO form"))?;
+    let output = run_release_gh_capture(
+        config,
+        &[
+            "repo".into(),
+            "list".into(),
+            owner.into(),
+            "--limit".into(),
+            "1000".into(),
+            "--json".into(),
+            "nameWithOwner,createdAt,isFork,isPrivate".into(),
+        ],
+        "listing campaign release probe repositories for the TTL sweep",
+    )?;
+    let repositories: Vec<CampaignReleaseProbeRepository> =
+        if output.iter().all(|byte| byte.is_ascii_whitespace()) {
+            Vec::new()
+        } else {
+            serde_json::from_slice(&output)
+                .context("campaign release probe repository listing is not valid JSON")?
+        };
+    let cutoff = now - TimeDelta::days(RELEASE_PROBE_TTL_DAYS);
+    let mut deleted = 0;
+    for repository in repositories {
+        let listed_owner = repository
+            .name_with_owner
+            .split_once('/')
+            .map(|(listed_owner, _)| listed_owner);
+        if listed_owner.is_none_or(|listed_owner| !listed_owner.eq_ignore_ascii_case(owner))
+            || !repository
+                .name_with_owner
+                .split_once('/')
+                .is_some_and(|(_, name)| name.starts_with(RELEASE_PROBE_PREFIX))
+            || repository.created_at >= cutoff
+        {
+            continue;
+        }
+        validate_campaign_release_probe_repository(source_repository, &repository.name_with_owner)?;
+        if !repository.is_private || repository.is_fork {
+            bail!(
+                "refusing to expire campaign release probe {} because it is not a private non-fork repository",
+                repository.name_with_owner
+            );
+        }
+        delete_campaign_release_probe_repository(
+            config,
+            source_repository,
+            &repository.name_with_owner,
+            "deleting an expired campaign release probe repository",
+        )?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+fn prepare_campaign_release_probe_source(
+    checkout: &Path,
+    revision: &str,
+    source: &Path,
+) -> Result<()> {
+    run_release_probe_git(
+        &[
+            "init".into(),
+            "--quiet".into(),
+            "--initial-branch=main".into(),
+            source.as_os_str().to_owned(),
+        ],
+        "initializing the local campaign release probe source",
+    )?;
+    run_release_probe_git(
+        &[
+            "-C".into(),
+            source.as_os_str().to_owned(),
+            "fetch".into(),
+            "--quiet".into(),
+            "--no-tags".into(),
+            checkout.as_os_str().to_owned(),
+            revision.into(),
+        ],
+        "copying the integrated revision into the campaign release probe source",
+    )?;
+    run_release_probe_git(
+        &[
+            "-C".into(),
+            source.as_os_str().to_owned(),
+            "reset".into(),
+            "--quiet".into(),
+            "--hard".into(),
+            "FETCH_HEAD".into(),
+        ],
+        "checking out the integrated revision for the campaign release probe",
+    )
+}
+
+fn run_release_probe_git(arguments: &[OsString], context: &str) -> Result<()> {
+    let output = ProcessCommand::new("git")
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("cannot execute git while preparing the campaign release probe")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = if output.stderr.is_empty() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    bail!(
+        "{context} exited {}: {}",
+        output.status,
+        compact_text(&String::from_utf8_lossy(detail))
+    )
+}
+
+fn create_campaign_release_probe_repository(
+    config: &CampaignReleaseExecutionConfig,
+    source_repository: &str,
+    probe_repository: &str,
+    source: &Path,
+) -> Result<()> {
+    validate_campaign_release_probe_repository(source_repository, probe_repository)?;
+    run_release_gh(
+        config,
+        &[
+            "repo".into(),
+            "create".into(),
+            probe_repository.into(),
+            "--private".into(),
+            "--source".into(),
+            source.as_os_str().to_owned(),
+            "--remote".into(),
+            "origin".into(),
+            "--push".into(),
+        ],
+        "creating the private campaign release probe repository",
+    )
+}
+
+fn delete_campaign_release_probe_repository(
+    config: &CampaignReleaseExecutionConfig,
+    source_repository: &str,
+    probe_repository: &str,
+    context: &str,
+) -> Result<()> {
+    validate_campaign_release_probe_repository(source_repository, probe_repository)?;
+    run_release_gh(
+        config,
+        &[
+            "repo".into(),
+            "delete".into(),
+            probe_repository.into(),
+            "--yes".into(),
+        ],
+        context,
+    )
+}
+
+fn write_campaign_release_probe_receipt(
+    directory: &Path,
+    path: &Path,
+    receipt: &CampaignReleaseProbeReceipt,
+) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(receipt)?;
+    bytes.push(b'\n');
+    write_campaign_release_file(directory, path, &bytes, MAX_RELEASE_RECORD_BYTES).with_context(
+        || {
+            format!(
+                "cannot write campaign release probe receipt {}",
+                path.display()
+            )
+        },
+    )
 }
 
 fn release_plan_sha256(plan: &CampaignReleasePlan) -> Result<String> {
@@ -862,6 +1306,14 @@ fn run_release_gh(
     arguments: &[OsString],
     context: &str,
 ) -> Result<()> {
+    run_release_gh_capture(config, arguments, context).map(|_| ())
+}
+
+fn run_release_gh_capture(
+    config: &CampaignReleaseExecutionConfig,
+    arguments: &[OsString],
+    context: &str,
+) -> Result<Vec<u8>> {
     let output = ProcessCommand::new(&config.gh_program)
         .args(arguments)
         .stdin(Stdio::null())
@@ -874,8 +1326,17 @@ fn run_release_gh(
                 config.gh_program.display()
             )
         })?;
+    if output.stdout.len() > MAX_RELEASE_FORGE_OUTPUT_BYTES
+        || output.stderr.len() > MAX_RELEASE_FORGE_OUTPUT_BYTES
+    {
+        bail!(
+            "{context} through {} produced more than {} bytes on one output stream",
+            config.gh_program.display(),
+            MAX_RELEASE_FORGE_OUTPUT_BYTES
+        );
+    }
     if output.status.success() {
-        return Ok(());
+        return Ok(output.stdout);
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -6884,6 +7345,37 @@ mod tests {
             panic!("release command did not parse")
         };
         assert_eq!(args.gh_program, Some(PathBuf::from("/tmp/recording-gh")));
+        assert!(!args.probe);
+
+        let probe = Opts::try_parse_from([
+            "tally",
+            "campaign",
+            "release",
+            "acme/widgets",
+            "specs/release.json",
+            "--probe",
+        ])
+        .unwrap();
+        assert!(matches!(
+            probe.command,
+            Some(Command::Campaign {
+                command: CampaignCommand::Release(CampaignReleaseArgs {
+                    probe: true,
+                    plan: false,
+                    ..
+                })
+            })
+        ));
+        assert!(Opts::try_parse_from([
+            "tally",
+            "campaign",
+            "release",
+            "acme/widgets",
+            "specs/release.json",
+            "--plan",
+            "--probe",
+        ])
+        .is_err());
     }
 
     fn release_execution_plan_for_test() -> CampaignReleasePlan {
@@ -6962,6 +7454,7 @@ mod tests {
             "/../../test/fixtures/shell-command-provider"
         );
         let program = directory.join("recording-gh");
+        let repository_list = directory.join("gh-repository-list.json");
         let mut source = OsString::from(program.as_os_str());
         source.push(".tally-test-script");
         fs::write(
@@ -6973,6 +7466,8 @@ count=0
 if test -f '{count}'; then count=$(cat '{count}'); fi
 count=$((count + 1))
 printf '%s\n' "$count" > '{count}'
+command_name="$1"
+subcommand="${{2:-}}"
 printf '%s' "$1" >> '{calls}'
 shift
 for argument in "$@"; do printf '\t%s' "$argument" >> '{calls}'; done
@@ -6981,10 +7476,14 @@ if test -f '{fail_on}' && test "$(cat '{fail_on}' | tr -d '\n')" = "$count"; the
   printf 'injected failure %s\n' "$count" >&2
   exit 23
 fi
+if test "$command_name" = repo && test "$subcommand" = list && test -f '{repository_list}'; then
+  cat '{repository_list}'
+fi
 "#,
                 calls = calls.display(),
                 count = count.display(),
                 fail_on = fail_on.display(),
+                repository_list = repository_list.display(),
             ),
         )
         .unwrap();
@@ -6993,7 +7492,122 @@ fi
     }
 
     #[test]
-    fn completed_fixture_campaign_renders_a_read_only_release_plan() {
+    fn release_probe_ttl_sweep_deletes_only_expired_private_non_forks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let calls = temporary.path().join("gh-calls");
+        let count = temporary.path().join("gh-count");
+        let fail_on = temporary.path().join("gh-fail-on");
+        fs::write(
+            temporary.path().join("gh-repository-list.json"),
+            serde_json::to_vec(&json!([{
+                "nameWithOwner": "acme/tally-probe-20260801-expired1",
+                "createdAt": "2026-08-01T00:00:00Z",
+                "isFork": false,
+                "isPrivate": true
+            }, {
+                "nameWithOwner": "acme/tally-probe-20260812-current1",
+                "createdAt": "2026-08-12T00:00:00Z",
+                "isFork": false,
+                "isPrivate": true
+            }, {
+                "nameWithOwner": "acme/product-repository",
+                "createdAt": "2020-01-01T00:00:00Z",
+                "isFork": false,
+                "isPrivate": true
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let shim = release_recording_gh(temporary.path(), &calls, &count, &fail_on);
+        let config = CampaignReleaseExecutionConfig::resolve(Some(shim)).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            sweep_expired_campaign_release_probes(&config, "acme/widgets", now).unwrap(),
+            1
+        );
+        let recorded = fs::read_to_string(calls).unwrap();
+        let calls = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "{recorded}");
+        assert!(calls[0].starts_with("repo\tlist\tacme\t"));
+        assert_eq!(
+            calls[1],
+            "repo\tdelete\tacme/tally-probe-20260801-expired1\t--yes"
+        );
+
+        assert!(
+            validate_campaign_release_probe_repository("acme/widgets", "acme/widgets").is_err()
+        );
+        assert!(validate_campaign_release_probe_repository(
+            "acme/widgets",
+            "other/tally-probe-20260814-abcdef12"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn failed_release_probe_is_torn_down_and_writes_a_failure_receipt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("repository");
+        let state_dir = temporary.path().join("state");
+        fs::create_dir_all(&checkout).unwrap();
+        release_fixture_git(&checkout, &["init", "-b", "main"]);
+        release_fixture_git(&checkout, &["config", "user.name", "Fixture"]);
+        release_fixture_git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(checkout.join("probe.txt"), "probe\n").unwrap();
+        release_fixture_git(&checkout, &["add", "probe.txt"]);
+        release_fixture_git(&checkout, &["commit", "-m", "test: seed release probe"]);
+
+        let calls = temporary.path().join("gh-calls");
+        let count = temporary.path().join("gh-count");
+        let fail_on = temporary.path().join("gh-fail-on");
+        fs::write(&fail_on, "4\n").unwrap();
+        let shim = release_recording_gh(temporary.path(), &calls, &count, &fail_on);
+        let config = CampaignReleaseExecutionConfig::resolve(Some(shim)).unwrap();
+        let mut plan = release_execution_plan_for_test();
+        plan.revision = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
+
+        let error = execute_campaign_release_probe(&state_dir, &checkout, &plan, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("receipt written to"), "{error}");
+        let recorded = fs::read_to_string(calls).unwrap();
+        let calls = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 5, "{recorded}");
+        assert!(calls[3].starts_with("release\tcreate\t"), "{recorded}");
+        assert!(calls[4].starts_with("repo\tdelete\t"), "{recorded}");
+
+        let probes = campaign_release_directory(&state_dir, &plan.registration_id)
+            .unwrap()
+            .join("probes");
+        let probe_directories = fs::read_dir(probes)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(probe_directories.len(), 1);
+        let probe_directory = &probe_directories[0];
+        assert!(!probe_directory.join(".source").exists());
+        let receipt: Value = serde_json::from_slice(
+            &fs::read(probe_directory.join(RELEASE_PROBE_RECEIPT_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["repositoryCreated"], true);
+        assert_eq!(receipt["releaseComplete"], false);
+        assert_eq!(receipt["teardownComplete"], true);
+        assert!(receipt["failure"]
+            .as_str()
+            .unwrap()
+            .contains("injected failure 4"));
+    }
+
+    #[test]
+    fn completed_fixture_campaign_renders_a_plan_and_probes_the_full_release_lifecycle() {
         let temporary = tempfile::tempdir().unwrap();
         let checkout = temporary.path().join("repository");
         let state_dir = temporary.path().join("state");
@@ -7250,6 +7864,78 @@ fi
                 command: CampaignCommand::Release(CampaignReleaseArgs { plan: true, .. })
             })
         ));
+
+        let calls = temporary.path().join("probe-gh-calls");
+        let count = temporary.path().join("probe-gh-count");
+        let fail_on = temporary.path().join("probe-gh-fail-on");
+        let shim = release_recording_gh(temporary.path(), &calls, &count, &fail_on);
+        let config = CampaignReleaseExecutionConfig::resolve(Some(shim)).unwrap();
+        let receipt = execute_campaign_release_probe(&state_dir, &checkout, &plan, &config)
+            .expect("the shim-forge probe must complete");
+
+        assert_eq!(receipt.status, "passed");
+        assert_eq!(receipt.source_repository, repository);
+        assert_eq!(receipt.expired_repositories_deleted, 0);
+        assert!(receipt.repository_created);
+        assert!(receipt.release_complete);
+        assert!(receipt.teardown_complete);
+        assert!(receipt.receipt.is_file());
+        assert!(receipt.release_record.is_file());
+        assert!(!receipt.receipt.parent().unwrap().join(".source").exists());
+        assert!(
+            !campaign_release_directory(&state_dir, registration_id)
+                .unwrap()
+                .join(RELEASE_RECORD_FILE)
+                .exists(),
+            "a probe must not consume the real release's idempotency record"
+        );
+        validate_campaign_release_probe_repository(repository, &receipt.probe_repository).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(&receipt.receipt).unwrap()).unwrap();
+        assert_eq!(persisted["status"], "passed");
+        assert_eq!(persisted["probeRepository"], receipt.probe_repository);
+
+        let recorded = fs::read_to_string(&calls).unwrap();
+        let calls = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 6, "{recorded}");
+        assert_eq!(
+            calls[0],
+            "repo\tlist\tacme\t--limit\t1000\t--json\tnameWithOwner,createdAt,isFork,isPrivate"
+        );
+        assert!(
+            calls[1].starts_with(&format!(
+                "repo\tcreate\t{}\t--private\t--source\t",
+                receipt.probe_repository
+            )),
+            "{recorded}"
+        );
+        assert!(calls[1].ends_with("\t--remote\torigin\t--push"));
+        assert!(!calls[1].contains("--fork") && !calls[1].contains("--template"));
+        assert!(
+            calls[2].starts_with(&format!(
+                "api\t--method\tPOST\trepos/{}/git/refs",
+                receipt.probe_repository
+            )),
+            "{recorded}"
+        );
+        assert!(
+            calls[3].contains(&format!("\t--repo\t{}", receipt.probe_repository)),
+            "{recorded}"
+        );
+        assert!(
+            calls[4].contains(&format!("\t--repo\t{}", receipt.probe_repository)),
+            "{recorded}"
+        );
+        assert_eq!(
+            calls[5],
+            format!("repo\tdelete\t{}\t--yes", receipt.probe_repository)
+        );
+        assert!(
+            calls[2..5]
+                .iter()
+                .all(|call| !call.contains("view") && !call.contains("GET")),
+            "probe execution must not read state back from the disposable repository: {recorded}"
+        );
     }
 
     fn release_fixture_git(checkout: &Path, arguments: &[&str]) -> String {

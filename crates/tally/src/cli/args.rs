@@ -243,9 +243,12 @@ pub(super) struct CampaignReleaseArgs {
     #[arg(value_name = "WORKLIST")]
     pub(super) worklist_pattern: String,
     /// Render the complete release without contacting or changing a forge.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "probe")]
     pub(super) plan: bool,
-    /// `gh`-compatible forge program used by execute mode. Defaults to `gh` on PATH.
+    /// Exercise the release against a private disposable `tally-probe-*` repository.
+    #[arg(long, conflicts_with = "plan")]
+    pub(super) probe: bool,
+    /// `gh`-compatible forge program used by execute and probe modes. Defaults to `gh` on PATH.
     #[arg(long, value_name = "PATH")]
     pub(super) gh_program: Option<PathBuf>,
     /// Durable registration and attempt-receipt root.
