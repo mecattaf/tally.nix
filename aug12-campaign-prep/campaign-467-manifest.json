@@ -1,0 +1,169 @@
+{
+  "schemaVersion": 1,
+  "name": "flow-render-467",
+  "repository": {
+    "checkout": "/home/tom/mecattaf/tally.nix",
+    "baseBranch": "main",
+    "remote": "origin",
+    "forge": "github"
+  },
+  "maxTasks": 4,
+  "maxParallel": 1,
+  "driverRuntimeMaxSec": 900,
+  "runtimeMaxSec": 86400,
+  "pool": "campaign",
+  "mergeMethod": "squash",
+  "gitAiBinding": "off",
+  "gitAiAwaitSec": 60,
+  "agent": {
+    "adapter": "codex",
+    "argv": [
+      "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set."
+    ],
+    "priority": "low",
+    "runtimeMaxSec": 7200,
+    "approvalPolicy": "never",
+    "sandboxPolicy": "danger-full-access",
+    "diagnosisSandboxPolicy": "read-only",
+    "model": null
+  },
+  "steward": null,
+  "gates": [
+    {
+      "kind": "forbidPaths",
+      "id": "no-build-artifacts",
+      "forbidPaths": [
+        "*.db",
+        "*.db-wal",
+        "*.db-shm",
+        "*.sqlite*",
+        "result",
+        "result-*",
+        "*.rs.bk",
+        "*.profraw",
+        ".github/workflows/**"
+      ],
+      "runtimeMaxSec": 900
+    },
+    {
+      "kind": "command",
+      "id": "fmt",
+      "preflightArgv": [
+        "nix",
+        "develop",
+        "--command",
+        "sh",
+        "-euc",
+        "command -v rustfmt >/dev/null; printf '' | rustfmt --emit stdout >/dev/null"
+      ],
+      "argv": [
+        "nix",
+        "develop",
+        "--command",
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "runtimeMaxSec": 600
+    },
+    {
+      "kind": "command",
+      "id": "no-stubs",
+      "preflightArgv": [
+        "nix",
+        "develop",
+        "--command",
+        "sh",
+        "-euc",
+        "command -v grep >/dev/null; test -d crates"
+      ],
+      "argv": [
+        "nix",
+        "develop",
+        "--command",
+        "sh",
+        "-euc",
+        "! grep -rn 'todo!\\|unimplemented!\\|TODO' crates/"
+      ],
+      "runtimeMaxSec": 300
+    },
+    {
+      "kind": "command",
+      "id": "deny",
+      "preflightArgv": [
+        "nix",
+        "develop",
+        "--command",
+        "sh",
+        "-euc",
+        "command -v cargo >/dev/null; test -x test/cargo-deny.sh"
+      ],
+      "argv": [
+        "nix",
+        "develop",
+        "--command",
+        "test/cargo-deny.sh"
+      ],
+      "runtimeMaxSec": 900
+    },
+    {
+      "kind": "command",
+      "id": "tests",
+      "preflightArgv": [
+        "nix",
+        "develop",
+        "--command",
+        "sh",
+        "-euc",
+        "command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"
+      ],
+      "argv": [
+        "env",
+        "-u",
+        "TALLY_TEST_REMOTE_HOST",
+        "nix",
+        "develop",
+        "--command",
+        "cargo",
+        "test",
+        "--workspace"
+      ],
+      "runtimeMaxSec": 3600
+    },
+    {
+      "kind": "command",
+      "id": "clippy",
+      "preflightArgv": [
+        "nix",
+        "develop",
+        "--command",
+        "sh",
+        "-euc",
+        "command -v cargo-clippy >/dev/null || command -v clippy-driver >/dev/null"
+      ],
+      "argv": [
+        "nix",
+        "develop",
+        "--command",
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "runtimeMaxSec": 1800
+    }
+  ],
+  "tasks": [
+    {
+      "id": "flow-render",
+      "kind": "implementation",
+      "issue": 467,
+      "dependencies": []
+    }
+  ]
+}

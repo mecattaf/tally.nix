@@ -1,0 +1,150 @@
+# READY DIFF — Chapter-1 module-declared campaign (STEP C artifact)
+# Written 2026-08-11 late evening by the overnight steward. NOT DEPLOYED.
+# Target file: ~/mecattaf/dotfiles/home/tally.nix (inside `services.tally = { … }`).
+# Apply with: cd ~/mecattaf/dotfiles && git apply <this file after stripping '#' header lines>
+# or paste the hunk by hand at the anchor.
+#
+# Two known seams, both expected and neither a reason to edit this diff:
+#
+# 1. forge:"local" is not yet renderable by the module: renderCampaignRepositories
+#    (tally.nix nix/modules/common.nix:3619) hardcodes `forge = "github"` for every
+#    declared repository. The Chapter-2 authority work (plan tasks 2.1/2.9) is what
+#    makes a module-declared local campaign real; until then this declaration
+#    documents intent and the pool/gate shape. Per plan impedance 6, every pre-v3
+#    local campaign also needs `--allow-test-local-forge` at arm time.
+#
+# 2. No pools entry is needed: mkCampaignConfig's mutexPools fold
+#    (nix/modules/common.nix:3843-3865) installs `campaign-ch1` as a capacity-1
+#    co-residency mutex automatically from `pool.name`, alongside — not replacing —
+#    the ad-hoc `campaign` mutex. This is the additive dedicated-pool shape the
+#    Aug 12 handoff's path (c) described; it also means ch1 can later run
+#    concurrently with an ad-hoc forge-native campaign without touching the
+#    `campaign` pool's invariants.
+#
+# `enable = false` is deliberate: flipping it to true (and deploying) is the
+# operator's morning decision, sequenced after tonight's forge-native #527 run
+# closes out. maxTasks 6 = ch1.json's five implementation tasks + chapter-gate
+# checkpoint; maxParallel 2 per the plan; the ch1 worklist declares
+# conflictDomains on every implementation task, satisfying the maxParallel > 1
+# requirement. Gates are the six-gate ladder proven by #472 and re-used by #527,
+# in cheap-fails-first order; the chapter's own full-workspace gate
+# (test/fleet-gate.sh, 7200s) is the worklist's checkpoint task, not a campaign
+# gate, so it runs once at chapter end rather than per task.
+#
+--- a/home/tally.nix
++++ b/home/tally.nix
+@@ -134,6 +134,120 @@
+     # All jobs execute locally on coordinator; no daemonless SSH executor is
+     # part of the active topology.
+     executors = { };
++
++    # Silent-factory Chapter 1 (SILENT-FACTORY-PLAN.md Part 3, Chapter 1;
++    # worklist authority = silent-factory-worklists/ch1.json at origin/main,
++    # committed as 84786f4). Declared per D49 as a module-declared local
++    # campaign; see the seam notes in aug12-campaign-prep/ch1-module-declaration.diff
++    # for why forge:"local" does not render on the current pin.
++    campaigns.silent-factory-ch1 = {
++      enable = false; # morning decision: flip and deploy deliberately
++      repositories."mecattaf/tally.nix" = {
++        checkout = "/home/tom/mecattaf/tally.nix";
++        # baseBranch "main" and remote "origin" are the module defaults.
++      };
++      label = "tally-campaign";
++      # Own login, never a third party's (assign-tally freeze ritual).
++      mention = "@mecattaf build";
++      allowSelfTriggered = true;
++      worklist = "silent-factory-worklists/ch1.json";
++      maxTasks = 6;
++      maxParallel = 2;
++      agent = "codex";
++      agentApprovalPolicy = "never";
++      agentSandboxPolicy = "danger-full-access";
++      agentDiagnosisSandboxPolicy = "read-only";
++      agentRuntimeMaxSec = 7200;
++      driverRuntimeMaxSec = 900;
++      mergeMethod = "squash";
++      gitAiBinding = "off";
++      # Dedicated mutex; the mutexPools fold installs it additively. The
++      # ad-hoc `campaign` pool and its co-residency predicate are untouched.
++      pool.name = "campaign-ch1";
++      gates = [
++        {
++          kind = "forbidPaths";
++          id = "no-build-artifacts";
++          forbidPaths = [
++            "*.db"
++            "*.db-wal"
++            "*.db-shm"
++            "*.sqlite*"
++            "result"
++            "result-*"
++            "*.rs.bk"
++            "*.profraw"
++            ".github/workflows/**"
++          ];
++          runtimeMaxSec = 900;
++        }
++        {
++          kind = "command";
++          id = "fmt";
++          preflightArgv = [
++            "nix" "develop" "--command" "sh" "-euc"
++            "command -v rustfmt >/dev/null; printf '' | rustfmt --emit stdout >/dev/null"
++          ];
++          argv = [ "nix" "develop" "--command" "cargo" "fmt" "--all" "--check" ];
++          runtimeMaxSec = 600;
++        }
++        {
++          kind = "command";
++          id = "no-stubs";
++          preflightArgv = [
++            "nix" "develop" "--command" "sh" "-euc"
++            "command -v grep >/dev/null; test -d crates"
++          ];
++          argv = [
++            "nix" "develop" "--command" "sh" "-euc"
++            "! grep -rn 'todo!\\|unimplemented!\\|TODO' crates/"
++          ];
++          runtimeMaxSec = 300;
++        }
++        {
++          kind = "command";
++          id = "deny";
++          preflightArgv = [
++            "nix" "develop" "--command" "sh" "-euc"
++            "command -v cargo >/dev/null; test -x test/cargo-deny.sh"
++          ];
++          argv = [ "nix" "develop" "--command" "test/cargo-deny.sh" ];
++          runtimeMaxSec = 900;
++        }
++        {
++          kind = "command";
++          id = "tests";
++          preflightArgv = [
++            "nix" "develop" "--command" "sh" "-euc"
++            "command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"
++          ];
++          argv = [
++            "env" "-u" "TALLY_TEST_REMOTE_HOST"
++            "nix" "develop" "--command" "cargo" "test" "--workspace"
++          ];
++          runtimeMaxSec = 3600;
++        }
++        {
++          kind = "command";
++          id = "clippy";
++          preflightArgv = [
++            "nix" "develop" "--command" "sh" "-euc"
++            "command -v cargo-clippy >/dev/null || command -v clippy-driver >/dev/null"
++          ];
++          argv = [
++            "nix" "develop" "--command" "cargo" "clippy"
++            "--workspace" "--all-targets" "--all-features" "--" "-D" "warnings"
++          ];
++          runtimeMaxSec = 1800;
++        }
++      ];
++    };
+
+     adapters = lib.optionalAttrs isCoordinator {
+       ocr-driver = inputs.tally.lib.adapters.mkAdapter {

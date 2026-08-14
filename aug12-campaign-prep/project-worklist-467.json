@@ -1,0 +1,174 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "schemaVersion": 1,
+    "name": "flow-render-467",
+    "repository": {
+      "checkout": "/home/tom/mecattaf/tally.nix",
+      "baseBranch": "main",
+      "remote": "origin",
+      "forge": "github"
+    },
+    "maxTasks": 4,
+    "maxParallel": 1,
+    "driverRuntimeMaxSec": 900,
+    "runtimeMaxSec": 86400,
+    "pool": "campaign",
+    "mergeMethod": "squash",
+    "gitAiBinding": "off",
+    "gitAiAwaitSec": 60,
+    "agent": {
+      "adapter": "codex",
+      "argv": [
+        "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set."
+      ],
+      "priority": "low",
+      "runtimeMaxSec": 7200,
+      "approvalPolicy": "never",
+      "sandboxPolicy": "danger-full-access",
+      "diagnosisSandboxPolicy": "read-only",
+      "model": null
+    },
+    "steward": null,
+    "gates": [
+      {
+        "kind": "forbidPaths",
+        "id": "no-build-artifacts",
+        "forbidPaths": [
+          "*.db",
+          "*.db-wal",
+          "*.db-shm",
+          "*.sqlite*",
+          "result",
+          "result-*",
+          "*.rs.bk",
+          "*.profraw",
+          ".github/workflows/**"
+        ],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "fmt",
+        "preflightArgv": [
+          "nix",
+          "develop",
+          "--command",
+          "sh",
+          "-euc",
+          "command -v rustfmt >/dev/null; printf '' | rustfmt --emit stdout >/dev/null"
+        ],
+        "argv": [
+          "nix",
+          "develop",
+          "--command",
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "runtimeMaxSec": 600
+      },
+      {
+        "kind": "command",
+        "id": "no-stubs",
+        "preflightArgv": [
+          "nix",
+          "develop",
+          "--command",
+          "sh",
+          "-euc",
+          "command -v grep >/dev/null; test -d crates"
+        ],
+        "argv": [
+          "nix",
+          "develop",
+          "--command",
+          "sh",
+          "-euc",
+          "! grep -rn 'todo!\\|unimplemented!\\|TODO' crates/"
+        ],
+        "runtimeMaxSec": 300
+      },
+      {
+        "kind": "command",
+        "id": "deny",
+        "preflightArgv": [
+          "nix",
+          "develop",
+          "--command",
+          "sh",
+          "-euc",
+          "command -v cargo >/dev/null; test -x test/cargo-deny.sh"
+        ],
+        "argv": [
+          "nix",
+          "develop",
+          "--command",
+          "test/cargo-deny.sh"
+        ],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "tests",
+        "preflightArgv": [
+          "nix",
+          "develop",
+          "--command",
+          "sh",
+          "-euc",
+          "command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"
+        ],
+        "argv": [
+          "env",
+          "-u",
+          "TALLY_TEST_REMOTE_HOST",
+          "nix",
+          "develop",
+          "--command",
+          "cargo",
+          "test",
+          "--workspace"
+        ],
+        "runtimeMaxSec": 3600
+      },
+      {
+        "kind": "command",
+        "id": "clippy",
+        "preflightArgv": [
+          "nix",
+          "develop",
+          "--command",
+          "sh",
+          "-euc",
+          "command -v cargo-clippy >/dev/null || command -v clippy-driver >/dev/null"
+        ],
+        "argv": [
+          "nix",
+          "develop",
+          "--command",
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--all-features",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "runtimeMaxSec": 1800
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "flow-render",
+      "kind": "implementation",
+      "issue": 467,
+      "dependencies": [],
+      "title": "flow: tally flow render — static mermaid extraction from a checked script",
+      "body": "## Goal\n\nImplement `tally flow render <script>`: conservative static extraction of a checked flow's node graph as mermaid, without executing the script. The complete behavioral spec is the archived original issue body below; it is the authority for this task and none of it has been implemented yet.\n\n## Tree state (verified 2026-08-11 evening, per the self-hosting rule)\n\n- At `main` = 84786f4 and in the installed pin (`fxn0jyc…-tally-0.1.0`): `tally flow` has no `render` subcommand, and no source file in `crates/` mentions mermaid. Nothing described below is already done; there is no partial implementation to collide with.\n- `examples/flows/` holds the shipped JS flow scripts (`academic-ocr.js`, `agency-nightly.js`, `domain-failure.js`, `fleet-deploy.js`, `monthly-review.js`, `pooled-review.js`, `spec-build.js`, `worklist-fanout.js`). The Python drivers were relocated to `drivers/`; \"renders all shipped examples/flows entries\" in the acceptance below means those `.js` flow scripts.\n- SILENT-FACTORY-PLAN.md ruling D53 puts all documentation work out of this pass's scope: the original issue's \"doc/agent/flows.md should show one rendered example\" line is optional follow-up, not part of this task's acceptance.\n\n## Self-hosting notice\n\nThe workload is tally itself. Never run `nixos-rebuild`, `home-manager switch`, or restart any `tally-*` unit — the daemon executing this campaign is the one grading you. Never read or write `~/.local/state/tally`. Merged work reaches the running system at a later deliberate deploy, never during this run.\n\n## Original issue body (archived 2026-08-11 before adoption; the spec)\n\n### Summary\n\nAdd `tally flow render <script>`: static extraction of a checked flow's node graph as mermaid, without executing the script. Closes the design-doc round trip: mission planning produces a flow diagram, the flow is the frozen plan, and render regenerates the diagram from the artifact — so plan and program cannot drift silently.\n\n### Motivation\n\nThe planning style requires a diagram at design time (the brief format carries one). Today the diagram is hand-drawn and rots the moment the script changes. PocketFlow demonstrates the value at the far pole: action-labeled successor tables make its graphs trivially statically drawable. Tally's dialect is bounded JS — more expressive, not fully statically drawable — but the checker already parses and normalizes the source; a conservative extraction over that same AST covers the real authoring patterns (the shipped examples are all straight-line, awaited-dependency, or bounded-loop shapes).\n\n### Suggested behavior (conservative by construction)\n\n1. Nodes: every node-producing call site (`job`, `sh`, `drv`, and the sugars), labeled with literal `key` when present, else call-site line; pools annotated when literal.\n2. Edges: data/await dependencies derivable from literal bindings (`const a = await sh(...)` feeding a later spec) as solid edges; control ambiguity (dynamic keys, args-driven fanout, settle-routing) rendered as dashed edges from a decision marker — never guessed.\n3. Loops over `args` render as a single node with a fanout badge (`×args.inputs`), consistent with iterationCap semantics.\n4. Output: mermaid `flowchart` to stdout; `--check`-level exit codes; never evaluates the script (same static pass family as `tally flow check`).\n5. Non-goal: completeness. A dashed edge that says \"runtime-decided\" is correct output, not a failure.\n\n### Acceptance\n\n- Renders all shipped `examples/flows/` entries; output embeds cleanly in a mermaid fence; flake check runs render over the examples as a smoke (parse-stability guard).\n\n### Related\n\nPrior art: PocketFlow (github.com/The-Pocket/PocketFlow) static graph drawability.\n"
+    }
+  ]
+}

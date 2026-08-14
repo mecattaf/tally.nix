@@ -1,0 +1,368 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "epsilon-extension",
+    "maxTasks": 12,
+    "maxParallel": 3,
+    "steward": "narrator",
+    "gates": [
+      {
+        "kind": "command",
+        "id": "driver-suite",
+        "preflightArgv": ["sh", "-euc", "command -v python3 >/dev/null"],
+        "argv": ["python3", "test/spec_build_driver_test.py"],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "cargo-tests",
+        "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
+        "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"],
+        "runtimeMaxSec": 3600
+      },
+      {
+        "kind": "command",
+        "id": "clippy",
+        "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
+        "argv": ["nix", "develop", "--command", "cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
+        "runtimeMaxSec": 1800
+      },
+      {
+        "kind": "command",
+        "id": "flake-build-subset",
+        "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
+        "argv": ["nix", "build", "--no-link", ".#checks.x86_64-linux.spec-build-driver-tests", ".#checks.x86_64-linux.module-layer", ".#checks.x86_64-linux.campaign-runtime"],
+        "runtimeMaxSec": 1800
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "receipt-authority-stamp",
+      "kind": "implementation",
+      "title": "Stamp armSerial, worklist sha, and a timestamp on every attempt receipt",
+      "goal": "The attempt-receipts ledger (diagnosis, pardon, escalation, machinery-retry shapes) carries no timestamp, no armSerial, and no worklist digest, so the claim 'these burned attempts predate the amendment that addresses them' is an operator assertion the ledger cannot express (CA-3). These stamps are not bookkeeping: they are the EPOCH KEY that epoch-scoped-budgets derives attempt counting from. Bump the receipt schema so every record written from now on carries the writing registration's armSerial, the admitted worklist sha256, and an RFC3339 timestamp; extend actor coverage so machine-written records are attributable too. Receipt writers live in both the driver (diagnosis/escalation records) and the tally CLI (pardon records) — stamp both. Readers must accept both schema versions: the epsilon-era ledgers under ~/.local/state/tally/campaigns/attempt-receipts/ are history and must keep reconciling (F39's census rule: old records lack the new fields and that absence is legal). Build no consumer of the new fields here; epoch-scoped-budgets is the consumer and depends on this task.",
+      "deliveredBehaviors": [
+        "New receipts of every kind carry armSerial, worklistSha256, and writtenAt",
+        "Old-shape receipts still reconcile (a fixture from a real epsilon receipt proves it)"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "new-fields-written",
+          "description": "A test-produced receipt of each kind carries the three new fields; the test fails if any kind omits them.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace receipt 2>&1 | tail -20"]
+        },
+        {
+          "id": "legacy-receipts-reconcile",
+          "description": "A fixture copied verbatim from a real epsilon-era receipt (old shape, no new fields) still decodes and reconciles; the fixture file exists in-tree.",
+          "argv": ["bash", "-lc", "ls test/fixtures | grep -i receipt && nix develop --command cargo test --workspace legacy_receipt 2>&1 | tail -10"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally-core/src", "crates/tally-core/tests", "crates/spec-build-driver/src", "crates/tally/src", "test/fixtures"]
+    },
+    {
+      "id": "epoch-scoped-budgets",
+      "kind": "implementation",
+      "title": "Attempt budgets become a derivation over epochs; resume and the pardon concept delete",
+      "goal": "Today the two-attempt budget is keyed to a task identity that outlives its authority, which manufactures the pardon: 10 of epsilon's 10 pardons were mechanically derivable, three were races that only exist because counters are mutable state, and the machine literally prints 'run tally campaign resume to unblock' — computing the conclusion and instructing the human to type it (campaign.rs near :4183). Re-key the budget to the attempt's INPUT: a receipt counts against a task's budget only when its stamped epoch (from receipt-authority-stamp) matches the task's current input epoch, defined by the task's own bytes in the admitted worklist, the campaign gate set, and the steering high-water mark addressed to it. New input means a fresh budget by derivation — no verb, no actor, no cleared state; a steer addressed to a task IS new input. Old-epoch receipts never count, so the stale-pass race (F37) and the pardon race cannot exist. Unstamped legacy receipts count conservatively (today's behavior). Add the un-authored lifetime backstop: ~10 attempts per task across all epochs, a hardcoded constant, after which the task latches for human attention. Then delete: the resume verb from the CLI surface, amendment_pardon_plan's dependencies-only special case, and the instruct-the-human warning path. The record contains zero resume uses that were not either mechanical or a steer's shadow.",
+      "deliveredBehaviors": [
+        "A worklist amendment touching a task makes it dispatchable with a fresh budget, no verb involved; the derivation is receipt-pure",
+        "A steer addressed to a task refreshes its budget by the same derivation",
+        "resume no longer exists; the lifetime backstop latches after ~10 lifetime attempts with the escalation report"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0", "the intern-audit 0-for-9 decomposition"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "epoch-refresh",
+          "description": "A test burns an attempt, re-admits a worklist whose delta touches the task, and asserts the task is dispatchable with a fresh budget and no pardon record exists; the test fails on today's code.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace epoch 2>&1 | tail -20"]
+        },
+        {
+          "id": "resume-deleted",
+          "description": "The campaign verb surface no longer contains Resume.",
+          "argv": ["bash", "-lc", "! grep -n 'Resume' crates/tally/src/cli/args.rs"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["receipt-authority-stamp"],
+      "conflictDomains": ["crates/tally/src", "crates/tally/tests", "crates/tally-core/src", "crates/spec-build-driver/src", "examples/flows/spec-build.js"]
+    },
+    {
+      "id": "summary-ref-stage-digest",
+      "kind": "implementation",
+      "title": "Scope durable summary refs by the admitted graph digest; delete the archive ritual's cause",
+      "goal": "The summary ref namespace is a function of (campaign name, issue number) and nothing else — local_state_prefix in crates/spec-build-driver/src/actions.rs and campaign_state_ref_prefix in crates/tally/src/cli/campaign.rs — so any two stages sharing an identity collide on summary/{complete,quiescent} by construction (F38), which cost epsilon two live collisions and a three-times-botched manual archive step. Fix it the way the merge refs already do: the summary ref path gains a stage discriminator derived from the admitted worklist/graph digest, in both the driver writer and every CLI consumer (release_closing_summary and the archived-summary artifact collector must understand both the new scoped names and the legacy unscoped/archived ones — past campaigns' refs are history). Build no archive verb: the ritual's cause is deleted, not codified. Strike the standing archive step from skills/campaign-operator/SKILL.md for campaigns armed after this change.",
+      "deliveredBehaviors": [
+        "Two successive registrations of one identity write disjoint summary refs with zero operator steps",
+        "release still resolves the closing summary for both new-scoped and legacy refs"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-collision",
+          "description": "A test writes summaries under two different admitted digests of one campaign identity and asserts distinct refs and no disagrees-with-this-outcome error; the test fails on today's code.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace summary_ref 2>&1 | tail -20"]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver seam harness passes.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/spec-build-driver/src", "crates/tally/src", "crates/tally-core/src", "skills/campaign-operator"]
+    },
+    {
+      "id": "outcome-envelope",
+      "kind": "implementation",
+      "title": "Structured final-message outcomes: needs-authority and impossible; a refusal is never a crash",
+      "goal": "The flow's failureClass (examples/flows/spec-build.js near :2101) has five classes and none is a refusal, so an agent honoring a boundary surfaces as a no-commit exit plus a projection timeout, indistinguishable from a crash, costing a second burned attempt per episode before the real cause surfaces (F35; episodes 2/3 and 7/8 of the epsilon ledger). Add the structured outcome contract on the agent's final message: {\"outcome\": \"needs-authority\", \"paths\": [...]} — the refusal class for authority-surface paths (the R3 deny-list; under ext1's retrospective certification this is the only refusable class) — classifies as its own failure class, spends no attempt, writes a receipt naming the requested paths verbatim, and renders distinctly in campaign status. {\"outcome\": \"impossible\", \"reason\": \"...\"} records the worker's impossibility CLAIM as evidence for the judge — a claim, never a verdict (the /goal rule: adversarially guarded, the worker does not grade its own exit). A final message with no envelope remains a crash at signal level, unchanged. The brief's boundary paragraph gains one sentence stating the envelope shapes. This narrows v1's needs-grant design: with grants deleted at the root there is nothing to grant; this is the deny-list channel and the census's escape hatch.",
+      "deliveredBehaviors": [
+        "A needs-authority envelope classifies as its own class, spends nothing, and its receipt names the paths",
+        "An impossible envelope is recorded as a claim and routed to the judge, never self-certifying",
+        "campaign status renders both distinctly; the brief documents the envelope"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "envelope-classified",
+          "description": "Driver tests prove both envelopes classify to their own classes with zero attempt cost for needs-authority, and that a no-envelope exit still classifies as before.",
+          "argv": ["bash", "-lc", "grep -n 'needs-authority' examples/flows/spec-build.js | head -3 && nix develop --command cargo test --workspace needs_authority 2>&1 | tail -15"]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver seam harness passes.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["examples/flows/spec-build.js", "crates/spec-build-driver/src", "crates/tally/src"]
+    },
+    {
+      "id": "judge-verdict",
+      "kind": "implementation",
+      "title": "Promote the diagnosis slot to the judge: typed verdict gates retry; structured proposals feed the inbox",
+      "goal": "Epsilon's diagnosis record is 18 causes, 18 correct, zero wrong files — and in 7 of 9 escalation episodes the attempt-1 diagnosis explicitly named an out-of-task cause (one literally opens 'Do not retry chapter-gate unchanged') while the unconditional two-attempt budget burned attempt 2 against the machine's own written advice. Give the judgment authority: diagnosisResultSchema gains a required typed verdict — retry (in-task actionable fix; the steering reason rides into attempt 2, the loop as built), blocked (out-of-task cause; stop at attempt 1 and notify), transient (machinery/session fault; free machinery retry) — and the flow gates attempt 2 on verdict == retry. Deterministic rails bound it: checkpoint tasks never receive retry; a needs-authority envelope is always blocked; the per-epoch and lifetime caps stay hardcoded. The schema also gains an optional structured proposal (kind, paths, goal text, acceptance criteria, dependencies) — the content receipts 16 and 29 already contained in prose — which the escalation report renders as a ready worklist diff (the report itself stays deterministic, PA-43, kept verbatim). Rebind the diagnosis job from effective.agent to the steward catalog role (the flow's own comments still call it 'the steward's diagnose slot'; AUGUST-01-DESIGN.md:138 assigned it to Sonnet and the implementation drifted; which model answers is a host-catalog fact, never worklist bytes). Honor the disclosure rule the flow already states: every rule the validator enforces and the verdict semantics appear in the model's mission.",
+      "deliveredBehaviors": [
+        "Attempt 2 dispatches only on a retry verdict; blocked stops at one attempt with the report; transient uses the machinery retry budget",
+        "A blocked verdict with an actionable worklist fix carries a structured proposal rendered into the escalation report",
+        "The diagnosis job resolves through the steward catalog role in a read-only sandbox"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0", "the intern-audit corrected recommendation"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "verdict-gates-retry",
+          "description": "Driver tests prove a blocked verdict stops at attempt 1, a retry verdict dispatches attempt 2 with the diagnosis as steering, and a checkpoint task never retries; the first two fail on today's code.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace verdict 2>&1 | tail -20"]
+        },
+        {
+          "id": "proposal-in-report",
+          "description": "An escalation report produced from a blocked-with-proposal diagnosis contains the rendered proposal.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace proposal 2>&1 | tail -10"]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver seam harness passes.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["outcome-envelope"],
+      "conflictDomains": ["examples/flows/spec-build.js", "crates/spec-build-driver/src", "crates/spec-build-driver/tests", "crates/tally-core/src"]
+    },
+    {
+      "id": "subject-adoption-narrator-retire",
+      "kind": "implementation",
+      "title": "Adopt the lane's own subject; retire the narration slot from the merge path",
+      "goal": "Epsilon's lane agents wrote 10 valid conventional-commit subjects out of 37 tips and the squash layer discarded all 10 to fall back to the task-id template, because the narrator — a separate model slot — failed 74 of 74 proposals (PA-25/26). For the record, that 0-for-35 was harness-caused (38 rejections were a dotfiles shim envelope bug; 30 were validator rules the model was never shown, VD-11/12) — but the slot is structurally dominated regardless: the lane already holds the best-informed subject, and the slot's total failure went unnoticed for 35 merges, meaning it gates nothing. Change the merge path: validate the lane tip's own subject (and body where present) under the commit grammar, applying deterministic repairs (fold at 100 columns, trailing period) as formatting rather than rejection; adopt when valid; fall back to the template otherwise; record the provenance in the merge body as rejected proposals are recorded today. Remove the narration request path and NARRATION_ATTEMPTS from the driver. Keep the steward catalog seam itself — judge-verdict occupies it; only the narration occupation ends.",
+      "deliveredBehaviors": [
+        "A valid lane-tip subject survives the squash; deterministic repairs are applied as formatting",
+        "No model call remains in the merge path; the steward catalog seam survives for the judge"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "adoption-works",
+          "description": "A driver test squashes a lane whose tip subject is grammar-valid and asserts the subject survives; a second case with an invalid tip falls back to the template; a third proves a 101-column body line is folded, not rejected.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test -p spec-build-driver subject_adoption 2>&1 | tail -15"]
+        },
+        {
+          "id": "narration-slot-gone",
+          "description": "NARRATION_ATTEMPTS and the narration request path no longer exist in the driver.",
+          "argv": ["bash", "-lc", "! grep -n 'NARRATION_ATTEMPTS' crates/spec-build-driver/src/actions.rs"]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver seam harness passes.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/spec-build-driver/src", "crates/spec-build-driver/tests"]
+    },
+    {
+      "id": "final-bar-executes",
+      "kind": "implementation",
+      "title": "The final bar runs cases or its check attribute dies; fleet-gate gains a bar step",
+      "goal": "final-conformance-bar-harness (flake.nix near :3465) asserts that three strings appear in a --list listing and executes zero cases — false coverage that let 12 of 24 bar cases assert pre-deletion contracts across an entire chapter (VD-5, F33). Make it honest: the attribute executes a named subset of non-VM bar cases inside the sandbox, or, if no case can run sandboxed (prove it in the task report, not by assertion), delete the attribute so the coverage claim disappears with it. Independently, test/fleet-gate.sh gains a final-bar step so the bar runs in every chapter gate without a hand-authored argv remembering it — AUGUST-08's standing commitment ('the bar runs forever') honored mechanically for the first time.",
+      "deliveredBehaviors": [
+        "Either the flake check executes bar cases or it no longer exists",
+        "test/fleet-gate.sh runs the final bar as a ladder step"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0", "AUGUST-08-HYPOTHESES.md standing commitment 1"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "no-list-only-coverage",
+          "description": "No check attribute's builder invokes the bar with --list as its only execution; grep proves it.",
+          "argv": ["bash", "-lc", "! grep -n 'final-conformance-bar --list' flake.nix || { grep -A3 'final-conformance-bar --list' flake.nix | grep -q 'final-conformance-bar [^-]'; }"]
+        },
+        {
+          "id": "gate-has-bar",
+          "description": "fleet-gate's ladder names a final-bar step.",
+          "argv": ["bash", "-lc", "grep -n 'final-bar' test/fleet-gate.sh | head -3"]
+        },
+        {
+          "id": "flake-green",
+          "description": "The touched checks build.",
+          "argv": ["bash", "-lc", "nix build --no-link .#checks.x86_64-linux.module-layer 2>&1 | tail -5"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["flake.nix", "test/fleet-gate.sh", "test/final-bar"]
+    },
+    {
+      "id": "fleet-gate-cheap-first",
+      "kind": "implementation",
+      "title": "Metadata predicates to stage 0; the local-audit arm ends throwaway PRs",
+      "goal": "test/fleet-gate.sh runs changelog-policy — a ~200ms metadata predicate — as the LAST stage of a ~17-minute ladder, and its forge-native form (an open GitHub PR must contain the head sha) forced three throwaway PRs (#604, #605, #606) whose only purpose was gate fodder (PA-09, PA-36), inverting the cheap-fails-first doctrine AUGUST-12 records as a win. Reorder: every pure-metadata predicate (changelog policy, commit resolvability) runs before any build stage. Generalize the gate-local-audit pattern from epsilon-0: a head presented as a local audit (integration heads, out-of-band worktree commits not yet pushed) passes the changelog stage with an explicit 'local audit' note instead of demanding a PR; the PR requirement remains for heads presented as publications to main.",
+      "deliveredBehaviors": [
+        "Metadata predicates fail in seconds, not after the build stages",
+        "A local-audit head needs no PR; a main-publication head still does"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0"],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "order-proven",
+          "description": "The changelog stage appears in the ladder before the cargo stages.",
+          "argv": ["bash", "-lc", "awk '/changelog/{c=NR} /cargo fmt/{f=NR} END{exit !(c<f)}' test/fleet-gate.sh"]
+        },
+        {
+          "id": "gate-self-test",
+          "description": "The gate script parses and carries the local-audit arm.",
+          "argv": ["bash", "-lc", "bash -n test/fleet-gate.sh && grep -n 'local audit' test/fleet-gate.sh | head -2"]
+        }
+      ],
+      "dependencies": ["final-bar-executes"],
+      "conflictDomains": ["test/fleet-gate.sh"]
+    },
+    {
+      "id": "authoring-doctrine-skills",
+      "kind": "implementation",
+      "title": "Commit the equipment: the census, the gate-set template, and the run doctrine into the two skills",
+      "goal": "The ladder's most measurable improvement came from doctrine, not code (PA-34: authority corrections fell from 41% to 11% via census-authoring and H1), and the equipment ledger proved that on the epsilon record a well-equipped run needed zero ownership corrections, zero gate cycles, and zero steers — yet the doctrine lives in untracked run records. Write it into the two skills where authoring happens. skills/assign-tally/SKILL.md gains: the 11-item equipment list and the edge-census steps (deletion-consumer grep; assertion-inversion sweep; estate-bytes grep counting the fields the writer emitted; toolchain side-effect rehearsal with cohort ownership; gate/checkpoint argv rehearsal in a pristine worktree including a local un-pushed HEAD; acceptance-argv output audit writing '2>&1 | tail -30' into flooding argvs; seam ACs from real artifacts, every delivered behavior having an AC that fails without it; effective-width computation; external-authority preflight incl. gh scopes and one rollback rehearsal for deploying runs; known-breakage intake as scoped tasks); the mandatory gate-set template (driver suite, workspace tests, clippy -D warnings, a BUILT flake-check subset naming real attributes — never a bare --no-build eval — and the final bar at the chapter gate); commit-first-verify-second; take the machine's enumerated list verbatim; estimate deletion stages as chains and build stages as fans. skills/campaign-operator/SKILL.md gains: the stale-pin attribution rule (diff the deployed store path — campaign quiescent prints flow and driver — before crediting or blaming any merged commit; this error invalidated findings twice in one document, VD-13); record-it-and-stop; the frozen-flow rule; the interim close checklist in order (quiescent, release --plan, probe, release, disarm last, nothing after disarm) until ext1 mechanizes the close; recovery language updated for the epoch model (steer refreshes budget; resume no longer exists). Style: match the existing skills' voice; no new files.",
+      "deliveredBehaviors": [
+        "assign-tally carries the equipment list, the edge census, and the gate-set template",
+        "campaign-operator carries the stale-pin, record-and-stop, frozen-flow rules and the epoch-era recovery language"
+      ],
+      "readFirst": {
+        "specSections": ["EPSILON-EXTENSION.md ext0", "the equipment ledger, sections 2.4 and 4"],
+        "styleReferences": ["skills/assign-tally/SKILL.md", "skills/campaign-operator/SKILL.md"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "template-present",
+          "description": "The gate-set template names clippy and a built check subset.",
+          "argv": ["bash", "-lc", "grep -n 'clippy' skills/assign-tally/SKILL.md | head -2 && grep -n 'nix build' skills/assign-tally/SKILL.md | head -2"]
+        },
+        {
+          "id": "census-present",
+          "description": "The edge census names the deletion-consumer grep and the estate-bytes rule.",
+          "argv": ["bash", "-lc", "grep -in 'consumer' skills/assign-tally/SKILL.md | head -2 && grep -in 'writer emitted' skills/assign-tally/SKILL.md | head -2"]
+        },
+        {
+          "id": "stale-pin-rule-present",
+          "description": "The operator skill states the stale-pin attribution rule.",
+          "argv": ["bash", "-lc", "grep -in 'store path' skills/campaign-operator/SKILL.md | head -2"]
+        }
+      ],
+      "dependencies": ["epoch-scoped-budgets"],
+      "conflictDomains": ["skills/assign-tally", "skills/campaign-operator"]
+    },
+    {
+      "id": "chapter-gate",
+      "kind": "checkpoint",
+      "title": "Extension stage 0 gate: full gate ladder plus the final conformance bar",
+      "argv": [
+        "bash",
+        "-lc",
+        "test/fleet-gate.sh \"$(git rev-parse HEAD)\" && exec test/final-bar/run \"$PWD\""
+      ],
+      "runtimeMaxSec": 10800,
+      "dependencies": [
+        "receipt-authority-stamp",
+        "epoch-scoped-budgets",
+        "summary-ref-stage-digest",
+        "outcome-envelope",
+        "judge-verdict",
+        "subject-adoption-narrator-retire",
+        "final-bar-executes",
+        "fleet-gate-cheap-first",
+        "authoring-doctrine-skills"
+      ]
+    }
+  ]
+}
