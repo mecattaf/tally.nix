@@ -166,6 +166,9 @@
             mkdir -p "$out/share/tally/flows" "$out/libexec/tally"
             cp ${./examples/flows/spec-build.js} "$out/share/tally/flows/spec-build.js"
             ln -s ${specBuildDriver}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver"
+            # The Python entry point remains authoritative until the seam
+            # proof. Keep the Rust dispatcher beside it for that proof.
+            ln -s ${specBuildDriverRust}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver-rust"
             wrapProgram "$out/bin/tally" \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
@@ -783,6 +786,20 @@
           '';
         };
         specBuildDriver = import ./nix/lib/spec-build-driver.nix { inherit pkgs; };
+        specBuildDriverRust = pkgs.rustPlatform.buildRustPackage {
+          pname = "spec-build-driver-rust";
+          version = "0.1.0";
+          src = tallySource;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # All Boa workspace crates share this one fixed-output git source.
+            outputHashes."boa_ast-1.0.0-dev" = "sha256-xdB+SCFjaV+/hJu9n+3Il3vN0TZQXq0V95XmsJ/ihwo=";
+          };
+          cargoBuildFlags = [ "--package=spec-build-driver" ];
+          cargoTestFlags = [ "--package=spec-build-driver" ];
+          SPEC_BUILD_PY_FALLBACK = "${specBuildDriver}/bin/spec-build-driver";
+          meta.mainProgram = "spec-build-driver";
+        };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
         catalogFixtureUnchecked = catalogLibrary.renderCatalog (
           catalogFixtureInput
@@ -3419,6 +3436,7 @@
           doc = documentation;
           agency-nightly-driver = agencyNightlyDriver;
           spec-build-driver = specBuildDriver;
+          spec-build-driver-rust = specBuildDriverRust;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
         };
@@ -3472,6 +3490,7 @@
                 python3 ${./test/spec_build_contract_corpus_test.py}
                 touch "$out"
               '';
+          spec-build-driver-rust = specBuildDriverRust;
           campaign-runtime =
             pkgs.runCommand "tally-campaign-runtime"
               {
