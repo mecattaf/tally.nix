@@ -246,7 +246,7 @@
         }
       ],
       "dependencies": [],
-      "conflictDomains": ["crates/spec-build-driver/src", "crates/spec-build-driver/tests"]
+      "conflictDomains": ["crates/spec-build-driver/src", "crates/spec-build-driver/tests", "test/spec_build_driver_test.py"]
     },
     {
       "id": "final-bar-executes",
