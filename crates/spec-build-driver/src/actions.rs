@@ -144,6 +144,7 @@ pub(crate) fn dispatch(action: &str, brief: &Json) -> Result<Json> {
         "sweep" => action_sweep(brief),
         "reconcile" => action_reconcile(brief),
         "diff" => action_diff(brief),
+        "outcome" => action_worker_outcome(brief),
         "steeringRecheck" => action_steering_recheck(brief),
         "steer" => action_steer(brief),
         "retry" => action_retry(brief),
@@ -2226,6 +2227,124 @@ fn json_truthy(value: Option<&Json>) -> bool {
     }
 }
 
+fn classify_worker_outcome(value: Option<&Json>) -> Result<Option<WorkerOutcome>> {
+    let Some(object) = value.and_then(Json::as_object) else {
+        return Ok(None);
+    };
+    match object.get("outcome").and_then(Json::as_str) {
+        Some("needs-authority") => {
+            let object = object_complete(
+                value.expect("an object was matched above"),
+                &["outcome", "paths"],
+                "needs-authority worker outcome",
+            )?;
+            let paths = normalize_paths(
+                object.get("paths"),
+                "needs-authority worker outcome.paths",
+                true,
+            )?
+            .expect("required paths are present");
+            if paths.len() > 128 {
+                return Err(DriverError::new(
+                    "needs-authority worker outcome.paths exceeds 128 entries",
+                ));
+            }
+            if paths.iter().any(|path| path.chars().count() > 4_096) {
+                return Err(DriverError::new(
+                    "needs-authority worker outcome path exceeds 4096 characters",
+                ));
+            }
+            Ok(Some(WorkerOutcome::NeedsAuthority { paths }))
+        }
+        Some("impossible") => {
+            let object = object_complete(
+                value.expect("an object was matched above"),
+                &["outcome", "reason"],
+                "impossible worker outcome",
+            )?;
+            Ok(Some(WorkerOutcome::Impossible {
+                reason: required_text(
+                    object.get("reason"),
+                    "impossible worker outcome.reason",
+                    12_000,
+                )?,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn action_worker_outcome(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "issue",
+            "task",
+            "taskUuid",
+            "message",
+            "attemptReceipts",
+        ],
+        "worker outcome brief",
+    )?;
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let task = data
+        .get("task")
+        .ok_or_else(|| DriverError::new("worker outcome brief.task is required"))?;
+    let task_id = task_id(task)?.to_owned();
+    if !is_task_id(&task_id) {
+        return Err(DriverError::new("taskId is not safe"));
+    }
+    let task_revision = task_revision(task_object(task, "worker outcome brief.task")?)?
+        .ok_or_else(|| DriverError::new("worker outcome task requires a completion revision"))?;
+    let task_uuid = required_string(data.get("taskUuid"), "taskUuid", Some(36))?;
+    let parsed_uuid = Uuid::parse_str(&task_uuid)
+        .map_err(|_| DriverError::new("taskUuid must be a canonical UUID"))?;
+    if parsed_uuid.to_string() != task_uuid {
+        return Err(DriverError::new(
+            "taskUuid must use canonical UUID spelling",
+        ));
+    }
+    let outcome = classify_worker_outcome(data.get("message"))?.ok_or_else(|| {
+        DriverError::new("worker final message has no structured outcome envelope")
+    })?;
+    let (recorded, receipt) = append_attempt_receipt(
+        data.get("attemptReceipts"),
+        &campaign,
+        &issue_number,
+        Json::object([
+            ("kind", Json::from("worker-outcome")),
+            ("taskId", Json::from(task_id.clone())),
+            ("taskRevision", Json::from(task_revision.clone())),
+            ("taskUuid", Json::from(task_uuid.clone())),
+            ("outcome", Json::from(outcome.class())),
+            ("paths", outcome.paths_json()),
+            ("reason", outcome.reason_json()),
+        ]),
+    )?;
+    let comment = receipt
+        .as_object()
+        .and_then(|record| record.get("comment"))
+        .and_then(Json::as_str)
+        .expect("append receipt returns a comment")
+        .to_owned();
+    Ok(Json::object([
+        ("taskId", Json::from(task_id)),
+        ("taskRevision", Json::from(task_revision)),
+        ("taskUuid", Json::from(task_uuid)),
+        ("outcome", Json::from(outcome.class())),
+        ("comment", Json::from(comment)),
+        ("paths", outcome.paths_json()),
+        ("reason", outcome.reason_json()),
+        ("recorded", Json::from(recorded)),
+        ("attemptCost", Json::Number("0".to_owned())),
+    ]))
+}
+
 fn action_steer(brief: &Json) -> Result<Json> {
     let data = object_exact(
         brief,
@@ -2587,6 +2706,10 @@ fn action_escalate(brief: &Json) -> Result<Json> {
         .get("retries")
         .and_then(Json::as_array)
         .ok_or_else(|| DriverError::new("reconciliation.retries must be an array"))?;
+    let outcomes = object
+        .get("outcomes")
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new("reconciliation.outcomes must be an array"))?;
     if let Some(existing) = object.get("escalation").and_then(Json::as_str) {
         return Ok(Json::object([
             ("posted", Json::from(false)),
@@ -2617,12 +2740,23 @@ fn action_escalate(brief: &Json) -> Result<Json> {
                 .then(|| task_id.to_owned())
         })
         .collect();
+    let has_authority_request = outcomes.iter().any(|outcome| {
+        outcome
+            .as_object()
+            .and_then(|outcome| outcome.get("outcome"))
+            .and_then(Json::as_str)
+            == Some("needs-authority")
+    });
+    let blocking_rule = if has_authority_request {
+        "Tally stopped because each directly blocked task either failed twice with machine steering or requested authority-surface paths; authority requests spend no attempt."
+    } else {
+        "Tally stopped only after each directly blocked task failed twice with machine steering."
+    };
     let mut lines = vec![
         "### Spec-build escalation: frontier quiescent".to_owned(),
         String::new(),
         "The worklist is incomplete and no unblocked task is dispatchable.".to_owned(),
-        "Tally stopped only after each directly blocked task failed twice with machine steering."
-            .to_owned(),
+        blocking_rule.to_owned(),
         String::new(),
         format!(
             "Directly blocked tasks: {}",
@@ -2636,10 +2770,51 @@ fn action_escalate(brief: &Json) -> Result<Json> {
             "Blocked worklist tasks (including descendants): {}",
             blocked.len()
         ),
-        String::new(),
-        "Accumulated machine diagnoses:".to_owned(),
     ];
     let mut public_values = Vec::new();
+    if !outcomes.is_empty() {
+        lines.extend([String::new(), "Structured worker outcomes:".to_owned()]);
+        for outcome in outcomes {
+            let outcome = outcome
+                .as_object()
+                .ok_or_else(|| DriverError::new("reconciliation outcome must be an object"))?;
+            let task_id = outcome
+                .get("taskId")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            match outcome.get("outcome").and_then(Json::as_str) {
+                Some("needs-authority") => {
+                    let paths = outcome
+                        .get("paths")
+                        .and_then(Json::as_array)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .map(|path| format!("`{path}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!(
+                        "- `{task_id}` needs authority (attempt cost 0): {paths}"
+                    ));
+                }
+                Some("impossible") => {
+                    let reason = outcome
+                        .get("reason")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "- `{task_id}` worker impossibility claim (not a verdict): {}",
+                        compact_summary(reason, 160)
+                    ));
+                    public_values.push(reason.to_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+    if !diagnoses.is_empty() {
+        lines.extend([String::new(), "Accumulated machine diagnoses:".to_owned()]);
+    }
     for diagnosis in diagnoses {
         let diagnosis = diagnosis
             .as_object()
@@ -4266,10 +4441,65 @@ impl VisibleAttempt {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkerOutcome {
+    NeedsAuthority { paths: Vec<String> },
+    Impossible { reason: String },
+}
+
+impl WorkerOutcome {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::NeedsAuthority { .. } => "needs-authority",
+            Self::Impossible { .. } => "impossible",
+        }
+    }
+
+    fn paths_json(&self) -> Json {
+        match self {
+            Self::NeedsAuthority { paths } => {
+                Json::Array(paths.iter().cloned().map(Json::from).collect())
+            }
+            Self::Impossible { .. } => Json::Null,
+        }
+    }
+
+    fn reason_json(&self) -> Json {
+        match self {
+            Self::NeedsAuthority { .. } => Json::Null,
+            Self::Impossible { reason } => Json::from(reason.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VisibleWorkerOutcome {
+    task_id: String,
+    task_revision: String,
+    task_uuid: String,
+    comment: String,
+    outcome: WorkerOutcome,
+}
+
+impl VisibleWorkerOutcome {
+    fn to_json(&self) -> Json {
+        Json::object([
+            ("taskId", Json::from(self.task_id.clone())),
+            ("taskRevision", Json::from(self.task_revision.clone())),
+            ("taskUuid", Json::from(self.task_uuid.clone())),
+            ("outcome", Json::from(self.outcome.class())),
+            ("comment", Json::from(self.comment.clone())),
+            ("paths", self.outcome.paths_json()),
+            ("reason", self.outcome.reason_json()),
+        ])
+    }
+}
+
 #[derive(Clone, Debug)]
 enum AttemptEvent {
     Diagnosis(VisibleAttempt),
     Retry(VisibleAttempt),
+    WorkerOutcome(VisibleWorkerOutcome),
     Escalation {
         comment: String,
     },
@@ -4283,6 +4513,7 @@ enum AttemptEvent {
 struct AttemptState {
     diagnoses: Vec<VisibleAttempt>,
     retries: Vec<VisibleAttempt>,
+    outcomes: Vec<VisibleWorkerOutcome>,
     escalation: Option<String>,
     warnings: Vec<String>,
 }
@@ -4364,6 +4595,14 @@ fn validate_attempt_receipt(
     match kind {
         "diagnosis" => fields.extend(["taskId", "attempt", "diagnosis", "redaction"]),
         "retry" => fields.extend(["taskId", "attempt", "reason", "redaction"]),
+        "worker-outcome" => fields.extend([
+            "taskId",
+            "taskRevision",
+            "taskUuid",
+            "outcome",
+            "paths",
+            "reason",
+        ]),
         "escalation" => fields.push("body"),
         "pardon" => fields.extend(["tasks", "reason", "actor", "nonce"]),
         _ => {
@@ -4428,6 +4667,84 @@ fn validate_attempt_receipt(
             } else {
                 AttemptEvent::Retry(visible)
             })
+        }
+        "worker-outcome" => {
+            let task_id =
+                required_string(record.get("taskId"), &format!("{context}.taskId"), None)?;
+            if !is_task_id(&task_id) {
+                return Err(DriverError::new(format!("{context}.taskId is unsafe")));
+            }
+            let task_revision = required_string(
+                record.get("taskRevision"),
+                &format!("{context}.taskRevision"),
+                Some(71),
+            )?;
+            let valid_revision = task_revision.len() == 71
+                && task_revision.starts_with("sha256:")
+                && task_revision[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            if !valid_revision {
+                return Err(DriverError::new(format!(
+                    "{context}.taskRevision must be a lowercase SHA-256 identity"
+                )));
+            }
+            let task_uuid = required_string(
+                record.get("taskUuid"),
+                &format!("{context}.taskUuid"),
+                Some(36),
+            )?;
+            let parsed_uuid = Uuid::parse_str(&task_uuid)
+                .map_err(|_| DriverError::new(format!("{context}.taskUuid must be a UUID")))?;
+            if parsed_uuid.to_string() != task_uuid {
+                return Err(DriverError::new(format!(
+                    "{context}.taskUuid must use canonical UUID spelling"
+                )));
+            }
+            let outcome = match record.get("outcome").and_then(Json::as_str) {
+                Some("needs-authority") => {
+                    if !matches!(record.get("reason"), Some(Json::Null)) {
+                        return Err(DriverError::new(format!(
+                            "{context}.reason must be null for needs-authority"
+                        )));
+                    }
+                    let paths =
+                        normalize_paths(record.get("paths"), &format!("{context}.paths"), true)?
+                            .expect("required outcome paths are present");
+                    if paths.len() > 128 || paths.iter().any(|path| path.chars().count() > 4_096) {
+                        return Err(DriverError::new(format!(
+                            "{context}.paths exceeds the worker outcome bound"
+                        )));
+                    }
+                    WorkerOutcome::NeedsAuthority { paths }
+                }
+                Some("impossible") => {
+                    if !matches!(record.get("paths"), Some(Json::Null)) {
+                        return Err(DriverError::new(format!(
+                            "{context}.paths must be null for impossible"
+                        )));
+                    }
+                    WorkerOutcome::Impossible {
+                        reason: required_text(
+                            record.get("reason"),
+                            &format!("{context}.reason"),
+                            12_000,
+                        )?,
+                    }
+                }
+                _ => {
+                    return Err(DriverError::new(format!(
+                        "{context}.outcome must be needs-authority or impossible"
+                    )))
+                }
+            };
+            Ok(AttemptEvent::WorkerOutcome(VisibleWorkerOutcome {
+                task_id,
+                task_revision,
+                task_uuid,
+                comment,
+                outcome,
+            }))
         }
         "escalation" => {
             required_text(record.get("body"), &format!("{context}.body"), 60_000)?;
@@ -4560,25 +4877,27 @@ fn read_attempt_receipts(
 
 fn fold_attempt_receipts(
     events: Vec<AttemptEvent>,
-    task_ids: &BTreeSet<String>,
+    task_revisions: &BTreeMap<String, Option<String>>,
 ) -> Result<AttemptState> {
     let mut visible_diagnoses = BTreeMap::<String, Vec<VisibleAttempt>>::new();
     let mut visible_retries = BTreeMap::<String, Vec<VisibleAttempt>>::new();
+    let mut visible_outcomes = BTreeMap::<String, Vec<VisibleWorkerOutcome>>::new();
     let mut diagnosis_counters = BTreeMap::<String, Vec<u64>>::new();
     let mut retry_counters = BTreeMap::<String, Vec<u64>>::new();
+    let mut authority_counters = BTreeSet::<String>::new();
     let mut escalations = Vec::<(String, BTreeSet<String>, BTreeSet<String>)>::new();
     let mut warnings = Vec::new();
 
     fn keep_attempt(
         receipt: VisibleAttempt,
         diagnosis: bool,
-        task_ids: &BTreeSet<String>,
+        task_revisions: &BTreeMap<String, Option<String>>,
         counters: AttemptKinds<'_, u64>,
         visible: AttemptKinds<'_, VisibleAttempt>,
         warnings: &mut Vec<String>,
     ) {
         let kind = if diagnosis { "diagnosis" } else { "retry" };
-        if !task_ids.contains(&receipt.task_id) {
+        if !task_revisions.contains_key(&receipt.task_id) {
             warnings.push(format!(
                 "dropped machine {kind} for '{}': the worklist no longer names that task",
                 receipt.task_id
@@ -4616,7 +4935,7 @@ fn fold_attempt_receipts(
             AttemptEvent::Diagnosis(receipt) => keep_attempt(
                 receipt,
                 true,
-                task_ids,
+                task_revisions,
                 AttemptKinds {
                     diagnoses: &mut diagnosis_counters,
                     retries: &mut retry_counters,
@@ -4630,7 +4949,7 @@ fn fold_attempt_receipts(
             AttemptEvent::Retry(receipt) => keep_attempt(
                 receipt,
                 false,
-                task_ids,
+                task_revisions,
                 AttemptKinds {
                     diagnoses: &mut diagnosis_counters,
                     retries: &mut retry_counters,
@@ -4641,14 +4960,43 @@ fn fold_attempt_receipts(
                 },
                 &mut warnings,
             ),
+            AttemptEvent::WorkerOutcome(receipt) => {
+                let Some(expected_revision) = task_revisions.get(&receipt.task_id) else {
+                    warnings.push(format!(
+                        "dropped worker outcome for '{}': the worklist no longer names that task",
+                        receipt.task_id
+                    ));
+                    continue;
+                };
+                if expected_revision
+                    .as_ref()
+                    .is_some_and(|revision| revision != &receipt.task_revision)
+                {
+                    warnings.push(format!(
+                        "dropped worker outcome for '{}': receipt revision {} does not match current revision {}",
+                        receipt.task_id,
+                        receipt.task_revision,
+                        expected_revision.as_deref().expect("a mismatching revision is present")
+                    ));
+                    continue;
+                }
+                if matches!(receipt.outcome, WorkerOutcome::NeedsAuthority { .. }) {
+                    authority_counters.insert(receipt.task_id.clone());
+                }
+                visible_outcomes
+                    .entry(receipt.task_id.clone())
+                    .or_default()
+                    .push(receipt);
+            }
             AttemptEvent::Escalation { comment } => {
-                let contributors = diagnosis_counters
+                let mut contributors: BTreeSet<_> = diagnosis_counters
                     .iter()
                     .filter_map(|(task_id, attempts)| {
                         let attempts: BTreeSet<_> = attempts.iter().copied().collect();
                         (attempts == BTreeSet::from([1, 2])).then(|| task_id.clone())
                     })
                     .collect();
+                contributors.extend(authority_counters.iter().cloned());
                 escalations.push((comment, contributors, BTreeSet::new()));
             }
             AttemptEvent::Pardon { tasks, comment } => {
@@ -4662,6 +5010,10 @@ fn fold_attempt_receipts(
                         pardoned += retry_counters.remove(task_id).map_or(0, |rows| rows.len());
                         visible_diagnoses.remove(task_id);
                         visible_retries.remove(task_id);
+                        pardoned += visible_outcomes
+                            .remove(task_id)
+                            .map_or(0, |rows| rows.len());
+                        authority_counters.remove(task_id);
                     }
                     let mut remaining = Vec::new();
                     for (comment, contributors, mut covered) in escalations {
@@ -4680,6 +5032,9 @@ fn fold_attempt_receipts(
                     retry_counters.clear();
                     visible_diagnoses.clear();
                     visible_retries.clear();
+                    pardoned += visible_outcomes.values().map(Vec::len).sum::<usize>();
+                    visible_outcomes.clear();
+                    authority_counters.clear();
                     pardoned += escalations.len();
                     escalations.clear();
                 }
@@ -4710,6 +5065,7 @@ fn fold_attempt_receipts(
     }
     let mut diagnoses: Vec<_> = visible_diagnoses.into_values().flatten().collect();
     let mut retries: Vec<_> = visible_retries.into_values().flatten().collect();
+    let outcomes: Vec<_> = visible_outcomes.into_values().flatten().collect();
     diagnoses.sort_by(|left, right| {
         left.task_id
             .cmp(&right.task_id)
@@ -4723,6 +5079,7 @@ fn fold_attempt_receipts(
     Ok(AttemptState {
         diagnoses,
         retries,
+        outcomes,
         escalation: escalations.into_iter().next().map(|row| row.0),
         warnings,
     })
@@ -4732,25 +5089,30 @@ fn campaign_attempt_state(
     source: Option<&Json>,
     campaign: &str,
     issue_number: &str,
-    task_ids: &BTreeSet<String>,
+    task_revisions: &BTreeMap<String, Option<String>>,
 ) -> Result<AttemptState> {
     fold_attempt_receipts(
         read_attempt_receipts(source, campaign, issue_number)?,
-        task_ids,
+        task_revisions,
     )
 }
 
 fn attempt_state_all(events: Vec<AttemptEvent>) -> Result<AttemptState> {
-    let task_ids: BTreeSet<_> = events
-        .iter()
-        .filter_map(|event| match event {
+    let mut task_revisions = BTreeMap::new();
+    for event in &events {
+        match event {
             AttemptEvent::Diagnosis(receipt) | AttemptEvent::Retry(receipt) => {
-                Some(receipt.task_id.clone())
+                task_revisions
+                    .entry(receipt.task_id.clone())
+                    .or_insert(None);
             }
-            AttemptEvent::Escalation { .. } | AttemptEvent::Pardon { .. } => None,
-        })
-        .collect();
-    fold_attempt_receipts(events, &task_ids)
+            AttemptEvent::WorkerOutcome(receipt) => {
+                task_revisions.insert(receipt.task_id.clone(), Some(receipt.task_revision.clone()));
+            }
+            AttemptEvent::Escalation { .. } | AttemptEvent::Pardon { .. } => {}
+        }
+    }
+    fold_attempt_receipts(events, &task_revisions)
 }
 
 fn campaign_attempt_state_all(
@@ -4977,6 +5339,17 @@ fn append_attempt_receipt(
                     task_id.unwrap_or_default(),
                     attempt.unwrap_or_default()
                 )));
+            }
+        } else if kind == "worker-outcome" {
+            let task_uuid = payload_object.get("taskUuid").and_then(Json::as_str);
+            if let Some(existing) = state
+                .outcomes
+                .iter()
+                .find(|receipt| Some(receipt.task_uuid.as_str()) == task_uuid)
+            {
+                let sequence = comment_sequence(&existing.comment)?;
+                return record_with_comment(&records[sequence - 1], campaign)
+                    .map(|record| (false, record));
             }
         } else if kind == "escalation" {
             if let Some(comment) = &state.escalation {
@@ -5819,18 +6192,20 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
                 .to_owned(),
         );
     }
-    let task_ids: BTreeSet<_> = tasks
+    let task_revisions: BTreeMap<_, _> = tasks
         .iter()
-        .map(task_id)
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+        .map(|task| {
+            Ok((
+                task_id(task)?.to_owned(),
+                task_revision(task_object(task, "reconciled task")?)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
     let mut attempts = campaign_attempt_state(
         data.get("attemptReceipts"),
         &campaign,
         &issue_number,
-        &task_ids,
+        &task_revisions,
     )?;
     let order: BTreeMap<_, _> = tasks
         .iter()
@@ -5849,17 +6224,33 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
             item.attempt,
         )
     });
+    attempts.outcomes.sort_by_key(|item| {
+        (
+            order.get(&item.task_id).copied().unwrap_or(usize::MAX),
+            comment_sequence(&item.comment).unwrap_or(usize::MAX),
+        )
+    });
     let remaining: Vec<_> = tasks
         .iter()
         .filter(|task| task_id(task).is_ok_and(|id| !completed_ids.contains(id)))
         .cloned()
         .collect();
-    let direct_blocked: BTreeSet<_> = attempts
+    let mut direct_blocked: BTreeSet<_> = attempts
         .diagnoses
         .iter()
         .filter(|diagnosis| diagnosis.attempt == 2 && !completed_ids.contains(&diagnosis.task_id))
         .map(|diagnosis| diagnosis.task_id.clone())
         .collect();
+    direct_blocked.extend(
+        attempts
+            .outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(outcome.outcome, WorkerOutcome::NeedsAuthority { .. })
+                    && !completed_ids.contains(&outcome.task_id)
+            })
+            .map(|outcome| outcome.task_id.clone()),
+    );
     let mut blocked_by = BTreeMap::<String, BTreeSet<String>>::new();
     let mut blocked = Vec::new();
     for task in &tasks {
@@ -5930,6 +6321,11 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
         .iter()
         .map(VisibleAttempt::retry_json)
         .collect();
+    let outcomes: Vec<_> = attempts
+        .outcomes
+        .iter()
+        .map(VisibleWorkerOutcome::to_json)
+        .collect();
     let remaining_ids: Vec<_> = remaining
         .iter()
         .map(|task| task_id(task).map(Json::from))
@@ -5951,6 +6347,7 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
         ("frontier".to_owned(), Json::Array(frontier)),
         ("diagnoses".to_owned(), Json::Array(diagnoses)),
         ("retries".to_owned(), Json::Array(retries)),
+        ("outcomes".to_owned(), Json::Array(outcomes)),
         ("deferrals".to_owned(), Json::Array(deferrals)),
         ("blocked".to_owned(), Json::Array(blocked)),
         ("quiescent".to_owned(), Json::from(quiescent)),
@@ -9981,14 +10378,16 @@ fn action_cleanup(brief: &Json) -> Result<Json> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
 
     use super::{
+        action_worker_outcome, campaign_attempt_state, classify_worker_outcome,
         closed_inline_code_spans, contains_bare_exclamation_mark, publish_closing_summary,
         read_local_blob, replace_bare_exclamation_marks, validate_outcome_first, Json, RepoConfig,
+        WorkerOutcome,
     };
     use tally_core::campaign_folds::{campaign_digest, CampaignReconciliation, CampaignSource};
     use uuid::Uuid;
@@ -10033,6 +10432,168 @@ mod tests {
             },
             "complete",
         )
+    }
+
+    fn worker_outcome_test_brief(root: &Path, task_uuid: &str, message: Json) -> Json {
+        Json::object([
+            ("campaign", Json::from("fixture")),
+            (
+                "issue",
+                Json::object([
+                    ("number", Json::from("7")),
+                    ("url", Json::from("local://acme/spec/issues/7")),
+                ]),
+            ),
+            (
+                "task",
+                Json::object([
+                    ("id", Json::from("task-1")),
+                    ("revision", Json::from(format!("sha256:{}", "a".repeat(64)))),
+                ]),
+            ),
+            ("taskUuid", Json::from(task_uuid)),
+            ("message", message),
+            (
+                "attemptReceipts",
+                Json::object([
+                    ("schemaVersion", Json::Number("1".to_owned())),
+                    ("kind", Json::from("local-jsonl")),
+                    (
+                        "path",
+                        Json::from(
+                            root.join(
+                                "campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl",
+                            )
+                            .display()
+                            .to_string(),
+                        ),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn needs_authority_and_impossible_classify_distinctly_without_reclassifying_no_envelope() {
+        let requested_paths = vec![
+            Json::from(".github/workflows/release.yml"),
+            Json::from("test/fleet-gate.sh"),
+        ];
+        let needs_authority = Json::object([
+            ("outcome", Json::from("needs-authority")),
+            ("paths", Json::Array(requested_paths.clone())),
+        ]);
+        let impossible = Json::object([
+            ("outcome", Json::from("impossible")),
+            (
+                "reason",
+                Json::from("The required upstream proof does not exist."),
+            ),
+        ]);
+        assert_eq!(
+            classify_worker_outcome(Some(&needs_authority)).unwrap(),
+            Some(WorkerOutcome::NeedsAuthority {
+                paths: requested_paths
+                    .iter()
+                    .map(|path| path.as_str().unwrap().to_owned())
+                    .collect(),
+            })
+        );
+        assert!(matches!(
+            classify_worker_outcome(Some(&impossible)).unwrap(),
+            Some(WorkerOutcome::Impossible { .. })
+        ));
+        assert_eq!(
+            classify_worker_outcome(Some(&Json::from("ordinary final message"))).unwrap(),
+            None,
+            "a final message without an envelope stays on the existing agent signal path"
+        );
+
+        let temporary =
+            std::env::temp_dir().join(format!("tally-worker-outcome-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temporary).unwrap();
+        let first_uuid = "00000000-0000-4000-8000-000000000701";
+        let first = action_worker_outcome(&worker_outcome_test_brief(
+            &temporary,
+            first_uuid,
+            needs_authority.clone(),
+        ))
+        .unwrap();
+        let first = first.as_object().unwrap();
+        assert_eq!(
+            first.get("outcome").and_then(Json::as_str),
+            Some("needs-authority")
+        );
+        assert_eq!(first.get("attemptCost").and_then(Json::as_u64), Some(0));
+        assert_eq!(first.get("recorded").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            first.get("paths").unwrap().stringify(),
+            Json::Array(requested_paths).stringify()
+        );
+
+        let repeated = action_worker_outcome(&worker_outcome_test_brief(
+            &temporary,
+            first_uuid,
+            needs_authority,
+        ))
+        .unwrap();
+        assert_eq!(
+            repeated
+                .as_object()
+                .and_then(|result| result.get("recorded"))
+                .and_then(Json::as_bool),
+            Some(false)
+        );
+
+        let second = action_worker_outcome(&worker_outcome_test_brief(
+            &temporary,
+            "00000000-0000-4000-8000-000000000702",
+            impossible,
+        ))
+        .unwrap();
+        assert_eq!(
+            second
+                .as_object()
+                .and_then(|result| result.get("outcome"))
+                .and_then(Json::as_str),
+            Some("impossible")
+        );
+        assert_eq!(
+            second
+                .as_object()
+                .and_then(|result| result.get("attemptCost"))
+                .and_then(Json::as_u64),
+            Some(0)
+        );
+
+        let revisions = BTreeMap::from([(
+            "task-1".to_owned(),
+            Some(format!("sha256:{}", "a".repeat(64))),
+        )]);
+        let state = campaign_attempt_state(
+            worker_outcome_test_brief(&temporary, first_uuid, Json::Null)
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+            &revisions,
+        )
+        .unwrap();
+        assert!(state.diagnoses.is_empty());
+        assert!(state.retries.is_empty());
+        assert_eq!(state.outcomes.len(), 2);
+        let log = fs::read_to_string(
+            temporary.join("campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "the repeated worker UUID is idempotent"
+        );
+        assert!(log.contains(".github/workflows/release.yml"));
+        assert!(log.contains("test/fleet-gate.sh"));
+        fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]

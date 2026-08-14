@@ -1087,30 +1087,57 @@ pub(super) fn print_run_body(
     } else {
         outln!();
         outln!(
-            "{:<9}  {:<18}  {:<24}  TITLE",
+            "{:<15}  {:<18}  {:<24}  TITLE",
             "STATUS",
             "TASK",
             "CURRENT / BLOCKED BY"
         );
         for task in shown {
             let task_ref = task["taskRef"].as_str().unwrap_or("-");
-            let context = task["failureStage"]
-                .as_str()
-                .map(ToOwned::to_owned)
-                .or_else(|| task["currentNode"].as_str().map(ToOwned::to_owned))
-                .or_else(|| {
-                    let blocked = task["blockedBy"]
-                        .as_array()?
-                        .iter()
+            let outcome = task.get("outcome").and_then(Value::as_object);
+            let outcome_kind = outcome
+                .and_then(|outcome| outcome.get("kind"))
+                .and_then(Value::as_str);
+            let outcome_context = outcome_kind.and_then(|kind| match kind {
+                "needs-authority" => Some(
+                    outcome
+                        .and_then(|outcome| outcome.get("paths"))
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
                         .filter_map(Value::as_str)
-                        .collect::<Vec<_>>();
-                    (!blocked.is_empty()).then(|| blocked.join(","))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                "impossible" => outcome
+                    .and_then(|outcome| outcome.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                _ => None,
+            });
+            let context = outcome_context
+                .filter(|context| !context.is_empty())
+                .or_else(|| {
+                    task["failureStage"]
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .or_else(|| task["currentNode"].as_str().map(ToOwned::to_owned))
+                        .or_else(|| {
+                            let blocked = task["blockedBy"]
+                                .as_array()?
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>();
+                            (!blocked.is_empty()).then(|| blocked.join(","))
+                        })
+                        .or_else(|| task["pullRequest"].as_str().map(ToOwned::to_owned))
                 })
-                .or_else(|| task["pullRequest"].as_str().map(ToOwned::to_owned))
                 .unwrap_or_else(|| "-".to_owned());
             outln!(
-                "{:<9}  {:<18}  {:<24}  {}",
-                compact_text(task["status"].as_str().unwrap_or("unknown")),
+                "{:<15}  {:<18}  {:<24}  {}",
+                compact_text(
+                    outcome_kind.unwrap_or_else(|| task["status"].as_str().unwrap_or("unknown"))
+                ),
                 compact_text(task_ref),
                 compact_text(&context),
                 compact_text(task["title"].as_str().unwrap_or("-"))

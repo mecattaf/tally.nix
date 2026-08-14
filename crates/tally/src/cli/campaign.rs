@@ -300,8 +300,33 @@ enum PardonScope {
 enum LocalAttemptReceiptV1 {
     Diagnosis { task_id: String, attempt: u8 },
     Retry,
+    WorkerOutcome(LocalWorkerOutcome),
     Escalation,
     Pardon { tasks: Option<BTreeSet<String>> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalWorkerOutcome {
+    sequence: u64,
+    task_id: String,
+    task_revision: String,
+    task_uuid: String,
+    outcome: WorkerOutcomePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerOutcomePayload {
+    NeedsAuthority { paths: Vec<String> },
+    Impossible { reason: String },
+}
+
+impl WorkerOutcomePayload {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::NeedsAuthority { .. } => "needs-authority",
+            Self::Impossible { .. } => "impossible",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +341,7 @@ enum ReleaseAttemptReceipt {
         attempt: u64,
         reason: String,
     },
+    WorkerOutcome,
     Escalation,
     Pardon {
         sequence: u64,
@@ -2473,6 +2499,7 @@ fn read_release_attempt_log(
                         .expect("validated retry reason is text")
                         .to_owned(),
                 },
+                LocalAttemptReceiptV1::WorkerOutcome(_) => ReleaseAttemptReceipt::WorkerOutcome,
                 LocalAttemptReceiptV1::Escalation => ReleaseAttemptReceipt::Escalation,
                 LocalAttemptReceiptV1::Pardon { tasks } => {
                     ReleaseAttemptReceipt::Pardon { sequence, tasks }
@@ -2545,6 +2572,7 @@ fn release_attempt_facts(
             }
             ReleaseAttemptReceipt::Diagnosis { .. }
             | ReleaseAttemptReceipt::Retry { .. }
+            | ReleaseAttemptReceipt::WorkerOutcome
             | ReleaseAttemptReceipt::Escalation => {}
         }
     }
@@ -3718,6 +3746,20 @@ fn validate_local_attempt_receipt(
                 common.into_iter().chain(specific).collect(),
             )
         }
+        "worker-outcome" => {
+            let specific = [
+                "taskId",
+                "taskRevision",
+                "taskUuid",
+                "outcome",
+                "paths",
+                "reason",
+            ];
+            (
+                common.into_iter().chain(specific).collect(),
+                common.into_iter().chain(specific).collect(),
+            )
+        }
         "escalation" => {
             let specific = ["body"];
             (
@@ -3795,6 +3837,111 @@ fn validate_local_attempt_receipt(
         "retry" => {
             task_attempt("reason", MAX_RETRY_CHARS)?;
             Ok(LocalAttemptReceiptV1::Retry)
+        }
+        "worker-outcome" => {
+            let task_id = object
+                .get("taskId")
+                .and_then(Value::as_str)
+                .filter(|task_id| safe_task_id(task_id))
+                .ok_or_else(|| invalid(format!("{context}.taskId is unsafe")))?
+                .to_owned();
+            let task_revision = object
+                .get("taskRevision")
+                .and_then(Value::as_str)
+                .filter(|revision| is_sha256_identity(revision))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{context}.taskRevision must be a lowercase SHA-256 identity"
+                    ))
+                })?
+                .to_owned();
+            let task_uuid = object
+                .get("taskUuid")
+                .and_then(Value::as_str)
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .ok()
+                        .map(|parsed| (value, parsed))
+                })
+                .filter(|(value, parsed)| parsed.to_string() == **value)
+                .map(|(value, _)| value.to_owned())
+                .ok_or_else(|| invalid(format!("{context}.taskUuid must be a canonical UUID")))?;
+            let outcome = match object.get("outcome").and_then(Value::as_str) {
+                Some("needs-authority") => {
+                    if !object.get("reason").is_some_and(Value::is_null) {
+                        return Err(invalid(format!(
+                            "{context}.reason must be null for needs-authority"
+                        )));
+                    }
+                    let paths = object
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .filter(|paths| !paths.is_empty() && paths.len() <= 128)
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "{context}.paths must contain between 1 and 128 paths"
+                            ))
+                        })?;
+                    let mut seen = BTreeSet::new();
+                    let mut validated = Vec::with_capacity(paths.len());
+                    for (index, value) in paths.iter().enumerate() {
+                        validate_attempt_receipt_string(
+                            value,
+                            &format!("{context}.paths[{index}]"),
+                            4_096,
+                        )?;
+                        let path = value.as_str().expect("validated path is text");
+                        let pieces = path.split('/').collect::<Vec<_>>();
+                        if path.starts_with('/')
+                            || path.ends_with('/')
+                            || path == "."
+                            || pieces
+                                .iter()
+                                .any(|piece| piece.is_empty() || matches!(*piece, "." | ".."))
+                            || !seen.insert(path.to_owned())
+                        {
+                            return Err(invalid(format!(
+                                "{context}.paths[{index}] must be a unique normalized relative path"
+                            )));
+                        }
+                        validated.push(path.to_owned());
+                    }
+                    WorkerOutcomePayload::NeedsAuthority { paths: validated }
+                }
+                Some("impossible") => {
+                    if !object.get("paths").is_some_and(Value::is_null) {
+                        return Err(invalid(format!(
+                            "{context}.paths must be null for impossible"
+                        )));
+                    }
+                    let reason = object
+                        .get("reason")
+                        .ok_or_else(|| invalid(format!("{context}.reason is required")))?;
+                    validate_attempt_receipt_text(
+                        reason,
+                        &format!("{context}.reason"),
+                        MAX_DIAGNOSIS_CHARS,
+                    )?;
+                    WorkerOutcomePayload::Impossible {
+                        reason: reason
+                            .as_str()
+                            .expect("validated reason is text")
+                            .to_owned(),
+                    }
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "{context}.outcome must be needs-authority or impossible"
+                    )))
+                }
+            };
+            Ok(LocalAttemptReceiptV1::WorkerOutcome(LocalWorkerOutcome {
+                sequence: expected_sequence,
+                task_id,
+                task_revision,
+                task_uuid,
+                outcome,
+            }))
         }
         "escalation" => {
             validate_attempt_receipt_text(
@@ -3947,7 +4094,7 @@ fn read_local_attempt_receipts(
 
 fn active_escalated_tasks_from_receipts(
     records: &[LocalAttemptReceiptV1],
-    current_tasks: &BTreeSet<String>,
+    current_revisions: &BTreeMap<String, String>,
 ) -> Result<BTreeSet<String>> {
     #[derive(Default)]
     struct Escalation {
@@ -3956,24 +4103,33 @@ fn active_escalated_tasks_from_receipts(
     }
 
     let mut diagnoses = BTreeMap::<String, Vec<u8>>::new();
+    let mut authority_requests = BTreeSet::<String>::new();
     let mut escalations = Vec::<Escalation>::new();
     for record in records {
         match record {
             LocalAttemptReceiptV1::Diagnosis {
                 task_id, attempt, ..
-            } if current_tasks.contains(task_id) => {
+            } if current_revisions.contains_key(task_id) => {
                 diagnoses.entry(task_id.clone()).or_default().push(*attempt);
             }
             LocalAttemptReceiptV1::Diagnosis { .. } => {}
             LocalAttemptReceiptV1::Retry => {}
+            LocalAttemptReceiptV1::WorkerOutcome(outcome)
+                if current_revisions.get(&outcome.task_id) == Some(&outcome.task_revision)
+                    && matches!(outcome.outcome, WorkerOutcomePayload::NeedsAuthority { .. }) =>
+            {
+                authority_requests.insert(outcome.task_id.clone());
+            }
+            LocalAttemptReceiptV1::WorkerOutcome(_) => {}
             LocalAttemptReceiptV1::Escalation => {
-                let contributors = diagnoses
+                let mut contributors: BTreeSet<_> = diagnoses
                     .iter()
                     .filter(|(_, attempts)| {
                         attempts.iter().copied().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2])
                     })
                     .map(|(task_id, _)| task_id.clone())
                     .collect();
+                contributors.extend(authority_requests.iter().cloned());
                 escalations.push(Escalation {
                     contributors,
                     covered: BTreeSet::new(),
@@ -3981,6 +4137,7 @@ fn active_escalated_tasks_from_receipts(
             }
             LocalAttemptReceiptV1::Pardon { tasks: None, .. } => {
                 diagnoses.clear();
+                authority_requests.clear();
                 escalations.clear();
             }
             LocalAttemptReceiptV1::Pardon {
@@ -3988,6 +4145,7 @@ fn active_escalated_tasks_from_receipts(
             } => {
                 for task_id in scope {
                     diagnoses.remove(task_id);
+                    authority_requests.remove(task_id);
                 }
                 for escalation in &mut escalations {
                     escalation
@@ -4013,7 +4171,7 @@ fn active_escalated_tasks_from_receipts(
                 .cloned()
                 .collect::<Vec<_>>()
         })
-        .filter(|task_id| current_tasks.contains(task_id))
+        .filter(|task_id| current_revisions.contains_key(task_id))
         .collect())
 }
 
@@ -4021,19 +4179,118 @@ fn active_local_escalated_tasks(
     state_dir: &Path,
     graph: &CampaignGraph,
 ) -> Result<BTreeSet<String>> {
-    let current_tasks = graph
-        .canonical
-        .manifest
-        .tasks
-        .iter()
-        .map(|task| task.id.clone())
-        .collect::<BTreeSet<_>>();
+    let current_revisions = release_task_revisions(&graph.canonical)?;
     let records = read_local_attempt_receipts(
         state_dir,
         &graph.canonical.manifest.name,
         LOCAL_CAMPAIGN_ISSUE_NUMBER,
     )?;
-    active_escalated_tasks_from_receipts(&records, &current_tasks)
+    active_escalated_tasks_from_receipts(&records, &current_revisions)
+}
+
+fn active_worker_outcomes_from_receipts(
+    records: &[LocalAttemptReceiptV1],
+    current_revisions: &BTreeMap<String, String>,
+) -> BTreeMap<String, LocalWorkerOutcome> {
+    let mut outcomes = BTreeMap::new();
+    for record in records {
+        match record {
+            LocalAttemptReceiptV1::WorkerOutcome(outcome)
+                if current_revisions.get(&outcome.task_id) == Some(&outcome.task_revision) =>
+            {
+                outcomes.insert(outcome.task_id.clone(), outcome.clone());
+            }
+            LocalAttemptReceiptV1::Pardon { tasks: None } => outcomes.clear(),
+            LocalAttemptReceiptV1::Pardon { tasks: Some(tasks) } => {
+                for task_id in tasks {
+                    outcomes.remove(task_id);
+                }
+            }
+            LocalAttemptReceiptV1::Diagnosis { .. }
+            | LocalAttemptReceiptV1::Retry
+            | LocalAttemptReceiptV1::WorkerOutcome(_)
+            | LocalAttemptReceiptV1::Escalation => {}
+        }
+    }
+    outcomes
+}
+
+fn worker_outcome_status_value(campaign: &str, outcome: &LocalWorkerOutcome) -> Value {
+    let (paths, reason, claim) = match &outcome.outcome {
+        WorkerOutcomePayload::NeedsAuthority { paths } => {
+            (json!(paths), Value::Null, Value::Bool(false))
+        }
+        WorkerOutcomePayload::Impossible { reason } => {
+            (Value::Null, json!(reason), Value::Bool(true))
+        }
+    };
+    json!({
+        "kind": outcome.outcome.class(),
+        "receipt": local_attempt_receipt_url(campaign, outcome.sequence),
+        "taskRevision": outcome.task_revision,
+        "taskUuid": outcome.task_uuid,
+        "paths": paths,
+        "reason": reason,
+        "attemptCost": 0,
+        "claim": claim,
+    })
+}
+
+fn project_campaign_status_outcomes(
+    status: &mut Value,
+    campaign: &str,
+    records: &[LocalAttemptReceiptV1],
+    current_revisions: &BTreeMap<String, String>,
+) -> Result<()> {
+    let active = active_worker_outcomes_from_receipts(records, current_revisions);
+    let tasks = status
+        .get_mut("tasks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| invalid("daemon returned an invalid campaign task table"))?;
+    let mut projected = Vec::new();
+    for task in tasks {
+        if task.get("status").and_then(Value::as_str) == Some("done") {
+            continue;
+        }
+        let Some(task_id) = task
+            .get("taskRef")
+            .and_then(Value::as_str)
+            .and_then(|task_ref| {
+                task_ref
+                    .rsplit_once('/')
+                    .map(|(_, task_id)| task_id.to_owned())
+            })
+        else {
+            continue;
+        };
+        let Some(outcome) = active.get(&task_id) else {
+            continue;
+        };
+        let value = worker_outcome_status_value(campaign, outcome);
+        task.as_object_mut()
+            .ok_or_else(|| invalid("daemon returned a non-object campaign task"))?
+            .insert("outcome".to_owned(), value.clone());
+        projected.push(json!({"taskId": task_id, "outcome": value}));
+    }
+    status
+        .as_object_mut()
+        .ok_or_else(|| invalid("daemon returned a non-object campaign status"))?
+        .insert("outcomes".to_owned(), Value::Array(projected));
+    Ok(())
+}
+
+fn attach_campaign_status_outcomes(
+    state_dir: &Path,
+    graph: Option<&CanonicalCampaignGraphV1>,
+    status: &mut Value,
+) -> Result<()> {
+    let Some(graph) = graph else {
+        return Ok(());
+    };
+    let campaign = &graph.manifest.name;
+    let current_revisions = release_task_revisions(graph)?;
+    let records = read_local_attempt_receipts(state_dir, campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)?;
+    project_campaign_status_outcomes(status, campaign, &records, &current_revisions)
 }
 
 fn append_local_campaign_pardon(
@@ -6449,7 +6706,7 @@ async fn run_campaign_status(
     let latest = client
         .call_with_deadline("__campaign.status", Some(params), rpc_timeout)
         .await?;
-    let status = reconciled_campaign_status(
+    let mut status = reconciled_campaign_status(
         &client,
         rpc_timeout,
         latest,
@@ -6459,6 +6716,7 @@ async fn run_campaign_status(
         &worklist_pattern,
     )
     .await?;
+    attach_campaign_status_outcomes(&state_dir, approved_graph.as_ref(), &mut status)?;
     if args.json {
         outln!("{}", serde_json::to_string(&status)?);
         return Ok(());
@@ -8920,7 +9178,13 @@ fi
 
         let loaded = read_local_attempt_receipts(temporary.path(), campaign, issue_number).unwrap();
         assert_eq!(loaded.len(), 6, "an interrupted append is not a fact");
-        let current = BTreeSet::from(["finish".to_owned(), "foundation".to_owned()]);
+        let current = BTreeMap::from([
+            ("finish".to_owned(), format!("sha256:{}", "a".repeat(64))),
+            (
+                "foundation".to_owned(),
+                format!("sha256:{}", "b".repeat(64)),
+            ),
+        ]);
         assert_eq!(
             active_escalated_tasks_from_receipts(&loaded, &current).unwrap(),
             BTreeSet::from(["finish".to_owned()])
@@ -8963,8 +9227,77 @@ fi
             LocalAttemptReceiptV1::Escalation,
         ];
         assert!(
-            active_escalated_tasks_from_receipts(&removed_task_history, &BTreeSet::new()).is_err(),
+            active_escalated_tasks_from_receipts(&removed_task_history, &BTreeMap::new()).is_err(),
             "removed tasks are dropped before escalation causality is folded"
+        );
+    }
+
+    #[test]
+    fn needs_authority_and_impossible_render_as_distinct_campaign_outcomes() {
+        let authority_revision = format!("sha256:{}", "a".repeat(64));
+        let impossible_revision = format!("sha256:{}", "b".repeat(64));
+        let revisions = BTreeMap::from([
+            ("authority-task".to_owned(), authority_revision.clone()),
+            ("impossible-task".to_owned(), impossible_revision.clone()),
+        ]);
+        let records = vec![
+            LocalAttemptReceiptV1::WorkerOutcome(LocalWorkerOutcome {
+                sequence: 1,
+                task_id: "authority-task".to_owned(),
+                task_revision: authority_revision,
+                task_uuid: "00000000-0000-4000-8000-000000000801".to_owned(),
+                outcome: WorkerOutcomePayload::NeedsAuthority {
+                    paths: vec![
+                        ".github/workflows/release.yml".to_owned(),
+                        "test/fleet-gate.sh".to_owned(),
+                    ],
+                },
+            }),
+            LocalAttemptReceiptV1::WorkerOutcome(LocalWorkerOutcome {
+                sequence: 2,
+                task_id: "impossible-task".to_owned(),
+                task_revision: impossible_revision,
+                task_uuid: "00000000-0000-4000-8000-000000000802".to_owned(),
+                outcome: WorkerOutcomePayload::Impossible {
+                    reason: "The required upstream proof does not exist.".to_owned(),
+                },
+            }),
+        ];
+        let mut status = json!({
+            "tasks": [
+                {
+                    "taskRef": "registration/authority-task",
+                    "title": "Authority task",
+                    "status": "pending",
+                    "blockedBy": []
+                },
+                {
+                    "taskRef": "registration/impossible-task",
+                    "title": "Impossible task",
+                    "status": "pending",
+                    "blockedBy": []
+                }
+            ]
+        });
+        project_campaign_status_outcomes(&mut status, "fixture", &records, &revisions).unwrap();
+        assert_eq!(
+            status["tasks"][0]["outcome"]["kind"],
+            json!("needs-authority")
+        );
+        assert_eq!(
+            status["tasks"][0]["outcome"]["paths"],
+            json!([".github/workflows/release.yml", "test/fleet-gate.sh"])
+        );
+        assert_eq!(status["tasks"][0]["outcome"]["attemptCost"], json!(0));
+        assert_eq!(status["tasks"][1]["outcome"]["kind"], json!("impossible"));
+        assert_eq!(status["tasks"][1]["outcome"]["claim"], json!(true));
+
+        let mut escalated = records;
+        escalated.push(LocalAttemptReceiptV1::Escalation);
+        assert_eq!(
+            active_escalated_tasks_from_receipts(&escalated, &revisions).unwrap(),
+            BTreeSet::from(["authority-task".to_owned()]),
+            "needs-authority blocks without manufacturing diagnosis attempts"
         );
     }
 

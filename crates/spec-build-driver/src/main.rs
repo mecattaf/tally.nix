@@ -21,6 +21,8 @@ enum Action {
     Reconcile,
     #[value(name = "diff")]
     Diff,
+    #[value(name = "outcome")]
+    Outcome,
     #[value(name = "steeringRecheck")]
     SteeringRecheck,
     #[value(name = "steer")]
@@ -60,6 +62,7 @@ impl Action {
             Self::Sweep => "sweep",
             Self::Reconcile => "reconcile",
             Self::Diff => "diff",
+            Self::Outcome => "outcome",
             Self::SteeringRecheck => "steeringRecheck",
             Self::Steer => "steer",
             Self::Retry => "retry",
@@ -121,11 +124,12 @@ mod tests {
 
     use super::{Action, Cli};
 
-    const ACTION_NAMES: [&str; 19] = [
+    const ACTION_NAMES: [&str; 20] = [
         "worklist",
         "sweep",
         "reconcile",
         "diff",
+        "outcome",
         "steeringRecheck",
         "steer",
         "retry",
