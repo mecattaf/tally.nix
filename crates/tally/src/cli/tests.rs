@@ -15,6 +15,32 @@ fn rpc_timeout_flag_is_global() {
 }
 
 #[test]
+fn rebuild_is_a_top_level_offline_run_view() {
+    let options = Opts::try_parse_from([
+        "tally",
+        "rebuild",
+        "00000000-0000-4000-8000-000000000043",
+        "--json",
+        "--state-dir",
+        "/var/lib/tally/state",
+        "--data-dir",
+        "/var/lib/tally/data",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Rebuild(RebuildArgs {
+            id,
+            json: true,
+            state_dir: Some(state_dir),
+            data_dir: Some(data_dir),
+        })) if id == "00000000-0000-4000-8000-000000000043"
+            && state_dir == Path::new("/var/lib/tally/state")
+            && data_dir == Path::new("/var/lib/tally/data")
+    ));
+}
+
+#[test]
 fn campaign_arm_takes_repository_and_committed_worklist_identity() {
     let options = Opts::try_parse_from([
         "tally",

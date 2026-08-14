@@ -51,6 +51,8 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: CampaignCommand,
     },
+    /// Replay one run from canonical stores and sampled executor unit facts (`tally rebuild`).
+    Rebuild(RebuildArgs),
     /// Validate every commit in a Git revision range against tally's commit grammar.
     LintHistory(LintHistoryArgs),
     Witness {
@@ -88,6 +90,24 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: ReaderStateCommand,
     },
+}
+
+#[derive(Debug, Args)]
+pub(super) struct RebuildArgs {
+    /// Flow run whose derived projection should be rebuilt.
+    #[arg(value_name = "FLOW_RUN_ID")]
+    pub(super) id: String,
+    /// Emit the complete machine-readable rebuilt view.
+    #[arg(long)]
+    pub(super) json: bool,
+    /// State directory containing enqueue and execution records; defaults to
+    /// the XDG state directory. Point it at the daemon's configured stateDir.
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+    /// Data directory containing witness, lifecycle, membership, lineage, and
+    /// attestation ledgers; defaults to the XDG data directory.
+    #[arg(long, value_name = "PATH")]
+    pub(super) data_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
