@@ -789,6 +789,40 @@
       ]
     },
     {
+      "id": "schema-example-stderr-lint",
+      "kind": "implementation",
+      "title": "Replace forbidden stderr macros in the schema-generator example",
+      "goal": "The chapter gate's clippy stage (gate-only lint class, F33) flagged crates/spec-build-driver/examples/generate-flow-args-schema.rs: five forbidden standard stderr-printing macros under -D warnings. Adopt the machine's prescription verbatim: replace them with locked std::io::stderr writes following the pattern in crates/spec-build-driver/src/main.rs, then verify with clippy exactly as the gate runs it. Formatting and tests already passed at the gate; touch nothing else.",
+      "deliveredBehaviors": [
+        "Workspace clippy passes under -D warnings"
+      ],
+      "readFirst": {
+        "specSections": [
+          "SILENT-FACTORY-PLAN.md Part 7 section 7.5"
+        ],
+        "styleReferences": [
+          "crates/spec-build-driver/src/main.rs"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "clippy-green",
+          "description": "Clippy passes exactly as the gate runs it.",
+          "argv": [
+            "bash",
+            "-lc",
+            "nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -5"
+          ]
+        }
+      ],
+      "dependencies": [
+        "argsschema-single-source"
+      ],
+      "conflictDomains": [
+        "crates/spec-build-driver"
+      ]
+    },
+    {
       "id": "chapter-gate",
       "kind": "checkpoint",
       "title": "Epsilon stage 2 gate: full gate ladder plus the final conformance bar",
@@ -816,7 +850,8 @@
         "port-effect-half",
         "argsschema-single-source",
         "rust-driver-seam-proof",
-        "delete-python-driver"
+        "delete-python-driver",
+        "schema-example-stderr-lint"
       ]
     }
   ]
