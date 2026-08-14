@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -13,7 +14,10 @@ fn main() -> ExitCode {
         [path] => (false, Some(path.clone())),
         [flag, path] if flag == "--check" => (true, Some(path.clone())),
         _ => {
-            eprintln!("usage: generate-flow-args-schema [--check] [FLOW_PATH]");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "usage: generate-flow-args-schema [--check] [FLOW_PATH]"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -24,14 +28,22 @@ fn main() -> ExitCode {
     let source = match fs::read_to_string(&path) {
         Ok(source) => source,
         Err(error) => {
-            eprintln!("cannot read {}: {error}", path.display());
+            let _ = writeln!(
+                io::stderr().lock(),
+                "cannot read {}: {error}",
+                path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
     let generated = match replace_generated_flow_args_schema(&source) {
         Ok(generated) => generated,
         Err(error) => {
-            eprintln!("cannot generate {}: {error}", path.display());
+            let _ = writeln!(
+                io::stderr().lock(),
+                "cannot generate {}: {error}",
+                path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -39,7 +51,8 @@ fn main() -> ExitCode {
         if generated == source {
             return ExitCode::SUCCESS;
         }
-        eprintln!(
+        let _ = writeln!(
+            io::stderr().lock(),
             "{} is stale; run `cargo run -p spec-build-driver --example generate-flow-args-schema`",
             path.display()
         );
@@ -47,7 +60,11 @@ fn main() -> ExitCode {
     }
     if generated != source {
         if let Err(error) = fs::write(&path, generated) {
-            eprintln!("cannot write {}: {error}", path.display());
+            let _ = writeln!(
+                io::stderr().lock(),
+                "cannot write {}: {error}",
+                path.display()
+            );
             return ExitCode::FAILURE;
         }
     }
