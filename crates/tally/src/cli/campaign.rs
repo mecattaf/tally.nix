@@ -14,13 +14,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::{AdapterConfig, AdapterHardening, ScrapeMode, ScrapeStream};
 use tally_core::campaign_contract::{
-    admit_manifest_value, validate_agent, validate_argv, validate_gates, CampaignAgent,
-    CampaignGate, CampaignManifest, CampaignRepository, CampaignSteward, CanonicalCampaignGraphV1,
-    CanonicalCampaignTaskV1, BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION,
+    admit_manifest_value, task_completion_revision, validate_agent, validate_argv, validate_gates,
+    CampaignAgent, CampaignGate, CampaignManifest, CampaignRepository, CampaignSteward,
+    CanonicalCampaignGraphV1, CanonicalCampaignTaskV1, BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION,
     DEFAULT_AGENT_APPROVAL_POLICY, DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY, DEFAULT_AGENT_PRIORITY,
     DEFAULT_AGENT_RUNTIME_MAX_SEC, DEFAULT_AGENT_SANDBOX_POLICY, DEFAULT_DRIVER_RUNTIME_MAX_SEC,
     DEFAULT_MAX_TASKS, DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN, DEFAULT_STEWARD_RUNTIME_MAX_SEC,
     MAX_CAMPAIGN_TASKS,
+};
+use tally_core::campaign_folds::{
+    campaign_digest, render_campaign_summary, stable_publish_branch, BlockedFact, CampaignDigest,
+    CampaignReconciliation, CampaignSource, CheckpointFact, DeferralFact, DiagnosisFact,
+    MergedFact, ReconciledTask, RetryFact, TALLY_REVISION_PREFIX, TALLY_TASK_PREFIX,
 };
 use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
@@ -45,6 +50,11 @@ const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
 const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
 const LOCAL_ALLOWED_ACTOR: &str = "local";
+const RELEASE_PLAN_SCHEMA_VERSION: u32 = 1;
+const RELEASE_SUMMARY_SCHEMA_VERSION: u32 = 1;
+const MAX_RELEASE_REGISTRATION_BYTES: u64 = 1024 * 1024;
+const MAX_RELEASE_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const COMPLETE_SUMMARY_MARKER_PREFIX: &str = "<!-- tally:campaign-complete:v1 source=";
 
 #[derive(Debug, Clone)]
 struct WorklistTask {
@@ -273,6 +283,143 @@ enum LocalAttemptReceiptV1 {
     Pardon { tasks: Option<BTreeSet<String>> },
 }
 
+#[derive(Debug, Clone)]
+enum ReleaseAttemptReceipt {
+    Diagnosis {
+        task_id: String,
+        attempt: u64,
+        diagnosis: String,
+    },
+    Retry {
+        task_id: String,
+        attempt: u64,
+        reason: String,
+    },
+    Escalation,
+    Pardon {
+        sequence: u64,
+        tasks: Option<BTreeSet<String>>,
+    },
+}
+
+#[derive(Debug)]
+struct ReleaseAttemptLog {
+    path: PathBuf,
+    present: bool,
+    bytes: Vec<u8>,
+    records: Vec<ReleaseAttemptReceipt>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseGitRef {
+    object_id: String,
+    object_type: String,
+    reference: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseCommit {
+    object_id: String,
+    parents: Vec<String>,
+    committed_at: i64,
+    subject: String,
+    task_values: Vec<String>,
+    revision_values: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseCheckpoint {
+    task_id: String,
+    reference: String,
+    revision: String,
+    source_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ReleaseClosingSummaryV1 {
+    schema_version: u32,
+    kind: String,
+    campaign: String,
+    issue_number: String,
+    outcome: String,
+    body: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseSummaryRef {
+    reference: String,
+    object_id: String,
+    source_sha256: Option<String>,
+    summary: ReleaseClosingSummaryV1,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseNote {
+    task_id: String,
+    commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_commit: Option<String>,
+    header: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    breaking: bool,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseGateProof {
+    task_id: String,
+    reference: String,
+    revision: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseSummaryProof {
+    reference: String,
+    object_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseArtifact {
+    kind: String,
+    locator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleasePlan {
+    schema_version: u32,
+    mode: &'static str,
+    campaign: String,
+    registration_id: String,
+    repository: String,
+    worklist: String,
+    version: String,
+    revision: String,
+    integration_ref: String,
+    closing_summary: CampaignReleaseSummaryProof,
+    release_notes: Vec<CampaignReleaseNote>,
+    gate_proof: CampaignReleaseGateProof,
+    artifacts: Vec<CampaignReleaseArtifact>,
+    digest: CampaignDigest,
+    campaign_summary: String,
+}
+
 #[derive(Debug)]
 enum CampaignPollAttempt {
     Dispatched,
@@ -297,6 +444,7 @@ pub(super) async fn run_campaign(
         CampaignCommand::Resume(args) => {
             run_campaign_resume(socket, config_path, rpc_timeout, args).await
         }
+        CampaignCommand::Release(args) => run_campaign_release(args),
         CampaignCommand::Poll(args) => {
             run_campaign_poll(socket, config_path, rpc_timeout, args).await
         }
@@ -307,6 +455,1212 @@ pub(super) async fn run_campaign(
         CampaignCommand::Quiescent(args) => run_campaign_quiescent(args),
         CampaignCommand::Disarm(args) => run_campaign_disarm(args),
     }
+}
+
+fn run_campaign_release(args: CampaignReleaseArgs) -> Result<()> {
+    if !args.plan {
+        return Err(invalid(
+            "campaign release currently requires --plan; release execution is not enabled",
+        ));
+    }
+    let (code_repository, worklist_pattern) =
+        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
+    let state_dir = resolve_state_dir(args.state_dir)?;
+    let plan = render_campaign_release_plan(&state_dir, &code_repository, &worklist_pattern)?;
+
+    // The compact first line is deliberately stable for scripts. Human text
+    // follows after a blank line, so plan mode serves both consumers without
+    // growing a second flag or rendering path.
+    outln!("{}", serde_json::to_string(&plan)?);
+    outln!();
+    outln!("{}", render_campaign_release_human(&plan).trim_end());
+    Ok(())
+}
+
+fn render_campaign_release_plan(
+    state_dir: &Path,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> Result<CampaignReleasePlan> {
+    let registration = read_release_registration(state_dir, code_repository, worklist_pattern)?;
+    let graph = read_approved_graph_snapshot(state_dir, &registration)?.ok_or_else(|| {
+        invalid(format!(
+            "campaign {code_repository}/{worklist_pattern} has no approved graph snapshot; re-arm it before rendering a release"
+        ))
+    })?;
+    validate_release_graph(&registration, &graph)?;
+
+    let campaign = graph.manifest.name.as_str();
+    let integration_branch =
+        stable_publish_branch(campaign, &registration.registration_id, "integration", None);
+    let integration_ref = format!("refs/heads/{integration_branch}");
+    let campaign_branch_prefix = format!(
+        "refs/heads/{}",
+        integration_branch
+            .strip_suffix("integration")
+            .expect("the integration branch ends with its fixed leaf")
+    );
+    let state_prefix = campaign_state_ref_prefix(campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER);
+    let refs = release_local_refs(
+        &registration.checkout,
+        &[
+            integration_ref.clone(),
+            campaign_branch_prefix,
+            format!("{state_prefix}/"),
+        ],
+    )?;
+    let integration = release_required_ref(&refs, &integration_ref, "commit")?;
+    let history = release_integration_history(&registration.checkout, &integration_ref)?;
+    let revisions = release_task_revisions(&graph)?;
+    let merged_commits = release_merged_commits(&graph, &revisions, &history)?;
+    let source_revision = merged_commits
+        .first()
+        .and_then(|(_, commit)| commit.parents.first())
+        .cloned()
+        .unwrap_or_else(|| integration.object_id.clone());
+
+    let all_checkpoints =
+        release_checkpoint_refs(&graph, &refs, &state_prefix, &integration.object_id)?;
+    let gate_checkpoint =
+        release_gate_checkpoint(&graph, &all_checkpoints, &integration.object_id)?;
+    let checkpoints =
+        release_current_checkpoints(&graph, &all_checkpoints, &gate_checkpoint.source_sha256)?;
+
+    let summaries = release_summary_refs(&registration.checkout, &refs, &state_prefix, campaign)?;
+    let closing_summary =
+        release_closing_summary(&summaries, &state_prefix, &gate_checkpoint.source_sha256)?;
+    let attempt_log = read_release_attempt_log(state_dir, campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)?;
+
+    let task_ids = graph
+        .manifest
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    let (diagnoses, retries, warnings) = release_attempt_facts(&attempt_log.records, &task_ids);
+    let merged = merged_commits
+        .iter()
+        .map(|(task_id, commit)| MergedFact {
+            task_id: task_id.clone(),
+            pull_request: format!(
+                "local://{code_repository}/{}",
+                stable_publish_branch(
+                    campaign,
+                    &registration.registration_id,
+                    task_id,
+                    revisions.get(task_id).map(String::as_str),
+                )
+            ),
+            merge_commit: commit.object_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let checkpoint_facts = checkpoints
+        .iter()
+        .map(|checkpoint| CheckpointFact {
+            task_id: checkpoint.task_id.clone(),
+            revision: checkpoint.revision.clone(),
+        })
+        .collect::<Vec<_>>();
+    let reconciliation = CampaignReconciliation {
+        campaign: campaign.to_owned(),
+        repository: code_repository.to_owned(),
+        source: CampaignSource {
+            path: Some(worklist_pattern.to_owned()),
+            sha256: gate_checkpoint.source_sha256.clone(),
+            revision: source_revision,
+            repository: None,
+            extra: serde_json::Map::new(),
+        },
+        base_revision: integration.object_id.clone(),
+        tasks: graph
+            .manifest
+            .tasks
+            .iter()
+            .zip(&graph.tasks)
+            .map(|(reference, content)| ReconciledTask {
+                id: reference.id.clone(),
+                title: content.title.clone(),
+            })
+            .collect(),
+        merged,
+        checkpoints: checkpoint_facts,
+        remaining: Vec::new(),
+        diagnoses,
+        retries,
+        deferrals: Vec::<DeferralFact>::new(),
+        blocked: Vec::<BlockedFact>::new(),
+        warnings,
+    };
+    let digest = campaign_digest(&reconciliation, "complete");
+    if digest.merged.len() + digest.checkpoints.len() != digest.task_count {
+        bail!(
+            "completed campaign {campaign:?} has only {} durable merge/checkpoint fact(s) for {} task(s)",
+            digest.merged.len() + digest.checkpoints.len(),
+            digest.task_count
+        );
+    }
+    let campaign_summary = render_campaign_summary(&digest);
+
+    let release_notes = release_notes(&registration, &graph, &refs, &revisions, &merged_commits)?;
+    let artifacts = release_artifacts(
+        integration,
+        &release_notes,
+        &refs,
+        &checkpoints,
+        closing_summary,
+        &summaries,
+        &attempt_log,
+    );
+    let committed_at = history
+        .iter()
+        .find(|commit| commit.object_id == gate_checkpoint.revision)
+        .map(|commit| commit.committed_at)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            release_commit_timestamp(&registration.checkout, &gate_checkpoint.revision)
+        })?;
+    let version = release_version(committed_at, &gate_checkpoint.revision)?;
+
+    Ok(CampaignReleasePlan {
+        schema_version: RELEASE_PLAN_SCHEMA_VERSION,
+        mode: "plan",
+        campaign: campaign.to_owned(),
+        registration_id: registration.registration_id.clone(),
+        repository: code_repository.to_owned(),
+        worklist: worklist_pattern.to_owned(),
+        version,
+        revision: integration.object_id.clone(),
+        integration_ref,
+        closing_summary: CampaignReleaseSummaryProof {
+            reference: closing_summary.reference.clone(),
+            object_id: closing_summary.object_id.clone(),
+        },
+        release_notes,
+        gate_proof: CampaignReleaseGateProof {
+            task_id: gate_checkpoint.task_id,
+            reference: gate_checkpoint.reference,
+            revision: gate_checkpoint.revision,
+        },
+        artifacts,
+        digest,
+        campaign_summary,
+    })
+}
+
+fn read_release_registration(
+    state_dir: &Path,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> Result<CampaignRegistration> {
+    let path = release_registration_path(state_dir, code_repository, worklist_pattern);
+    let metadata = fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "cannot read campaign registration {}; arm the campaign before rendering its release",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_RELEASE_REGISTRATION_BYTES
+    {
+        bail!(
+            "campaign registration {} is not a bounded private regular file",
+            path.display()
+        );
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("cannot read campaign registration {}", path.display()))?;
+    let authority: CampaignRegistrationV4 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("campaign registration {} is invalid", path.display()))?;
+    if authority.schema_version != REGISTRY_SCHEMA_VERSION
+        || authority.code_repository != code_repository
+        || authority.worklist_pattern != worklist_pattern
+        || authority.arm_serial == 0
+        || !authority.checkout.is_absolute()
+        || !is_sha256_identity(&authority.approved_graph_digest)
+        || uuid::Uuid::parse_str(&authority.registration_id).is_err()
+    {
+        bail!(
+            "campaign registration {} is not valid schema-{} authority for {code_repository}/{worklist_pattern}",
+            path.display(),
+            REGISTRY_SCHEMA_VERSION
+        );
+    }
+    Ok(CampaignRegistration::new(authority, None))
+}
+
+fn release_registration_path(
+    state_dir: &Path,
+    code_repository: &str,
+    worklist_pattern: &str,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(code_repository.as_bytes());
+    hasher.update([0]);
+    hasher.update(worklist_pattern.as_bytes());
+    state_dir
+        .join("campaigns/armed")
+        .join(format!("{:x}.json", hasher.finalize()))
+}
+
+fn validate_release_graph(
+    registration: &CampaignRegistration,
+    graph: &CanonicalCampaignGraphV1,
+) -> Result<()> {
+    let repository = &graph.manifest.repository;
+    if graph.executable_digest != registration.approved_graph_digest
+        || repository.checkout != registration.checkout
+        || repository.base_branch != registration.base_branch
+        || repository.remote != registration.remote
+        || repository.forge != "local"
+        || !safe_component(&graph.manifest.name)
+    {
+        bail!(
+            "campaign approved graph disagrees with registration {} arm {}",
+            registration.registration_id,
+            registration.arm_serial
+        );
+    }
+    Ok(())
+}
+
+fn is_sha256_identity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    (40..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Run one of the deliberately tiny local Git read primitives used by plan
+/// mode. Keeping the allowlist here makes an accidental fetch, push, ls-remote,
+/// or forge helper structurally unavailable to the renderer.
+fn release_git_read(checkout: &Path, arguments: &[String], context: &str) -> Result<Vec<u8>> {
+    if !matches!(
+        arguments.first().map(String::as_str),
+        Some("for-each-ref" | "log" | "cat-file" | "show")
+    ) {
+        bail!("internal release renderer attempted a non-read-only Git operation");
+    }
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(arguments)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .output()
+        .with_context(|| format!("cannot run local Git while {context}"))?;
+    if !output.status.success() {
+        bail!(
+            "local Git failed while {context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if output.stdout.len() > MAX_RELEASE_GIT_OUTPUT_BYTES {
+        bail!("local Git output exceeded 8 MiB while {context}");
+    }
+    Ok(output.stdout)
+}
+
+fn release_local_refs(checkout: &Path, prefixes: &[String]) -> Result<Vec<ReleaseGitRef>> {
+    let mut arguments = vec![
+        "for-each-ref".to_owned(),
+        "--format=%(objectname)%09%(objecttype)%09%(refname)".to_owned(),
+    ];
+    arguments.extend(prefixes.iter().cloned());
+    let stdout = release_git_read(checkout, &arguments, "listing local campaign refs")?;
+    let stdout = String::from_utf8(stdout).context("local campaign refs were not UTF-8")?;
+    let mut refs = Vec::new();
+    for line in stdout.lines().filter(|line| !line.is_empty()) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3
+            || !is_git_object_id(fields[0])
+            || !matches!(fields[1], "blob" | "commit")
+            || !fields[2].starts_with("refs/")
+        {
+            bail!("local campaign ref listing returned a malformed row");
+        }
+        refs.push(ReleaseGitRef {
+            object_id: fields[0].to_owned(),
+            object_type: fields[1].to_owned(),
+            reference: fields[2].to_owned(),
+        });
+    }
+    refs.sort_by(|left, right| left.reference.cmp(&right.reference));
+    Ok(refs)
+}
+
+fn release_required_ref<'a>(
+    refs: &'a [ReleaseGitRef],
+    reference: &str,
+    object_type: &str,
+) -> Result<&'a ReleaseGitRef> {
+    let matches = refs
+        .iter()
+        .filter(|candidate| candidate.reference == reference)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [candidate] if candidate.object_type == object_type => Ok(candidate),
+        [candidate] => bail!(
+            "campaign ref {reference:?} must point directly to a {object_type}, not a {}",
+            candidate.object_type
+        ),
+        [] => bail!(
+            "completed campaign is missing local ref {reference:?}; restore its durable refs before rendering a release"
+        ),
+        _ => bail!("local campaign ref {reference:?} appeared more than once"),
+    }
+}
+
+fn release_integration_history(checkout: &Path, reference: &str) -> Result<Vec<ReleaseCommit>> {
+    let task_key = TALLY_TASK_PREFIX.trim_end_matches(':');
+    let revision_key = TALLY_REVISION_PREFIX.trim_end_matches(':');
+    let format = format!(
+        "%H%x00%P%x00%ct%x00%s%x00%(trailers:key={task_key},valueonly,unfold=true,separator=%x1f)%x00%(trailers:key={revision_key},valueonly,unfold=true,separator=%x1f)"
+    );
+    let arguments = vec![
+        "log".to_owned(),
+        "--first-parent".to_owned(),
+        "-z".to_owned(),
+        format!("--format={format}"),
+        reference.to_owned(),
+    ];
+    let stdout = release_git_read(checkout, &arguments, "reading local integration trailers")?;
+    let stdout = String::from_utf8(stdout).context("local integration history was not UTF-8")?;
+    let mut fields = stdout.split('\0').collect::<Vec<_>>();
+    if fields.last() == Some(&"") {
+        fields.pop();
+    }
+    if fields.len() % 6 != 0 {
+        bail!("local integration trailer listing returned malformed output");
+    }
+    fields
+        .chunks_exact(6)
+        .map(|fields| {
+            let object_id = fields[0];
+            let parents = fields[1]
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !is_git_object_id(object_id)
+                || parents.iter().any(|parent| !is_git_object_id(parent))
+            {
+                bail!("local integration history returned a malformed commit");
+            }
+            let committed_at = fields[2]
+                .parse::<i64>()
+                .context("local integration history returned a malformed timestamp")?;
+            Ok(ReleaseCommit {
+                object_id: object_id.to_owned(),
+                parents,
+                committed_at,
+                subject: fields[3].to_owned(),
+                task_values: split_release_trailers(fields[4]),
+                revision_values: split_release_trailers(fields[5]),
+            })
+        })
+        .collect()
+}
+
+fn split_release_trailers(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split('\u{1f}').map(str::to_owned).collect()
+    }
+}
+
+fn release_task_revisions(graph: &CanonicalCampaignGraphV1) -> Result<BTreeMap<String, String>> {
+    if graph.manifest.tasks.len() != graph.tasks.len() {
+        bail!("campaign approved graph has mismatched task references and content");
+    }
+    graph
+        .manifest
+        .tasks
+        .iter()
+        .zip(&graph.tasks)
+        .map(|(reference, content)| {
+            Ok((
+                reference.id.clone(),
+                task_completion_revision(&graph.manifest, reference, content)?,
+            ))
+        })
+        .collect()
+}
+
+fn release_merged_commits(
+    graph: &CanonicalCampaignGraphV1,
+    revisions: &BTreeMap<String, String>,
+    history: &[ReleaseCommit],
+) -> Result<Vec<(String, ReleaseCommit)>> {
+    let implementation_ids = graph
+        .manifest
+        .tasks
+        .iter()
+        .filter(|task| task.kind == "implementation")
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut claims = BTreeMap::<(String, String), Vec<&ReleaseCommit>>::new();
+    for commit in history {
+        if let ([task_id], [revision]) = (
+            commit.task_values.as_slice(),
+            commit.revision_values.as_slice(),
+        ) {
+            if safe_task_id(task_id) && is_sha256_identity(revision) {
+                claims
+                    .entry((task_id.clone(), revision.clone()))
+                    .or_default()
+                    .push(commit);
+            }
+        }
+    }
+    for task_id in &implementation_ids {
+        let revision = revisions
+            .get(*task_id)
+            .expect("every graph task has a computed revision");
+        match claims.get(&(String::from(*task_id), revision.clone())) {
+            Some(matches) if matches.len() == 1 => {}
+            Some(_) => bail!(
+                "multiple local integration commits claim campaign task {task_id:?} revision {revision}"
+            ),
+            None => bail!(
+                "completed campaign is missing the {TALLY_TASK_PREFIX} {task_id} / {TALLY_REVISION_PREFIX} {revision} trailer proof"
+            ),
+        }
+    }
+
+    let mut merged = Vec::new();
+    for commit in history.iter().rev() {
+        let ([task_id], [revision]) = (
+            commit.task_values.as_slice(),
+            commit.revision_values.as_slice(),
+        ) else {
+            continue;
+        };
+        if implementation_ids.contains(task_id.as_str()) && revisions.get(task_id) == Some(revision)
+        {
+            merged.push((task_id.clone(), commit.clone()));
+        }
+    }
+    if merged.len() != implementation_ids.len() {
+        bail!(
+            "completed campaign trailer oracle found {} of {} implementation task(s)",
+            merged.len(),
+            implementation_ids.len()
+        );
+    }
+    Ok(merged)
+}
+
+fn release_checkpoint_refs(
+    graph: &CanonicalCampaignGraphV1,
+    refs: &[ReleaseGitRef],
+    state_prefix: &str,
+    integration_tip: &str,
+) -> Result<Vec<ReleaseCheckpoint>> {
+    let checkpoint_ids = graph
+        .manifest
+        .tasks
+        .iter()
+        .filter(|task| task.kind == "checkpoint")
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let prefix = format!("{state_prefix}/checkpoint/");
+    let mut checkpoints = Vec::new();
+    for reference in refs
+        .iter()
+        .filter(|reference| reference.reference.starts_with(&prefix))
+    {
+        let suffix = reference
+            .reference
+            .strip_prefix(&prefix)
+            .expect("checkpoint ref was filtered by prefix");
+        let Some((identity, named_revision)) = suffix.split_once('/') else {
+            continue;
+        };
+        if named_revision.contains('/') || !is_git_object_id(named_revision) {
+            continue;
+        }
+        let Some((task_id, source_digest)) = identity.rsplit_once('-') else {
+            continue;
+        };
+        if !checkpoint_ids.contains(task_id)
+            || source_digest.len() != 64
+            || !source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            continue;
+        }
+        if reference.object_type != "commit" || reference.object_id != named_revision {
+            bail!(
+                "checkpoint ref {:?} must point directly to its named commit",
+                reference.reference
+            );
+        }
+        checkpoints.push(ReleaseCheckpoint {
+            task_id: task_id.to_owned(),
+            reference: reference.reference.clone(),
+            revision: reference.object_id.clone(),
+            source_sha256: format!("sha256:{source_digest}"),
+        });
+    }
+    if checkpoints.is_empty() {
+        bail!(
+            "completed campaign has no local checkpoint refs below {prefix}; restore the gate proof before rendering a release"
+        );
+    }
+    if !checkpoints
+        .iter()
+        .any(|checkpoint| checkpoint.revision == integration_tip)
+    {
+        bail!("completed campaign has no checkpoint ref for integration tip {integration_tip}");
+    }
+    checkpoints.sort_by(|left, right| left.reference.cmp(&right.reference));
+    Ok(checkpoints)
+}
+
+fn release_gate_checkpoint(
+    graph: &CanonicalCampaignGraphV1,
+    checkpoints: &[ReleaseCheckpoint],
+    integration_tip: &str,
+) -> Result<ReleaseCheckpoint> {
+    let implementation_ids = graph
+        .manifest
+        .tasks
+        .iter()
+        .filter(|task| task.kind == "implementation")
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let dependencies = graph
+        .manifest
+        .tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task.dependencies.as_slice()))
+        .collect::<BTreeMap<_, _>>();
+    let gate_ids = graph
+        .manifest
+        .tasks
+        .iter()
+        .filter(|task| task.kind == "checkpoint")
+        .filter_map(|task| {
+            let mut closure = BTreeSet::new();
+            let mut stack = vec![task.id.as_str()];
+            while let Some(task_id) = stack.pop() {
+                if !closure.insert(task_id) {
+                    continue;
+                }
+                if let Some(items) = dependencies.get(task_id) {
+                    stack.extend(items.iter().map(String::as_str));
+                }
+            }
+            implementation_ids
+                .is_subset(&closure)
+                .then_some(task.id.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    if gate_ids.is_empty() {
+        bail!("completed campaign has no checkpoint covering every implementation task");
+    }
+    let candidates = checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.revision == integration_tip && gate_ids.contains(checkpoint.task_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [checkpoint] => Ok((*checkpoint).clone()),
+        [] => bail!(
+            "completed campaign has no gate-proof checkpoint ref at integration tip {integration_tip}"
+        ),
+        _ => bail!(
+            "completed campaign has multiple gate-proof checkpoint refs at integration tip {integration_tip}"
+        ),
+    }
+}
+
+fn release_current_checkpoints(
+    graph: &CanonicalCampaignGraphV1,
+    checkpoints: &[ReleaseCheckpoint],
+    source_sha256: &str,
+) -> Result<Vec<ReleaseCheckpoint>> {
+    graph
+        .manifest
+        .tasks
+        .iter()
+        .filter(|task| task.kind == "checkpoint")
+        .map(|task| {
+            let matches = checkpoints
+                .iter()
+                .filter(|checkpoint| {
+                    checkpoint.task_id == task.id && checkpoint.source_sha256 == source_sha256
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [checkpoint] => Ok((*checkpoint).clone()),
+                [] => bail!(
+                    "completed campaign is missing checkpoint ref for task {:?} and source {}",
+                    task.id,
+                    source_sha256
+                ),
+                _ => bail!(
+                    "completed campaign has multiple checkpoint refs for task {:?} and source {}",
+                    task.id,
+                    source_sha256
+                ),
+            }
+        })
+        .collect()
+}
+
+fn release_summary_refs(
+    checkout: &Path,
+    refs: &[ReleaseGitRef],
+    state_prefix: &str,
+    campaign: &str,
+) -> Result<Vec<ReleaseSummaryRef>> {
+    let prefix = format!("{state_prefix}/summary/");
+    refs.iter()
+        .filter(|reference| reference.reference.starts_with(&prefix))
+        .map(|reference| {
+            if reference.object_type != "blob" {
+                bail!(
+                    "campaign summary ref {:?} must point directly to a blob",
+                    reference.reference
+                );
+            }
+            let bytes = release_git_read(
+                checkout,
+                &[
+                    "cat-file".to_owned(),
+                    "blob".to_owned(),
+                    reference.object_id.clone(),
+                ],
+                "reading a local campaign summary",
+            )?;
+            let summary: ReleaseClosingSummaryV1 =
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "campaign summary ref {:?} does not contain valid closing-summary JSON",
+                        reference.reference
+                    )
+                })?;
+            if summary.schema_version != RELEASE_SUMMARY_SCHEMA_VERSION
+                || summary.kind != "closing-summary"
+                || summary.campaign != campaign
+                || summary.issue_number != LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string()
+                || !matches!(summary.outcome.as_str(), "complete" | "quiescent")
+                || summary.body.chars().count() > 60_000
+            {
+                bail!(
+                    "campaign summary ref {:?} has invalid identity or shape",
+                    reference.reference
+                );
+            }
+            let source_sha256 = complete_summary_source(&summary.body)?;
+            Ok(ReleaseSummaryRef {
+                reference: reference.reference.clone(),
+                object_id: reference.object_id.clone(),
+                source_sha256,
+                summary,
+            })
+        })
+        .collect()
+}
+
+fn complete_summary_source(body: &str) -> Result<Option<String>> {
+    let Some(first_line) = body.lines().next() else {
+        return Ok(None);
+    };
+    let Some(value) = first_line
+        .strip_prefix(COMPLETE_SUMMARY_MARKER_PREFIX)
+        .and_then(|value| value.strip_suffix(" -->"))
+    else {
+        return Ok(None);
+    };
+    if !is_sha256_identity(value) {
+        bail!("campaign complete summary carries a malformed source identity");
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn release_closing_summary<'a>(
+    summaries: &'a [ReleaseSummaryRef],
+    state_prefix: &str,
+    source_sha256: &str,
+) -> Result<&'a ReleaseSummaryRef> {
+    let mut matches = summaries
+        .iter()
+        .filter(|summary| {
+            summary.summary.outcome == "complete"
+                && summary.source_sha256.as_deref() == Some(source_sha256)
+        })
+        .collect::<Vec<_>>();
+    let current = format!("{state_prefix}/summary/complete");
+    matches.sort_by_key(|summary| summary.reference != current);
+    match matches.as_slice() {
+        [] => bail!(
+            "completed campaign has no local complete-summary ref for source {source_sha256}; restore or archive its durable summary before rendering a release"
+        ),
+        [summary] => Ok(*summary),
+        [summary, ..] if summary.reference == current => Ok(*summary),
+        _ => bail!(
+            "completed campaign has multiple archived complete summaries for source {source_sha256}"
+        ),
+    }
+}
+
+fn read_release_attempt_log(
+    state_dir: &Path,
+    campaign: &str,
+    issue_number: u64,
+) -> Result<ReleaseAttemptLog> {
+    let path = local_attempt_receipts_path(state_dir, campaign)?;
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReleaseAttemptLog {
+                path,
+                present: false,
+                bytes: Vec::new(),
+                records: Vec::new(),
+            })
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open attempt-receipts log {}", path.display()))
+        }
+    };
+    FileExt::lock_shared(&file)
+        .with_context(|| format!("cannot lock attempt-receipts log {}", path.display()))?;
+    let read = (|| {
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() > MAX_ATTEMPT_RECEIPTS_LOG_BYTES
+        {
+            bail!(
+                "attempt-receipts log is not a bounded private regular file: {}",
+                path.display()
+            );
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bail!(
+                "attempt-receipts log {} has a truncated final record; repair the durable log before rendering a release",
+                path.display()
+            );
+        }
+        let mut records = Vec::new();
+        let complete = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+        for (index, line) in complete
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !complete.is_empty() || !line.is_empty())
+            .enumerate()
+        {
+            if line.is_empty() {
+                bail!(
+                    "attempt-receipts log {} contains a blank record at line {}",
+                    path.display(),
+                    index + 1
+                );
+            }
+            let sequence = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| invalid("attempt-receipts sequence is exhausted"))?;
+            let value: Value = serde_json::from_slice(line).with_context(|| {
+                format!(
+                    "attempt receipt {sequence} in {} is invalid JSON",
+                    path.display()
+                )
+            })?;
+            let validated = validate_local_attempt_receipt(
+                value.clone(),
+                &path,
+                sequence,
+                campaign,
+                issue_number,
+            )?;
+            let object = value
+                .as_object()
+                .expect("validated attempt receipt is an object");
+            let record = match validated {
+                LocalAttemptReceiptV1::Diagnosis { task_id, attempt } => {
+                    ReleaseAttemptReceipt::Diagnosis {
+                        task_id,
+                        attempt: u64::from(attempt),
+                        diagnosis: object["diagnosis"]
+                            .as_str()
+                            .expect("validated diagnosis is text")
+                            .to_owned(),
+                    }
+                }
+                LocalAttemptReceiptV1::Retry => ReleaseAttemptReceipt::Retry {
+                    task_id: object["taskId"]
+                        .as_str()
+                        .expect("validated retry task is text")
+                        .to_owned(),
+                    attempt: object["attempt"]
+                        .as_u64()
+                        .expect("validated retry attempt is an integer"),
+                    reason: object["reason"]
+                        .as_str()
+                        .expect("validated retry reason is text")
+                        .to_owned(),
+                },
+                LocalAttemptReceiptV1::Escalation => ReleaseAttemptReceipt::Escalation,
+                LocalAttemptReceiptV1::Pardon { tasks } => {
+                    ReleaseAttemptReceipt::Pardon { sequence, tasks }
+                }
+            };
+            records.push(record);
+        }
+        Ok((bytes, records))
+    })();
+    let unlock = FileExt::unlock(&file)
+        .with_context(|| format!("cannot unlock attempt-receipts log {}", path.display()));
+    let (bytes, records) = match (read, unlock) {
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Ok(value), Ok(())) => value,
+    };
+    Ok(ReleaseAttemptLog {
+        path,
+        present: true,
+        bytes,
+        records,
+    })
+}
+
+fn release_attempt_facts(
+    records: &[ReleaseAttemptReceipt],
+    task_ids: &BTreeSet<String>,
+) -> (Vec<DiagnosisFact>, Vec<RetryFact>, Vec<String>) {
+    let mut diagnoses = Vec::<DiagnosisFact>::new();
+    let mut retries = Vec::<RetryFact>::new();
+    let mut warnings = Vec::new();
+    for record in records {
+        match record {
+            ReleaseAttemptReceipt::Diagnosis {
+                task_id,
+                attempt,
+                diagnosis,
+            } if task_ids.contains(task_id) => diagnoses.push(DiagnosisFact {
+                task_id: task_id.clone(),
+                attempt: *attempt,
+                diagnosis: diagnosis.clone(),
+            }),
+            ReleaseAttemptReceipt::Retry {
+                task_id,
+                attempt,
+                reason,
+            } if task_ids.contains(task_id) => retries.push(RetryFact {
+                task_id: task_id.clone(),
+                attempt: *attempt,
+                reason: reason.clone(),
+            }),
+            ReleaseAttemptReceipt::Pardon { sequence, tasks } => {
+                let before = diagnoses.len() + retries.len();
+                match tasks {
+                    None => {
+                        diagnoses.clear();
+                        retries.clear();
+                    }
+                    Some(scope) => {
+                        diagnoses.retain(|fact| !scope.contains(&fact.task_id));
+                        retries.retain(|fact| !scope.contains(&fact.task_id));
+                    }
+                }
+                let pardoned = before - diagnoses.len() - retries.len();
+                if pardoned > 0 {
+                    warnings.push(format!(
+                        "campaign pardon at attempt receipt {sequence} removed {pardoned} earlier machine receipt(s) from this release projection"
+                    ));
+                }
+            }
+            ReleaseAttemptReceipt::Diagnosis { .. }
+            | ReleaseAttemptReceipt::Retry { .. }
+            | ReleaseAttemptReceipt::Escalation => {}
+        }
+    }
+    (diagnoses, retries, warnings)
+}
+
+fn release_notes(
+    registration: &CampaignRegistration,
+    graph: &CanonicalCampaignGraphV1,
+    refs: &[ReleaseGitRef],
+    revisions: &BTreeMap<String, String>,
+    merged_commits: &[(String, ReleaseCommit)],
+) -> Result<Vec<CampaignReleaseNote>> {
+    let titles = graph
+        .manifest
+        .tasks
+        .iter()
+        .zip(&graph.tasks)
+        .map(|(reference, content)| (reference.id.as_str(), content.title.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    merged_commits
+        .iter()
+        .map(|(task_id, merged)| {
+            let branch = stable_publish_branch(
+                &graph.manifest.name,
+                &registration.registration_id,
+                task_id,
+                revisions.get(task_id).map(String::as_str),
+            );
+            let reference = format!("refs/heads/{branch}");
+            let source = refs
+                .iter()
+                .find(|candidate| candidate.reference == reference);
+            let (source_ref, source_commit, header) = match source {
+                Some(source) if source.object_type == "commit" => (
+                    Some(source.reference.clone()),
+                    Some(source.object_id.clone()),
+                    release_commit_subject(&registration.checkout, &source.object_id)?,
+                ),
+                Some(source) => bail!(
+                    "campaign task ref {:?} must point directly to a commit, not a {}",
+                    source.reference,
+                    source.object_type
+                ),
+                None => (None, None, merged.subject.clone()),
+            };
+            let fallback = titles.get(task_id.as_str()).copied().unwrap_or(task_id);
+            let (kind, scope, breaking, summary) = conventional_release_header(&header, fallback);
+            Ok(CampaignReleaseNote {
+                task_id: task_id.clone(),
+                commit: merged.object_id.clone(),
+                source_ref,
+                source_commit,
+                header,
+                kind,
+                scope,
+                breaking,
+                summary,
+            })
+        })
+        .collect()
+}
+
+fn release_commit_subject(checkout: &Path, object_id: &str) -> Result<String> {
+    let output = release_git_read(
+        checkout,
+        &[
+            "show".to_owned(),
+            "--no-patch".to_owned(),
+            "--format=%s".to_owned(),
+            object_id.to_owned(),
+        ],
+        "reading a merged task subject",
+    )?;
+    let subject = String::from_utf8(output)
+        .context("merged task subject was not UTF-8")?
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    if subject.is_empty() || subject.contains(['\r', '\n', '\0']) {
+        bail!("merged task commit {object_id} has an invalid subject");
+    }
+    Ok(subject)
+}
+
+fn conventional_release_header(
+    header: &str,
+    fallback: &str,
+) -> (String, Option<String>, bool, String) {
+    let Some((raw_prefix, summary)) = header.split_once(": ") else {
+        return ("other".to_owned(), None, false, fallback.to_owned());
+    };
+    if summary.trim().is_empty() {
+        return ("other".to_owned(), None, false, fallback.to_owned());
+    }
+    let breaking = raw_prefix.ends_with('!');
+    let prefix = raw_prefix.strip_suffix('!').unwrap_or(raw_prefix);
+    let (kind, scope) = match prefix.split_once('(') {
+        Some((kind, rest)) if rest.ends_with(')') => {
+            (kind, Some(rest.trim_end_matches(')').to_owned()))
+        }
+        Some(_) => return ("other".to_owned(), None, false, fallback.to_owned()),
+        None => (prefix, None),
+    };
+    let valid_atom = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'/')
+            })
+    };
+    if !valid_atom(kind) || scope.as_deref().is_some_and(|scope| !valid_atom(scope)) {
+        return ("other".to_owned(), None, false, fallback.to_owned());
+    }
+    (kind.to_owned(), scope, breaking, summary.to_owned())
+}
+
+fn release_artifacts(
+    integration: &ReleaseGitRef,
+    release_notes: &[CampaignReleaseNote],
+    refs: &[ReleaseGitRef],
+    checkpoints: &[ReleaseCheckpoint],
+    closing_summary: &ReleaseSummaryRef,
+    summaries: &[ReleaseSummaryRef],
+    attempt_log: &ReleaseAttemptLog,
+) -> Vec<CampaignReleaseArtifact> {
+    let mut artifacts = vec![CampaignReleaseArtifact {
+        kind: "integration".to_owned(),
+        locator: integration.reference.clone(),
+        object_id: Some(integration.object_id.clone()),
+        sha256: None,
+        bytes: None,
+    }];
+    for note in release_notes {
+        let (Some(source_ref), Some(source_commit)) =
+            (note.source_ref.as_deref(), note.source_commit.as_deref())
+        else {
+            continue;
+        };
+        if refs.iter().any(|reference| {
+            reference.reference == source_ref && reference.object_id == source_commit
+        }) {
+            artifacts.push(CampaignReleaseArtifact {
+                kind: "task-commit".to_owned(),
+                locator: source_ref.to_owned(),
+                object_id: Some(source_commit.to_owned()),
+                sha256: None,
+                bytes: None,
+            });
+        }
+    }
+    artifacts.extend(
+        checkpoints
+            .iter()
+            .map(|checkpoint| CampaignReleaseArtifact {
+                kind: "checkpoint".to_owned(),
+                locator: checkpoint.reference.clone(),
+                object_id: Some(checkpoint.revision.clone()),
+                sha256: None,
+                bytes: None,
+            }),
+    );
+    artifacts.push(CampaignReleaseArtifact {
+        kind: "closing-summary".to_owned(),
+        locator: closing_summary.reference.clone(),
+        object_id: Some(closing_summary.object_id.clone()),
+        sha256: None,
+        bytes: None,
+    });
+    artifacts.extend(
+        summaries
+            .iter()
+            .filter(|summary| {
+                summary.reference != closing_summary.reference
+                    && summary.reference.contains("/summary/archive/")
+            })
+            .map(|summary| CampaignReleaseArtifact {
+                kind: "archived-summary".to_owned(),
+                locator: summary.reference.clone(),
+                object_id: Some(summary.object_id.clone()),
+                sha256: None,
+                bytes: None,
+            }),
+    );
+    if attempt_log.present {
+        artifacts.push(CampaignReleaseArtifact {
+            kind: "attempt-receipts".to_owned(),
+            locator: attempt_log.path.display().to_string(),
+            object_id: None,
+            sha256: Some(format!("sha256:{:x}", Sha256::digest(&attempt_log.bytes))),
+            bytes: u64::try_from(attempt_log.bytes.len()).ok(),
+        });
+    }
+    artifacts
+}
+
+fn release_commit_timestamp(checkout: &Path, object_id: &str) -> Result<i64> {
+    let output = release_git_read(
+        checkout,
+        &[
+            "show".to_owned(),
+            "--no-patch".to_owned(),
+            "--format=%ct".to_owned(),
+            object_id.to_owned(),
+        ],
+        "reading the gate-proof timestamp",
+    )?;
+    String::from_utf8(output)
+        .context("gate-proof timestamp was not UTF-8")?
+        .trim()
+        .parse::<i64>()
+        .context("gate-proof timestamp was malformed")
+}
+
+fn release_version(committed_at: i64, revision: &str) -> Result<String> {
+    let timestamp = DateTime::<Utc>::from_timestamp(committed_at, 0)
+        .ok_or_else(|| invalid("gate-proof commit timestamp is outside the supported range"))?;
+    let short_revision = revision.chars().take(7).collect::<String>();
+    if short_revision.len() != 7 {
+        return Err(invalid(
+            "gate-proof revision is too short for a release version",
+        ));
+    }
+    Ok(format!(
+        "0.0.0+{}.{}",
+        timestamp.format("%Y%m%d%H%M%S"),
+        short_revision
+    ))
+}
+
+fn render_campaign_release_human(plan: &CampaignReleasePlan) -> String {
+    let mut lines = vec![
+        format!("Release plan  {}  {}", plan.repository, plan.version),
+        format!("Campaign      {} ({})", plan.campaign, plan.registration_id),
+        format!("Revision      {}", plan.revision),
+        format!(
+            "Gate proof    {}  {}",
+            plan.gate_proof.task_id, plan.gate_proof.reference
+        ),
+        String::new(),
+        "Release notes".to_owned(),
+    ];
+    if plan.release_notes.is_empty() {
+        lines.push("- No implementation commits.".to_owned());
+    } else {
+        lines.extend(
+            plan.release_notes
+                .iter()
+                .map(|note| format!("- {} [{}]", note.header, &note.commit[..7])),
+        );
+    }
+    lines.extend([String::new(), "Artifacts".to_owned()]);
+    lines.extend(
+        plan.artifacts
+            .iter()
+            .map(|artifact| format!("- {}: {}", artifact.kind, artifact.locator)),
+    );
+    lines.extend([
+        String::new(),
+        "Campaign receipt".to_owned(),
+        String::new(),
+        plan.campaign_summary.trim_end().to_owned(),
+    ]);
+    let mut rendered = lines.join("\n");
+    rendered.push('\n');
+    rendered
 }
 
 fn parse_repository(value: &str) -> Result<String> {
@@ -4849,6 +6203,316 @@ mod tests {
             }],
             "tasks": tasks
         })
+    }
+
+    #[test]
+    fn completed_fixture_campaign_renders_a_read_only_release_plan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("repository");
+        let state_dir = temporary.path().join("state");
+        fs::create_dir_all(&checkout).unwrap();
+        release_fixture_git(&checkout, &["init", "-b", "main"]);
+        release_fixture_git(&checkout, &["config", "user.name", "Fixture"]);
+        release_fixture_git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(checkout.join("base.txt"), "base\n").unwrap();
+        release_fixture_git(&checkout, &["add", "base.txt"]);
+        release_fixture_git(&checkout, &["commit", "-m", "chore: fixture base"]);
+        let source_revision = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
+
+        let campaign = "fixture-release";
+        let registration_id = "0198a62b-41ee-7000-8000-000000000777";
+        let worklist = "specs/release.json";
+        let repository = "acme/widgets";
+        let manifest = admit_manifest_value(json!({
+            "schemaVersion": 1,
+            "name": campaign,
+            "repository": {
+                "checkout": checkout,
+                "baseBranch": "main",
+                "remote": "network-is-forbidden",
+                "forge": "local"
+            },
+            "maxTasks": 4,
+            "maxParallel": 1,
+            "agent": {},
+            "gates": [{
+                "kind": "command",
+                "id": "test",
+                "preflightArgv": ["true"],
+                "argv": ["true"]
+            }],
+            "tasks": [{
+                "id": "ship-feature",
+                "kind": "implementation",
+                "issue": 1,
+                "dependencies": [],
+                "conflictDomains": ["crates/tally"]
+            }, {
+                "id": "release-gate",
+                "kind": "checkpoint",
+                "issue": 2,
+                "dependencies": ["ship-feature"],
+                "argv": ["true"],
+                "runtimeMaxSec": 30
+            }]
+        }))
+        .unwrap();
+        let graph = CanonicalCampaignGraphV1::new(
+            manifest,
+            vec![
+                CanonicalCampaignTaskV1 {
+                    number: 1,
+                    title: "Ship the fixture feature".to_owned(),
+                    body: "Implement the fixture release surface.".to_owned(),
+                },
+                CanonicalCampaignTaskV1 {
+                    number: 2,
+                    title: "Prove the fixture release".to_owned(),
+                    body: "Run the fixture release gate.".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+        let task_revision =
+            task_completion_revision(&graph.manifest, &graph.manifest.tasks[0], &graph.tasks[0])
+                .unwrap();
+        let task_branch = stable_publish_branch(
+            campaign,
+            registration_id,
+            "ship-feature",
+            Some(&task_revision),
+        );
+        release_fixture_git(&checkout, &["checkout", "-b", &task_branch]);
+        fs::write(checkout.join("feature.txt"), "released\n").unwrap();
+        release_fixture_git(&checkout, &["add", "feature.txt"]);
+        release_fixture_git(
+            &checkout,
+            &["commit", "-m", "feat(cli): render fixture releases"],
+        );
+        let source_commit = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
+        release_fixture_git(&checkout, &["checkout", "main"]);
+
+        let integration_branch =
+            stable_publish_branch(campaign, registration_id, "integration", None);
+        release_fixture_git(&checkout, &["checkout", "-b", &integration_branch]);
+        let integration_message = format!(
+            "ship-feature: Ship the fixture feature\n\n{TALLY_TASK_PREFIX} ship-feature\n{TALLY_REVISION_PREFIX} {task_revision}"
+        );
+        release_fixture_git(
+            &checkout,
+            &["commit", "--allow-empty", "-m", &integration_message],
+        );
+        let integration_tip = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
+
+        let source_sha256 = format!("sha256:{}", "a".repeat(64));
+        let state_prefix = campaign_state_ref_prefix(campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER);
+        let checkpoint_ref = format!(
+            "{state_prefix}/checkpoint/release-gate-{}/{integration_tip}",
+            source_sha256.trim_start_matches("sha256:")
+        );
+        release_fixture_git(
+            &checkout,
+            &["update-ref", &checkpoint_ref, &integration_tip],
+        );
+
+        let complete_summary = json!({
+            "schemaVersion": RELEASE_SUMMARY_SCHEMA_VERSION,
+            "kind": "closing-summary",
+            "campaign": campaign,
+            "issueNumber": LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+            "outcome": "complete",
+            "body": format!(
+                "{COMPLETE_SUMMARY_MARKER_PREFIX}{source_sha256} -->\n\n### Campaign complete\n"
+            )
+        });
+        let complete_object = release_fixture_blob(&checkout, &complete_summary);
+        let complete_ref = format!("{state_prefix}/summary/complete");
+        release_fixture_git(&checkout, &["update-ref", &complete_ref, &complete_object]);
+        let archive_summary = json!({
+            "schemaVersion": RELEASE_SUMMARY_SCHEMA_VERSION,
+            "kind": "closing-summary",
+            "campaign": campaign,
+            "issueNumber": LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+            "outcome": "quiescent",
+            "body": "<!-- tally:campaign-summary:v1 campaign=fixture-release issue=1 outcome=quiescent -->\n"
+        });
+        let archive_object = release_fixture_blob(&checkout, &archive_summary);
+        let archive_ref = format!("{state_prefix}/summary/archive/earlier-quiescent");
+        release_fixture_git(&checkout, &["update-ref", &archive_ref, &archive_object]);
+
+        let authority = CampaignRegistrationV4 {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            registration_id: registration_id.to_owned(),
+            worklist_pattern: worklist.to_owned(),
+            code_repository: repository.to_owned(),
+            checkout: checkout.clone(),
+            base_branch: "main".to_owned(),
+            remote: "network-is-forbidden".to_owned(),
+            armed_at: "2026-08-14T12:00:00Z".to_owned(),
+            arm_serial: 1,
+            approved_graph_digest: graph.executable_digest.clone(),
+            local_actor: local_actor(),
+            allowed_actors: vec!["local".to_owned()],
+            last_observation: None,
+            flow: checkout.join("never-read-flow.js"),
+            driver: checkout.join("never-read-driver"),
+            workspace_root: temporary.path().join("campaign-workspaces"),
+        };
+        let registration_path = release_registration_path(&state_dir, repository, worklist);
+        fs::create_dir_all(registration_path.parent().unwrap()).unwrap();
+        fs::write(
+            &registration_path,
+            serde_json::to_vec_pretty(&authority).unwrap(),
+        )
+        .unwrap();
+        let registration = CampaignRegistration::new(authority, None);
+        write_approved_graph_snapshot(&state_dir, &registration, &graph).unwrap();
+        let attempt_path = local_attempt_receipts_path(&state_dir, campaign).unwrap();
+        fs::create_dir_all(attempt_path.parent().unwrap()).unwrap();
+        fs::write(
+            &attempt_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                    "sequence": 1,
+                    "kind": "diagnosis",
+                    "campaign": campaign,
+                    "issueNumber": LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+                    "taskId": "ship-feature",
+                    "attempt": 1,
+                    "diagnosis": "The first fixture attempt needed steering.",
+                    "redaction": "conservative-v2"
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let before = release_fixture_fingerprint(&[&state_dir, &checkout]);
+        let plan = render_campaign_release_plan(&state_dir, repository, worklist).unwrap();
+        let after = release_fixture_fingerprint(&[&state_dir, &checkout]);
+
+        assert_eq!(before, after, "--plan must not change local durable state");
+        assert_eq!(plan.schema_version, RELEASE_PLAN_SCHEMA_VERSION);
+        assert_eq!(plan.mode, "plan");
+        assert_eq!(plan.revision, integration_tip);
+        assert_eq!(
+            plan.integration_ref,
+            format!("refs/heads/{integration_branch}")
+        );
+        assert_eq!(plan.closing_summary.reference, complete_ref);
+        assert_eq!(plan.gate_proof.task_id, "release-gate");
+        assert_eq!(plan.gate_proof.reference, checkpoint_ref);
+        assert_eq!(plan.release_notes.len(), 1);
+        assert_eq!(
+            plan.release_notes[0].source_ref.as_deref(),
+            Some(format!("refs/heads/{task_branch}").as_str())
+        );
+        assert_eq!(
+            plan.release_notes[0].source_commit.as_deref(),
+            Some(source_commit.as_str())
+        );
+        assert_eq!(
+            plan.release_notes[0].header,
+            "feat(cli): render fixture releases"
+        );
+        assert_eq!(plan.release_notes[0].kind, "feat");
+        assert_eq!(plan.release_notes[0].scope.as_deref(), Some("cli"));
+        assert_eq!(plan.digest.merged[0].task_id, "ship-feature");
+        assert_eq!(plan.digest.checkpoints[0].task_id, "release-gate");
+        assert_eq!(plan.digest.source.revision, source_revision);
+        assert_eq!(plan.digest.base_revision, integration_tip);
+        assert_eq!(plan.digest.steering.len(), 1);
+        assert!(
+            plan.artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "archived-summary"
+                    && artifact.locator == archive_ref)
+        );
+        assert!(plan
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "attempt-receipts"));
+        assert_eq!(
+            plan.version,
+            format!("0.0.0+20260814123456.{}", &integration_tip[..7])
+        );
+
+        let parsed = Opts::try_parse_from([
+            "tally",
+            "campaign",
+            "release",
+            repository,
+            worklist,
+            "--plan",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Campaign {
+                command: CampaignCommand::Release(CampaignReleaseArgs { plan: true, .. })
+            })
+        ));
+    }
+
+    fn release_fixture_git(checkout: &Path, arguments: &[&str]) -> String {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(arguments)
+            .env("GIT_AUTHOR_DATE", "2026-08-14T12:34:56Z")
+            .env("GIT_COMMITTER_DATE", "2026-08-14T12:34:56Z")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed:\n{}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn release_fixture_blob(checkout: &Path, value: &Value) -> String {
+        let path = checkout.join(".release-summary-fixture.json");
+        fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        let object = release_fixture_git(checkout, &["hash-object", "-w", path.to_str().unwrap()]);
+        fs::remove_file(path).unwrap();
+        object
+    }
+
+    fn release_fixture_fingerprint(roots: &[&Path]) -> String {
+        fn visit(path: &Path, hasher: &mut Sha256) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            hasher.update(path.as_os_str().as_encoded_bytes());
+            hasher.update(metadata.mode().to_le_bytes());
+            if metadata.file_type().is_dir() {
+                let mut children = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(&child, hasher);
+                }
+            } else if metadata.file_type().is_symlink() {
+                hasher.update(fs::read_link(path).unwrap().as_os_str().as_encoded_bytes());
+            } else {
+                hasher.update(fs::read(path).unwrap());
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        for root in roots {
+            visit(root, &mut hasher);
+        }
+        format!("{:x}", hasher.finalize())
     }
 
     #[test]

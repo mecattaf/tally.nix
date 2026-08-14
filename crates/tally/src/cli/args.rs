@@ -147,6 +147,8 @@ pub(super) enum CampaignCommand {
     Steer(CampaignSteerArgs),
     /// Pardon an escalated campaign's counters, record why, and re-arm it.
     Resume(CampaignResumeArgs),
+    /// Render or execute the release represented by a completed campaign.
+    Release(CampaignReleaseArgs),
     /// Reconcile changed armed campaigns into fresh bounded flow passes.
     Poll(CampaignPollArgs),
     /// Show the current or latest durable pass for one campaign, plus usage
@@ -210,6 +212,22 @@ pub(super) struct CampaignResumeArgs {
     #[arg(long)]
     pub(super) wait: bool,
     /// Durable registration root; defaults beneath tally state.
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignReleaseArgs {
+    /// Code repository coordinate of the completed campaign.
+    #[arg(value_name = "OWNER/REPO")]
+    pub(super) code_repository: String,
+    /// Committed worklist pattern identifying the campaign.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist_pattern: String,
+    /// Render the complete release without contacting or changing a forge.
+    #[arg(long)]
+    pub(super) plan: bool,
+    /// Durable registration and attempt-receipt root.
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }
