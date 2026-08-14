@@ -409,10 +409,12 @@ pub const CANONICAL_SURFACES: &[CanonicalSurface] = &[
     ),
 ];
 
-/// Canonical inputs read by [`crate::durable_view::durable_run_view`].
+/// Canonical inputs read by [`crate::durable_view::durable_run_view`] and the
+/// promoted [`crate::durable_view::rebuild_run_view`].
 ///
-/// Captures are optional enrichment, but remain declared because passing an
-/// executor makes them an input to the rebuilt view.
+/// Execution records supply rebuild's unit-liveness corroboration. Captures
+/// are optional enrichment, but remain declared because passing an executor
+/// makes them an input to either rebuilt view.
 pub const DURABLE_RUN_VIEW_INPUTS: &[CanonicalSurfaceId] = &[
     CanonicalSurfaceId::AdmissionEvents,
     CanonicalSurfaceId::WitnessLedger,
@@ -421,6 +423,7 @@ pub const DURABLE_RUN_VIEW_INPUTS: &[CanonicalSurfaceId] = &[
     CanonicalSurfaceId::FlowLineage,
     CanonicalSurfaceId::AttestationLedgers,
     CanonicalSurfaceId::ReaderState,
+    CanonicalSurfaceId::ExecutionRecords,
     CanonicalSurfaceId::ExecutionCaptures,
 ];
 
@@ -724,6 +727,7 @@ mod tests {
                 CanonicalSurfaceId::FlowLineage,
                 CanonicalSurfaceId::AttestationLedgers,
                 CanonicalSurfaceId::ReaderState,
+                CanonicalSurfaceId::ExecutionRecords,
                 CanonicalSurfaceId::ExecutionCaptures,
             ]
         );

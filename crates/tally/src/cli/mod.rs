@@ -9,6 +9,7 @@ mod flow;
 mod out;
 mod queue;
 mod reader_state;
+mod rebuild;
 mod text;
 
 #[cfg(test)]
@@ -33,7 +34,9 @@ use tally_client::{
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
 use tally_core::config::Priority;
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings, DEFAULT_MAX_CONNECTIONS};
-use tally_core::durable_view::{durable_run_view, DurableViewError};
+use tally_core::durable_view::{
+    durable_run_view, rebuild_run_view, verify_rebuild_matches_live, DurableViewError,
+};
 use tally_core::evidence::RetryPolicy;
 use tally_core::exec_attestation::{
     compare as compare_witness_attestations, read_verified_exec_attestations, run_exec,
@@ -44,7 +47,7 @@ use tally_core::executor::{
 };
 use tally_core::producers::{record_producer_runtime, ProducerEngine, ProducerObservation};
 use tally_core::provenance::Orchestration;
-use tally_core::query_v2::ObservabilityError;
+use tally_core::query_v2::{ObservabilityError, RunView};
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
 use tally_core::wire::{EnqueuePayload, SubmissionMode, SubmissionOptions};
@@ -81,6 +84,7 @@ use flow::*;
 use out::{errln, outln};
 use queue::*;
 use reader_state::*;
+use rebuild::*;
 
 pub(crate) fn main() {
     let mut args = std::env::args_os().collect::<Vec<_>>();
@@ -306,6 +310,9 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         }
         Some(Command::Campaign { command }) => {
             run_campaign(&socket, opts.config.as_deref(), rpc_timeout, command).await
+        }
+        Some(Command::Rebuild(args)) => {
+            run_rebuild(&socket, opts.config.as_deref(), rpc_timeout, args).await
         }
         Some(Command::LintHistory(args)) => run_lint_history(args),
         Some(Command::Witness { command }) => run_witness(command),

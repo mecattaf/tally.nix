@@ -956,7 +956,7 @@ fn print_durable_run(
     print_run_human(&value, status_filter)
 }
 
-fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
+pub(super) fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
     let flow_run_id = run["flowRunId"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run response"))?;
