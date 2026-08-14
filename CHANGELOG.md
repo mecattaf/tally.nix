@@ -6,6 +6,12 @@ authorized.
 
 ## [Unreleased]
 
+### Preserve pre-deletion GitHub field decode compatibility
+
+- Durable enqueue rows and enqueue payloads now accept and discard the retired
+  `ghOrigin`, `ghTriggerActor`, and `ghSelfActor` fields emitted by older
+  writers while continuing to reject every other unknown field.
+
 ### Make local campaign arm self-contained
 
 - `campaign arm OWNER/REPO WORKLIST` now derives campaign policy from the

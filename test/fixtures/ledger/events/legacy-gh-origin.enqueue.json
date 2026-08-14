@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "eventId": "00000000-0000-4000-8000-000000000041",
+  "acknowledged": true,
+  "guardrailDepth": 1,
+  "row": {
+    "rowVersion": 5,
+    "uuid": "00000000-0000-4000-8000-000000000042",
+    "description": "legacy GitHub field compatibility fixture",
+    "priority": "low",
+    "source": "calendar",
+    "adapter": "shell",
+    "pool": [
+      "local-ai-review"
+    ],
+    "model": null,
+    "cwd": null,
+    "leaseEpoch": 1,
+    "attempt": 1,
+    "argv": [
+      "true"
+    ],
+    "evidence": [
+      "exit:0"
+    ],
+    "noEnqueue": true,
+    "credentials": {},
+    "origin": {
+      "schemaVersion": 1,
+      "source": "calendar",
+      "producer": {
+        "name": "calendar-fixture",
+        "kind": "calendar"
+      }
+    },
+    "ghOrigin": null,
+    "relatedTrigger": null,
+    "evidenceClass": null,
+    "manifestHash": null
+  }
+}

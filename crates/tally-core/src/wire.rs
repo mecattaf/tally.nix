@@ -23,7 +23,8 @@ use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
 use crate::taskdb::{
-    effective_cwd, AdmissionOrigin, EnqueueSource, RelatedTrigger, WorkspaceMetadata,
+    effective_cwd, AdmissionOrigin, DiscardedLegacyGhField, EnqueueSource, RelatedTrigger,
+    WorkspaceMetadata,
 };
 use crate::witness::Derivation;
 
@@ -429,13 +430,47 @@ macro_rules! define_enqueue_payload {
             $field:ident: $field_type:ty => $json_name:literal
         ),+ $(,)?
     ) => {
-        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Serialize)]
         #[serde(deny_unknown_fields, rename_all = "camelCase")]
         pub struct EnqueuePayload {
             $(
                 $(#[$field_attribute])*
                 pub $field: $field_type,
             )+
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct EnqueuePayloadDecode {
+            $(
+                $(#[$field_attribute])*
+                $field: $field_type,
+            )+
+            // D33 compatibility arms: the retired writer stamped these fields on
+            // every payload. They are accepted only during decode and discarded.
+            #[serde(default, rename = "ghTriggerActor")]
+            legacy_gh_trigger_actor: DiscardedLegacyGhField,
+            #[serde(default, rename = "ghSelfActor")]
+            legacy_gh_self_actor: DiscardedLegacyGhField,
+            #[serde(default, rename = "ghOrigin")]
+            legacy_gh_origin: DiscardedLegacyGhField,
+        }
+
+        impl<'de> Deserialize<'de> for EnqueuePayload {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let decoded = EnqueuePayloadDecode::deserialize(deserializer)?;
+                let _discarded_legacy_gh_fields = (
+                    decoded.legacy_gh_trigger_actor,
+                    decoded.legacy_gh_self_actor,
+                    decoded.legacy_gh_origin,
+                );
+                Ok(Self {
+                    $($field: decoded.$field,)+
+                })
+            }
         }
 
         /// JSON field names accepted by the kernel enqueue boundary, in declaration order.
@@ -1015,6 +1050,11 @@ mod tests {
     use super::*;
     use crate::pagination::PageCache;
     use crate::watch::{change_cursor, ChangeKind, ChangeStore};
+
+    const LEGACY_GH_FIELDS_PAYLOAD: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/legacy-gh-fields.payload.json"
+    ));
 
     #[derive(Clone, Copy)]
     struct EchoHandler;
@@ -1991,6 +2031,41 @@ mod tests {
         assert_eq!(encoded["pool"], serde_json::json!(["slot", "zeta"]));
         let decoded: EnqueuePayload = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.pools, legacy.pools);
+    }
+
+    #[test]
+    fn enqueue_payload_discards_legacy_gh_fields_without_relaxing_unknown_fields() {
+        let mut captured: Value = serde_json::from_str(LEGACY_GH_FIELDS_PAYLOAD).unwrap();
+        for field in ["ghTriggerActor", "ghSelfActor", "ghOrigin"] {
+            assert!(captured[field].is_null());
+        }
+
+        let decoded: EnqueuePayload = serde_json::from_value(captured.clone()).unwrap();
+        let reencoded = serde_json::to_value(decoded).unwrap();
+        for field in ["ghTriggerActor", "ghSelfActor", "ghOrigin"] {
+            assert!(reencoded.get(field).is_none());
+        }
+
+        captured["ghTriggerActor"] = Value::String("contributor".to_owned());
+        captured["ghSelfActor"] = Value::String("tally-bot".to_owned());
+        captured["ghOrigin"] = serde_json::json!({
+            "producer": "github",
+            "source": "notifications",
+            "itemId": "legacy-item"
+        });
+
+        let decoded: EnqueuePayload = serde_json::from_value(captured.clone()).unwrap();
+        assert_eq!(decoded.source, Some(EnqueueSource::Calendar));
+        let reencoded = serde_json::to_value(decoded).unwrap();
+        for field in ["ghTriggerActor", "ghSelfActor", "ghOrigin"] {
+            assert!(reencoded.get(field).is_none());
+        }
+
+        captured["genuinelyUnknown"] = Value::Bool(true);
+        let error = serde_json::from_value::<EnqueuePayload>(captured).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown field `genuinelyUnknown`"));
     }
 
     #[test]

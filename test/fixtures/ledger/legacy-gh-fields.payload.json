@@ -1,0 +1,34 @@
+{
+  "invocation": null,
+  "argv": [
+    "true"
+  ],
+  "pool": "local-ai-review",
+  "priority": "low",
+  "adapter": "shell",
+  "source": "calendar",
+  "dedupKey": "calendar-fixture",
+  "parent": null,
+  "evidence": [
+    "exit:0"
+  ],
+  "evidenceClass": null,
+  "manifestHash": null,
+  "consumptionEstimate": null,
+  "runtimeMaxSec": null,
+  "noEnqueue": true,
+  "credentials": {},
+  "origin": {
+    "schemaVersion": 1,
+    "source": "calendar",
+    "producer": {
+      "name": "calendar-fixture",
+      "kind": "calendar"
+    }
+  },
+  "callerJobId": null,
+  "ghTriggerActor": null,
+  "ghSelfActor": null,
+  "ghOrigin": null,
+  "wait": false
+}

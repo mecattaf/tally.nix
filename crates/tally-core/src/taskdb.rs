@@ -52,6 +52,24 @@ impl EnqueueSource {
     }
 }
 
+/// Decode-only sink for GitHub fields emitted before their durable surface was deleted.
+///
+/// D33 keeps old ledger bytes readable, just as it keeps the [`EnqueueSource::Gh`]
+/// string arm. Values are consumed with [`serde::de::IgnoredAny`], so even a
+/// non-null legacy payload is neither retained nor serialized again.
+#[derive(Default)]
+pub(crate) struct DiscardedLegacyGhField;
+
+impl<'de> Deserialize<'de> for DiscardedLegacyGhField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProducerOrigin {
@@ -276,9 +294,49 @@ impl RecordedLaunchCwd {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RowSeed {
+macro_rules! define_row_seed {
+    (
+        $(
+            $(#[$field_attribute:meta])*
+            pub $field:ident: $field_type:ty,
+        )+
+    ) => {
+        #[derive(Debug, Clone, PartialEq, Serialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        pub struct RowSeed {
+            $(
+                $(#[$field_attribute])*
+                pub $field: $field_type,
+            )+
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct RowSeedDecode {
+            $(
+                $(#[$field_attribute])*
+                $field: $field_type,
+            )+
+            #[serde(default, rename = "ghOrigin")]
+            legacy_gh_origin: DiscardedLegacyGhField,
+        }
+
+        impl<'de> Deserialize<'de> for RowSeed {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let decoded = RowSeedDecode::deserialize(deserializer)?;
+                let _discarded_legacy_gh_origin = decoded.legacy_gh_origin;
+                Ok(Self {
+                    $($field: decoded.$field,)+
+                })
+            }
+        }
+    };
+}
+
+define_row_seed! {
     #[serde(default = "default_row_version")]
     pub row_version: u32,
     pub uuid: Uuid,
@@ -1163,6 +1221,11 @@ mod tests {
 
     use super::*;
 
+    const LEGACY_GH_ORIGIN_EVENT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/events/legacy-gh-origin.enqueue.json"
+    ));
+
     fn seed(uuid: Uuid) -> RowSeed {
         RowSeed {
             row_version: CURRENT_ROW_VERSION,
@@ -1340,6 +1403,45 @@ mod tests {
                 .pools,
             ["alpha", "zeta"]
         );
+    }
+
+    #[test]
+    fn durable_rows_discard_legacy_gh_origin_without_relaxing_unknown_fields() {
+        let mut captured: Value = serde_json::from_str(LEGACY_GH_ORIGIN_EVENT).unwrap();
+        assert!(captured["row"]["ghOrigin"].is_null());
+
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        fs::create_dir_all(&events).unwrap();
+        let event_id = captured["eventId"].as_str().unwrap();
+        fs::write(
+            events.join(format!("{event_id}.enqueue.json")),
+            serde_json::to_vec(&captured).unwrap(),
+        )
+        .unwrap();
+
+        let restored = read_acknowledged_events(&events).unwrap();
+        assert_eq!(restored.len(), 1);
+        let reencoded = serde_json::to_value(&restored[0]).unwrap();
+        assert!(reencoded["row"].get("ghOrigin").is_none());
+
+        captured["row"]["ghOrigin"] = serde_json::json!({
+            "producer": "github",
+            "source": "notifications",
+            "itemId": "legacy-item",
+            "actor": "contributor",
+            "selfActor": "tally-bot",
+            "actorExclude": "self"
+        });
+        let restored: DurableEnqueueEvent = serde_json::from_value(captured.clone()).unwrap();
+        let reencoded = serde_json::to_value(restored).unwrap();
+        assert!(reencoded["row"].get("ghOrigin").is_none());
+
+        captured["row"]["genuinelyUnknown"] = Value::Bool(true);
+        let error = serde_json::from_value::<DurableEnqueueEvent>(captured).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown field `genuinelyUnknown`"));
     }
 
     #[test]
