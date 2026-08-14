@@ -1166,14 +1166,63 @@ const checkpointFactSchema = {
   additionalProperties: false
 };
 
+const diagnosisProposalSchema = {
+  type: "object",
+  required: ["kind", "paths", "goal", "acceptanceCriteria", "dependencies"],
+  properties: {
+    kind: { enum: ["amendment-task", "gate-set-fix"] },
+    paths: {
+      type: "array",
+      minItems: 1,
+      maxItems: 128,
+      uniqueItems: true,
+      items: { type: "string", minLength: 1, maxLength: 4096 }
+    },
+    goal: { type: "string", minLength: 1, maxLength: 12000 },
+    acceptanceCriteria: {
+      type: "array",
+      minItems: 1,
+      maxItems: 16,
+      items: {
+        type: "object",
+        required: ["id", "description", "argv"],
+        properties: {
+          id: {
+            type: "string",
+            maxLength: 80,
+            pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          },
+          description: { type: "string", minLength: 1, maxLength: 4000 },
+          argv: {
+            type: "array",
+            minItems: 1,
+            maxItems: 32,
+            items: { type: "string", minLength: 1, maxLength: 4096 }
+          }
+        },
+        additionalProperties: false
+      }
+    },
+    dependencies: {
+      type: "array",
+      maxItems: 128,
+      uniqueItems: true,
+      items: taskIdSchema
+    }
+  },
+  additionalProperties: false
+};
+
 const diagnosisFactSchema = {
   type: "object",
-  required: ["taskId", "attempt", "comment", "diagnosis"],
+  required: ["taskId", "attempt", "comment", "diagnosis", "verdict"],
   properties: {
     taskId: taskIdSchema,
     attempt: { type: "integer", minimum: 1, maximum: 2 },
     comment: { type: "string", minLength: 1 },
-    diagnosis: { type: "string", minLength: 1, maxLength: 12000 }
+    diagnosis: { type: "string", minLength: 1, maxLength: 12000 },
+    verdict: { enum: ["retry", "blocked", "transient"] },
+    proposal: diagnosisProposalSchema
   },
   additionalProperties: false
 };
@@ -1542,6 +1591,9 @@ const narrationAttemptsSchema = {
   }
 };
 
+const diagnosisBriefSentinel =
+  "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
+
 // Semantic identity is separate from the operator-facing label. NodeSpec does
 // not expose arbitrary orchestration fields, so the explicit flow-local key
 // carries this versioned closed schema to tally-core admission; core persists
@@ -1721,6 +1773,20 @@ const diffSchema = {
   additionalProperties: false
 };
 
+const retrySchema = {
+  type: "object",
+  required: ["taskId", "attempt", "comment", "exhausted", "posted", "redacted"],
+  properties: {
+    taskId: taskIdSchema,
+    attempt: { type: "integer", minimum: 0, maximum: 2 },
+    comment: { type: ["string", "null"], minLength: 1 },
+    exhausted: { type: "boolean" },
+    posted: { type: "boolean" },
+    redacted: { type: "boolean" }
+  },
+  additionalProperties: false
+};
+
 const steeringSchema = {
   type: "object",
   required: ["kind", "taskId", "attempt", "comment", "blocked", "posted", "redacted"],
@@ -1729,9 +1795,15 @@ const steeringSchema = {
     taskId: taskIdSchema,
     attempt: { type: "integer", minimum: 1, maximum: 2 },
     comment: { type: "string", minLength: 1 },
+    verdict: { enum: ["retry", "blocked", "transient"] },
+    proposal: diagnosisProposalSchema,
     blocked: { type: "boolean" },
     posted: { type: "boolean" },
-    redacted: { type: "boolean" }
+    redacted: { type: "boolean" },
+    exhausted: { type: "boolean" },
+    retry: {
+      anyOf: [retrySchema, { type: "null" }]
+    }
   },
   additionalProperties: false
 };
@@ -1842,21 +1914,27 @@ const continuationSchema = {
   additionalProperties: false
 };
 
-const retrySchema = {
+const diagnosisResultSchema = {
   type: "object",
-  required: ["taskId", "attempt", "comment", "exhausted", "posted", "redacted"],
+  required: ["verdict", "diagnosis"],
   properties: {
-    taskId: taskIdSchema,
-    attempt: { type: "integer", minimum: 0, maximum: 2 },
-    comment: { type: ["string", "null"], minLength: 1 },
-    exhausted: { type: "boolean" },
-    posted: { type: "boolean" },
-    redacted: { type: "boolean" }
+    verdict: { enum: ["retry", "blocked", "transient"] },
+    diagnosis: { type: "string", minLength: 1, maxLength: 12000 },
+    proposal: diagnosisProposalSchema
   },
-  additionalProperties: false
+  additionalProperties: false,
+  allOf: [
+    {
+      if: {
+        required: ["verdict"],
+        properties: { verdict: { const: "blocked" } }
+      },
+      else: { not: { required: ["proposal"] } }
+    }
+  ]
 };
 
-const diagnosisResultSchema = {
+const legacyDiagnosisResultSchema = {
   type: "string",
   minLength: 1,
   maxLength: 12000
@@ -2383,6 +2461,54 @@ function applyAgentPolicies(spec, sandboxPolicy = effective.agent.sandboxPolicy)
     spec.sandboxPolicy = sandboxPolicy;
   }
   return spec;
+}
+
+// The judge is the campaign's steward catalog role, not the worker that wrote
+// the lane. Canonical campaign manifests always carry the resolved role. The
+// fallback exists only for the pre-manifest direct-flow seam used by older
+// clients and fixtures; an explicitly absent canonical role is a configuration
+// error on the failure path rather than a silent worker-as-judge downgrade.
+function legacyDiagnosisSeam() {
+  return args.campaignGraph === undefined && args.steward === undefined;
+}
+
+function applyDiagnosisRole(spec) {
+  if (effective.steward === null) {
+    if (legacyDiagnosisSeam()) {
+      return applyAgentPolicies(
+        {
+          ...spec,
+          argv: effective.agent.argv,
+          adapter: effective.agent.adapter,
+          priority: effective.agent.priority
+        },
+        effective.agent.diagnosisSandboxPolicy
+      );
+    }
+    const error = new Error(
+      "spec-build diagnosis requires a configured steward catalog role"
+    );
+    error.name = "SpecBuildConfigurationError";
+    error.code = "diagnosis-steward-missing";
+    throw error;
+  }
+  const role = effective.steward;
+  const bound = {
+    ...spec,
+    // The adapter name resolves its executable and model in the host catalog;
+    // the node contributes only the workload prompt, never those host bytes.
+    argv: [diagnosisBriefSentinel],
+    adapter: role.adapter,
+    priority: "low",
+    sandboxPolicy: "read-only"
+  };
+  if (role.runtimeMaxSec !== null && role.runtimeMaxSec !== undefined) {
+    bound.runtimeMaxSec = role.runtimeMaxSec;
+  }
+  if (role.env !== undefined && Object.keys(role.env).length > 0) {
+    bound.env = role.env;
+  }
+  return bound;
 }
 
 // Campaign-wide local records reach every task; a task-addressed record
@@ -3662,6 +3788,28 @@ function sweepDeferral(sweepNode) {
       const ownershipBoundary = task.kind === "implementation"
         ? ` ${conflictDomainsBoundary(task, failure.prepared)}`
         : "";
+      const verdictContract =
+        " Return exactly one diagnosis result object. Set verdict to retry only for an " +
+        "actionable fix wholly inside this implementation task's authorized paths; that " +
+        "diagnosis becomes attempt 2 steering. Set verdict to blocked for an out-of-task " +
+        "cause such as missing authority, a gate-contract fix, a dependency, or a source " +
+        "fix elsewhere; blocked stops after this attempt and notifies the operator. Set " +
+        "verdict to transient only for a machinery or session fault; transient consumes " +
+        "the existing bounded machinery-retry budget. A needs-authority worker envelope " +
+        "is always blocked before diagnosis. Checkpoint tasks never retry, and no verdict " +
+        "can exceed the hard two-attempt or lifetime caps. The diagnosis field must begin " +
+        "with one outcome-first sentence whose first word is a past-tense verb, end that " +
+        "sentence with a period or colon before any list, contain no exclamation marks, " +
+        "and stay under 12,000 characters. Include proposal only with a blocked verdict " +
+        "when an actionable worklist or authority fix exists. A proposal kind is exactly " +
+        "amendment-task or gate-set-fix; paths must be unique normalized repository-relative " +
+        "paths with no empty, dot, or dot-dot component (at most 128 paths and 4,096 " +
+        "characters each); goal states the desired result in at most 12,000 characters; " +
+        "there are 1 to 16 acceptance criteria, each with a unique safe id of at most 80 " +
+        "characters, a description of at most 4,000 characters, and 1 to 32 argv strings " +
+        "of at most 4,096 characters each; and dependencies contains at most 128 unique " +
+        "stable task IDs of at most 80 characters. Do not include credentials, tokens, " +
+        "or other secret-looking values in either diagnosis or proposal.";
       const diagnosisBrief = {
         schemaVersion: 1,
         role: "diagnosis",
@@ -3673,13 +3821,13 @@ function sweepDeferral(sweepNode) {
         // named would be asking it to invent them.
         mission: (
           failure.impossibleClaim
-            ? `Worker task ${task.id} returned an impossibility claim. Assess that claim independently and return concise, actionable steering; the worker does not grade its own exit, so do not treat the claim or this request as a verdict. Begin with one outcome-first sentence whose first word is a past-tense verb, end it with a period or colon before any list, use no exclamation marks, and stay under 12,000 characters. Do not modify the repository. Treat the claim, capture stderr, and diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
+            ? `Worker task ${task.id} returned an impossibility claim. Assess that claim independently; the worker does not grade its own exit, so treat the claim as evidence rather than proof. Do not modify the repository.`
             : failure.ungated
-            ? `Task ${task.id} could not be judged by the tree-delta permission gate and its lane is being aborted, not retried: its agent node failed, so the ownership node never ran and certified no paths, and the task declares no conflictDomains, leaving no allowlist to judge its worktree against. No out-of-allowlist change has been established. Return a concise record of what the failing attempt was doing, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
+            ? `Task ${task.id} could not be judged by the tree-delta permission gate and its lane is being aborted, not retried: its agent node failed, so the ownership node never ran and certified no paths, and the task declares no conflictDomains, leaving no allowlist to judge its worktree against. No out-of-allowlist change has been established. Return a concise blocked record for the operator. Do not modify the repository.`
             : failure.breach
-            ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise record of what the out-of-allowlist change(s) were and why they likely happened, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
-            : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Begin with one outcome-first sentence whose first word is a past-tense verb, end it with a period or colon before any list, use no exclamation marks, and stay under 12,000 characters. Conforming example: “Observed the Codex session exit after its tool router rejected the command.” Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
-        ) + ownershipBoundary + literalSubstringRule + historyWalkRule,
+            ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise blocked record of what the out-of-allowlist change(s) were and why they likely happened. Do not modify the repository.`
+            : `Judge failed spec-build task ${task.id} independently from the worker that attempted it. Return a concise diagnosis and the typed verdict that deterministic machinery must execute. Do not modify the repository.`
+        ) + verdictContract + ownershipBoundary + literalSubstringRule + historyWalkRule,
         campaign: {
           name: effective.campaign,
           repository: codeRepository,
@@ -3723,20 +3871,18 @@ function sweepDeferral(sweepNode) {
         `diagnose-${task.id}`,
         `diagnose-${task.id}`
       );
-      const diagnosisSpec = applyAgentPolicies(
+      const diagnosisSpec = applyDiagnosisRole(
         {
-          argv: effective.agent.argv,
-          adapter: effective.agent.adapter,
           pools: ["campaign-agent"],
-          priority: effective.agent.priority,
           evidence: ["exit:0"],
           brief: diagnosisBrief,
           key: diagnosisIdentity.key,
           label: diagnosisIdentity.label,
           taskRef,
-          resultSchema: diagnosisResultSchema
-        },
-        effective.agent.diagnosisSandboxPolicy
+          resultSchema: legacyDiagnosisSeam()
+            ? legacyDiagnosisResultSchema
+            : diagnosisResultSchema
+        }
       );
       if (failure.prepared !== null && diff.available) {
         diagnosisSpec.workspace = workspaceFor(
@@ -3746,6 +3892,18 @@ function sweepDeferral(sweepNode) {
       }
       const diagnosed = await job(diagnosisSpec, { settle: false });
       const attempt = previousDiagnoses.length + 1;
+      // Old scripted flow clients returned the pre-verdict string directly.
+      // Production diagnosis nodes are schema-forced to the object above; the
+      // compatibility arm keeps those clients useful without weakening the
+      // model-facing result schema.
+      const diagnosisResult = typeof diagnosed.result === "string"
+        ? {
+            verdict: failure.breach || attempt === 2
+              ? "blocked"
+              : "retry",
+            diagnosis: diagnosed.result
+          }
+        : diagnosed.result;
       // #386: a breach carries its own deterministic evidence -- the paths
       // the tree-delta gate named in its own failure -- straight into the
       // durable receipt, so the offending paths are witnessed regardless of
@@ -3757,7 +3915,17 @@ function sweepDeferral(sweepNode) {
         issue: args.issue,
         taskId: task.id,
         attempt,
-        diagnosis: diagnosed.result,
+        diagnosis: diagnosisResult.diagnosis,
+        ...(legacyDiagnosisSeam()
+          ? {}
+          : {
+              taskKind: task.kind,
+              stage: failure.stage,
+              verdict: diagnosisResult.verdict,
+              ...(diagnosisResult.proposal === undefined
+                ? {}
+                : { proposal: diagnosisResult.proposal })
+            }),
         attemptReceipts,
         ...(gateEvidence ? { gateEvidence } : {}),
         ...(failure.breach
@@ -3806,6 +3974,11 @@ function sweepDeferral(sweepNode) {
     .map(outcome => outcome.value);
   const diagnoses = steeringResults.filter(result => result.kind === "diagnosis");
   retries.push(...steeringResults.filter(result => result.kind === "retry"));
+  retries.push(
+    ...steeringResults
+      .map(result => result.retry)
+      .filter(result => result !== null && result !== undefined && result.posted)
+  );
   let terminalError = diagnosisFailure ? diagnosisFailure.error : retryError;
   const advanced =
     merged.length > 0 ||
@@ -3898,11 +4071,17 @@ function sweepDeferral(sweepNode) {
     // one of these durable outcomes holds.
     state: merged.length > 0 || checkpoints.length > 0
       ? "advanced"
-      : diagnoses.length > 0
+      : diagnoses.some(diagnosis => diagnosis.verdict === "retry")
         ? "steered"
+        : retries.length > 0
+          ? "retrying"
+          : !legacyDiagnosisSeam() && diagnoses.some(
+            diagnosis => diagnosis.verdict === "blocked" || diagnosis.blocked
+          )
+            ? "blocked"
         : outcomes.some(outcome => outcome.outcome === "needs-authority")
           ? "needs-authority"
-          : "retrying",
+          : "steered",
     reconciled: reconciledProjection(reconciliation),
     maintenance: sweepNode.result,
     checkpoints,

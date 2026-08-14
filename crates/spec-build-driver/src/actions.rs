@@ -2169,6 +2169,150 @@ fn validated_diagnosis(diagnosis: &str, evidence: Option<&Json>) -> String {
     )
 }
 
+fn normalize_diagnosis_proposal(value: Option<&Json>, context: &str) -> Result<Option<Json>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let proposal = object_exact(
+        value,
+        &[
+            "kind",
+            "paths",
+            "goal",
+            "acceptanceCriteria",
+            "dependencies",
+        ],
+        context,
+    )?;
+    let kind = required_string(proposal.get("kind"), &format!("{context}.kind"), None)?;
+    if !matches!(kind.as_str(), "amendment-task" | "gate-set-fix") {
+        return Err(DriverError::new(format!(
+            "{context}.kind must be amendment-task or gate-set-fix"
+        )));
+    }
+    let paths = normalize_paths(proposal.get("paths"), &format!("{context}.paths"), true)?
+        .expect("proposal paths are required");
+    if paths.len() > 128 || paths.iter().any(|path| path.chars().count() > 4_096) {
+        return Err(DriverError::new(format!(
+            "{context}.paths exceeds the proposal bound"
+        )));
+    }
+    let goal = required_text(proposal.get("goal"), &format!("{context}.goal"), 12_000)?;
+    let acceptance = normalize_acceptance(
+        proposal.get("acceptanceCriteria"),
+        &format!("{context}.acceptanceCriteria"),
+    )?;
+    let criteria = acceptance
+        .as_array()
+        .expect("normalized acceptance criteria are an array");
+    if criteria.len() > 16 {
+        return Err(DriverError::new(format!(
+            "{context}.acceptanceCriteria exceeds 16 entries"
+        )));
+    }
+    for (index, criterion) in criteria.iter().enumerate() {
+        let argv = criterion
+            .as_object()
+            .and_then(|criterion| criterion.get("argv"))
+            .and_then(Json::as_array)
+            .expect("normalized criterion argv is an array");
+        if argv.len() > 32
+            || argv.iter().any(|argument| {
+                argument
+                    .as_str()
+                    .is_some_and(|argument| argument.chars().count() > 4_096)
+            })
+        {
+            return Err(DriverError::new(format!(
+                "{context}.acceptanceCriteria[{index}].argv exceeds the proposal bound"
+            )));
+        }
+    }
+    let dependencies = string_list(
+        proposal.get("dependencies"),
+        &format!("{context}.dependencies"),
+        false,
+    )?;
+    if dependencies.len() > 128
+        || dependencies
+            .iter()
+            .any(|dependency| dependency.chars().count() > 80 || !is_task_id(dependency))
+        || dependencies.iter().collect::<BTreeSet<_>>().len() != dependencies.len()
+    {
+        return Err(DriverError::new(format!(
+            "{context}.dependencies must contain at most 128 unique stable task IDs"
+        )));
+    }
+    Ok(Some(Json::object([
+        ("kind", Json::from(kind)),
+        (
+            "paths",
+            Json::Array(paths.into_iter().map(Json::from).collect()),
+        ),
+        ("goal", Json::from(goal)),
+        ("acceptanceCriteria", acceptance),
+        (
+            "dependencies",
+            Json::Array(dependencies.into_iter().map(Json::from).collect()),
+        ),
+    ])))
+}
+
+fn redact_json_strings(value: &Json) -> (Json, bool) {
+    match value {
+        Json::String(value) => {
+            let (value, redacted) = redact_public_text(value);
+            (Json::from(value), redacted)
+        }
+        Json::Array(values) => {
+            let mut redacted = false;
+            let values = values
+                .iter()
+                .map(|value| {
+                    let (value, item_redacted) = redact_json_strings(value);
+                    redacted |= item_redacted;
+                    value
+                })
+                .collect();
+            (Json::Array(values), redacted)
+        }
+        Json::Object(values) => {
+            let mut redacted = false;
+            let values = values
+                .iter()
+                .map(|(key, value)| {
+                    let (value, item_redacted) = redact_json_strings(value);
+                    redacted |= item_redacted;
+                    (key.clone(), value)
+                })
+                .collect();
+            (Json::Object(values), redacted)
+        }
+        value => (value.clone(), false),
+    }
+}
+
+fn public_diagnosis_proposal(value: Option<&Json>) -> Result<(Option<Json>, bool)> {
+    let proposal = normalize_diagnosis_proposal(value, "proposal")?;
+    let Some(proposal) = proposal else {
+        return Ok((None, false));
+    };
+    let (redacted_proposal, redacted) = redact_json_strings(&proposal);
+    if !redacted {
+        return Ok((Some(proposal), false));
+    }
+    // Redaction may make a path or stable ID cease to satisfy its structural
+    // grammar. Secrets still never reach the public ledger; in that rare case
+    // retain the diagnosis and omit the now-unactionable proposal.
+    Ok((
+        normalize_diagnosis_proposal(Some(&redacted_proposal), "redacted proposal").unwrap_or(None),
+        true,
+    ))
+}
+
 fn bound_public_diagnosis(value: &str) -> String {
     if value.chars().count() <= MAX_DIAGNOSIS_CHARS {
         return value.to_owned();
@@ -2345,6 +2489,91 @@ fn action_worker_outcome(brief: &Json) -> Result<Json> {
     ]))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn diagnosis_steering_result(
+    task_id: &str,
+    attempt: u64,
+    comment: String,
+    verdict: DiagnosisVerdict,
+    proposal: Option<&Json>,
+    posted: bool,
+    redacted: bool,
+    retry: Option<Json>,
+) -> Json {
+    let mut result = BTreeMap::from([
+        ("kind".to_owned(), Json::from("diagnosis")),
+        ("taskId".to_owned(), Json::from(task_id)),
+        ("attempt".to_owned(), Json::Number(attempt.to_string())),
+        ("comment".to_owned(), Json::from(comment)),
+        ("verdict".to_owned(), Json::from(verdict.as_str())),
+        (
+            "blocked".to_owned(),
+            Json::from(attempt == 2 || verdict == DiagnosisVerdict::Blocked),
+        ),
+        ("posted".to_owned(), Json::from(posted)),
+        ("redacted".to_owned(), Json::from(redacted)),
+        ("retry".to_owned(), retry.unwrap_or(Json::Null)),
+    ]);
+    if let Some(proposal) = proposal {
+        result.insert("proposal".to_owned(), proposal.clone());
+    }
+    Json::Object(result)
+}
+
+fn transient_steering_result(retry: &Json) -> Json {
+    let retry = retry
+        .as_object()
+        .expect("record_machine_retry returns an object");
+    Json::object([
+        ("kind", Json::from("retry")),
+        (
+            "taskId",
+            retry
+                .get("taskId")
+                .expect("record_machine_retry returns taskId")
+                .clone(),
+        ),
+        (
+            "attempt",
+            retry
+                .get("attempt")
+                .expect("record_machine_retry returns attempt")
+                .clone(),
+        ),
+        (
+            "comment",
+            retry
+                .get("comment")
+                .expect("a posted machinery retry returns comment")
+                .clone(),
+        ),
+        ("verdict", Json::from("transient")),
+        ("blocked", Json::from(false)),
+        (
+            "posted",
+            retry
+                .get("posted")
+                .expect("record_machine_retry returns posted")
+                .clone(),
+        ),
+        (
+            "redacted",
+            retry
+                .get("redacted")
+                .expect("record_machine_retry returns redacted")
+                .clone(),
+        ),
+        (
+            "exhausted",
+            retry
+                .get("exhausted")
+                .expect("record_machine_retry returns exhausted")
+                .clone(),
+        ),
+        ("retry", Json::Null),
+    ])
+}
+
 fn action_steer(brief: &Json) -> Result<Json> {
     let data = object_exact(
         brief,
@@ -2354,8 +2583,12 @@ fn action_steer(brief: &Json) -> Result<Json> {
             "repositoryConfig",
             "issue",
             "taskId",
+            "taskKind",
+            "stage",
             "attempt",
             "diagnosis",
+            "verdict",
+            "proposal",
             "attemptReceipts",
             "checkpointCapture",
             "gateEvidence",
@@ -2384,6 +2617,27 @@ fn action_steer(brief: &Json) -> Result<Json> {
         return Err(DriverError::new("attempt must equal 1 or 2"));
     }
     let attempt = attempt.expect("validated attempt");
+    let task_kind = data
+        .get("taskKind")
+        .and_then(Json::as_str)
+        .unwrap_or("implementation");
+    if !matches!(task_kind, "implementation" | "checkpoint") {
+        return Err(DriverError::new(
+            "taskKind must equal implementation or checkpoint",
+        ));
+    }
+    let requested_verdict =
+        DiagnosisVerdict::parse(data.get("verdict"), "verdict")?.unwrap_or(if attempt == 2 {
+            DiagnosisVerdict::Blocked
+        } else {
+            DiagnosisVerdict::Retry
+        });
+    let (proposal, proposal_redacted) = public_diagnosis_proposal(data.get("proposal"))?;
+    if proposal.is_some() && requested_verdict != DiagnosisVerdict::Blocked {
+        return Err(DriverError::new(
+            "proposal is allowed only with a blocked diagnosis verdict",
+        ));
+    }
     let breach = json_truthy(data.get("breach"));
     let abort_reason = data
         .get("abortReason")
@@ -2400,18 +2654,39 @@ fn action_steer(brief: &Json) -> Result<Json> {
         .iter()
         .filter(|receipt| receipt.task_id == task_id)
         .collect();
+    let spent_machinery_retries = state
+        .retries
+        .iter()
+        .filter(|receipt| receipt.task_id == task_id)
+        .count();
+    // The judge proposes; deterministic rails decide what can execute. A
+    // checkpoint never receives a second dispatch, attempt two is the hard
+    // per-input ceiling, and transient consumes (rather than bypasses) the
+    // machinery retry budget.
+    let transient_budget_exhausted = requested_verdict == DiagnosisVerdict::Transient
+        && spent_machinery_retries >= MAX_MACHINE_RETRIES;
+    let mut verdict =
+        if breach || task_kind == "checkpoint" || attempt == 2 || transient_budget_exhausted {
+            DiagnosisVerdict::Blocked
+        } else {
+            requested_verdict
+        };
+    let proposal = (verdict == DiagnosisVerdict::Blocked)
+        .then_some(proposal)
+        .flatten();
 
     if breach {
         if let Some(existing) = task_receipts.iter().find(|receipt| receipt.attempt == 2) {
-            return Ok(Json::object([
-                ("kind", Json::from("diagnosis")),
-                ("taskId", Json::from(task_id)),
-                ("attempt", Json::Number("2".to_owned())),
-                ("comment", Json::from(existing.comment.clone())),
-                ("blocked", Json::from(true)),
-                ("posted", Json::from(false)),
-                ("redacted", Json::from(false)),
-            ]));
+            return Ok(diagnosis_steering_result(
+                &task_id,
+                2,
+                existing.comment.clone(),
+                DiagnosisVerdict::Blocked,
+                existing.proposal.as_ref(),
+                false,
+                false,
+                None,
+            ));
         }
         let (capture_note, capture_redacted) = if data.contains_key("checkpointCapture") {
             let note = checkpoint_capture_note(data.get("checkpointCapture"), &campaign, &task_id)?;
@@ -2448,35 +2723,36 @@ fn action_steer(brief: &Json) -> Result<Json> {
                 &task_id,
                 post_attempt,
                 &composed,
+                DiagnosisVerdict::Blocked,
+                (post_attempt == 1).then_some(proposal.as_ref()).flatten(),
             )?);
         }
-        return Ok(Json::object([
-            ("kind", Json::from("diagnosis")),
-            ("taskId", Json::from(task_id)),
-            ("attempt", Json::Number("2".to_owned())),
-            ("comment", posted_comment.map_or(Json::Null, Json::from)),
-            ("blocked", Json::from(true)),
-            ("posted", Json::from(true)),
-            (
-                "redacted",
-                Json::from(redacted_diagnosis || redacted_detail || capture_redacted),
-            ),
-        ]));
+        return Ok(diagnosis_steering_result(
+            &task_id,
+            2,
+            posted_comment.expect("a missing breach attempt was recorded"),
+            DiagnosisVerdict::Blocked,
+            proposal.as_ref(),
+            true,
+            redacted_diagnosis || redacted_detail || capture_redacted || proposal_redacted,
+            None,
+        ));
     }
 
     if let Some(existing) = task_receipts
         .iter()
         .find(|receipt| receipt.attempt == attempt)
     {
-        return Ok(Json::object([
-            ("kind", Json::from("diagnosis")),
-            ("taskId", Json::from(task_id)),
-            ("attempt", Json::Number(attempt.to_string())),
-            ("comment", Json::from(existing.comment.clone())),
-            ("blocked", Json::from(attempt == 2)),
-            ("posted", Json::from(false)),
-            ("redacted", Json::from(false)),
-        ]));
+        return Ok(diagnosis_steering_result(
+            &task_id,
+            attempt,
+            existing.comment.clone(),
+            existing.effective_verdict(),
+            existing.proposal.as_ref(),
+            false,
+            false,
+            None,
+        ));
     }
     let expected_attempt = task_receipts.len() as u64 + 1;
     if attempt != expected_attempt {
@@ -2497,6 +2773,40 @@ fn action_steer(brief: &Json) -> Result<Json> {
     let diagnosis = bound_public_diagnosis(&diagnosis);
     let diagnosis = validated_diagnosis(&diagnosis, data.get("gateEvidence"));
     let diagnosis = append_checkpoint_capture_note(&diagnosis, &capture_note, MAX_DIAGNOSIS_CHARS);
+    // A transient diagnosis is a reason for the existing free machinery
+    // retry, not a task-attempt receipt. Keeping it out of the diagnosis
+    // ledger means the redispatch remains attempt 1 while the independent
+    // machinery budget is charged.
+    if verdict == DiagnosisVerdict::Transient {
+        let stage = data
+            .get("stage")
+            .and_then(Json::as_str)
+            .unwrap_or("diagnosis");
+        if !Regex::new(r"^[a-z][a-z0-9:._-]{0,63}$")
+            .expect("static stage regex")
+            .is_match(stage)
+        {
+            return Err(DriverError::new("stage is not a safe campaign stage name"));
+        }
+        let retry = record_machine_retry(
+            data.get("attemptReceipts"),
+            &campaign,
+            &issue_number,
+            &task_id,
+            stage,
+            &format!("The judge classified this failure as transient.\n\n{diagnosis}"),
+            "",
+        )?;
+        if retry
+            .as_object()
+            .and_then(|retry| retry.get("posted"))
+            .and_then(Json::as_bool)
+            == Some(true)
+        {
+            return Ok(transient_steering_result(&retry));
+        }
+        verdict = DiagnosisVerdict::Blocked;
+    }
     let comment = record_diagnosis(
         data.get("attemptReceipts"),
         &campaign,
@@ -2504,15 +2814,82 @@ fn action_steer(brief: &Json) -> Result<Json> {
         &task_id,
         attempt,
         &diagnosis,
+        verdict,
+        proposal.as_ref(),
     )?;
+    Ok(diagnosis_steering_result(
+        &task_id,
+        attempt,
+        comment,
+        verdict,
+        proposal.as_ref(),
+        true,
+        redacted || capture_redacted || proposal_redacted,
+        None,
+    ))
+}
+
+fn record_machine_retry(
+    source: Option<&Json>,
+    campaign: &str,
+    issue_number: &str,
+    task_id: &str,
+    stage: &str,
+    detail: &str,
+    capture_note: &str,
+) -> Result<Json> {
+    let state = campaign_attempt_state_all(source, campaign, issue_number)?;
+    let spent = state
+        .retries
+        .iter()
+        .filter(|receipt| receipt.task_id == task_id)
+        .count();
+    if spent >= MAX_MACHINE_RETRIES {
+        return Ok(Json::object([
+            ("taskId", Json::from(task_id)),
+            ("attempt", Json::from(spent)),
+            ("comment", Json::Null),
+            ("exhausted", Json::from(true)),
+            ("posted", Json::from(false)),
+            ("redacted", Json::from(false)),
+        ]));
+    }
+    let attempt = spent + 1;
+    let mut raw_reason = format!("Stage `{stage}` faulted.");
+    if !capture_note.is_empty() {
+        raw_reason.push_str(&format!("\n\n{capture_note}"));
+    }
+    raw_reason.push_str(&format!("\n\n{detail}"));
+    let (mut reason, redacted) = redact_public_text(&raw_reason);
+    if reason.chars().count() > MAX_RETRY_CHARS {
+        reason = format!("{}...", take_chars(&reason, MAX_RETRY_CHARS - 3).trim_end());
+    }
+    let reason = required_text(Some(&Json::from(reason)), "retry reason", MAX_RETRY_CHARS)?;
+    let (created, receipt) = append_attempt_receipt(
+        source,
+        campaign,
+        issue_number,
+        Json::object([
+            ("kind", Json::from("retry")),
+            ("taskId", Json::from(task_id)),
+            ("attempt", Json::from(attempt)),
+            ("reason", Json::from(reason)),
+            ("redaction", Json::from(PUBLIC_REDACTION)),
+        ]),
+    )?;
+    let comment = receipt
+        .as_object()
+        .and_then(|receipt| receipt.get("comment"))
+        .and_then(Json::as_str)
+        .expect("append receipt returns comment")
+        .to_owned();
     Ok(Json::object([
-        ("kind", Json::from("diagnosis")),
         ("taskId", Json::from(task_id)),
-        ("attempt", Json::Number(attempt.to_string())),
+        ("attempt", Json::from(attempt)),
         ("comment", Json::from(comment)),
-        ("blocked", Json::from(attempt == 2)),
-        ("posted", Json::from(true)),
-        ("redacted", Json::from(redacted || capture_redacted)),
+        ("exhausted", Json::from(attempt == MAX_MACHINE_RETRIES)),
+        ("posted", Json::from(created)),
+        ("redacted", Json::from(redacted)),
     ]))
 }
 
@@ -2554,64 +2931,20 @@ fn action_retry(brief: &Json) -> Result<Json> {
         return Err(DriverError::new("stage is not a safe campaign stage name"));
     }
     let detail = required_text(data.get("detail"), "detail", MAX_RETRY_CHARS)?;
-    let state = campaign_attempt_state_all(data.get("attemptReceipts"), &campaign, &issue_number)?;
-    let spent = state
-        .retries
-        .iter()
-        .filter(|receipt| receipt.task_id == task_id)
-        .count();
-    if spent >= MAX_MACHINE_RETRIES {
-        return Ok(Json::object([
-            ("taskId", Json::from(task_id)),
-            ("attempt", Json::from(spent)),
-            ("comment", Json::Null),
-            ("exhausted", Json::from(true)),
-            ("posted", Json::from(false)),
-            ("redacted", Json::from(false)),
-        ]));
-    }
-    let attempt = spent + 1;
     let capture_note = if data.contains_key("checkpointCapture") {
         checkpoint_capture_note(data.get("checkpointCapture"), &campaign, &task_id)?
     } else {
         String::new()
     };
-    let mut raw_reason = format!("Stage `{stage}` faulted.");
-    if !capture_note.is_empty() {
-        raw_reason.push_str(&format!("\n\n{capture_note}"));
-    }
-    raw_reason.push_str(&format!("\n\n{detail}"));
-    let (mut reason, redacted) = redact_public_text(&raw_reason);
-    if reason.chars().count() > MAX_RETRY_CHARS {
-        reason = format!("{}...", take_chars(&reason, MAX_RETRY_CHARS - 3).trim_end());
-    }
-    let reason = required_text(Some(&Json::from(reason)), "retry reason", MAX_RETRY_CHARS)?;
-    let (created, receipt) = append_attempt_receipt(
+    record_machine_retry(
         data.get("attemptReceipts"),
         &campaign,
         &issue_number,
-        Json::object([
-            ("kind", Json::from("retry")),
-            ("taskId", Json::from(task_id.clone())),
-            ("attempt", Json::from(attempt)),
-            ("reason", Json::from(reason)),
-            ("redaction", Json::from(PUBLIC_REDACTION)),
-        ]),
-    )?;
-    let comment = receipt
-        .as_object()
-        .and_then(|receipt| receipt.get("comment"))
-        .and_then(Json::as_str)
-        .expect("append receipt returns comment")
-        .to_owned();
-    Ok(Json::object([
-        ("taskId", Json::from(task_id)),
-        ("attempt", Json::from(attempt)),
-        ("comment", Json::from(comment)),
-        ("exhausted", Json::from(attempt == MAX_MACHINE_RETRIES)),
-        ("posted", Json::from(created)),
-        ("redacted", Json::from(redacted)),
-    ]))
+        &task_id,
+        &stage,
+        &detail,
+        &capture_note,
+    )
 }
 
 fn compact_summary(value: &str, maximum: usize) -> String {
@@ -2621,6 +2954,76 @@ fn compact_summary(value: &str, maximum: usize) -> String {
     } else {
         format!("{}...", take_chars(&compact, maximum - 3))
     }
+}
+
+fn rendered_proposal_diff(proposal: &Json) -> Result<Vec<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(&proposal.stringify()).map_err(|error| {
+            DriverError::new(format!(
+                "cannot render structured diagnosis proposal: {error}"
+            ))
+        })?;
+    let rendered = serde_json::to_string_pretty(&value).map_err(|error| {
+        DriverError::new(format!(
+            "cannot render structured diagnosis proposal: {error}"
+        ))
+    })?;
+    Ok(std::iter::once("```diff".to_owned())
+        .chain(rendered.lines().map(|line| format!("+ {line}")))
+        .chain(std::iter::once("```".to_owned()))
+        .collect())
+}
+
+fn append_diagnosis_report(
+    lines: &mut Vec<String>,
+    diagnoses: &[Json],
+    public_values: &mut Vec<String>,
+) -> Result<()> {
+    if !diagnoses.is_empty() {
+        lines.extend([String::new(), "Accumulated machine diagnoses:".to_owned()]);
+    }
+    let mut proposals = Vec::new();
+    for diagnosis in diagnoses {
+        let diagnosis = diagnosis
+            .as_object()
+            .ok_or_else(|| DriverError::new("reconciliation diagnosis must be an object"))?;
+        let task_id = diagnosis
+            .get("taskId")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        let attempt = diagnosis
+            .get("attempt")
+            .and_then(Json::as_u64)
+            .unwrap_or_default();
+        let text = diagnosis
+            .get("diagnosis")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        let verdict = diagnosis
+            .get("verdict")
+            .and_then(Json::as_str)
+            .unwrap_or(if attempt == 2 { "blocked" } else { "retry" });
+        lines.push(format!(
+            "- `{task_id}` attempt {attempt} ({verdict}): {}",
+            compact_summary(text, 64)
+        ));
+        public_values.push(text.to_owned());
+        if let Some(proposal) = diagnosis.get("proposal") {
+            proposals.push((task_id.to_owned(), attempt, proposal.clone()));
+            public_values.push(proposal.stringify());
+        }
+    }
+    if !proposals.is_empty() {
+        lines.extend([
+            String::new(),
+            "Prepared worklist proposals (ready diffs):".to_owned(),
+        ]);
+        for (task_id, attempt, proposal) in proposals {
+            lines.extend([String::new(), format!("`{task_id}` attempt {attempt}:")]);
+            lines.extend(rendered_proposal_diff(&proposal)?);
+        }
+    }
+    Ok(())
 }
 
 fn checkpoint_capture_paths(values: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -2748,9 +3151,9 @@ fn action_escalate(brief: &Json) -> Result<Json> {
             == Some("needs-authority")
     });
     let blocking_rule = if has_authority_request {
-        "Tally stopped because each directly blocked task either failed twice with machine steering or requested authority-surface paths; authority requests spend no attempt."
+        "Tally stopped because each directly blocked task received a blocked judge verdict, reached the hard attempt cap, or requested authority-surface paths; authority requests spend no attempt."
     } else {
-        "Tally stopped only after each directly blocked task failed twice with machine steering."
+        "Tally stopped because each directly blocked task received a blocked judge verdict or reached the hard attempt cap."
     };
     let mut lines = vec![
         "### Spec-build escalation: frontier quiescent".to_owned(),
@@ -2812,31 +3215,7 @@ fn action_escalate(brief: &Json) -> Result<Json> {
             }
         }
     }
-    if !diagnoses.is_empty() {
-        lines.extend([String::new(), "Accumulated machine diagnoses:".to_owned()]);
-    }
-    for diagnosis in diagnoses {
-        let diagnosis = diagnosis
-            .as_object()
-            .ok_or_else(|| DriverError::new("reconciliation diagnosis must be an object"))?;
-        let task_id = diagnosis
-            .get("taskId")
-            .and_then(Json::as_str)
-            .unwrap_or_default();
-        let attempt = diagnosis
-            .get("attempt")
-            .and_then(Json::as_u64)
-            .unwrap_or_default();
-        let text = diagnosis
-            .get("diagnosis")
-            .and_then(Json::as_str)
-            .unwrap_or_default();
-        lines.push(format!(
-            "- `{task_id}` attempt {attempt}: {}",
-            compact_summary(text, 64)
-        ));
-        public_values.push(text.to_owned());
-    }
+    append_diagnosis_report(&mut lines, diagnoses, &mut public_values)?;
     if !retries.is_empty() {
         lines.extend([
             String::new(),
@@ -4413,22 +4792,63 @@ fn write_local_blob(config: &RepoConfig, reference: &str, value: &Json) -> Resul
     Ok((true, value.clone()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosisVerdict {
+    Retry,
+    Blocked,
+    Transient,
+}
+
+impl DiagnosisVerdict {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Blocked => "blocked",
+            Self::Transient => "transient",
+        }
+    }
+
+    fn parse(value: Option<&Json>, context: &str) -> Result<Option<Self>> {
+        match value {
+            None => Ok(None),
+            Some(value) => match value.as_str() {
+                Some("retry") => Ok(Some(Self::Retry)),
+                Some("blocked") => Ok(Some(Self::Blocked)),
+                Some("transient") => Ok(Some(Self::Transient)),
+                _ => Err(DriverError::new(format!(
+                    "{context} must be retry, blocked, or transient"
+                ))),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct VisibleAttempt {
     task_id: String,
     attempt: u64,
     comment: String,
     text: String,
+    verdict: Option<DiagnosisVerdict>,
+    proposal: Option<Json>,
 }
 
 impl VisibleAttempt {
     fn diagnosis_json(&self) -> Json {
-        Json::object([
-            ("taskId", Json::from(self.task_id.clone())),
-            ("attempt", Json::Number(self.attempt.to_string())),
-            ("comment", Json::from(self.comment.clone())),
-            ("diagnosis", Json::from(self.text.clone())),
-        ])
+        let mut object = BTreeMap::from([
+            ("taskId".to_owned(), Json::from(self.task_id.clone())),
+            ("attempt".to_owned(), Json::Number(self.attempt.to_string())),
+            ("comment".to_owned(), Json::from(self.comment.clone())),
+            ("diagnosis".to_owned(), Json::from(self.text.clone())),
+            (
+                "verdict".to_owned(),
+                Json::from(self.effective_verdict().as_str()),
+            ),
+        ]);
+        if let Some(proposal) = &self.proposal {
+            object.insert("proposal".to_owned(), proposal.clone());
+        }
+        Json::Object(object)
     }
 
     fn retry_json(&self) -> Json {
@@ -4438,6 +4858,18 @@ impl VisibleAttempt {
             ("comment", Json::from(self.comment.clone())),
             ("reason", Json::from(self.text.clone())),
         ])
+    }
+
+    const fn effective_verdict(&self) -> DiagnosisVerdict {
+        match self.verdict {
+            Some(verdict) => verdict,
+            None if self.attempt == 2 => DiagnosisVerdict::Blocked,
+            None => DiagnosisVerdict::Retry,
+        }
+    }
+
+    const fn blocks_task(&self) -> bool {
+        self.attempt == 2 || matches!(self.effective_verdict(), DiagnosisVerdict::Blocked)
     }
 }
 
@@ -4593,7 +5025,14 @@ fn validate_attempt_receipt(
     ];
     let mut fields = common.to_vec();
     match kind {
-        "diagnosis" => fields.extend(["taskId", "attempt", "diagnosis", "redaction"]),
+        "diagnosis" => fields.extend([
+            "taskId",
+            "attempt",
+            "diagnosis",
+            "verdict",
+            "proposal",
+            "redaction",
+        ]),
         "retry" => fields.extend(["taskId", "attempt", "reason", "redaction"]),
         "worker-outcome" => fields.extend([
             "taskId",
@@ -4648,6 +5087,24 @@ fn validate_attempt_receipt(
             } else {
                 "reason"
             };
+            let verdict = if kind == "diagnosis" {
+                DiagnosisVerdict::parse(record.get("verdict"), &format!("{context}.verdict"))?
+            } else {
+                None
+            };
+            let proposal = if kind == "diagnosis" {
+                normalize_diagnosis_proposal(
+                    record.get("proposal"),
+                    &format!("{context}.proposal"),
+                )?
+            } else {
+                None
+            };
+            if proposal.is_some() && verdict != Some(DiagnosisVerdict::Blocked) {
+                return Err(DriverError::new(format!(
+                    "{context}.proposal is allowed only with a blocked diagnosis verdict"
+                )));
+            }
             let visible = VisibleAttempt {
                 task_id,
                 attempt: attempt.expect("validated above"),
@@ -4661,6 +5118,8 @@ fn validate_attempt_receipt(
                         MAX_RETRY_CHARS
                     },
                 )?,
+                verdict,
+                proposal,
             };
             Ok(if kind == "diagnosis" {
                 AttemptEvent::Diagnosis(visible)
@@ -4989,12 +5448,10 @@ fn fold_attempt_receipts(
                     .push(receipt);
             }
             AttemptEvent::Escalation { comment } => {
-                let mut contributors: BTreeSet<_> = diagnosis_counters
+                let mut contributors: BTreeSet<_> = visible_diagnoses
                     .iter()
-                    .filter_map(|(task_id, attempts)| {
-                        let attempts: BTreeSet<_> = attempts.iter().copied().collect();
-                        (attempts == BTreeSet::from([1, 2])).then(|| task_id.clone())
-                    })
+                    .filter(|(_, diagnoses)| diagnoses.iter().any(VisibleAttempt::blocks_task))
+                    .map(|(task_id, _)| task_id.clone())
                     .collect();
                 contributors.extend(authority_counters.iter().cloned());
                 escalations.push((comment, contributors, BTreeSet::new()));
@@ -5387,6 +5844,7 @@ fn append_attempt_receipt(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_diagnosis(
     source: Option<&Json>,
     campaign: &str,
@@ -5394,19 +5852,22 @@ fn record_diagnosis(
     task_id: &str,
     attempt: u64,
     diagnosis: &str,
+    verdict: DiagnosisVerdict,
+    proposal: Option<&Json>,
 ) -> Result<String> {
-    let (_, receipt) = append_attempt_receipt(
-        source,
-        campaign,
-        issue_number,
-        Json::object([
-            ("kind", Json::from("diagnosis")),
-            ("taskId", Json::from(task_id)),
-            ("attempt", Json::Number(attempt.to_string())),
-            ("diagnosis", Json::from(diagnosis)),
-            ("redaction", Json::from(PUBLIC_REDACTION)),
-        ]),
-    )?;
+    let mut payload = BTreeMap::from([
+        ("kind".to_owned(), Json::from("diagnosis")),
+        ("taskId".to_owned(), Json::from(task_id)),
+        ("attempt".to_owned(), Json::Number(attempt.to_string())),
+        ("diagnosis".to_owned(), Json::from(diagnosis)),
+        ("verdict".to_owned(), Json::from(verdict.as_str())),
+        ("redaction".to_owned(), Json::from(PUBLIC_REDACTION)),
+    ]);
+    if let Some(proposal) = proposal {
+        payload.insert("proposal".to_owned(), proposal.clone());
+    }
+    let (_, receipt) =
+        append_attempt_receipt(source, campaign, issue_number, Json::Object(payload))?;
     Ok(receipt
         .as_object()
         .and_then(|receipt| receipt.get("comment"))
@@ -6238,7 +6699,7 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
     let mut direct_blocked: BTreeSet<_> = attempts
         .diagnoses
         .iter()
-        .filter(|diagnosis| diagnosis.attempt == 2 && !completed_ids.contains(&diagnosis.task_id))
+        .filter(|diagnosis| diagnosis.blocks_task() && !completed_ids.contains(&diagnosis.task_id))
         .map(|diagnosis| diagnosis.task_id.clone())
         .collect();
     direct_blocked.extend(
@@ -10384,9 +10845,10 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        action_worker_outcome, campaign_attempt_state, classify_worker_outcome,
-        closed_inline_code_spans, contains_bare_exclamation_mark, publish_closing_summary,
-        read_local_blob, replace_bare_exclamation_marks, validate_outcome_first, Json, RepoConfig,
+        action_steer, action_worker_outcome, append_diagnosis_report, campaign_attempt_state,
+        campaign_attempt_state_all, classify_worker_outcome, closed_inline_code_spans,
+        contains_bare_exclamation_mark, publish_closing_summary, read_local_blob,
+        replace_bare_exclamation_marks, validate_outcome_first, DiagnosisVerdict, Json, RepoConfig,
         WorkerOutcome,
     };
     use tally_core::campaign_folds::{campaign_digest, CampaignReconciliation, CampaignSource};
@@ -10469,6 +10931,107 @@ mod tests {
                         ),
                     ),
                 ]),
+            ),
+        ])
+    }
+
+    fn diagnosis_test_checkout(root: &Path) -> std::path::PathBuf {
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        summary_ref_test_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        checkout
+    }
+
+    fn diagnosis_test_brief(
+        root: &Path,
+        checkout: &Path,
+        task_kind: &str,
+        verdict: &str,
+        proposal: Option<Json>,
+    ) -> Json {
+        let mut brief = BTreeMap::from([
+            ("campaign".to_owned(), Json::from("fixture")),
+            ("repository".to_owned(), Json::from("acme/spec")),
+            (
+                "repositoryConfig".to_owned(),
+                Json::object([
+                    ("checkout", Json::from(checkout.display().to_string())),
+                    ("baseBranch", Json::from("main")),
+                    ("remote", Json::from("origin")),
+                    ("forge", Json::from("local")),
+                ]),
+            ),
+            (
+                "issue".to_owned(),
+                Json::object([
+                    ("number", Json::from("7")),
+                    ("url", Json::from("local://acme/spec/issues/7")),
+                ]),
+            ),
+            ("taskId".to_owned(), Json::from("task-1")),
+            ("taskKind".to_owned(), Json::from(task_kind)),
+            ("stage".to_owned(), Json::from("agent")),
+            ("attempt".to_owned(), Json::Number("1".to_owned())),
+            (
+                "diagnosis".to_owned(),
+                Json::from("Identified the bounded failure and its remedy."),
+            ),
+            ("verdict".to_owned(), Json::from(verdict)),
+            (
+                "attemptReceipts".to_owned(),
+                Json::object([
+                    ("schemaVersion", Json::Number("1".to_owned())),
+                    ("kind", Json::from("local-jsonl")),
+                    (
+                        "path",
+                        Json::from(
+                            root.join(
+                                "campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl",
+                            )
+                            .display()
+                            .to_string(),
+                        ),
+                    ),
+                ]),
+            ),
+        ]);
+        if let Some(proposal) = proposal {
+            brief.insert("proposal".to_owned(), proposal);
+        }
+        Json::Object(brief)
+    }
+
+    fn actionable_diagnosis_proposal() -> Json {
+        Json::object([
+            ("kind", Json::from("amendment-task")),
+            (
+                "paths",
+                Json::Array(vec![Json::from("test/final-bar/cases/driver.py")]),
+            ),
+            (
+                "goal",
+                Json::from("Synchronize the final-bar assertion with the shipped driver."),
+            ),
+            (
+                "acceptanceCriteria",
+                Json::Array(vec![Json::object([
+                    ("id", Json::from("final-bar-sync")),
+                    (
+                        "description",
+                        Json::from("The synchronized final-bar case passes."),
+                    ),
+                    (
+                        "argv",
+                        Json::Array(vec![
+                            Json::from("python3"),
+                            Json::from("test/final-bar/cases/driver.py"),
+                        ]),
+                    ),
+                ])]),
+            ),
+            (
+                "dependencies",
+                Json::Array(vec![Json::from("driver-foundation")]),
             ),
         ])
     }
@@ -10593,6 +11156,215 @@ mod tests {
         );
         assert!(log.contains(".github/workflows/release.yml"));
         assert!(log.contains("test/fleet-gate.sh"));
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn blocked_verdict_stops_at_attempt_one() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-blocked-verdict-test-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let brief = diagnosis_test_brief(&temporary, &checkout, "implementation", "blocked", None);
+
+        let result = action_steer(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(
+            result.get("verdict").and_then(Json::as_str),
+            Some("blocked")
+        );
+        assert_eq!(result.get("blocked").and_then(Json::as_bool), Some(true));
+        assert!(matches!(result.get("retry"), Some(Json::Null)));
+
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert_eq!(state.diagnoses.len(), 1);
+        assert!(state.diagnoses[0].blocks_task());
+        assert_eq!(
+            state.diagnoses[0].effective_verdict(),
+            DiagnosisVerdict::Blocked
+        );
+        assert!(state.retries.is_empty());
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn retry_verdict_exposes_attempt_two_with_the_diagnosis_as_steering() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-retry-verdict-test-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let brief = diagnosis_test_brief(&temporary, &checkout, "implementation", "retry", None);
+
+        let result = action_steer(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(result.get("verdict").and_then(Json::as_str), Some("retry"));
+        assert_eq!(result.get("blocked").and_then(Json::as_bool), Some(false));
+
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert_eq!(state.diagnoses.len(), 1);
+        assert!(!state.diagnoses[0].blocks_task());
+        let steering = state.diagnoses[0].diagnosis_json();
+        assert_eq!(
+            steering
+                .as_object()
+                .and_then(|diagnosis| diagnosis.get("verdict"))
+                .and_then(Json::as_str),
+            Some("retry")
+        );
+        assert_eq!(
+            steering
+                .as_object()
+                .and_then(|diagnosis| diagnosis.get("diagnosis"))
+                .and_then(Json::as_str),
+            Some("Identified the bounded failure and its remedy.")
+        );
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_retry_verdict_is_forced_blocked_without_a_retry() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-checkpoint-verdict-test-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let brief = diagnosis_test_brief(&temporary, &checkout, "checkpoint", "retry", None);
+
+        let result = action_steer(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(
+            result.get("verdict").and_then(Json::as_str),
+            Some("blocked")
+        );
+        assert_eq!(result.get("blocked").and_then(Json::as_bool), Some(true));
+        assert!(matches!(result.get("retry"), Some(Json::Null)));
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert_eq!(state.diagnoses.len(), 1);
+        assert!(state.diagnoses[0].blocks_task());
+        assert!(state.retries.is_empty());
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn transient_verdict_spends_the_machinery_retry_budget() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-transient-verdict-test-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let brief =
+            diagnosis_test_brief(&temporary, &checkout, "implementation", "transient", None);
+
+        let result = action_steer(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(
+            result.get("verdict").and_then(Json::as_str),
+            Some("transient")
+        );
+        assert_eq!(result.get("kind").and_then(Json::as_str), Some("retry"));
+        assert_eq!(result.get("blocked").and_then(Json::as_bool), Some(false));
+        assert_eq!(result.get("posted").and_then(Json::as_bool), Some(true));
+        assert!(matches!(result.get("retry"), Some(Json::Null)));
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert!(state.diagnoses.is_empty());
+        assert_eq!(state.retries.len(), 1);
+
+        let second = action_steer(&brief).unwrap();
+        let second = second.as_object().unwrap();
+        assert_eq!(second.get("kind").and_then(Json::as_str), Some("retry"));
+        assert_eq!(second.get("attempt").and_then(Json::as_u64), Some(2));
+        assert_eq!(second.get("exhausted").and_then(Json::as_bool), Some(true));
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert!(state.diagnoses.is_empty());
+        assert_eq!(state.retries.len(), 2);
+
+        let exhausted = action_steer(&brief).unwrap();
+        let exhausted = exhausted.as_object().unwrap();
+        assert_eq!(
+            exhausted.get("verdict").and_then(Json::as_str),
+            Some("blocked")
+        );
+        assert_eq!(exhausted.get("blocked").and_then(Json::as_bool), Some(true));
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert_eq!(state.diagnoses.len(), 1);
+        assert_eq!(state.retries.len(), 2);
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn blocked_proposal_is_rendered_into_the_escalation_report_as_a_ready_diff() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-proposal-report-test-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let proposal = actionable_diagnosis_proposal();
+        let brief = diagnosis_test_brief(
+            &temporary,
+            &checkout,
+            "implementation",
+            "blocked",
+            Some(proposal),
+        );
+        action_steer(&brief).unwrap();
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        let diagnoses = state
+            .diagnoses
+            .iter()
+            .map(super::VisibleAttempt::diagnosis_json)
+            .collect::<Vec<_>>();
+        let mut lines = Vec::new();
+        let mut public_values = Vec::new();
+        append_diagnosis_report(&mut lines, &diagnoses, &mut public_values).unwrap();
+        let report = lines.join("\n");
+
+        assert!(report.contains("Prepared worklist proposals (ready diffs):"));
+        assert!(report.contains("+   \"kind\": \"amendment-task\""));
+        assert!(report.contains("test/final-bar/cases/driver.py"));
+        assert!(report.contains("Synchronize the final-bar assertion"));
+        assert!(report.contains("final-bar-sync"));
+        assert!(report.contains("driver-foundation"));
         fs::remove_dir_all(temporary).unwrap();
     }
 
