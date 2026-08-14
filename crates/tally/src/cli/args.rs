@@ -51,6 +51,8 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: CampaignCommand,
     },
+    /// Validate every commit in a Git revision range against tally's commit grammar.
+    LintHistory(LintHistoryArgs),
     Witness {
         #[command(subcommand)]
         command: WitnessCommand,
@@ -86,6 +88,22 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: ReaderStateCommand,
     },
+}
+
+#[derive(Debug, Args)]
+pub(super) struct LintHistoryArgs {
+    /// Git revision or revision range accepted by `git log`.
+    #[arg(value_name = "RANGE")]
+    pub(super) range: String,
+    /// Allowed commit scope. Repeat the flag or pass a comma-separated list.
+    #[arg(
+        long = "scope",
+        visible_alias = "scopes",
+        value_name = "SCOPE",
+        value_delimiter = ',',
+        required = true
+    )]
+    pub(super) scopes: Vec<String>,
 }
 
 /// One durable reader-state change, made directly against the store file —
