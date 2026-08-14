@@ -8,108 +8,171 @@ export const meta = {
   name: "spec-build",
   description: "Reconcile one witnessed spec-build frontier against durable local state",
   pools: ["campaign-agent", "campaign-control"],
+  // BEGIN RUST-GENERATED SPEC-BUILD ARGS SCHEMA
   argsSchema: {
-    type: "object",
-    $defs: {
-      canonicalArgv: {
-        type: "array",
-        minItems: 1,
-        items: {
-          type: "string",
-          minLength: 1,
-          pattern: "^[^\\u0000-\\u001f\\u007f]+$"
-        }
-      },
-      canonicalAgent: {
-        type: "object",
-        required: [
-          "adapter",
-          "argv",
-          "priority",
-          "runtimeMaxSec",
-          "approvalPolicy",
-          "sandboxPolicy",
-          "diagnosisSandboxPolicy",
-          "model"
-        ],
-        properties: {
-          adapter: { type: "string", minLength: 1 },
-          argv: { $ref: "#/$defs/canonicalArgv" },
-          priority: { enum: ["interrupt", "high", "medium", "low"] },
-          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
-          approvalPolicy: { type: ["string", "null"], minLength: 1 },
-          sandboxPolicy: { type: ["string", "null"], minLength: 1 },
-          diagnosisSandboxPolicy: { type: ["string", "null"], minLength: 1 },
-          model: { type: ["string", "null"], minLength: 1, maxLength: 128 }
-        },
-        additionalProperties: false
-      },
-      canonicalSteward: {
-        type: ["object", "null"],
-        required: ["adapter", "argv", "env", "finalMessagePattern", "runtimeMaxSec"],
-        properties: {
-          adapter: {
-            type: "string",
-            minLength: 1,
-            maxLength: 80,
-            pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+    "$defs": {
+      "canonicalCampaignManifest": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 255,
+            "const": 1
           },
-          argv: { $ref: "#/$defs/canonicalArgv" },
-          env: {
-            type: "object",
-            maxProperties: 64,
-            propertyNames: { pattern: "^[A-Za-z_][A-Za-z0-9_]*$" },
-            additionalProperties: { type: "string", minLength: 1, maxLength: 4096 }
+          "name": {
+            "type": "string",
+            "maxLength": 80,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
           },
-          finalMessagePattern: { type: "string", minLength: 1, maxLength: 1024 },
-          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 }
-        },
-        additionalProperties: false
-      },
-      canonicalGate: {
-        oneOf: [
-          {
-            type: "object",
-            required: ["kind", "id", "preflightArgv", "argv", "runtimeMaxSec"],
-            properties: {
-              kind: { const: "command" },
-              id: {
-                type: "string",
-                maxLength: 80,
-                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          "repository": {
+            "type": "object",
+            "properties": {
+              "checkout": {
+                "type": "string",
+                "pattern": "^/"
               },
-              preflightArgv: { $ref: "#/$defs/canonicalArgv" },
-              argv: { $ref: "#/$defs/canonicalArgv" },
-              runtimeMaxSec: { type: "integer", minimum: 1 }
+              "baseBranch": {
+                "type": "string",
+                "minLength": 1
+              },
+              "remote": {
+                "type": "string",
+                "maxLength": 80,
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              "forge": {
+                "type": "string",
+                "enum": [
+                  "local"
+                ]
+              }
             },
-            additionalProperties: false
+            "additionalProperties": false,
+            "required": [
+              "checkout",
+              "baseBranch",
+              "remote",
+              "forge"
+            ]
           },
-          {
-            type: "object",
-            required: ["kind", "id", "forbidPaths", "runtimeMaxSec"],
-            properties: {
-              kind: { const: "forbidPaths" },
-              id: {
-                type: "string",
-                maxLength: 80,
-                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          "maxTasks": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "maximum": 128
+          },
+          "maxParallel": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "maximum": 128
+          },
+          "driverRuntimeMaxSec": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "runtimeMaxSec": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 1
+          },
+          "pool": {
+            "type": "string",
+            "maxLength": 80,
+            "pattern": "^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|campaign/(?!\\.{1,2}/)[A-Za-z0-9_.-]+/(?!\\.{1,2}$)[A-Za-z0-9_.-]+)$"
+          },
+          "mergeMethod": {
+            "type": "string",
+            "enum": [
+              "merge",
+              "squash"
+            ]
+          },
+          "agent": {
+            "$ref": "#/$defs/canonicalAgent"
+          },
+          "steward": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/canonicalSteward"
               },
-              forbidPaths: {
-                type: "array",
-                minItems: 1,
-                maxItems: 128,
-                uniqueItems: true,
-                items: { type: "string", minLength: 1, maxLength: 1024 }
-              },
-              runtimeMaxSec: { type: "integer", minimum: 1 }
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/canonicalGate"
             },
-            additionalProperties: false
+            "minItems": 1,
+            "maxItems": 16
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "implementation",
+                    "checkpoint"
+                  ]
+                },
+                "issue": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "dependencies": {
+                  "type": "array",
+                  "items": true
+                },
+                "conflictDomains": {
+                  "type": "array",
+                  "items": true
+                },
+                "argv": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": true
+                },
+                "runtimeMaxSec": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "kind",
+                "issue",
+                "dependencies",
+                "argv",
+                "runtimeMaxSec"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 128
           }
-        ]
-      },
-      canonicalCampaignManifest: {
-        type: "object",
-        required: [
+        },
+        "additionalProperties": false,
+        "required": [
           "schemaVersion",
           "name",
           "repository",
@@ -123,78 +186,766 @@ export const meta = {
           "steward",
           "gates",
           "tasks"
-        ],
-        properties: {
-          schemaVersion: { const: 1 },
-          name: {
-            type: "string",
-            maxLength: 80,
-            pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+        ]
+      },
+      "canonicalAgent": {
+        "type": "object",
+        "properties": {
+          "adapter": {
+            "type": "string",
+            "minLength": 1
           },
-          repository: {
-            type: "object",
-            required: ["checkout", "baseBranch", "remote", "forge"],
-            properties: {
-              checkout: { type: "string", pattern: "^/" },
-              baseBranch: { type: "string", minLength: 1 },
-              remote: {
-                type: "string",
-                maxLength: 80,
-                pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
-              },
-              forge: { const: "local" }
-            },
-            additionalProperties: false
+          "argv": {
+            "$ref": "#/$defs/canonicalArgv"
           },
-          maxTasks: { type: "integer", minimum: 1, maximum: 128 },
-          maxParallel: { type: "integer", minimum: 1, maximum: 128 },
-          driverRuntimeMaxSec: { type: "integer", minimum: 1 },
-          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
-          pool: {
-            type: "string",
-            maxLength: 80,
-            pattern: "^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|campaign/(?!\\.{1,2}/)[A-Za-z0-9_.-]+/(?!\\.{1,2}$)[A-Za-z0-9_.-]+)$"
+          "priority": {
+            "type": "string",
+            "enum": [
+              "interrupt",
+              "high",
+              "medium",
+              "low"
+            ]
           },
-          mergeMethod: { enum: ["merge", "squash"] },
-          agent: { $ref: "#/$defs/canonicalAgent" },
-          steward: { $ref: "#/$defs/canonicalSteward" },
-          gates: {
-            type: "array",
-            minItems: 1,
-            maxItems: 16,
-            items: { $ref: "#/$defs/canonicalGate" }
+          "runtimeMaxSec": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 1
           },
-          tasks: {
-            type: "array",
-            minItems: 1,
-            maxItems: 128,
-            items: {
-              type: "object",
-              required: [
-                "id",
-                "kind",
-                "issue",
-                "dependencies",
-                "argv",
-                "runtimeMaxSec"
-              ],
-              properties: {
-                id: { type: "string" },
-                kind: { enum: ["implementation", "checkpoint"] },
-                issue: { type: "integer" },
-                dependencies: { type: "array" },
-                conflictDomains: { type: "array" },
-                argv: { type: ["array", "null"] },
-                runtimeMaxSec: { type: ["integer", "null"] }
-              },
-              additionalProperties: false
-            }
+          "approvalPolicy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "sandboxPolicy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "diagnosisSandboxPolicy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 128
           }
         },
-        additionalProperties: false
+        "additionalProperties": false,
+        "required": [
+          "adapter",
+          "argv",
+          "priority",
+          "runtimeMaxSec",
+          "approvalPolicy",
+          "sandboxPolicy",
+          "diagnosisSandboxPolicy",
+          "model"
+        ]
+      },
+      "canonicalArgv": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "minItems": 1
+      },
+      "canonicalSteward": {
+        "type": "object",
+        "properties": {
+          "adapter": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          },
+          "argv": {
+            "$ref": "#/$defs/canonicalArgv"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "maxProperties": 64,
+            "propertyNames": {
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            }
+          },
+          "finalMessagePattern": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "runtimeMaxSec": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "adapter",
+          "argv",
+          "env",
+          "finalMessagePattern",
+          "runtimeMaxSec"
+        ]
+      },
+      "canonicalGate": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "maxLength": 80,
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              "preflightArgv": {
+                "$ref": "#/$defs/canonicalArgv"
+              },
+              "argv": {
+                "$ref": "#/$defs/canonicalArgv"
+              },
+              "runtimeMaxSec": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 1
+              },
+              "kind": {
+                "type": "string",
+                "const": "command"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "id",
+              "preflightArgv",
+              "argv",
+              "runtimeMaxSec"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "maxLength": 80,
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+              },
+              "forbidPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                },
+                "minItems": 1,
+                "maxItems": 128,
+                "uniqueItems": true
+              },
+              "runtimeMaxSec": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 1
+              },
+              "kind": {
+                "type": "string",
+                "const": "forbidPaths"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "id",
+              "forbidPaths",
+              "runtimeMaxSec"
+            ]
+          }
+        ]
       }
     },
-    required: [
+    "allOf": [
+      {
+        "if": {
+          "required": [
+            "taskSteering"
+          ]
+        },
+        "then": {
+          "required": [
+            "localActor",
+            "steeringSource"
+          ]
+        }
+      },
+      {
+        "if": {
+          "required": [
+            "localActor"
+          ]
+        },
+        "then": {
+          "required": [
+            "steeringSource"
+          ]
+        }
+      },
+      {
+        "if": {
+          "required": [
+            "steeringSource"
+          ]
+        },
+        "then": {
+          "required": [
+            "localActor"
+          ]
+        }
+      }
+    ],
+    "type": "object",
+    "properties": {
+      "campaign": {
+        "type": "string",
+        "maxLength": 80,
+        "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+      },
+      "campaignIdentity": {
+        "type": "string",
+        "pattern": "^[0-9a-fA-F-]{36}$"
+      },
+      "campaignGraph": {
+        "type": "object",
+        "properties": {
+          "manifest": {
+            "$ref": "#/$defs/canonicalCampaignManifest"
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "number": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 1
+                },
+                "title": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300
+                },
+                "body": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64000
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "number",
+                "title",
+                "body"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 128
+          },
+          "executableDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "manifest",
+          "tasks",
+          "executableDigest"
+        ]
+      },
+      "armedManifest": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/canonicalCampaignManifest"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "allowedActors": {
+        "type": "array",
+        "items": true
+      },
+      "capabilities": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "repository": {
+        "type": "string",
+        "pattern": "^[^/ \\t]+/[^/ \\t]+$"
+      },
+      "codeRepository": {
+        "type": "string",
+        "pattern": "^[^/ \\t]+/[^/ \\t]+$"
+      },
+      "specRepository": {
+        "type": "string",
+        "pattern": "^[^/ \\t]+/[^/ \\t]+$"
+      },
+      "issueRepository": {
+        "type": "string",
+        "pattern": "^[^/ \\t]+/[^/ \\t]+$"
+      },
+      "issue": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "url": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "number",
+          "url"
+        ]
+      },
+      "runId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      },
+      "repositories": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "checkout": {
+              "type": "string",
+              "pattern": "^/"
+            },
+            "baseBranch": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._/+-]+$"
+            },
+            "remote": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "forge": {
+              "type": "string",
+              "enum": [
+                "github",
+                "local"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "checkout",
+            "baseBranch",
+            "remote",
+            "forge"
+          ]
+        },
+        "minProperties": 1
+      },
+      "worklist": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "minLength": 1
+              },
+              "graphDigest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "graphDigest"
+            ]
+          }
+        ]
+      },
+      "maxTasks": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 1,
+        "maximum": 128
+      },
+      "maxParallel": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 1,
+        "maximum": 128
+      },
+      "continuation": {
+        "type": "object",
+        "properties": {
+          "argv": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            "minItems": 1,
+            "maxItems": 64
+          },
+          "pool": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "interrupt",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "runtimeMaxSec": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 1
+          },
+          "eventsDir": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "argv",
+          "pool",
+          "priority",
+          "eventsDir"
+        ]
+      },
+      "workspaceRoot": {
+        "type": "string",
+        "pattern": "^/"
+      },
+      "captureRoot": {
+        "type": "string",
+        "pattern": "^/.*/capture/archive$"
+      },
+      "tally": {
+        "type": "string",
+        "pattern": "^/"
+      },
+      "driver": {
+        "type": "string",
+        "pattern": "^/"
+      },
+      "driverRuntimeMaxSec": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 1
+      },
+      "postFailureEvidence": {
+        "type": "boolean"
+      },
+      "postFailureStderr": {
+        "type": "boolean"
+      },
+      "steering": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "author": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "body": {
+              "type": "string",
+              "maxLength": 64000
+            },
+            "createdAt": {
+              "type": "string",
+              "minLength": 1
+            },
+            "updatedAt": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "url",
+            "author",
+            "body",
+            "createdAt",
+            "updatedAt"
+          ]
+        },
+        "maxItems": 1000
+      },
+      "localActor": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[^\\s/\\\\\\u0000]+$"
+      },
+      "steeringSource": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 255,
+            "const": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "local-jsonl"
+            ]
+          },
+          "registrationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "localActor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[^\\s/\\\\\\u0000]+$"
+          },
+          "logPath": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "lockPath": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "preparedCursor": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "schemaVersion",
+          "kind",
+          "registrationId",
+          "localActor",
+          "logPath",
+          "lockPath",
+          "preparedCursor"
+        ]
+      },
+      "taskSteering": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 1
+              },
+              "url": {
+                "type": "string",
+                "minLength": 1
+              },
+              "author": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 64000
+              },
+              "createdAt": {
+                "type": "string",
+                "minLength": 1
+              },
+              "updatedAt": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "url",
+              "author",
+              "body",
+              "createdAt",
+              "updatedAt"
+            ]
+          },
+          "maxItems": 1000
+        },
+        "maxProperties": 128
+      },
+      "mergeMethod": {
+        "type": "string",
+        "enum": [
+          "merge",
+          "squash"
+        ]
+      },
+      "steward": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/canonicalSteward"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "agent": {
+        "type": "object",
+        "properties": {
+          "adapter": {
+            "type": "string",
+            "minLength": 1
+          },
+          "argv": {
+            "$ref": "#/$defs/canonicalArgv"
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "interrupt",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "runtimeMaxSec": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 1
+          },
+          "approvalPolicy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "sandboxPolicy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "diagnosisSandboxPolicy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "adapter",
+          "argv",
+          "priority",
+          "runtimeMaxSec",
+          "approvalPolicy",
+          "sandboxPolicy",
+          "diagnosisSandboxPolicy",
+          "model"
+        ]
+      },
+      "gates": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/canonicalGate"
+        },
+        "minItems": 1,
+        "maxItems": 16,
+        "uniqueItems": true
+      }
+    },
+    "additionalProperties": false,
+    "required": [
       "repository",
       "issue",
       "runId",
@@ -206,267 +957,40 @@ export const meta = {
       "driver",
       "driverRuntimeMaxSec"
     ],
-    properties: {
-      campaign: {
-        type: "string",
-        maxLength: 80,
-        pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
-      },
-      campaignIdentity: {
-        type: "string",
-        pattern: "^[0-9a-fA-F-]{36}$"
-      },
-      // campaign.rs still carries its already-admitted graph while the flow
-      // consumes the committed local worklist. The graph supplies execution
-      // configuration only; its issue-shaped task projection never reaches
-      // the driver.
-      campaignGraph: {
-        type: "object",
-        required: ["manifest", "tasks", "executableDigest"],
-        properties: {
-          manifest: { $ref: "#/$defs/canonicalCampaignManifest" },
-          tasks: {
-            type: "array",
-            minItems: 1,
-            maxItems: 128,
-            items: {
-              type: "object",
-              required: ["number", "title", "body"],
-              properties: {
-                number: { type: "integer", minimum: 1 },
-                title: { type: "string", minLength: 1, maxLength: 300 },
-                body: { type: "string", minLength: 1, maxLength: 64000 }
-              },
-              additionalProperties: false
-            }
-          },
-          executableDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
-        },
-        additionalProperties: false
-      },
-      // These three fields are ignored compatibility cargo from the current
-      // Rust dispatch envelope. No authorization, capability decision, or
-      // worklist reconstruction consults them.
-      armedManifest: { type: ["object", "null"] },
-      allowedActors: { type: "array" },
-      capabilities: { type: "object" },
-      repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
-      // The two-repository seam. Each names an entry of `repositories`. A
-      // campaign that sets none of them resolves every coordinate to
-      // `repository` and runs the single-repository path unchanged.
-      codeRepository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
-      specRepository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
-      issueRepository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
-      issue: {
-        type: "object",
-        required: ["number", "url"],
-        properties: {
-          number: { type: "string", pattern: "^[1-9][0-9]*$" },
-          url: { type: "string", minLength: 1 }
-        },
-        additionalProperties: false
-      },
-      runId: { type: "string", minLength: 1, maxLength: 512 },
-      repositories: {
-        type: "object",
-        minProperties: 1,
-        additionalProperties: {
-          type: "object",
-          required: ["checkout", "baseBranch", "remote", "forge"],
-          properties: {
-            checkout: { type: "string", pattern: "^/" },
-            baseBranch: { type: "string", pattern: "^[A-Za-z0-9._/+-]+$" },
-            remote: { type: "string", pattern: "^[A-Za-z0-9._-]+$" },
-            // Retained as inert module-contract data. Execution no longer
-            // branches on this value; every driver action is local.
-            forge: { enum: ["github", "local"] }
-          },
-          additionalProperties: false
-        }
-      },
-      worklist: {
-        oneOf: [
-          { type: "string", minLength: 1 },
-          {
-            type: "object",
-            required: ["kind", "graphDigest"],
-            properties: {
-              // Opaque transport spelling retained by campaign.rs. The flow
-              // binds the committed file pattern from the local issue URL.
-              kind: { type: "string", minLength: 1 },
-              graphDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
-            },
-            additionalProperties: false
-          }
-        ]
-      },
-      maxTasks: { type: "integer", minimum: 1, maximum: 128 },
-      maxParallel: { type: "integer", minimum: 1, maximum: 128 },
-      // The machine's self-continuation. A pass that advanced writes this
-      // bounded enqueue payload into the daemon's events directory; the 5 s
-      // drain admits the next pass. No forge round-trip, no public comment.
-      continuation: {
-        type: "object",
-        required: ["argv", "pool", "priority", "eventsDir"],
-        properties: {
-          argv: {
-            type: "array",
-            minItems: 1,
-            maxItems: 64,
-            items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
-          },
-          pool: {
-            type: "array",
-            minItems: 1,
-            maxItems: 8,
-            uniqueItems: true,
-            items: { type: "string", minLength: 1, maxLength: 128 }
-          },
-          priority: { enum: ["interrupt", "high", "medium", "low"] },
-          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
-          eventsDir: { type: "string", pattern: "^/" }
-        },
-        additionalProperties: false
-      },
-      workspaceRoot: { type: "string", pattern: "^/" },
-      // Bounded checkpoint attempt snapshots join the executor's existing
-      // per-attempt archive and therefore inherit its retention horizon.
-      captureRoot: { type: "string", pattern: "^/.*/capture/archive$" },
-      tally: { type: "string", pattern: "^/" },
-      driver: { type: "string", pattern: "^/" },
-      driverRuntimeMaxSec: { type: "integer", minimum: 1 },
-      postFailureEvidence: { type: "boolean" },
-      postFailureStderr: { type: "boolean" },
-      steering: {
-        type: "array",
-        maxItems: 1000,
-        items: {
-          type: "object",
-          required: ["id", "url", "author", "body", "createdAt", "updatedAt"],
-          properties: {
-            id: { type: "integer", minimum: 1 },
-            url: { type: "string", minLength: 1 },
-            author: { type: "string", minLength: 1, maxLength: 128 },
-            body: { type: "string", maxLength: 64000 },
-            createdAt: { type: "string", minLength: 1 },
-            updatedAt: { type: "string", minLength: 1 }
-          },
-          additionalProperties: false
-        }
-      },
-      // Closed arm authority for the local steering source. Unlike the old
-      // comment transport, authorization is not inferred from a forge actor
-      // carried by whichever record happened to arrive first.
-      localActor: {
-        type: "string",
-        minLength: 1,
-        maxLength: 128,
-        pattern: "^[^\\s/\\\\\\u0000]+$"
-      },
-      steeringSource: {
-        type: "object",
-        required: [
-          "schemaVersion",
-          "kind",
-          "registrationId",
-          "localActor",
-          "logPath",
-          "lockPath",
-          "preparedCursor"
-        ],
-        properties: {
-          schemaVersion: { const: 1 },
-          kind: { const: "local-jsonl" },
-          registrationId: { type: "string", minLength: 1, maxLength: 128 },
-          localActor: {
-            type: "string",
-            minLength: 1,
-            maxLength: 128,
-            pattern: "^[^\\s/\\\\\\u0000]+$"
-          },
-          logPath: { type: "string", pattern: "^/" },
-          lockPath: { type: "string", pattern: "^/" },
-          preparedCursor: { type: "integer", minimum: 0 }
-        },
-        additionalProperties: false
-      },
-      // Task-addressed steering, keyed by stable task ID for local sources.
-      taskSteering: {
-        type: "object",
-        maxProperties: 128,
-        additionalProperties: {
-          type: "array",
-          maxItems: 1000,
-          items: {
-            type: "object",
-            required: ["id", "url", "author", "body", "createdAt", "updatedAt"],
-            properties: {
-              id: { type: "integer", minimum: 1 },
-              url: { type: "string", minLength: 1 },
-              author: { type: "string", minLength: 1, maxLength: 128 },
-              body: { type: "string", maxLength: 64000 },
-              createdAt: { type: "string", minLength: 1 },
-              updatedAt: { type: "string", minLength: 1 }
-            },
-            additionalProperties: false
-          }
-        }
-      },
-      // How the merge node integrates a task. Absent means the campaign
-      // default, `squash`: the footprint a campaign should leave behind is one
-      // conventional commit per task, not a merge commit with a template message.
-      mergeMethod: { enum: ["merge", "squash"] },
-      // The module carries the normalized execution contract; the driver
-      // never fills these members in.
-      steward: { $ref: "#/$defs/canonicalSteward" },
-      agent: { $ref: "#/$defs/canonicalAgent" },
-      gates: {
-        type: "array",
-        minItems: 1,
-        maxItems: 16,
-        uniqueItems: true,
-        items: { $ref: "#/$defs/canonicalGate" }
-      }
-    },
-    oneOf: [
+    "oneOf": [
       {
-        required: [
+        "properties": {
+          "worklist": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
           "campaign",
           "repositories",
           "maxTasks",
           "maxParallel",
           "agent",
           "gates"
-        ],
-        properties: { worklist: { type: "string", minLength: 1 } }
+        ]
       },
       {
-        required: [
+        "properties": {
+          "worklist": {
+            "type": "object"
+          }
+        },
+        "required": [
           "campaignIdentity",
           "campaignGraph",
           "steering",
           "localActor",
           "steeringSource"
-        ],
-        properties: { worklist: { type: "object" } }
+        ]
       }
-    ],
-    allOf: [
-      {
-        if: { required: ["taskSteering"] },
-        then: { required: ["localActor", "steeringSource"] }
-      },
-      {
-        if: { required: ["localActor"] },
-        then: { required: ["steeringSource"] }
-      },
-      {
-        if: { required: ["steeringSource"] },
-        then: { required: ["localActor"] }
-      }
-    ],
-    additionalProperties: false
+    ]
   },
+  // END RUST-GENERATED SPEC-BUILD ARGS SCHEMA
   // One pass is bounded by maxParallel <= 128 and gates <= 16. Before the
   // first merge, a separate pristine-base lane preflights every command gate --
   // and witnesses each gate's real argv, non-gating, beside its probe -- before

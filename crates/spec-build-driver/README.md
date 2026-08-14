@@ -10,3 +10,12 @@ actions are dispatched to the Python driver while the port proceeds. Set
 `SPEC_BUILD_PY_FALLBACK` to override that driver's executable path. The Nix
 package compiles the packaged Python driver path in as the default, while a
 workspace build defaults to the checked-out `drivers/spec_build_driver.py`.
+
+The flow argument contract is typed in `src/flow_args.rs`. Its derived JSON
+Schema is checked byte-for-byte against the pure-literal `meta.argsSchema` in
+`examples/flows/spec-build.js`. After changing the Rust contract, regenerate
+the flow with:
+
+```console
+cargo run -p spec-build-driver --example generate-flow-args-schema
+```
