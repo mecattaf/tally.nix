@@ -280,8 +280,7 @@ def campaign_manifest_corpus(context: Context) -> None:
             json.dumps(driver_worklist_brief(arm_checkout, document)), encoding="utf-8"
         )
         driven = context.command(
-            "python3",
-            context.driver_script,
+            context.driver,
             "worklist",
             env=context.environment(TALLY_BRIEF=driver_brief),
             timeout=60,

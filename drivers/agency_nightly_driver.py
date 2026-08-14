@@ -19,6 +19,9 @@ the flow sees a typed, witnessed value rather than a dead node.
 
 Authentication is whatever ``gh`` and ``git`` already have on the machine. This
 driver never reads, writes, or asks for a token.
+
+Retirement issue: ``agency-nightly-rust-port`` — port this driver and
+``campaign_worktrees.py`` to Rust together.
 """
 
 from __future__ import annotations

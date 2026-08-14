@@ -19,12 +19,80 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = Path(
-    os.environ.get(
-        "SPEC_BUILD_DRIVER",
-        ROOT / "drivers/spec_build_driver.py",
+
+
+def driver_under_test() -> Path:
+    """Resolve the Rust driver, building the canonical package when necessary."""
+    configured = os.environ.get("SPEC_BUILD_DRIVER")
+    if configured:
+        return Path(configured)
+
+    target_root = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+    if not target_root.is_absolute():
+        target_root = ROOT / target_root
+    workspace_binary = target_root / "debug/spec-build-driver"
+
+    cargo = shutil.which("cargo")
+    if cargo is not None:
+        built = subprocess.run(
+            [
+                cargo,
+                "build",
+                "--quiet",
+                "--package",
+                "spec-build-driver",
+                "--bin",
+                "spec-build-driver",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if built.returncode != 0:
+            raise RuntimeError(
+                "could not build the Rust spec-build driver with Cargo: "
+                + (built.stderr.strip() or built.stdout.strip() or "no output")
+            )
+        if workspace_binary.is_file():
+            return workspace_binary
+
+    if workspace_binary.is_file():
+        return workspace_binary
+
+    nix = shutil.which("nix")
+    if nix is not None:
+        built = subprocess.run(
+            [
+                nix,
+                "build",
+                "--no-link",
+                "--print-out-paths",
+                ".#spec-build-driver",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        paths = [Path(line) for line in built.stdout.splitlines() if line.strip()]
+        if built.returncode == 0 and len(paths) == 1:
+            packaged_binary = paths[0] / "bin/spec-build-driver"
+            if packaged_binary.is_file():
+                return packaged_binary
+        raise RuntimeError(
+            "could not build the Rust spec-build driver with Nix: "
+            + (built.stderr.strip() or built.stdout.strip() or "no output")
+        )
+
+    raise RuntimeError(
+        "the Rust spec-build driver is unavailable; set SPEC_BUILD_DRIVER or install Cargo"
     )
-)
+
+
+DRIVER = driver_under_test()
 FINAL_MESSAGE_PREFIX = "TALLY_FINAL_MESSAGE="
 ATTEMPT_RECEIPTS_FILE = "attempt-receipts-v1.jsonl"
 MAX_CONTINUATION_EVENT_BYTES = 1024 * 1024

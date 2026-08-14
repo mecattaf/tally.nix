@@ -253,7 +253,7 @@ fn args() -> Value {
         "workspaceRoot": "/srv/spec/worktrees",
         "captureRoot": "/srv/spec/state/capture/archive",
         "tally": "/nix/store/tally/bin/tally",
-        "driver": "/nix/store/driver/spec_build_driver.py",
+        "driver": "/nix/store/driver/bin/spec-build-driver",
         "driverRuntimeMaxSec": 900
     })
 }

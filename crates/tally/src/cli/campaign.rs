@@ -9367,7 +9367,7 @@ fi
     }
 
     #[test]
-    fn arm_argv_validation_matches_the_driver() {
+    fn arm_campaign_policy_acceptance_is_pinned() {
         assert!(validate_argv(&["true".into(), "".into()], "argv").is_err());
         assert!(validate_argv(&["true".into(), "line\nbreak".into()], "argv").is_err());
         validate_argv(&["true".into(), "--flag".into()], "argv").unwrap();
@@ -9422,7 +9422,7 @@ fi
                 {"kind": "forbidPaths", "id": "same", "forbidPaths": ["*.db"]}
             ]}
         ]);
-        let rust_acceptance = cases
+        let acceptance = cases
             .as_array()
             .unwrap()
             .iter()
@@ -9434,45 +9434,13 @@ fi
                 .is_ok()
             })
             .collect::<Vec<_>>();
-
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let driver = repo_root.join("drivers/spec_build_driver.py");
-        let input_dir = tempfile::tempdir().unwrap();
-        let input = input_dir.path().join("campaign-policy-cases.json");
-        fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
-        let script = r#"
-import importlib.util
-import json
-import sys
-
-spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-with open(sys.argv[2], encoding="utf-8") as handle:
-    cases = json.load(handle)
-accepted = []
-for case in cases:
-    try:
-        module.normalize_worklist_campaign(case, "specs/night/epsilon.json")
-    except module.DriverError:
-        accepted.append(False)
-    else:
-        accepted.append(True)
-print(json.dumps(accepted))
-"#;
-        let output = ProcessCommand::new("python3")
-            .args(["-c", script])
-            .arg(&driver)
-            .arg(&input)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "driver policy parity probe failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+        assert_eq!(
+            acceptance,
+            vec![
+                true, true, false, false, false, false, false, false, false, false, false, true,
+                false,
+            ]
         );
-        let driver_acceptance: Vec<bool> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(rust_acceptance, driver_acceptance);
     }
 
     #[test]
@@ -9482,125 +9450,6 @@ print(json.dumps(accepted))
             sha256_json(&value).unwrap(),
             "sha256:356741b14061aca3cb3e9abc01fe332af042dfcd59d81c56ee9fb57832dc6429"
         );
-    }
-
-    /// Rust admits, normalizes, and hashes the graph once. The packaged Python
-    /// driver must consume those exact bytes even when the operator spelled a
-    /// checkout through a symlink or `..`, and a minimal explicit steward must
-    /// already contain every default before it crosses the boundary.
-
-    #[test]
-    fn digest_mismatch_receipt_names_both_digests_and_the_first_divergent_path() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let driver = repo_root.join("drivers/spec_build_driver.py");
-        assert!(
-            driver.is_file(),
-            "packaged driver missing: {}",
-            driver.display()
-        );
-
-        // One agent, shared shape; the live side carries exactly one extra
-        // nested key, exactly the #429 skew shape.
-        let agent = json!({
-            "adapter": "codex",
-            "argv": [BRIEF_SENTINEL],
-            "priority": "low",
-            "runtimeMaxSec": 14_400,
-            "approvalPolicy": "never",
-            "sandboxPolicy": "danger-full-access",
-            "model": null
-        });
-        let armed_agent = agent.clone();
-        let mut live_agent = agent.clone();
-        live_agent["diagnosisSandboxPolicy"] = json!("read-only");
-        let manifest = |agent: Value| {
-            json!({
-                "schemaVersion": 1,
-                "name": "parity",
-                "agent": agent,
-                "tasks": []
-            })
-        };
-        let armed = manifest(armed_agent);
-        let live = manifest(live_agent);
-        let tasks = json!([]);
-
-        let input_dir = tempfile::tempdir().unwrap();
-        let input_path = input_dir.path().join("divergence.json");
-        fs::write(
-            &input_path,
-            serde_json::to_string(&json!({"armed": armed, "live": live, "tasks": tasks})).unwrap(),
-        )
-        .unwrap();
-        let script = r#"
-import importlib.util
-import json
-import sys
-
-spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-with open(sys.argv[2], encoding="utf-8") as handle:
-    data = json.load(handle)
-tasks = data["tasks"]
-armed_digest = module.canonical_sha256({"manifest": data["armed"], "tasks": tasks})
-live_digest = module.canonical_sha256({"manifest": data["live"], "tasks": tasks})
-receipt = module.graph_digest_mismatch_receipt(
-    data["armed"], data["live"], armed_digest, live_digest
-)
-path = module.first_divergent_canonical_path(data["armed"], data["live"])
-print(json.dumps({
-    "armedDigest": armed_digest,
-    "liveDigest": live_digest,
-    "receipt": receipt,
-    "path": path,
-}))
-"#;
-        let output = std::process::Command::new("python3")
-            .args(["-c", script])
-            .arg(&driver)
-            .arg(&input_path)
-            .output()
-            .expect("python3 must run the packaged driver for the divergence test");
-        assert!(
-            output.status.success(),
-            "packaged driver divergence probe failed (status {:?}):\nstdout: {}\nstderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        let probe: Value = serde_json::from_str(
-            &String::from_utf8(output.stdout).expect("divergence probe must print UTF-8"),
-        )
-        .expect("divergence probe must print JSON");
-
-        let armed_digest = probe["armedDigest"].as_str().unwrap();
-        let live_digest = probe["liveDigest"].as_str().unwrap();
-        let receipt = probe["receipt"].as_str().unwrap();
-        assert_ne!(armed_digest, live_digest);
-        assert_eq!(
-            probe["path"].as_str().unwrap(),
-            "agent.diagnosisSandboxPolicy: absent-in-armed / present-in-live"
-        );
-        // Both digests, in the arm CLI's `sha256:` form.
-        assert!(receipt.contains(armed_digest), "{receipt}");
-        assert!(receipt.contains(live_digest), "{receipt}");
-        // The first divergent canonical path, prefixed under the manifest.
-        assert!(
-            receipt.contains(
-                "manifest.agent.diagnosisSandboxPolicy: absent-in-armed / present-in-live"
-            ),
-            "{receipt}"
-        );
-        // The existing instruction survives: this adds evidence, it does not
-        // change the verdict.
-        assert!(
-            receipt.contains("inspect it and explicitly re-arm"),
-            "{receipt}"
-        );
-        // The receipt must not widen what it publishes: the withheld value
-        // never appears.
-        assert!(!receipt.contains("read-only"), "{receipt}");
     }
 
     #[test]

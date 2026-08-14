@@ -82,14 +82,11 @@
             ./examples/flows/fleet-deploy.js
             ./examples/flows/monthly-review.js
             ./examples/flows/pooled-review.js
-            ./drivers/campaign_worktrees.py
             ./examples/flows/spec-build.js
             ./examples/flows/worklist-fanout.js
-            ./drivers/spec_build_driver.py
             ./test/fixtures/flows
             ./test/fixtures/ledger
             ./test/fixtures/pools
-            ./test/fixtures/redaction
             ./test/fixtures/shell-command-provider
             ./test/fixtures/spec-build
             ./test/fixtures/traces
@@ -167,9 +164,6 @@
             mkdir -p "$out/share/tally/flows" "$out/libexec/tally"
             cp ${./examples/flows/spec-build.js} "$out/share/tally/flows/spec-build.js"
             ln -s ${specBuildDriver}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver"
-            # Retain the Python implementation as the Rust dispatcher's
-            # explicitly named fallback until the terminal Python cut.
-            ln -s ${specBuildDriverPython}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver-python"
             wrapProgram "$out/bin/tally" \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
@@ -774,7 +768,7 @@
             exec ${pkgs.bash}/bin/bash ${./doc/publish.sh} ${documentation} "$@"
           '';
         };
-        campaignDrivers = import ./nix/lib/campaign-drivers.nix { inherit pkgs; };
+        agencyNightlyDriverSources = import ./nix/lib/campaign-drivers.nix { inherit pkgs; };
         agencyNightlyDriver = pkgs.writeShellApplication {
           name = "agency-nightly-driver";
           runtimeInputs = [
@@ -783,10 +777,9 @@
             pkgs.python3
           ];
           text = ''
-            exec ${pkgs.python3}/bin/python3 ${campaignDrivers}/agency_nightly_driver.py "$@"
+            exec ${pkgs.python3}/bin/python3 ${agencyNightlyDriverSources}/agency_nightly_driver.py "$@"
           '';
         };
-        specBuildDriverPython = import ./nix/lib/spec-build-driver.nix { inherit pkgs; };
         specBuildDriver = pkgs.rustPlatform.buildRustPackage {
           pname = "spec-build-driver";
           version = "0.1.0";
@@ -800,10 +793,9 @@
           cargoTestFlags = [ "--package=spec-build-driver" ];
           nativeCheckInputs = [ pkgs.git ];
           nativeBuildInputs = [ pkgs.makeWrapper ];
-          SPEC_BUILD_PY_FALLBACK = "${specBuildDriverPython}/bin/spec-build-driver";
           postFixup = ''
             wrapProgram "$out/bin/spec-build-driver" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+              --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
           '';
           meta.mainProgram = "spec-build-driver";
         };
@@ -3443,8 +3435,6 @@
           doc = documentation;
           agency-nightly-driver = agencyNightlyDriver;
           spec-build-driver = specBuildDriver;
-          spec-build-driver-rust = specBuildDriver;
-          spec-build-driver-python = specBuildDriverPython;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
         };
@@ -3486,19 +3476,15 @@
                   pkgs.git
                   pkgs.python3
                 ];
+                SPEC_BUILD_DRIVER = "${specBuildDriver}/bin/spec-build-driver";
               }
               ''
                 export HOME="$TMPDIR/home"
                 mkdir -p "$HOME"
-                export SPEC_BUILD_DRIVER_SOURCE=${campaignDrivers}/spec_build_driver.py
-                export SPEC_BUILD_REDACTION_VECTORS=${./test/fixtures/redaction/vectors.json}
-                export SPEC_BUILD_CONTRACT_CORPUS=${./test/fixtures/spec-build/contract-corpus.json}
-                export SPEC_BUILD_CAMPAIGN_CONTRACT_SOURCE=${./crates/tally-core/src/campaign_contract.rs}
                 python3 ${./test/spec_build_driver_test.py}
-                python3 ${./test/spec_build_contract_corpus_test.py}
                 touch "$out"
               '';
-          spec-build-driver-rust = specBuildDriver;
+          spec-build-driver = specBuildDriver;
           campaign-runtime =
             pkgs.runCommand "tally-campaign-runtime"
               {
@@ -3958,7 +3944,7 @@
                   pkgs.git
                   pkgs.python3
                 ];
-                AGENCY_NIGHTLY_DRIVER = "${campaignDrivers}/agency_nightly_driver.py";
+                AGENCY_NIGHTLY_DRIVER = "${agencyNightlyDriverSources}/agency_nightly_driver.py";
               }
               ''
                 export HOME="$TMPDIR/home"
@@ -4036,49 +4022,6 @@
                   echo "spec-build.js dropped the non-gating preflight witness node" >&2
                   exit 1
                 fi
-                touch "$out"
-              '';
-          spec-build-conflict-domains =
-            pkgs.runCommand "tally-spec-build-conflict-domains"
-              {
-                nativeBuildInputs = [
-                  pkgs.git
-                  pkgs.python3
-                ];
-                SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
-              }
-              ''
-                ${pkgs.python3}/bin/python3 ${./test/spec_build_conflict_domains_test.py}
-                touch "$out"
-              '';
-          spec-build-two-repo =
-            pkgs.runCommand "tally-spec-build-two-repo"
-              {
-                nativeBuildInputs = [
-                  pkgs.git
-                  pkgs.python3
-                ];
-                SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
-                SPEC_BUILD_CONTRACT_CORPUS = "${./test/fixtures/spec-build/contract-corpus.json}";
-              }
-              ''
-                export HOME="$TMPDIR/home"
-                mkdir -p "$HOME"
-                ${pkgs.python3}/bin/python3 ${./test/spec_build_two_repo_test.py}
-                touch "$out"
-              '';
-          spec-build-checkpoint-receipts =
-            pkgs.runCommand "tally-spec-build-checkpoint-receipts"
-              {
-                nativeBuildInputs = [
-                  pkgs.git
-                  pkgs.python3
-                ];
-                SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
-                SPEC_BUILD_CHECKPOINT_REF_VECTORS = "${./test/fixtures/spec-build/checkpoint-refs.json}";
-              }
-              ''
-                ${pkgs.python3}/bin/python3 ${./test/spec_build_checkpoint_receipts_test.py}
                 touch "$out"
               '';
           flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;

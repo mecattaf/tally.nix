@@ -150,7 +150,7 @@ mod tests {
 
         for (variant, expected_name) in variants.iter().zip(ACTION_NAMES) {
             let parsed = Cli::try_parse_from(["spec-build-driver", expected_name])
-                .expect("the Python driver's action must remain accepted")
+                .expect("the driver's action must remain accepted")
                 .action;
             assert_eq!(parsed, *variant);
             assert_eq!(parsed.as_str(), expected_name);
