@@ -6,6 +6,14 @@ authorized.
 
 ## [Unreleased]
 
+### Bridge pre-port campaign completion proofs
+
+- Release planning still prefers the exact Rust task-completion revision, but
+  can bridge one legacy Python-revision trailer claim when an earlier campaign
+  generation's task ref names that revision and exposes the same Git tree.
+- JSON and human release plans now label every implementation task's completion
+  proof as `exact` or `bridge`, including the durable task ref used by a bridge.
+
 ### Preserve pre-deletion GitHub field decode compatibility
 
 - Durable enqueue rows and enqueue payloads now accept and discard the retired

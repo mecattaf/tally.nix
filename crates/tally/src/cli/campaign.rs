@@ -334,17 +334,43 @@ struct ReleaseAttemptLog {
 struct ReleaseGitRef {
     object_id: String,
     object_type: String,
+    tree_id: Option<String>,
     reference: String,
 }
 
 #[derive(Debug, Clone)]
 struct ReleaseCommit {
     object_id: String,
+    tree_id: String,
     parents: Vec<String>,
     committed_at: i64,
     message: String,
     task_values: Vec<String>,
     revision_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReleaseCompletionOracle {
+    Exact,
+    Bridge,
+}
+
+impl ReleaseCompletionOracle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseMergedCommit {
+    task_id: String,
+    commit: ReleaseCommit,
+    oracle: ReleaseCompletionOracle,
+    bridge_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +435,16 @@ struct CampaignReleaseSummaryProof {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CampaignReleaseCompletionProof {
+    task_id: String,
+    commit: String,
+    oracle: ReleaseCompletionOracle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CampaignReleaseArtifact {
     kind: String,
     locator: String,
@@ -433,6 +469,7 @@ struct CampaignReleasePlan {
     revision: String,
     integration_ref: String,
     closing_summary: CampaignReleaseSummaryProof,
+    completion_proofs: Vec<CampaignReleaseCompletionProof>,
     release_notes: Vec<CampaignReleaseNote>,
     gate_proof: CampaignReleaseGateProof,
     artifacts: Vec<CampaignReleaseArtifact>,
@@ -1459,28 +1496,18 @@ fn render_campaign_release_plan(
     let integration_branch =
         stable_publish_branch(campaign, &registration.registration_id, "integration", None);
     let integration_ref = format!("refs/heads/{integration_branch}");
-    let campaign_branch_prefix = format!(
-        "refs/heads/{}",
-        integration_branch
-            .strip_suffix("integration")
-            .expect("the integration branch ends with its fixed leaf")
-    );
     let state_prefix = campaign_state_ref_prefix(campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER);
     let refs = release_local_refs(
         &registration.checkout,
-        &[
-            integration_ref.clone(),
-            campaign_branch_prefix,
-            format!("{state_prefix}/"),
-        ],
+        &["refs/heads/tally/".to_owned(), format!("{state_prefix}/")],
     )?;
     let integration = release_required_ref(&refs, &integration_ref, "commit")?;
     let history = release_integration_history(&registration.checkout, &integration_ref)?;
     let revisions = release_task_revisions(&graph)?;
-    let merged_commits = release_merged_commits(&graph, &revisions, &history)?;
+    let merged_commits = release_merged_commits(&graph, &revisions, &history, &refs)?;
     let source_revision = merged_commits
         .first()
-        .and_then(|(_, commit)| commit.parents.first())
+        .and_then(|merged| merged.commit.parents.first())
         .cloned()
         .unwrap_or_else(|| integration.object_id.clone());
 
@@ -1505,18 +1532,25 @@ fn render_campaign_release_plan(
     let (diagnoses, retries, warnings) = release_attempt_facts(&attempt_log.records, &task_ids);
     let merged = merged_commits
         .iter()
-        .map(|(task_id, commit)| MergedFact {
-            task_id: task_id.clone(),
+        .map(|merged| MergedFact {
+            task_id: merged.task_id.clone(),
             pull_request: format!(
                 "local://{code_repository}/{}",
-                stable_publish_branch(
-                    campaign,
-                    &registration.registration_id,
-                    task_id,
-                    revisions.get(task_id).map(String::as_str),
-                )
+                merged
+                    .bridge_ref
+                    .as_deref()
+                    .and_then(|reference| reference.strip_prefix("refs/heads/"))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        stable_publish_branch(
+                            campaign,
+                            &registration.registration_id,
+                            &merged.task_id,
+                            revisions.get(&merged.task_id).map(String::as_str),
+                        )
+                    })
             ),
-            merge_commit: commit.object_id.clone(),
+            merge_commit: merged.commit.object_id.clone(),
         })
         .collect::<Vec<_>>();
     let checkpoint_facts = checkpoints
@@ -1566,6 +1600,7 @@ fn render_campaign_release_plan(
     }
     let campaign_summary = render_campaign_summary(&digest);
 
+    let completion_proofs = release_completion_proofs(&merged_commits);
     let release_notes = release_notes(&registration, &graph, &refs, &revisions, &merged_commits)?;
     let artifacts = release_artifacts(
         integration,
@@ -1600,6 +1635,7 @@ fn render_campaign_release_plan(
             reference: closing_summary.reference.clone(),
             object_id: closing_summary.object_id.clone(),
         },
+        completion_proofs,
         release_notes,
         gate_proof: CampaignReleaseGateProof {
             task_id: gate_checkpoint.task_id,
@@ -1736,10 +1772,18 @@ fn release_git_read(checkout: &Path, arguments: &[String], context: &str) -> Res
     Ok(output.stdout)
 }
 
+fn release_campaign_generation_ref_prefix(campaign: &str) -> String {
+    let sentinel = stable_publish_branch(campaign, "generation", "task", None);
+    let prefix = sentinel
+        .strip_suffix("generation/task")
+        .expect("the stable publish branch preserves the fixed sentinel suffix");
+    format!("refs/heads/{prefix}")
+}
+
 fn release_local_refs(checkout: &Path, prefixes: &[String]) -> Result<Vec<ReleaseGitRef>> {
     let mut arguments = vec![
         "for-each-ref".to_owned(),
-        "--format=%(objectname)%09%(objecttype)%09%(refname)".to_owned(),
+        "--format=%(objectname)%09%(objecttype)%09%(tree)%09%(refname)".to_owned(),
     ];
     arguments.extend(prefixes.iter().cloned());
     let stdout = release_git_read(checkout, &arguments, "listing local campaign refs")?;
@@ -1747,17 +1791,23 @@ fn release_local_refs(checkout: &Path, prefixes: &[String]) -> Result<Vec<Releas
     let mut refs = Vec::new();
     for line in stdout.lines().filter(|line| !line.is_empty()) {
         let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() != 3
+        if fields.len() != 4
             || !is_git_object_id(fields[0])
             || !matches!(fields[1], "blob" | "commit")
-            || !fields[2].starts_with("refs/")
+            || !fields[3].starts_with("refs/")
         {
             bail!("local campaign ref listing returned a malformed row");
         }
+        let tree_id = match fields[1] {
+            "commit" if is_git_object_id(fields[2]) => Some(fields[2].to_owned()),
+            "blob" if fields[2].is_empty() => None,
+            _ => bail!("local campaign ref listing returned a malformed row"),
+        };
         refs.push(ReleaseGitRef {
             object_id: fields[0].to_owned(),
             object_type: fields[1].to_owned(),
-            reference: fields[2].to_owned(),
+            tree_id,
+            reference: fields[3].to_owned(),
         });
     }
     refs.sort_by(|left, right| left.reference.cmp(&right.reference));
@@ -1790,7 +1840,7 @@ fn release_integration_history(checkout: &Path, reference: &str) -> Result<Vec<R
     let task_key = TALLY_TASK_PREFIX.trim_end_matches(':');
     let revision_key = TALLY_REVISION_PREFIX.trim_end_matches(':');
     let format = format!(
-        "%H%x00%P%x00%ct%x00%B%x00%(trailers:key={task_key},valueonly,unfold=true,separator=%x1f)%x00%(trailers:key={revision_key},valueonly,unfold=true,separator=%x1f)"
+        "%H%x00%T%x00%P%x00%ct%x00%B%x00%(trailers:key={task_key},valueonly,unfold=true,separator=%x1f)%x00%(trailers:key={revision_key},valueonly,unfold=true,separator=%x1f)"
     );
     let arguments = vec![
         "log".to_owned(),
@@ -1805,32 +1855,35 @@ fn release_integration_history(checkout: &Path, reference: &str) -> Result<Vec<R
     if fields.last() == Some(&"") {
         fields.pop();
     }
-    if fields.len() % 6 != 0 {
+    if fields.len() % 7 != 0 {
         bail!("local integration trailer listing returned malformed output");
     }
     fields
-        .chunks_exact(6)
+        .chunks_exact(7)
         .map(|fields| {
             let object_id = fields[0];
-            let parents = fields[1]
+            let tree_id = fields[1];
+            let parents = fields[2]
                 .split_whitespace()
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             if !is_git_object_id(object_id)
+                || !is_git_object_id(tree_id)
                 || parents.iter().any(|parent| !is_git_object_id(parent))
             {
                 bail!("local integration history returned a malformed commit");
             }
-            let committed_at = fields[2]
+            let committed_at = fields[3]
                 .parse::<i64>()
                 .context("local integration history returned a malformed timestamp")?;
             Ok(ReleaseCommit {
                 object_id: object_id.to_owned(),
+                tree_id: tree_id.to_owned(),
                 parents,
                 committed_at,
-                message: fields[3].to_owned(),
-                task_values: split_release_trailers(fields[4]),
-                revision_values: split_release_trailers(fields[5]),
+                message: fields[4].to_owned(),
+                task_values: split_release_trailers(fields[5]),
+                revision_values: split_release_trailers(fields[6]),
             })
         })
         .collect()
@@ -1866,7 +1919,8 @@ fn release_merged_commits(
     graph: &CanonicalCampaignGraphV1,
     revisions: &BTreeMap<String, String>,
     history: &[ReleaseCommit],
-) -> Result<Vec<(String, ReleaseCommit)>> {
+    refs: &[ReleaseGitRef],
+) -> Result<Vec<ReleaseMergedCommit>> {
     let implementation_ids = graph
         .manifest
         .tasks
@@ -1891,32 +1945,80 @@ fn release_merged_commits(
             }
         }
     }
+    let mut selected = BTreeMap::<String, ReleaseMergedCommit>::new();
     for task_id in &implementation_ids {
         let revision = revisions
             .get(*task_id)
             .expect("every graph task has a computed revision");
         match claims.get(&(String::from(*task_id), revision.clone())) {
-            Some(matches) if matches.len() == 1 => {}
+            Some(matches) if matches.len() == 1 => {
+                selected.insert(
+                    String::from(*task_id),
+                    ReleaseMergedCommit {
+                        task_id: String::from(*task_id),
+                        commit: matches[0].clone(),
+                        oracle: ReleaseCompletionOracle::Exact,
+                        bridge_ref: None,
+                    },
+                );
+            }
             Some(_) => bail!(
                 "multiple local integration commits claim campaign task {task_id:?} revision {revision}"
             ),
-            None => bail!(
-                "completed campaign is missing the {TALLY_TASK_PREFIX} {task_id} / {TALLY_REVISION_PREFIX} {revision} trailer proof"
-            ),
+            None => {
+                let mut bridge_candidates = BTreeMap::<String, (&ReleaseCommit, String)>::new();
+                for ((claim_task_id, claim_revision), commits) in &claims {
+                    if claim_task_id != *task_id {
+                        continue;
+                    }
+                    for commit in commits {
+                        if let Some(reference) = release_completion_bridge_ref(
+                            &graph.manifest.name,
+                            task_id,
+                            claim_revision,
+                            commit,
+                            refs,
+                        ) {
+                            bridge_candidates
+                                .entry(commit.object_id.clone())
+                                .or_insert((*commit, reference.reference.clone()));
+                        }
+                    }
+                }
+                match bridge_candidates.len() {
+                    0 => bail!(
+                        "completed campaign is missing the {TALLY_TASK_PREFIX} {task_id} / {TALLY_REVISION_PREFIX} {revision} trailer proof"
+                    ),
+                    1 => {
+                        let (commit, reference) = bridge_candidates
+                            .into_values()
+                            .next()
+                            .expect("one bridge candidate was counted");
+                        selected.insert(
+                            String::from(*task_id),
+                            ReleaseMergedCommit {
+                                task_id: String::from(*task_id),
+                                commit: commit.clone(),
+                                oracle: ReleaseCompletionOracle::Bridge,
+                                bridge_ref: Some(reference),
+                            },
+                        );
+                    }
+                    count => bail!(
+                        "multiple local integration commits ({count}) carry completion-ref bridge proofs for campaign task {task_id:?}"
+                    ),
+                }
+            }
         }
     }
 
     let mut merged = Vec::new();
     for commit in history.iter().rev() {
-        let ([task_id], [revision]) = (
-            commit.task_values.as_slice(),
-            commit.revision_values.as_slice(),
-        ) else {
-            continue;
-        };
-        if implementation_ids.contains(task_id.as_str()) && revisions.get(task_id) == Some(revision)
+        if let Some(proof) = selected
+            .values()
+            .find(|proof| proof.commit.object_id == commit.object_id)
         {
-            merged.push((task_id.clone(), commit.clone()));
+            merged.push(proof.clone());
         }
     }
     if merged.len() != implementation_ids.len() {
@@ -1927,6 +2029,44 @@ fn release_merged_commits(
         );
     }
     Ok(merged)
+}
+
+fn release_completion_bridge_ref<'a>(
+    campaign: &str,
+    task_id: &str,
+    revision: &str,
+    commit: &ReleaseCommit,
+    refs: &'a [ReleaseGitRef],
+) -> Option<&'a ReleaseGitRef> {
+    let digest = revision.strip_prefix("sha256:")?;
+    let revision_prefix = digest.get(..16)?;
+    let expected_leaf = format!("{task_id}-{revision_prefix}");
+    let generation_prefix = release_campaign_generation_ref_prefix(campaign);
+    refs.iter().find(|reference| {
+        reference.object_type == "commit"
+            && reference.tree_id.as_deref() == Some(commit.tree_id.as_str())
+            && reference
+                .reference
+                .strip_prefix(&generation_prefix)
+                .and_then(|suffix| suffix.split_once('/'))
+                .is_some_and(|(generation, leaf)| {
+                    safe_component(generation) && leaf == expected_leaf
+                })
+    })
+}
+
+fn release_completion_proofs(
+    merged_commits: &[ReleaseMergedCommit],
+) -> Vec<CampaignReleaseCompletionProof> {
+    merged_commits
+        .iter()
+        .map(|merged| CampaignReleaseCompletionProof {
+            task_id: merged.task_id.clone(),
+            commit: merged.commit.object_id.clone(),
+            oracle: merged.oracle,
+            reference: merged.bridge_ref.clone(),
+        })
+        .collect()
 }
 
 fn release_checkpoint_refs(
@@ -2376,7 +2516,7 @@ fn release_notes(
     graph: &CanonicalCampaignGraphV1,
     refs: &[ReleaseGitRef],
     revisions: &BTreeMap<String, String>,
-    merged_commits: &[(String, ReleaseCommit)],
+    merged_commits: &[ReleaseMergedCommit],
 ) -> Result<Vec<CampaignReleaseNote>> {
     let scopes = graph
         .manifest
@@ -2395,14 +2535,18 @@ fn release_notes(
         .collect::<BTreeMap<_, _>>();
     merged_commits
         .iter()
-        .map(|(task_id, merged)| {
-            let branch = stable_publish_branch(
-                &graph.manifest.name,
-                &registration.registration_id,
-                task_id,
-                revisions.get(task_id).map(String::as_str),
-            );
-            let reference = format!("refs/heads/{branch}");
+        .map(|merged| {
+            let task_id = &merged.task_id;
+            let commit = &merged.commit;
+            let reference = merged.bridge_ref.clone().unwrap_or_else(|| {
+                let branch = stable_publish_branch(
+                    &graph.manifest.name,
+                    &registration.registration_id,
+                    task_id,
+                    revisions.get(task_id).map(String::as_str),
+                );
+                format!("refs/heads/{branch}")
+            });
             let source = refs
                 .iter()
                 .find(|candidate| candidate.reference == reference);
@@ -2417,7 +2561,7 @@ fn release_notes(
                     source.reference,
                     source.object_type
                 ),
-                None => (None, None, merged.message.clone()),
+                None => (None, None, commit.message.clone()),
             };
             let header = commit_header(&message).to_owned();
             let fallback = titles.get(task_id.as_str()).copied().unwrap_or(task_id);
@@ -2425,7 +2569,7 @@ fn release_notes(
                 validated_release_header(&message, &scopes, fallback);
             Ok(CampaignReleaseNote {
                 task_id: task_id.clone(),
-                commit: merged.object_id.clone(),
+                commit: commit.object_id.clone(),
                 source_ref,
                 source_commit,
                 header,
@@ -2590,8 +2734,27 @@ fn render_campaign_release_human(plan: &CampaignReleasePlan) -> String {
             plan.gate_proof.task_id, plan.gate_proof.reference
         ),
         String::new(),
-        "Release notes".to_owned(),
+        "Completion proofs".to_owned(),
     ];
+    if plan.completion_proofs.is_empty() {
+        lines.push("- No implementation tasks.".to_owned());
+    } else {
+        lines.extend(plan.completion_proofs.iter().map(|proof| {
+            let reference = proof
+                .reference
+                .as_deref()
+                .map(|reference| format!(" via {reference}"))
+                .unwrap_or_default();
+            format!(
+                "- {}: {} [{}]{}",
+                proof.task_id,
+                proof.oracle.as_str(),
+                &proof.commit[..7],
+                reference
+            )
+        }));
+    }
+    lines.extend([String::new(), "Release notes".to_owned()]);
     if plan.release_notes.is_empty() {
         lines.push("- No implementation commits.".to_owned());
     } else {
@@ -7286,12 +7449,10 @@ mod tests {
         release_fixture_git(&checkout, &["commit", "--allow-empty", "-m", &valid]);
         let history = release_integration_history(&checkout, "HEAD").unwrap();
         let revisions = release_task_revisions(&graph).unwrap();
-        assert_eq!(
-            release_merged_commits(&graph, &revisions, &history)
-                .unwrap()
-                .len(),
-            1
-        );
+        let merged = release_merged_commits(&graph, &revisions, &history, &[]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].oracle, ReleaseCompletionOracle::Exact);
+        assert_eq!(merged[0].bridge_ref, None);
 
         let poisoned = [
             (
@@ -7329,7 +7490,7 @@ mod tests {
             release_fixture_git(&checkout, &["checkout", "--detach", &base]);
             release_fixture_git(&checkout, &["commit", "--allow-empty", "-m", &message]);
             let history = release_integration_history(&checkout, "HEAD").unwrap();
-            let error = release_merged_commits(&graph, &revisions, &history)
+            let error = release_merged_commits(&graph, &revisions, &history, &[])
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -7337,6 +7498,85 @@ mod tests {
                 "{case} unexpectedly reached the completion oracle: {error}"
             );
         }
+    }
+
+    #[test]
+    fn release_completion_bridge_accepts_a_legacy_revision_with_a_matching_task_ref() {
+        let fixture = release_completion_bridge_fixture();
+        let history = release_integration_history(&fixture.checkout, "HEAD").unwrap();
+        let refs =
+            release_local_refs(&fixture.checkout, &["refs/heads/tally/".to_owned()]).unwrap();
+
+        let merged =
+            release_merged_commits(&fixture.graph, &fixture.revisions, &history, &refs).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].task_id, "ship-feature");
+        assert_eq!(merged[0].commit.object_id, fixture.legacy_commit);
+        assert_eq!(merged[0].oracle, ReleaseCompletionOracle::Bridge);
+        assert_eq!(
+            merged[0].bridge_ref.as_deref(),
+            Some(fixture.legacy_ref.as_str())
+        );
+
+        let proofs = release_completion_proofs(&merged);
+        assert_eq!(
+            serde_json::to_value(&proofs[0]).unwrap(),
+            json!({
+                "taskId": "ship-feature",
+                "commit": fixture.legacy_commit,
+                "oracle": "bridge",
+                "reference": fixture.legacy_ref
+            })
+        );
+    }
+
+    #[test]
+    fn release_completion_bridge_without_a_task_ref_keeps_the_exact_missing_error() {
+        let fixture = release_completion_bridge_fixture();
+        let history = release_integration_history(&fixture.checkout, "HEAD").unwrap();
+        let expected = fixture.revisions.get("ship-feature").unwrap();
+
+        let error = release_merged_commits(&fixture.graph, &fixture.revisions, &history, &[])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "completed campaign is missing the {TALLY_TASK_PREFIX} ship-feature / {TALLY_REVISION_PREFIX} {expected} trailer proof"
+            )
+        );
+    }
+
+    #[test]
+    fn release_completion_exact_match_never_reports_the_bridge() {
+        let fixture = release_completion_bridge_fixture();
+        let revision = fixture.revisions.get("ship-feature").unwrap();
+        let exact_message = format!(
+            "ship-feature: exact fixture\n\n{TALLY_TASK_PREFIX} ship-feature\n{TALLY_REVISION_PREFIX} {revision}"
+        );
+        release_fixture_git(
+            &fixture.checkout,
+            &["commit", "--allow-empty", "-m", &exact_message],
+        );
+        let exact_commit = release_fixture_git(&fixture.checkout, &["rev-parse", "HEAD"]);
+        let history = release_integration_history(&fixture.checkout, "HEAD").unwrap();
+        let refs =
+            release_local_refs(&fixture.checkout, &["refs/heads/tally/".to_owned()]).unwrap();
+
+        let merged =
+            release_merged_commits(&fixture.graph, &fixture.revisions, &history, &refs).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].commit.object_id, exact_commit);
+        assert_eq!(merged[0].oracle, ReleaseCompletionOracle::Exact);
+        assert_eq!(merged[0].bridge_ref, None);
+        assert_eq!(
+            serde_json::to_value(&release_completion_proofs(&merged)[0]).unwrap(),
+            json!({
+                "taskId": "ship-feature",
+                "commit": exact_commit,
+                "oracle": "exact"
+            })
+        );
     }
 
     #[test]
@@ -7628,6 +7868,12 @@ mod tests {
                 reference: "refs/tally/campaign/fixture/summary/complete".to_owned(),
                 object_id: "b".repeat(40),
             },
+            completion_proofs: vec![CampaignReleaseCompletionProof {
+                task_id: "ship-feature".to_owned(),
+                commit: revision.clone(),
+                oracle: ReleaseCompletionOracle::Exact,
+                reference: None,
+            }],
             release_notes: vec![CampaignReleaseNote {
                 task_id: "ship-feature".to_owned(),
                 commit: revision.clone(),
@@ -7744,6 +7990,77 @@ mod tests {
             task_completion_revision(&graph.manifest, &graph.manifest.tasks[0], &graph.tasks[0])
                 .unwrap();
         (graph, revision)
+    }
+
+    struct ReleaseCompletionBridgeFixture {
+        _temporary: tempfile::TempDir,
+        checkout: PathBuf,
+        graph: CanonicalCampaignGraphV1,
+        revisions: BTreeMap<String, String>,
+        legacy_commit: String,
+        legacy_ref: String,
+    }
+
+    fn release_completion_bridge_fixture() -> ReleaseCompletionBridgeFixture {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("repository");
+        fs::create_dir_all(&checkout).unwrap();
+        release_fixture_git(&checkout, &["init", "-b", "main"]);
+        release_fixture_git(&checkout, &["config", "user.name", "Fixture"]);
+        release_fixture_git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(checkout.join("base.txt"), "base\n").unwrap();
+        release_fixture_git(&checkout, &["add", "base.txt"]);
+        release_fixture_git(&checkout, &["commit", "-m", "chore: fixture base"]);
+        let base = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
+        let (graph, _) = adversarial_release_graph(&checkout);
+        let revisions = release_task_revisions(&graph).unwrap();
+        let legacy_revision = format!("sha256:{}", "b".repeat(64));
+        assert_ne!(
+            revisions.get("ship-feature"),
+            Some(&legacy_revision),
+            "the bridge fixture needs distinct revision identities"
+        );
+        let task_branch = stable_publish_branch(
+            "fixture-release",
+            "0197a62b-41ee-7000-8000-000000000111",
+            "ship-feature",
+            Some(&legacy_revision),
+        );
+        let task_ref = format!("refs/heads/{task_branch}");
+        release_fixture_git(&checkout, &["checkout", "-b", &task_branch, &base]);
+        fs::write(checkout.join("feature.txt"), "legacy proof\n").unwrap();
+        release_fixture_git(&checkout, &["add", "feature.txt"]);
+        release_fixture_git(
+            &checkout,
+            &["commit", "-m", "feat(crates/tally): publish legacy fixture"],
+        );
+        let task_tree = release_fixture_git(&checkout, &["rev-parse", "HEAD^{tree}"]);
+
+        release_fixture_git(&checkout, &["checkout", "--detach", &base]);
+        fs::write(checkout.join("feature.txt"), "legacy proof\n").unwrap();
+        release_fixture_git(&checkout, &["add", "feature.txt"]);
+        let message = format!(
+            "ship-feature: legacy fixture\n\n{TALLY_TASK_PREFIX} ship-feature\n{TALLY_REVISION_PREFIX} {legacy_revision}"
+        );
+        release_fixture_git(&checkout, &["commit", "-m", &message]);
+        let legacy_commit = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            release_fixture_git(&checkout, &["rev-parse", "HEAD^{tree}"]),
+            task_tree,
+            "the durable task ref must expose the integrated snapshot"
+        );
+
+        ReleaseCompletionBridgeFixture {
+            _temporary: temporary,
+            checkout,
+            graph,
+            revisions,
+            legacy_commit,
+            legacy_ref: task_ref,
+        }
     }
 
     fn release_recording_gh(
@@ -8115,6 +8432,17 @@ fi
         assert_eq!(plan.closing_summary.reference, complete_ref);
         assert_eq!(plan.gate_proof.task_id, "release-gate");
         assert_eq!(plan.gate_proof.reference, checkpoint_ref);
+        assert_eq!(plan.completion_proofs.len(), 1);
+        assert_eq!(plan.completion_proofs[0].task_id, "ship-feature");
+        assert_eq!(
+            plan.completion_proofs[0].oracle,
+            ReleaseCompletionOracle::Exact
+        );
+        assert_eq!(plan.completion_proofs[0].reference, None);
+        assert!(
+            render_campaign_release_human(&plan).contains("- ship-feature: exact ["),
+            "human plan must label each task's completion oracle"
+        );
         assert_eq!(plan.release_notes.len(), 1);
         assert_eq!(
             plan.release_notes[0].source_ref.as_deref(),
