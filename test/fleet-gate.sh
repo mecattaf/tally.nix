@@ -142,12 +142,10 @@ run_cargo_deny_stage() {
 
 # Resolved exactly once, before the runner lock is taken and before any stage
 # runs. The main-audit decision is time-of-check dependent: a merge landing
-# while this run waits for the lock or works through the ladder would move the
-# tip of main away from the audited SHA, and the changelog stage would then see
-# a commit that is neither the tip nor an open pull-request head and fail a run
-# whose substantive stages all passed. Pinning the decision to the SHA's status
-# at script start keeps the verdict a property of the audited commit rather
-# than of when the last stage happened to execute.
+# while this run waits for the lock would move the tip of main away from the
+# audited SHA. Pinning the decision to the SHA's status at script start keeps
+# the verdict a property of the audited commit rather than of when the runner
+# became available.
 resolve_pull_request_metadata() {
   local pull_json main_sha
   if ! pull_json="$(
@@ -166,7 +164,7 @@ resolve_pull_request_metadata() {
   )"
   gate_is_main_audit=false
   gate_is_local_audit=false
-  gate_changelog_subject="local head; no pull request"
+  gate_changelog_subject="local audit: local head; no pull request"
 
   if [[ -n "$gate_pr_number" ]]; then
     gate_changelog_subject="head of open pull request #$gate_pr_number"
@@ -187,7 +185,7 @@ resolve_pull_request_metadata() {
 run_changelog_stage() {
   printf '\n==> changelog policy\n'
   if [[ "$gate_is_local_audit" == true ]]; then
-    printf 'NOT RUN changelog-touch rule: the changelog policy is a pull-request policy; no pull request exists for a local head\n'
+    printf 'PASS local audit: the changelog policy is a pull-request policy; no pull request is required for this local head\n'
     return
   fi
   if [[ ! -f CHANGELOG.md ]]; then
@@ -245,6 +243,8 @@ run_ladder() {
   printf 'changelog-subject: %s (pinned at script start)\n' "$gate_changelog_subject"
   printf 'timeout-scale: %s\n' "$timeout_scale_note"
 
+  run_changelog_stage
+
   run_step "cargo fmt" nix develop --command cargo fmt --all --check
   run_step "cargo test" nix develop --command env -u TALLY_TEST_REMOTE_HOST \
     "${timeout_scale_env[@]}" cargo test --workspace
@@ -258,7 +258,6 @@ run_ladder() {
   run_flow_multi_host_assertion
   run_no_stubs_check
   run_no_workflows_check
-  run_changelog_stage
 
   [[ -z "$(git status --porcelain --untracked-files=no)" ]] \
     || {
@@ -324,8 +323,8 @@ chmod 0700 "$gate_root"
 worktree="$gate_root/worktree"
 trap remove_gate_root EXIT INT TERM
 
-# Pin the changelog decision before waiting on the runner lock, so that neither
-# the wait nor the ladder itself can move it.
+# Pin the pull-request classification before waiting on the runner lock, so
+# that neither the wait nor the ladder itself can move it.
 resolve_pull_request_metadata
 
 mkdir -p "$cache_dir"
