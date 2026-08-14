@@ -245,6 +245,9 @@ pub(super) struct CampaignReleaseArgs {
     /// Render the complete release without contacting or changing a forge.
     #[arg(long)]
     pub(super) plan: bool,
+    /// `gh`-compatible forge program used by execute mode. Defaults to `gh` on PATH.
+    #[arg(long, value_name = "PATH")]
+    pub(super) gh_program: Option<PathBuf>,
     /// Durable registration and attempt-receipt root.
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
