@@ -98,11 +98,7 @@ impl Action {
 
     const fn handler(self) -> Handler {
         match self {
-            Self::Worklist
-            | Self::Sweep
-            | Self::Reconcile
-            | Self::Diff
-            | Self::SteeringRecheck
+            Self::SteeringRecheck
             | Self::Steer
             | Self::Retry
             | Self::Escalate
@@ -114,7 +110,13 @@ impl Action {
             | Self::Checkpoint
             | Self::Publish
             | Self::Merge => Handler::PythonFallback,
-            Self::Prep | Self::Cleanup | Self::Rebase => Handler::Native,
+            Self::Worklist
+            | Self::Sweep
+            | Self::Reconcile
+            | Self::Diff
+            | Self::Prep
+            | Self::Cleanup
+            | Self::Rebase => Handler::Native,
         }
     }
 }
@@ -222,7 +224,9 @@ mod tests {
             assert_eq!(parsed, *variant);
             assert_eq!(parsed.as_str(), expected_name);
             let expected_handler = match expected_name {
-                "prep" | "cleanup" | "rebase" => Handler::Native,
+                "worklist" | "sweep" | "reconcile" | "diff" | "prep" | "cleanup" | "rebase" => {
+                    Handler::Native
+                }
                 _ => Handler::PythonFallback,
             };
             assert_eq!(parsed.handler(), expected_handler);
@@ -230,14 +234,25 @@ mod tests {
     }
 
     #[test]
-    fn only_the_worktree_mechanics_actions_are_native() {
+    fn the_worktree_and_pure_fold_actions_are_native() {
         let native: Vec<_> = Action::value_variants()
             .iter()
             .copied()
             .filter(|action| action.handler() == Handler::Native)
             .map(Action::as_str)
             .collect();
-        assert_eq!(native, ["prep", "cleanup", "rebase"]);
+        assert_eq!(
+            native,
+            [
+                "worklist",
+                "sweep",
+                "reconcile",
+                "diff",
+                "prep",
+                "cleanup",
+                "rebase"
+            ]
+        );
     }
 
     #[test]

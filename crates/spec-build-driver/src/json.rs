@@ -20,6 +20,13 @@ impl Json {
         }
     }
 
+    pub(crate) fn as_object_mut(&mut self) -> Option<&mut BTreeMap<String, Json>> {
+        match self {
+            Self::Object(value) => Some(value),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_array(&self) -> Option<&[Json]> {
         match self {
             Self::Array(value) => Some(value),
