@@ -571,7 +571,7 @@
       "id": "port-fold-half",
       "kind": "implementation",
       "title": "Port the pure-fold half of the driver",
-      "goal": "Port the deterministic fold actions \u2014 worklist witnessing/validation (including the campaign policy section), sweep, reconcile, diff, digest and summary rendering \u2014 consuming the tally-core folds ported earlier rather than re-implementing them. Remove each from the fallback set as it lands; the reseated suite stays green throughout.",
+      "goal": "Port the deterministic fold actions \u2014 worklist witnessing/validation (including the campaign policy section), sweep, reconcile, diff, digest and summary rendering \u2014 consuming the tally-core folds ported earlier rather than re-implementing them. Remove each from the fallback set as it lands; the reseated suite stays green throughout. Ownership correction: Cargo.toml and Cargo.lock are yours \u2014 dependency additions update the lockfile, and a dirty lockfile fails publish.",
       "deliveredBehaviors": [
         "The fold actions run natively, consuming the tally-core shared folds"
       ],
@@ -599,7 +599,9 @@
         "reseat-driver-suite"
       ],
       "conflictDomains": [
-        "crates/spec-build-driver"
+        "crates/spec-build-driver",
+        "Cargo.toml",
+        "Cargo.lock"
       ]
     },
     {
@@ -633,7 +635,9 @@
         "port-worktrees"
       ],
       "conflictDomains": [
-        "crates/spec-build-driver"
+        "crates/spec-build-driver",
+        "Cargo.toml",
+        "Cargo.lock"
       ]
     },
     {
@@ -669,7 +673,9 @@
       "conflictDomains": [
         "examples/flows",
         "crates/tally-flow",
-        "crates/spec-build-driver"
+        "crates/spec-build-driver",
+        "Cargo.toml",
+        "Cargo.lock"
       ]
     },
     {
@@ -716,7 +722,9 @@
         "crates/spec-build-driver",
         "crates/tally/src/flow_live.rs",
         "crates/tally/tests",
-        "flake.nix"
+        "flake.nix",
+        "Cargo.toml",
+        "Cargo.lock"
       ]
     },
     {
@@ -772,7 +780,9 @@
         "drivers",
         "test",
         "flake.nix",
-        "crates/spec-build-driver"
+        "crates/spec-build-driver",
+        "Cargo.toml",
+        "Cargo.lock"
       ]
     },
     {
