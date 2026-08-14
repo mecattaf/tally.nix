@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::{DriverError, Result};
 
@@ -58,6 +59,58 @@ where
         .args(&arguments)
         .output()
         .map_err(|error| DriverError::new(format!("cannot execute git: {error}")))?;
+    let result = GitOutput {
+        status: output.status.code().unwrap_or(128),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    };
+    if check && !result.success() {
+        let rendered = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(DriverError::new(format!(
+            "git {rendered} exited {}: {}",
+            result.status,
+            result.detail()
+        )));
+    }
+    Ok(result)
+}
+
+pub(crate) fn git_with_input<I, S>(
+    directory: &Path,
+    arguments: I,
+    input: &[u8],
+    check: bool,
+) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let arguments: Vec<_> = arguments
+        .into_iter()
+        .map(|argument| argument.as_ref().to_owned())
+        .collect();
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(&arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| DriverError::new(format!("cannot execute git: {error}")))?;
+    child
+        .stdin
+        .take()
+        .expect("piped Git stdin")
+        .write_all(input)
+        .map_err(|error| DriverError::new(format!("cannot write git stdin: {error}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| DriverError::new(format!("cannot wait for git: {error}")))?;
     let result = GitOutput {
         status: output.status.code().unwrap_or(128),
         stdout: output.stdout,

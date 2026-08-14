@@ -13,3 +13,5 @@ clap.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tally-core = { path = "../tally-core" }
+uuid.workspace = true

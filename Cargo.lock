@@ -1901,6 +1901,8 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tally-core",
+ "uuid",
 ]
 
 [[package]]
