@@ -716,6 +716,36 @@ fn repository_fixture(path: &str) -> std::path::PathBuf {
         .join(path)
 }
 
+/// Resolve the actual Rust driver built for this test run.
+///
+/// Nix supplies its separately packaged binary so the package check exercises
+/// the installed seam. A workspace Cargo run gets the ordinary binary that
+/// Cargo builds for the driver's integration tests; deriving the profile
+/// directory from this test executable also respects CARGO_TARGET_DIR.
+fn rust_spec_build_driver() -> PathBuf {
+    let driver = std::env::var_os("TALLY_TEST_SPEC_BUILD_DRIVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .expect("the flow-live test executable should have a path")
+                .parent()
+                .and_then(Path::parent)
+                .expect("the flow-live test should run from a Cargo profile directory")
+                .join(format!("spec-build-driver{}", std::env::consts::EXE_SUFFIX))
+        });
+    assert!(
+        driver.is_file(),
+        "Rust spec-build driver is missing at {}; run the workspace tests so Cargo builds its integration target",
+        driver.display()
+    );
+    assert_ne!(
+        driver,
+        repository_fixture("drivers/spec_build_driver.py"),
+        "the Rust seam must not resolve to the Python fallback"
+    );
+    driver
+}
+
 fn copy_fixture_tree(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).unwrap();
     for entry in fs::read_dir(source).unwrap() {
@@ -2393,14 +2423,7 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             );
             fixture_git(&checkout, &["push", "--set-upstream", "origin", "main"]);
 
-            let driver = temp.path().join("spec-build-driver");
-            shell_program::install(
-                &driver,
-                format!(
-                    "#!/bin/sh\nexec python3 '{}' \"$@\"\n",
-                    repository_fixture("drivers/spec_build_driver.py").display()
-                ),
-            );
+            let driver = rust_spec_build_driver();
             let agent = repository_fixture("test/fixtures/spec-build/policy-agent.py");
 
             let mut config = config();
@@ -4670,8 +4693,7 @@ async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicat
             .unwrap();
 
             let run_continue = || {
-                let output = StdCommand::new("python3")
-                    .arg(repository_fixture("drivers/spec_build_driver.py"))
+                let output = StdCommand::new(rust_spec_build_driver())
                     .arg("continue")
                     .env("TALLY_BRIEF", &brief_path)
                     .output()

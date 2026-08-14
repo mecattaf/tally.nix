@@ -8114,34 +8114,11 @@ fn action_tree_delta(brief: &Json) -> Result<Json> {
     if !is_task_id(&task_id) {
         return Err(DriverError::new("task.id is not safe"));
     }
-    let workspace = data
-        .get("workspace")
-        .ok_or_else(|| DriverError::new("workspace must be an object"))?;
-    let workspace = object_exact(
-        workspace,
-        &[
-            "taskId",
-            "baseRev",
-            "branch",
-            "worktreePath",
-            "conflictDomains",
-        ],
-        "workspace",
-    )?;
-    normalize_paths(
-        workspace.get("conflictDomains"),
-        "workspace.conflictDomains",
-        false,
-    )?;
-    let workspace_task_id = required_string(workspace.get("taskId"), "workspace.taskId", None)?;
-    if workspace_task_id != task_id {
+    let workspace = prepared_workspace(data.get("workspace"), "workspace")?;
+    if workspace.task_id != task_id {
         return Err(DriverError::new("workspace.taskId does not match task.id"));
     }
-    let worktree = PathBuf::from(required_string(
-        workspace.get("worktreePath"),
-        "workspace.worktreePath",
-        None,
-    )?);
+    let worktree = workspace.worktree;
     if !worktree.is_absolute() || !worktree.is_dir() {
         return Err(DriverError::new(
             "workspace.worktreePath must be an absolute existing directory",

@@ -156,6 +156,7 @@
           doCheck = true;
           preCheck = ''
             export TALLY_NIX_CATALOG_FIXTURE=${catalogFixtureUnchecked}
+            export TALLY_TEST_SPEC_BUILD_DRIVER=${specBuildDriver}/bin/spec-build-driver
           '';
           nativeCheckInputs = [
             pkgs.git
@@ -166,9 +167,9 @@
             mkdir -p "$out/share/tally/flows" "$out/libexec/tally"
             cp ${./examples/flows/spec-build.js} "$out/share/tally/flows/spec-build.js"
             ln -s ${specBuildDriver}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver"
-            # The Python entry point remains authoritative until the seam
-            # proof. Keep the Rust dispatcher beside it for that proof.
-            ln -s ${specBuildDriverRust}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver-rust"
+            # Retain the Python implementation as the Rust dispatcher's
+            # explicitly named fallback until the terminal Python cut.
+            ln -s ${specBuildDriverPython}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver-python"
             wrapProgram "$out/bin/tally" \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
@@ -785,9 +786,9 @@
             exec ${pkgs.python3}/bin/python3 ${campaignDrivers}/agency_nightly_driver.py "$@"
           '';
         };
-        specBuildDriver = import ./nix/lib/spec-build-driver.nix { inherit pkgs; };
-        specBuildDriverRust = pkgs.rustPlatform.buildRustPackage {
-          pname = "spec-build-driver-rust";
+        specBuildDriverPython = import ./nix/lib/spec-build-driver.nix { inherit pkgs; };
+        specBuildDriver = pkgs.rustPlatform.buildRustPackage {
+          pname = "spec-build-driver";
           version = "0.1.0";
           src = tallySource;
           cargoLock = {
@@ -797,7 +798,13 @@
           };
           cargoBuildFlags = [ "--package=spec-build-driver" ];
           cargoTestFlags = [ "--package=spec-build-driver" ];
-          SPEC_BUILD_PY_FALLBACK = "${specBuildDriver}/bin/spec-build-driver";
+          nativeCheckInputs = [ pkgs.git ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          SPEC_BUILD_PY_FALLBACK = "${specBuildDriverPython}/bin/spec-build-driver";
+          postFixup = ''
+            wrapProgram "$out/bin/spec-build-driver" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+          '';
           meta.mainProgram = "spec-build-driver";
         };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
@@ -3436,7 +3443,8 @@
           doc = documentation;
           agency-nightly-driver = agencyNightlyDriver;
           spec-build-driver = specBuildDriver;
-          spec-build-driver-rust = specBuildDriverRust;
+          spec-build-driver-rust = specBuildDriver;
+          spec-build-driver-python = specBuildDriverPython;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
         };
@@ -3490,7 +3498,7 @@
                 python3 ${./test/spec_build_contract_corpus_test.py}
                 touch "$out"
               '';
-          spec-build-driver-rust = specBuildDriverRust;
+          spec-build-driver-rust = specBuildDriver;
           campaign-runtime =
             pkgs.runCommand "tally-campaign-runtime"
               {
