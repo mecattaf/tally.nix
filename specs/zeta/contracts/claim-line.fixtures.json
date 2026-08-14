@@ -1,0 +1,95 @@
+{
+  "description": "Accept/reject corpus for the spec-lint claim-line parser. The double pin between specs/README.md section 4 grammar prose and parser.rs. Each entry: line (as it would appear inside a '### R<group>' body), group, verdict ('accept' | 'reject'), and for rejects the rule id expected. Consumed by crates/spec-lint parser tests under the cargo-tests gate.",
+  "cases": [
+    {
+      "line": "1.1 `spec-lint --mode check` over a defect-free `specs/zeta` → exit 0 (given). [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "accept"
+    },
+    {
+      "line": "2.1 BELIEVE:test/fleet-gate.sh — the ladder runs `nix flake check -L --keep-going` → the attribute grades every gated head. [check: spec-lint]",
+      "group": 2,
+      "verdict": "accept"
+    },
+    {
+      "line": "3.1 a claim without a mechanical oracle names its human moment → the census enumerates it. [HUMAN-ATTENDED]",
+      "group": 3,
+      "verdict": "accept"
+    },
+    {
+      "line": "1.2 the parser accepts a claim id whose group matches the enclosing heading → this line parses. [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "accept"
+    },
+    {
+      "line": "1.3 a lint run over the corpus completes with no arrow on this line. [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L4",
+      "why": "missing arrow"
+    },
+    {
+      "line": "1.4 input arrives → the tool validates it and writes the report. [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L4",
+      "why": "two verbs joined by ' and ' in the observable"
+    },
+    {
+      "line": "2.5 a defect appears → the run exits 2. [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L3",
+      "why": "claim group 2 under heading group 1"
+    },
+    {
+      "line": "1.5 a defect appears → the run exits 2 (given).",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L9",
+      "why": "zero oracle bindings"
+    },
+    {
+      "line": "1.6 a defect appears → the run exits 2 (given). [gate: cargo-tests] [check: spec-lint]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L9",
+      "why": "two oracle bindings"
+    },
+    {
+      "line": "1.7 the tool handles malformed input gracefully → exit 2 (given). [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L5",
+      "why": "hedge word 'gracefully'"
+    },
+    {
+      "line": "1.8 a run over 30 files completes → exit 0. [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L7",
+      "why": "unsourced numerals 30 and 0"
+    },
+    {
+      "line": "1.9 `retry_with_jitter` fires → the attempt count rises by one (given). [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L8",
+      "why": "backticked identifier absent from tree, Vocabulary, and (NEW) set"
+    },
+    {
+      "line": "1.10 BELIEVE:src/does-not-exist.rs — the module exports the parser → callers resolve it. [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L12",
+      "why": "BELIEVE path does not exist"
+    },
+    {
+      "line": "1.11 formats like markdown, e.g. GFM, parse → exit 0 (given). [gate: cargo-tests]",
+      "group": 1,
+      "verdict": "reject",
+      "rule": "L6",
+      "why": "'e.g.' opens the set"
+    }
+  ]
+}
