@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset};
+use regex::Regex;
 use tally_core::campaign_folds::{
     campaign_digest as fold_campaign_digest, render_campaign_summary, stable_publish_branch,
     CampaignReconciliation,
@@ -22,12 +25,30 @@ use crate::worktrees::{self, Identity};
 
 const NARRATION_SUBJECT_MAX: usize = 200;
 const NARRATION_BODY_MAX: usize = 4_000;
+const NARRATION_HEADER_MAX: usize = 72;
+const NARRATION_BODY_LINE_MAX: usize = 100;
+const NARRATION_REASON_MAX: usize = 200;
+const NARRATION_ATTEMPTS: u64 = 2;
+const OUTCOME_FIRST_LEAD_MAX: usize = 240;
 const MAX_CAMPAIGN_TASKS: usize = 128;
 const MAX_DIFF_CHARS: usize = 128 * 1024;
 const MAX_ATTEMPT_RECEIPTS_LOG_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
+const MAX_MACHINE_RETRIES: usize = 2;
+const MAX_WORKER_FINDINGS_BYTES: usize = 8 * 1024;
+const MAX_CONTINUATION_EVENT_BYTES: usize = 1024 * 1024;
+const CHECKPOINT_CAPTURE_MAX_BYTES: usize = 8 * 1024;
+const CHECKPOINT_STDERR_LINES: usize = 10;
+const CHECKPOINT_PUBLIC_NOTE_MAX_CHARS: usize = 1_000;
 const ATTEMPT_RECEIPTS_FILE: &str = "attempt-receipts-v1.jsonl";
+const PUBLIC_REDACTION: &str = "conservative-v2";
+const PUBLIC_DIAGNOSIS_TRUNCATION: &str = "\n[... diagnosis truncated after redaction ...]";
+const WORKER_FINDINGS_TRUNCATION: &str = "\n[... worker findings truncated after redaction ...]";
+const CHECKPOINT_CAPTURE_FILE: &str = "checkpoint.json";
+const TALLY_TASK_PREFIX: &str = "Tally-Task:";
+const TALLY_REVISION_PREFIX: &str = "Tally-Revision:";
+const ASSISTED_BY_PREFIX: &str = "Assisted-by:";
 const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
 const LIVE_JOB_STATES: [&str; 3] = ["paused", "queued", "running"];
 
@@ -35,6 +56,10 @@ const LIVE_JOB_STATES: [&str; 3] = ["paused", "queued", "running"];
 const O_CLOEXEC: i32 = 0o2000000;
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(target_os = "linux")]
+const O_DIRECTORY: i32 = 0o200000;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
 const LOCK_SH: i32 = 1;
 const LOCK_EX: i32 = 2;
 const LOCK_UN: i32 = 8;
@@ -89,7 +114,9 @@ struct Publication {
 struct Constraint {
     gate_id: String,
     patterns: Vec<String>,
+    checked_paths: usize,
     base_rev: String,
+    head: String,
 }
 
 pub(crate) fn load_brief() -> Result<Json> {
@@ -117,8 +144,20 @@ pub(crate) fn dispatch(action: &str, brief: &Json) -> Result<Json> {
         "sweep" => action_sweep(brief),
         "reconcile" => action_reconcile(brief),
         "diff" => action_diff(brief),
+        "steeringRecheck" => action_steering_recheck(brief),
+        "steer" => action_steer(brief),
+        "retry" => action_retry(brief),
+        "escalate" => action_escalate(brief),
+        "continue" => action_continue(brief),
+        "preflight" => action_preflight(brief),
         "prep" => action_prep(brief),
+        "ownership" => action_ownership(brief),
+        "treeDelta" => action_tree_delta(brief),
+        "constraint" => action_constraint(brief),
+        "checkpoint" => action_checkpoint(brief),
+        "publish" => action_publish(brief),
         "rebase" => action_rebase(brief),
+        "merge" => action_merge(brief),
         "cleanup" => action_cleanup(brief),
         _ => Err(DriverError::new(format!(
             "action {action:?} has no native handler"
@@ -144,6 +183,26 @@ fn object_exact<'a>(
         return Err(DriverError::new(format!(
             "{context} has unknown fields: {}",
             unknown.join(", ")
+        )));
+    }
+    Ok(object)
+}
+
+fn object_complete<'a>(
+    value: &'a Json,
+    fields: &[&str],
+    context: &str,
+) -> Result<&'a BTreeMap<String, Json>> {
+    let object = object_exact(value, fields, context)?;
+    let missing: Vec<_> = fields
+        .iter()
+        .filter(|field| !object.contains_key(**field))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(DriverError::new(format!(
+            "{context} is missing canonical fields: {}",
+            missing.join(", ")
         )));
     }
     Ok(object)
@@ -1488,6 +1547,2575 @@ fn action_diff(brief: &Json) -> Result<Json> {
     ]))
 }
 
+fn local_actor(value: Option<&Json>, context: &str) -> Result<String> {
+    let actor = value
+        .and_then(Json::as_str)
+        .ok_or_else(|| DriverError::new(format!("{context} is not a valid local actor")))?;
+    if actor.is_empty()
+        || actor.chars().count() > 128
+        || actor.contains(['\0', '/', '\\'])
+        || actor.chars().any(char::is_whitespace)
+    {
+        return Err(DriverError::new(format!(
+            "{context} is not a valid local actor"
+        )));
+    }
+    Ok(actor.to_owned())
+}
+
+fn steering_comment(value: &Json, context: &str) -> Result<Json> {
+    let comment = object_complete(
+        value,
+        &["id", "url", "author", "body", "createdAt", "updatedAt"],
+        context,
+    )?;
+    let id = comment
+        .get("id")
+        .and_then(Json::as_u64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| DriverError::new(format!("{context}.id must be a positive integer")))?;
+    let body = comment
+        .get("body")
+        .and_then(Json::as_str)
+        .filter(|body| !body.contains('\0'))
+        .ok_or_else(|| {
+            DriverError::new(format!("{context}.body must be text without NUL bytes"))
+        })?;
+    if body.chars().count() > 64_000 {
+        return Err(DriverError::new(format!(
+            "{context}.body exceeds 64000 characters"
+        )));
+    }
+    Ok(Json::object([
+        ("id", Json::Number(id.to_string())),
+        (
+            "url",
+            Json::from(required_string(
+                comment.get("url"),
+                &format!("{context}.url"),
+                None,
+            )?),
+        ),
+        (
+            "author",
+            Json::from(local_actor(
+                comment.get("author"),
+                &format!("{context}.author"),
+            )?),
+        ),
+        ("body", Json::from(body)),
+        (
+            "createdAt",
+            Json::from(required_string(
+                comment.get("createdAt"),
+                &format!("{context}.createdAt"),
+                None,
+            )?),
+        ),
+        (
+            "updatedAt",
+            Json::from(required_string(
+                comment.get("updatedAt"),
+                &format!("{context}.updatedAt"),
+                None,
+            )?),
+        ),
+    ]))
+}
+
+fn steering_timestamp(value: Option<&Json>, context: &str) -> Result<DateTime<FixedOffset>> {
+    let text = required_string(value, context, None)?;
+    DateTime::parse_from_rfc3339(&text)
+        .map_err(|_| DriverError::new(format!("{context} is not an RFC 3339 timestamp")))
+}
+
+#[derive(Debug)]
+struct SteeringSource {
+    registration_id: String,
+    local_actor: String,
+    log_path: PathBuf,
+    lock_path: PathBuf,
+    prepared_cursor: u64,
+}
+
+fn steering_source(value: Option<&Json>, actor: &str) -> Result<SteeringSource> {
+    let value = value.ok_or_else(|| DriverError::new("steeringSource must be an object"))?;
+    let source = object_complete(
+        value,
+        &[
+            "schemaVersion",
+            "kind",
+            "registrationId",
+            "localActor",
+            "logPath",
+            "lockPath",
+            "preparedCursor",
+        ],
+        "steeringSource",
+    )?;
+    if source.get("schemaVersion").and_then(Json::as_u64) != Some(1)
+        || source.get("kind").and_then(Json::as_str) != Some("local-jsonl")
+    {
+        return Err(DriverError::new(
+            "steeringSource must use local-jsonl schema version 1",
+        ));
+    }
+    let registration_id = required_string(
+        source.get("registrationId"),
+        "steeringSource.registrationId",
+        Some(128),
+    )?;
+    let parsed = Uuid::parse_str(&registration_id)
+        .map_err(|_| DriverError::new("steeringSource.registrationId must be a canonical UUID"))?;
+    if parsed.to_string() != registration_id {
+        return Err(DriverError::new(
+            "steeringSource.registrationId must be a canonical UUID",
+        ));
+    }
+    let source_actor = local_actor(source.get("localActor"), "steeringSource.localActor")?;
+    if source_actor != actor {
+        return Err(DriverError::new(
+            "steeringSource.localActor does not match localActor",
+        ));
+    }
+    let log_path = PathBuf::from(required_string(
+        source.get("logPath"),
+        "steeringSource.logPath",
+        None,
+    )?);
+    let lock_path = PathBuf::from(required_string(
+        source.get("lockPath"),
+        "steeringSource.lockPath",
+        None,
+    )?);
+    if !log_path.is_absolute() || !lock_path.is_absolute() {
+        return Err(DriverError::new("steeringSource paths must be absolute"));
+    }
+    let parent = log_path.parent();
+    let valid_paths = log_path
+        .file_name()
+        .is_some_and(|name| name == "steering-v1.jsonl")
+        && lock_path
+            .file_name()
+            .is_some_and(|name| name == "steering.lock")
+        && parent == lock_path.parent()
+        && parent
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == registration_id.as_str())
+        && parent
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "steering")
+        && parent
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "campaigns");
+    if !valid_paths {
+        return Err(DriverError::new(
+            "steeringSource paths do not identify one campaign steering source",
+        ));
+    }
+    let prepared_cursor = source
+        .get("preparedCursor")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| {
+            DriverError::new("steeringSource.preparedCursor must be a non-negative integer")
+        })?;
+    Ok(SteeringSource {
+        registration_id,
+        local_actor: source_actor,
+        log_path,
+        lock_path,
+        prepared_cursor,
+    })
+}
+
+fn open_regular_nofollow(path: &Path, write: bool, context: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .custom_flags(O_CLOEXEC | O_NOFOLLOW);
+    let file = options.open(path).map_err(|error| {
+        DriverError::new(format!("cannot open {context} {}: {error}", path.display()))
+    })?;
+    if !file.metadata()?.is_file() {
+        return Err(DriverError::new(format!(
+            "{context} {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn local_steering_comments(source: &SteeringSource, task_id: &str) -> Result<(Vec<Json>, u64)> {
+    let lock = open_regular_nofollow(&source.lock_path, true, "campaign steering lock")?;
+    if unsafe { flock(lock.as_raw_fd(), LOCK_SH) } != 0 {
+        return Err(DriverError::new(format!(
+            "cannot lock campaign steering source: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let read = (|| {
+        let mut log = open_regular_nofollow(&source.log_path, false, "campaign steering log")?;
+        let metadata = log.metadata()?;
+        if metadata.len() > 128 * 1024 * 1024 {
+            return Err(DriverError::new("campaign steering log exceeds 128 MiB"));
+        }
+        let mut raw = Vec::with_capacity(metadata.len() as usize);
+        log.read_to_end(&mut raw)?;
+        if raw.len() > 128 * 1024 * 1024 {
+            return Err(DriverError::new("campaign steering log exceeds 128 MiB"));
+        }
+        if !raw.is_empty() && !raw.ends_with(b"\n") {
+            return Err(DriverError::new(
+                "campaign steering log has an incomplete final record",
+            ));
+        }
+        let text = std::str::from_utf8(&raw).map_err(|error| {
+            DriverError::new(format!("campaign steering log record is invalid: {error}"))
+        })?;
+        let mut comments = Vec::new();
+        let mut target_counts = BTreeMap::<Option<String>, usize>::new();
+        let mut prior_embargo = None;
+        for (index, line) in text.lines().enumerate() {
+            let sequence = index as u64 + 1;
+            if line.is_empty() {
+                return Err(DriverError::new(format!(
+                    "campaign steering log has an empty record at line {sequence}"
+                )));
+            }
+            let value = json::parse(line).map_err(|error| {
+                DriverError::new(format!(
+                    "campaign steering log record {sequence} is invalid: {error}"
+                ))
+            })?;
+            let record = object_complete(
+                &value,
+                &[
+                    "schemaVersion",
+                    "sequence",
+                    "registrationId",
+                    "taskId",
+                    "doNotDispatchBefore",
+                    "comment",
+                ],
+                &format!("campaign steering record {sequence}"),
+            )?;
+            let target = match record.get("taskId") {
+                None | Some(Json::Null) => None,
+                Some(Json::String(target))
+                    if target.chars().count() <= 80 && is_task_id(target) =>
+                {
+                    Some(target.clone())
+                }
+                _ => {
+                    return Err(DriverError::new(format!(
+                        "campaign steering record {sequence}.taskId is invalid"
+                    )))
+                }
+            };
+            let comment = steering_comment(
+                record.get("comment").unwrap_or(&Json::Null),
+                &format!("campaign steering record {sequence}.comment"),
+            )?;
+            let comment_object = comment.as_object().expect("comment object");
+            let expected_url = format!(
+                "local://campaign/{}/steering/{sequence}",
+                source.registration_id
+            );
+            let valid = record.get("schemaVersion").and_then(Json::as_u64) == Some(1)
+                && record.get("sequence").and_then(Json::as_u64) == Some(sequence)
+                && record.get("registrationId").and_then(Json::as_str)
+                    == Some(source.registration_id.as_str())
+                && comment_object.get("id").and_then(Json::as_u64) == Some(sequence)
+                && comment_object.get("url").and_then(Json::as_str) == Some(expected_url.as_str())
+                && comment_object.get("author").and_then(Json::as_str)
+                    == Some(source.local_actor.as_str());
+            if !valid {
+                return Err(DriverError::new(format!(
+                    "campaign steering record {sequence} violates steering-v1 invariants"
+                )));
+            }
+            let created = steering_timestamp(
+                comment_object.get("createdAt"),
+                &format!("campaign steering record {sequence}.comment.createdAt"),
+            )?;
+            let updated = steering_timestamp(
+                comment_object.get("updatedAt"),
+                &format!("campaign steering record {sequence}.comment.updatedAt"),
+            )?;
+            let embargo = steering_timestamp(
+                record.get("doNotDispatchBefore"),
+                &format!("campaign steering record {sequence}.doNotDispatchBefore"),
+            )?;
+            if updated != created || embargo != created + ChronoDuration::milliseconds(1_000) {
+                return Err(DriverError::new(format!(
+                    "campaign steering record {sequence} has inconsistent append-only timestamps"
+                )));
+            }
+            if prior_embargo.is_some_and(|prior| embargo <= prior) {
+                return Err(DriverError::new(format!(
+                    "campaign steering record {sequence} does not advance doNotDispatchBefore"
+                )));
+            }
+            prior_embargo = Some(embargo);
+            let count = target_counts.entry(target.clone()).or_default();
+            *count += 1;
+            if *count > 1_000 {
+                return Err(DriverError::new(format!(
+                    "campaign steering target {target:?} has more than 1000 records"
+                )));
+            }
+            if target.as_deref().is_none_or(|target| target == task_id) {
+                comments.push(comment);
+            }
+        }
+        Ok((comments, text.lines().count() as u64))
+    })();
+    unsafe {
+        flock(lock.as_raw_fd(), LOCK_UN);
+    }
+    read
+}
+
+fn action_steering_recheck(brief: &Json) -> Result<Json> {
+    let data = object_complete(
+        brief,
+        &[
+            "campaign",
+            "campaignIdentity",
+            "taskId",
+            "localActor",
+            "steeringSource",
+            "preparedComments",
+        ],
+        "steering re-check brief",
+    )?;
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let campaign_identity =
+        required_string(data.get("campaignIdentity"), "campaignIdentity", Some(128))?;
+    let task_id = required_string(data.get("taskId"), "taskId", None)?;
+    if task_id.chars().count() > 80 || !is_task_id(&task_id) {
+        return Err(DriverError::new("taskId is not safe"));
+    }
+    let actor = local_actor(data.get("localActor"), "localActor")?;
+    let source = steering_source(data.get("steeringSource"), &actor)?;
+    if source.registration_id != campaign_identity {
+        return Err(DriverError::new(
+            "steeringSource.registrationId does not match campaignIdentity",
+        ));
+    }
+    let prepared_values = data
+        .get("preparedComments")
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new("preparedComments must be an array"))?;
+    if prepared_values.len() > 2_000 {
+        return Err(DriverError::new(
+            "preparedComments has more than 2000 local steering records",
+        ));
+    }
+    let mut prepared = Vec::new();
+    let mut prepared_ids = BTreeSet::new();
+    for (index, value) in prepared_values.iter().enumerate() {
+        let comment = steering_comment(value, &format!("preparedComments[{index}]"))?;
+        let object = comment.as_object().expect("comment object");
+        let id = object.get("id").and_then(Json::as_u64).expect("comment id");
+        if object.get("author").and_then(Json::as_str) != Some(actor.as_str()) {
+            return Err(DriverError::new(
+                "preparedComments contains an actor outside local authority",
+            ));
+        }
+        if id > source.prepared_cursor {
+            return Err(DriverError::new(
+                "preparedComments contains an ID beyond the prepared cursor",
+            ));
+        }
+        let expected = format!("local://campaign/{}/steering/{id}", source.registration_id);
+        if object.get("url").and_then(Json::as_str) != Some(expected.as_str()) {
+            return Err(DriverError::new(
+                "preparedComments contains a record outside the local source",
+            ));
+        }
+        if !prepared_ids.insert(id) {
+            return Err(DriverError::new(format!(
+                "preparedComments repeated comment id {id}"
+            )));
+        }
+        prepared.push(comment);
+    }
+    let (rechecked, rechecked_cursor) = local_steering_comments(&source, &task_id)?;
+    if rechecked_cursor < source.prepared_cursor {
+        return Err(DriverError::new(
+            "campaign steering log is behind the prepared cursor",
+        ));
+    }
+    if rechecked.len() > 2_000 {
+        return Err(DriverError::new(
+            "task steering re-check comments has more than 2000 approved steering comments",
+        ));
+    }
+    let mut merged = prepared.clone();
+    let mut positions: BTreeMap<u64, usize> = merged
+        .iter()
+        .enumerate()
+        .map(|(index, comment)| {
+            (
+                comment
+                    .as_object()
+                    .and_then(|comment| comment.get("id"))
+                    .and_then(Json::as_u64)
+                    .expect("comment id"),
+                index,
+            )
+        })
+        .collect();
+    let mut late_ids = Vec::new();
+    for comment in rechecked {
+        let id = comment
+            .as_object()
+            .and_then(|comment| comment.get("id"))
+            .and_then(Json::as_u64)
+            .expect("comment id");
+        if let Some(position) = positions.get(&id).copied() {
+            if merged[position] != comment {
+                merged[position] = comment;
+                late_ids.push(Json::Number(id.to_string()));
+            }
+        } else {
+            positions.insert(id, merged.len());
+            merged.push(comment);
+            late_ids.push(Json::Number(id.to_string()));
+        }
+    }
+    Ok(Json::object([
+        ("taskId", Json::from(task_id)),
+        ("authorizedComments", Json::Array(merged)),
+        (
+            "receipt",
+            Json::object([
+                (
+                    "source",
+                    Json::object([
+                        ("kind", Json::from("local-jsonl")),
+                        ("registrationId", Json::from(source.registration_id)),
+                        (
+                            "path",
+                            Json::from(source.log_path.to_string_lossy().into_owned()),
+                        ),
+                        (
+                            "preparedCursor",
+                            Json::Number(source.prepared_cursor.to_string()),
+                        ),
+                        (
+                            "recheckedCursor",
+                            Json::Number(rechecked_cursor.to_string()),
+                        ),
+                    ]),
+                ),
+                ("rechecked", Json::from(true)),
+                ("recheckTruncated", Json::from(false)),
+                (
+                    "preparedCommentIds",
+                    Json::Array(
+                        prepared
+                            .iter()
+                            .map(|comment| {
+                                Json::Number(
+                                    comment
+                                        .as_object()
+                                        .and_then(|comment| comment.get("id"))
+                                        .and_then(Json::as_u64)
+                                        .expect("comment id")
+                                        .to_string(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
+                ("lateRecheckCommentIds", Json::Array(late_ids)),
+            ]),
+        ),
+    ]))
+}
+
+fn gate_evidence_requirements(value: Option<&Json>) -> (Option<String>, Option<String>) {
+    let Some(evidence) = value.and_then(Json::as_object) else {
+        return (None, None);
+    };
+    let id = evidence
+        .get("id")
+        .and_then(Json::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    let path = evidence
+        .get("detail")
+        .and_then(Json::as_str)
+        .and_then(|detail| {
+            Regex::new(
+                r#"forbidPaths gate \S+ rejected \d+ path\(s\) touched in lane history \(a later removal does not clear this; the path must never appear in any lane commit\): \"((?:[^\"\\]|\\.)*)\""#,
+            )
+            .expect("static forbidPaths evidence regex")
+            .captures(detail)
+            .and_then(|capture| capture.get(1))
+            .map(|path| path.as_str().to_owned())
+        });
+    (id, path)
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    let mut output = String::new();
+    let mut pending = false;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            pending = !output.is_empty();
+        } else {
+            if pending {
+                output.push(' ');
+                pending = false;
+            }
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn python_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn diagnosis_fallback_note(
+    reason: &str,
+    gate_id: Option<&str>,
+    path: Option<&str>,
+    rejected: Option<&str>,
+) -> String {
+    let mut note = format!(
+        "Recorded a grammar-rejected steward diagnosis. Validation rejected the proposal because {reason}."
+    );
+    if let Some(gate_id) = gate_id {
+        note.push_str(&format!(
+            " Required literal check id: {}.",
+            python_single_quoted(gate_id)
+        ));
+    }
+    if let Some(path) = path {
+        note.push_str(&format!(
+            " Required literal offending path: {}.",
+            python_single_quoted(path)
+        ));
+    }
+    if let Some(rejected) = rejected {
+        let excerpt = collapse_whitespace(rejected);
+        let excerpt = take_chars(&excerpt, 2_000);
+        let excerpt = trim_end_punctuation(&excerpt);
+        let excerpt = replace_bare_exclamation_marks(excerpt, ".");
+        if !excerpt.is_empty() {
+            note.push_str(&format!(" Redacted proposal excerpt: {excerpt}."));
+        }
+    }
+    if note.chars().count() > MAX_DIAGNOSIS_CHARS {
+        note = format!("{}…", take_chars(&note, MAX_DIAGNOSIS_CHARS - 1).trim_end());
+    }
+    note
+}
+
+fn diagnosis_rejection_reason(
+    diagnosis: &str,
+    gate_evidence: Option<&Json>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let (required_id, required_path) = gate_evidence_requirements(gate_evidence);
+    let mut reason = validate_outcome_first(diagnosis, MAX_DIAGNOSIS_CHARS, "diagnosis");
+    if reason.is_none()
+        && required_id
+            .as_ref()
+            .is_some_and(|required| !diagnosis.contains(required))
+    {
+        reason = Some(format!(
+            "diagnosis omits the failing check id {}",
+            python_single_quoted(required_id.as_deref().expect("checked above"))
+        ));
+    }
+    if reason.is_none()
+        && required_path
+            .as_ref()
+            .is_some_and(|required| !diagnosis.contains(required))
+    {
+        reason = Some(format!(
+            "diagnosis omits the offending path {}",
+            python_single_quoted(required_path.as_deref().expect("checked above"))
+        ));
+    }
+    (reason, required_id, required_path)
+}
+
+fn validated_diagnosis(diagnosis: &str, evidence: Option<&Json>) -> String {
+    let (reason, required_id, required_path) = diagnosis_rejection_reason(diagnosis, evidence);
+    reason.map_or_else(
+        || diagnosis.to_owned(),
+        |reason| {
+            diagnosis_fallback_note(
+                &reason,
+                required_id.as_deref(),
+                required_path.as_deref(),
+                Some(diagnosis),
+            )
+        },
+    )
+}
+
+fn bound_public_diagnosis(value: &str) -> String {
+    if value.chars().count() <= MAX_DIAGNOSIS_CHARS {
+        return value.to_owned();
+    }
+    let width = MAX_DIAGNOSIS_CHARS - PUBLIC_DIAGNOSIS_TRUNCATION.chars().count();
+    format!(
+        "{}{}",
+        take_chars(value, width).trim_end(),
+        PUBLIC_DIAGNOSIS_TRUNCATION
+    )
+}
+
+fn abort_reason_text(reason: &str) -> Option<&'static str> {
+    match reason {
+        "tree-delta-breach" => Some(
+            "Aborted the lane: a tree-delta permission breach found out-of-allowlist change(s), so this task will not be retried.",
+        ),
+        "tree-delta-ungated" => Some(
+            "Aborted the lane: the tree-delta permission gate could not judge this pass -- the agent node failed, so the ownership node never ran and certified no paths, and this task declares no conflictDomains, leaving no allowlist. No out-of-allowlist change has been established. Declare conflictDomains for this task and re-arm; this task will not be retried until then.",
+        ),
+        _ => None,
+    }
+}
+
+fn breach_note(diagnosis: &str, detail: &str, reason: &str) -> String {
+    let mut parts = vec![abort_reason_text(reason).expect("validated abort reason")];
+    if !diagnosis.is_empty() {
+        parts.push(diagnosis);
+    }
+    let evidence;
+    if !detail.is_empty() {
+        evidence = format!("Witnessed evidence: {detail}");
+        parts.push(&evidence);
+    }
+    parts.join("\n\n")
+}
+
+fn bounded_breach_note(diagnosis: &str, detail: &str, reason: &str) -> String {
+    let mut composed = breach_note(diagnosis, detail, reason);
+    let overflow = composed.chars().count().saturating_sub(MAX_DIAGNOSIS_CHARS);
+    if overflow != 0 {
+        let kept = diagnosis.chars().count().saturating_sub(overflow);
+        composed = breach_note(take_chars(diagnosis, kept).trim_end(), detail, reason);
+    }
+    bound_public_diagnosis(&composed)
+}
+
+fn json_truthy(value: Option<&Json>) -> bool {
+    match value {
+        None | Some(Json::Null) | Some(Json::Bool(false)) => false,
+        Some(Json::Number(number)) => number != "0" && number != "0.0",
+        Some(Json::String(value)) => !value.is_empty(),
+        Some(Json::Array(value)) => !value.is_empty(),
+        Some(Json::Object(value)) => !value.is_empty(),
+        Some(Json::Bool(true)) => true,
+    }
+}
+
+fn action_steer(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "taskId",
+            "attempt",
+            "diagnosis",
+            "attemptReceipts",
+            "checkpointCapture",
+            "gateEvidence",
+            "breach",
+            "breachDetail",
+            "abortReason",
+            "specRepository",
+            "issueRepository",
+        ],
+        "steer brief",
+    )?;
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let repository = repository_name(data.get("repository"), "repository")?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    campaign_coordinates(data, repository, config)?;
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let task_id = required_string(data.get("taskId"), "taskId", None)?;
+    if !is_task_id(&task_id) {
+        return Err(DriverError::new("taskId is not safe"));
+    }
+    let attempt = data.get("attempt").and_then(Json::as_u64);
+    if !matches!(attempt, Some(1 | 2)) {
+        return Err(DriverError::new("attempt must equal 1 or 2"));
+    }
+    let attempt = attempt.expect("validated attempt");
+    let breach = json_truthy(data.get("breach"));
+    let abort_reason = data
+        .get("abortReason")
+        .and_then(Json::as_str)
+        .unwrap_or("tree-delta-breach");
+    if abort_reason_text(abort_reason).is_none() {
+        return Err(DriverError::new(
+            "abortReason is not a declared lane-abort reason",
+        ));
+    }
+    let state = campaign_attempt_state_all(data.get("attemptReceipts"), &campaign, &issue_number)?;
+    let task_receipts: Vec<_> = state
+        .diagnoses
+        .iter()
+        .filter(|receipt| receipt.task_id == task_id)
+        .collect();
+
+    if breach {
+        if let Some(existing) = task_receipts.iter().find(|receipt| receipt.attempt == 2) {
+            return Ok(Json::object([
+                ("kind", Json::from("diagnosis")),
+                ("taskId", Json::from(task_id)),
+                ("attempt", Json::Number("2".to_owned())),
+                ("comment", Json::from(existing.comment.clone())),
+                ("blocked", Json::from(true)),
+                ("posted", Json::from(false)),
+                ("redacted", Json::from(false)),
+            ]));
+        }
+        let (capture_note, capture_redacted) = if data.contains_key("checkpointCapture") {
+            let note = checkpoint_capture_note(data.get("checkpointCapture"), &campaign, &task_id)?;
+            let (note, redacted) = redact_public_text(&note);
+            (note, redacted)
+        } else {
+            (String::new(), false)
+        };
+        let diagnosis = required_text(data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS)?;
+        let (diagnosis, redacted_diagnosis) = redact_public_text(&diagnosis);
+        let diagnosis = bound_public_diagnosis(&diagnosis);
+        let diagnosis = validated_diagnosis(&diagnosis, data.get("gateEvidence"));
+        let (detail, redacted_detail) = match data.get("breachDetail").and_then(Json::as_str) {
+            Some(detail) if !detail.trim().is_empty() => {
+                let (detail, redacted) = redact_public_text(detail);
+                (bound_public_diagnosis(&detail), redacted)
+            }
+            _ => (String::new(), false),
+        };
+        let mut composed = bounded_breach_note(&diagnosis, &detail, abort_reason);
+        composed = append_checkpoint_capture_note(&composed, &capture_note, MAX_DIAGNOSIS_CHARS);
+        let mut posted_comment = None;
+        for post_attempt in [1_u64, 2] {
+            if task_receipts
+                .iter()
+                .any(|receipt| receipt.attempt == post_attempt)
+            {
+                continue;
+            }
+            posted_comment = Some(record_diagnosis(
+                data.get("attemptReceipts"),
+                &campaign,
+                &issue_number,
+                &task_id,
+                post_attempt,
+                &composed,
+            )?);
+        }
+        return Ok(Json::object([
+            ("kind", Json::from("diagnosis")),
+            ("taskId", Json::from(task_id)),
+            ("attempt", Json::Number("2".to_owned())),
+            ("comment", posted_comment.map_or(Json::Null, Json::from)),
+            ("blocked", Json::from(true)),
+            ("posted", Json::from(true)),
+            (
+                "redacted",
+                Json::from(redacted_diagnosis || redacted_detail || capture_redacted),
+            ),
+        ]));
+    }
+
+    if let Some(existing) = task_receipts
+        .iter()
+        .find(|receipt| receipt.attempt == attempt)
+    {
+        return Ok(Json::object([
+            ("kind", Json::from("diagnosis")),
+            ("taskId", Json::from(task_id)),
+            ("attempt", Json::Number(attempt.to_string())),
+            ("comment", Json::from(existing.comment.clone())),
+            ("blocked", Json::from(attempt == 2)),
+            ("posted", Json::from(false)),
+            ("redacted", Json::from(false)),
+        ]));
+    }
+    let expected_attempt = task_receipts.len() as u64 + 1;
+    if attempt != expected_attempt {
+        return Err(DriverError::new(format!(
+            "task {task_id:?} diagnosis attempt {attempt} is not next after {} durable receipts",
+            task_receipts.len()
+        )));
+    }
+    let (capture_note, capture_redacted) = if data.contains_key("checkpointCapture") {
+        let note = checkpoint_capture_note(data.get("checkpointCapture"), &campaign, &task_id)?;
+        let (note, redacted) = redact_public_text(&note);
+        (note, redacted)
+    } else {
+        (String::new(), false)
+    };
+    let diagnosis = required_text(data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS)?;
+    let (diagnosis, redacted) = redact_public_text(&diagnosis);
+    let diagnosis = bound_public_diagnosis(&diagnosis);
+    let diagnosis = validated_diagnosis(&diagnosis, data.get("gateEvidence"));
+    let diagnosis = append_checkpoint_capture_note(&diagnosis, &capture_note, MAX_DIAGNOSIS_CHARS);
+    let comment = record_diagnosis(
+        data.get("attemptReceipts"),
+        &campaign,
+        &issue_number,
+        &task_id,
+        attempt,
+        &diagnosis,
+    )?;
+    Ok(Json::object([
+        ("kind", Json::from("diagnosis")),
+        ("taskId", Json::from(task_id)),
+        ("attempt", Json::Number(attempt.to_string())),
+        ("comment", Json::from(comment)),
+        ("blocked", Json::from(attempt == 2)),
+        ("posted", Json::from(true)),
+        ("redacted", Json::from(redacted || capture_redacted)),
+    ]))
+}
+
+fn action_retry(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "taskId",
+            "stage",
+            "detail",
+            "attemptReceipts",
+            "checkpointCapture",
+            "specRepository",
+            "issueRepository",
+        ],
+        "retry brief",
+    )?;
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let repository = repository_name(data.get("repository"), "repository")?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    campaign_coordinates(data, repository, config)?;
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let task_id = required_string(data.get("taskId"), "taskId", None)?;
+    if !is_task_id(&task_id) {
+        return Err(DriverError::new("taskId is not safe"));
+    }
+    let stage = required_string(data.get("stage"), "stage", None)?;
+    if !Regex::new(r"^[a-z][a-z0-9:._-]{0,63}$")
+        .expect("static stage regex")
+        .is_match(&stage)
+    {
+        return Err(DriverError::new("stage is not a safe campaign stage name"));
+    }
+    let detail = required_text(data.get("detail"), "detail", MAX_RETRY_CHARS)?;
+    let state = campaign_attempt_state_all(data.get("attemptReceipts"), &campaign, &issue_number)?;
+    let spent = state
+        .retries
+        .iter()
+        .filter(|receipt| receipt.task_id == task_id)
+        .count();
+    if spent >= MAX_MACHINE_RETRIES {
+        return Ok(Json::object([
+            ("taskId", Json::from(task_id)),
+            ("attempt", Json::from(spent)),
+            ("comment", Json::Null),
+            ("exhausted", Json::from(true)),
+            ("posted", Json::from(false)),
+            ("redacted", Json::from(false)),
+        ]));
+    }
+    let attempt = spent + 1;
+    let capture_note = if data.contains_key("checkpointCapture") {
+        checkpoint_capture_note(data.get("checkpointCapture"), &campaign, &task_id)?
+    } else {
+        String::new()
+    };
+    let mut raw_reason = format!("Stage `{stage}` faulted.");
+    if !capture_note.is_empty() {
+        raw_reason.push_str(&format!("\n\n{capture_note}"));
+    }
+    raw_reason.push_str(&format!("\n\n{detail}"));
+    let (mut reason, redacted) = redact_public_text(&raw_reason);
+    if reason.chars().count() > MAX_RETRY_CHARS {
+        reason = format!("{}...", take_chars(&reason, MAX_RETRY_CHARS - 3).trim_end());
+    }
+    let reason = required_text(Some(&Json::from(reason)), "retry reason", MAX_RETRY_CHARS)?;
+    let (created, receipt) = append_attempt_receipt(
+        data.get("attemptReceipts"),
+        &campaign,
+        &issue_number,
+        Json::object([
+            ("kind", Json::from("retry")),
+            ("taskId", Json::from(task_id.clone())),
+            ("attempt", Json::from(attempt)),
+            ("reason", Json::from(reason)),
+            ("redaction", Json::from(PUBLIC_REDACTION)),
+        ]),
+    )?;
+    let comment = receipt
+        .as_object()
+        .and_then(|receipt| receipt.get("comment"))
+        .and_then(Json::as_str)
+        .expect("append receipt returns comment")
+        .to_owned();
+    Ok(Json::object([
+        ("taskId", Json::from(task_id)),
+        ("attempt", Json::from(attempt)),
+        ("comment", Json::from(comment)),
+        ("exhausted", Json::from(attempt == MAX_MACHINE_RETRIES)),
+        ("posted", Json::from(created)),
+        ("redacted", Json::from(redacted)),
+    ]))
+}
+
+fn compact_summary(value: &str, maximum: usize) -> String {
+    let compact = collapse_whitespace(value);
+    if compact.chars().count() <= maximum {
+        compact
+    } else {
+        format!("{}...", take_chars(&compact, maximum - 3))
+    }
+}
+
+fn checkpoint_capture_paths(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let prefix = "Checkpoint capture: ";
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::new();
+    for value in values {
+        for line in value.lines() {
+            if let Some(path) = line.strip_prefix(prefix) {
+                if !path.is_empty() && seen.insert(path.to_owned()) {
+                    paths.push(path.to_owned());
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn escalation_snapshot(value: &Json) -> Result<&BTreeMap<String, Json>> {
+    value
+        .as_object()
+        .ok_or_else(|| DriverError::new("reconciliation must be an object"))
+}
+
+fn action_escalate(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "campaignIdentity",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "worklist",
+            "maxTasks",
+            "maxParallel",
+            "attemptReceipts",
+            "specRepository",
+            "issueRepository",
+        ],
+        "escalate brief",
+    )?;
+    let first = action_reconcile(brief)?;
+    let first_object = escalation_snapshot(&first)?;
+    if first_object.get("complete").and_then(Json::as_bool) == Some(true)
+        || first_object.get("quiescent").and_then(Json::as_bool) != Some(true)
+    {
+        return Err(DriverError::new(
+            "campaign escalation requires an incomplete empty frontier",
+        ));
+    }
+    let first_diagnoses = first_object
+        .get("diagnoses")
+        .and_then(Json::as_array)
+        .unwrap_or_default();
+    let first_retries = first_object
+        .get("retries")
+        .and_then(Json::as_array)
+        .unwrap_or_default();
+    if let Some(existing) = first_object.get("escalation").and_then(Json::as_str) {
+        return Ok(Json::object([
+            ("posted", Json::from(false)),
+            ("comment", Json::from(existing)),
+            ("summary", Json::Null),
+            ("diagnosisCount", Json::from(first_diagnoses.len())),
+            ("retryCount", Json::from(first_retries.len())),
+        ]));
+    }
+    let reconciliation = action_reconcile(brief)?;
+    let object = escalation_snapshot(&reconciliation)?;
+    if object.get("complete").and_then(Json::as_bool) == Some(true)
+        || object.get("quiescent").and_then(Json::as_bool) != Some(true)
+    {
+        return Err(DriverError::new(
+            "campaign quiescence changed during the pre-post durable refresh; refusing to post outcome=quiescent",
+        ));
+    }
+    let diagnoses = object
+        .get("diagnoses")
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new("reconciliation.diagnoses must be an array"))?;
+    let retries = object
+        .get("retries")
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new("reconciliation.retries must be an array"))?;
+    if let Some(existing) = object.get("escalation").and_then(Json::as_str) {
+        return Ok(Json::object([
+            ("posted", Json::from(false)),
+            ("comment", Json::from(existing)),
+            ("summary", Json::Null),
+            ("diagnosisCount", Json::from(diagnoses.len())),
+            ("retryCount", Json::from(retries.len())),
+        ]));
+    }
+    let campaign = required_string(object.get("campaign"), "campaign", None)?;
+    let repository = repository_name(object.get("repository"), "repository")?;
+    let code_config = repo_config(data.get("repositoryConfig"))?;
+    let (_, _, target) = campaign_coordinates(data, repository, code_config)?;
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let blocked = object
+        .get("blocked")
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new("reconciliation.blocked must be an array"))?;
+    let direct: Vec<_> = blocked
+        .iter()
+        .filter_map(Json::as_object)
+        .filter_map(|fact| {
+            let task_id = fact.get("taskId")?.as_str()?;
+            let blocked_by = fact.get("blockedBy")?.as_array()?;
+            blocked_by
+                .iter()
+                .any(|root| root.as_str() == Some(task_id))
+                .then(|| task_id.to_owned())
+        })
+        .collect();
+    let mut lines = vec![
+        "### Spec-build escalation: frontier quiescent".to_owned(),
+        String::new(),
+        "The worklist is incomplete and no unblocked task is dispatchable.".to_owned(),
+        "Tally stopped only after each directly blocked task failed twice with machine steering."
+            .to_owned(),
+        String::new(),
+        format!(
+            "Directly blocked tasks: {}",
+            direct
+                .iter()
+                .map(|task_id| format!("`{task_id}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!(
+            "Blocked worklist tasks (including descendants): {}",
+            blocked.len()
+        ),
+        String::new(),
+        "Accumulated machine diagnoses:".to_owned(),
+    ];
+    let mut public_values = Vec::new();
+    for diagnosis in diagnoses {
+        let diagnosis = diagnosis
+            .as_object()
+            .ok_or_else(|| DriverError::new("reconciliation diagnosis must be an object"))?;
+        let task_id = diagnosis
+            .get("taskId")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        let attempt = diagnosis
+            .get("attempt")
+            .and_then(Json::as_u64)
+            .unwrap_or_default();
+        let text = diagnosis
+            .get("diagnosis")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        lines.push(format!(
+            "- `{task_id}` attempt {attempt}: {}",
+            compact_summary(text, 64)
+        ));
+        public_values.push(text.to_owned());
+    }
+    if !retries.is_empty() {
+        lines.extend([
+            String::new(),
+            "Campaign machinery faults that bought a retry:".to_owned(),
+        ]);
+        for retry in retries {
+            let retry = retry
+                .as_object()
+                .ok_or_else(|| DriverError::new("reconciliation retry must be an object"))?;
+            let task_id = retry
+                .get("taskId")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            let attempt = retry
+                .get("attempt")
+                .and_then(Json::as_u64)
+                .unwrap_or_default();
+            let text = retry
+                .get("reason")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            lines.push(format!(
+                "- `{task_id}` fault {attempt}: {}",
+                compact_summary(text, 64)
+            ));
+            public_values.push(text.to_owned());
+        }
+    }
+    let capture_paths = checkpoint_capture_paths(public_values);
+    if !capture_paths.is_empty() {
+        lines.extend([String::new(), "Checkpoint captures:".to_owned()]);
+        lines.extend(capture_paths.into_iter().map(|path| format!("- {path}")));
+    }
+    let warnings = object
+        .get("warnings")
+        .and_then(Json::as_array)
+        .unwrap_or_default();
+    if !warnings.is_empty() {
+        lines.extend([String::new(), "Reconciler warnings:".to_owned()]);
+        lines.extend(
+            warnings
+                .iter()
+                .take(12)
+                .filter_map(Json::as_str)
+                .map(|warning| format!("- {}", compact_summary(warning, 200))),
+        );
+    }
+    let body = lines.join("\n");
+    if body.chars().count() > 60_000 {
+        return Err(DriverError::new(
+            "machine escalation exceeds 60,000 characters",
+        ));
+    }
+    let projected: CampaignReconciliation = serde_json::from_str(&reconciliation.stringify())
+        .map_err(|error| {
+            DriverError::new(format!(
+                "cannot project campaign reconciliation through tally-core: {error}"
+            ))
+        })?;
+    let digest = fold_campaign_digest(&projected, "quiescent");
+    let summary = publish_closing_summary(
+        &target.repository,
+        &target.config,
+        &campaign,
+        &issue_number,
+        &digest,
+    )?;
+    let (created, receipt) = append_attempt_receipt(
+        data.get("attemptReceipts"),
+        &campaign,
+        &issue_number,
+        Json::object([
+            ("kind", Json::from("escalation")),
+            ("body", Json::from(body)),
+        ]),
+    )?;
+    let comment = receipt
+        .as_object()
+        .and_then(|receipt| receipt.get("comment"))
+        .and_then(Json::as_str)
+        .expect("append receipt returns comment")
+        .to_owned();
+    Ok(Json::object([
+        ("posted", Json::from(created)),
+        ("comment", Json::from(comment)),
+        ("summary", Json::from(summary)),
+        ("diagnosisCount", Json::from(diagnoses.len())),
+        ("retryCount", Json::from(retries.len())),
+    ]))
+}
+
+#[derive(Debug)]
+struct ContinuationSpec {
+    argv: Vec<String>,
+    pool: Vec<String>,
+    priority: String,
+    runtime_seconds: Option<u64>,
+    events_dir: PathBuf,
+}
+
+fn continuation_spec(value: Option<&Json>) -> Result<ContinuationSpec> {
+    let value = value.ok_or_else(|| DriverError::new("continuation must be an object"))?;
+    let spec = object_exact(
+        value,
+        &["argv", "pool", "priority", "runtimeMaxSec", "eventsDir"],
+        "continuation",
+    )?;
+    let events_dir = PathBuf::from(required_string(
+        spec.get("eventsDir"),
+        "continuation.eventsDir",
+        Some(4_096),
+    )?);
+    if !events_dir.is_absolute() {
+        return Err(DriverError::new("continuation.eventsDir must be absolute"));
+    }
+    let priority = spec
+        .get("priority")
+        .and_then(Json::as_str)
+        .filter(|priority| matches!(*priority, "interrupt" | "high" | "medium" | "low"))
+        .ok_or_else(|| DriverError::new("continuation.priority is not a declared priority"))?
+        .to_owned();
+    let runtime_seconds = match spec.get("runtimeMaxSec") {
+        None | Some(Json::Null) => None,
+        value => Some(positive_u64(value, "continuation.runtimeMaxSec")?),
+    };
+    let pool = string_list(spec.get("pool"), "continuation.pool", true)?;
+    if pool.iter().collect::<BTreeSet<_>>().len() != pool.len() {
+        return Err(DriverError::new("continuation.pool must not repeat a pool"));
+    }
+    Ok(ContinuationSpec {
+        argv: argv_list(spec.get("argv"), "continuation.argv")?,
+        pool,
+        priority,
+        runtime_seconds,
+        events_dir,
+    })
+}
+
+fn continuation_run_id(
+    campaign: &str,
+    repository: &str,
+    issue_number: &str,
+    run_id: &str,
+) -> String {
+    let material = [
+        "spec-build-continuation:v1",
+        campaign,
+        repository,
+        issue_number,
+        run_id,
+    ]
+    .join("\n");
+    format!(
+        "continuation-{}",
+        &sha256::digest(material.as_bytes())[..32]
+    )
+}
+
+fn write_continuation_event(
+    spec: &ContinuationSpec,
+    dedup_key: &str,
+    brief: Option<Json>,
+) -> Result<(bool, PathBuf)> {
+    let mut payload = BTreeMap::from([
+        (
+            "argv".to_owned(),
+            Json::Array(spec.argv.iter().cloned().map(Json::from).collect()),
+        ),
+        ("adapter".to_owned(), Json::from("shell")),
+        (
+            "pool".to_owned(),
+            Json::Array(spec.pool.iter().cloned().map(Json::from).collect()),
+        ),
+        ("priority".to_owned(), Json::from(spec.priority.clone())),
+        ("source".to_owned(), Json::from("events-dir")),
+        ("dedupKey".to_owned(), Json::from(dedup_key)),
+        (
+            "submission".to_owned(),
+            Json::object([("mode", Json::from("full"))]),
+        ),
+        (
+            "evidence".to_owned(),
+            Json::Array(vec![Json::from("exit:0")]),
+        ),
+        ("noEnqueue".to_owned(), Json::from(false)),
+    ]);
+    if let Some(runtime) = spec.runtime_seconds {
+        payload.insert(
+            "runtimeMaxSec".to_owned(),
+            Json::Number(runtime.to_string()),
+        );
+    }
+    if let Some(brief) = brief {
+        payload.insert("brief".to_owned(), brief);
+    }
+    let name = format!(
+        "campaign-continuation-{}",
+        &sha256::digest(dedup_key.as_bytes())[..32]
+    );
+    let path = spec.events_dir.join(format!("{name}.json"));
+    let rendered = format!("{}\n", Json::Object(payload).stringify());
+    if rendered.len() > MAX_CONTINUATION_EVENT_BYTES {
+        return Err(DriverError::new(
+            "continuation payload exceeds the bounded event size",
+        ));
+    }
+    let temporary = spec
+        .events_dir
+        .join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        fs::create_dir_all(&spec.events_dir).map_err(|error| {
+            DriverError::new(format!(
+                "cannot write the continuation event {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| {
+                DriverError::new(format!(
+                    "cannot write the continuation event {}: {error}",
+                    path.display()
+                ))
+            })?;
+        file.write_all(rendered.as_bytes()).map_err(|error| {
+            DriverError::new(format!(
+                "cannot write the continuation event {}: {error}",
+                path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            DriverError::new(format!(
+                "cannot write the continuation event {}: {error}",
+                path.display()
+            ))
+        })?;
+        let created = match fs::hard_link(&temporary, &path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(DriverError::new(format!(
+                    "cannot write the continuation event {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        Ok((created, path.clone()))
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+fn action_continue(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "runId",
+            "continuation",
+            "brief",
+            "specRepository",
+            "issueRepository",
+        ],
+        "continue brief",
+    )?;
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let repository = repository_name(data.get("repository"), "repository")?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    let (_, _, target) = campaign_coordinates(data, repository.clone(), config)?;
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let run_id = required_string(data.get("runId"), "runId", Some(512))?;
+    let spec = continuation_spec(data.get("continuation"))?;
+    let next_run_id = continuation_run_id(&campaign, &repository, &issue_number, &run_id);
+    let dedup_key = format!("campaign-continuation:{repository}:{issue_number}:{next_run_id}");
+    let next_brief = match data.get("brief") {
+        None | Some(Json::Null) => None,
+        Some(Json::Object(brief)) => {
+            let mut brief = brief.clone();
+            brief.insert("runId".to_owned(), Json::from(next_run_id.clone()));
+            Some(Json::Object(brief))
+        }
+        _ => {
+            return Err(DriverError::new(
+                "continue brief.brief must be an object or null",
+            ))
+        }
+    };
+    let (created, path) = write_continuation_event(&spec, &dedup_key, next_brief)?;
+    let reference = format!(
+        "{}/continuation/{next_run_id}",
+        local_state_prefix(&campaign, &issue_number)
+    );
+    let expected = Json::object([
+        ("schemaVersion", Json::Number("1".to_owned())),
+        ("kind", Json::from("continuation")),
+        ("campaign", Json::from(campaign)),
+        ("issueNumber", Json::from(issue_number)),
+        ("runId", Json::from(run_id)),
+        ("dedupKey", Json::from(dedup_key.clone())),
+    ]);
+    let (_, observed) = write_local_blob(&target.config, &reference, &expected)?;
+    if observed != expected {
+        return Err(DriverError::new(format!(
+            "local campaign continuation {reference:?} disagrees with this pass"
+        )));
+    }
+    Ok(Json::object([
+        ("event", Json::from(path.to_string_lossy().into_owned())),
+        ("dedupKey", Json::from(dedup_key)),
+        ("runId", Json::from(next_run_id)),
+        ("created", Json::from(created)),
+        (
+            "receipt",
+            Json::from(format!("local://{}/{reference}", target.repository)),
+        ),
+    ]))
+}
+
+#[derive(Debug)]
+struct CheckpointCapture {
+    path: PathBuf,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    verdict: String,
+}
+
+fn read_capture_tail(path: &Path) -> Result<(String, bool)> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            DriverError::new(format!(
+                "cannot open checkpoint capture stream {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(DriverError::new(format!(
+            "checkpoint capture stream is not a private regular file: {}",
+            path.display()
+        )));
+    }
+    let start = metadata
+        .len()
+        .saturating_sub(CHECKPOINT_CAPTURE_MAX_BYTES as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut captured = Vec::new();
+    file.take(CHECKPOINT_CAPTURE_MAX_BYTES as u64)
+        .read_to_end(&mut captured)?;
+    if start != 0 {
+        let prefix = captured
+            .iter()
+            .take_while(|byte| (**byte & 0b1100_0000) == 0b1000_0000)
+            .count();
+        captured.drain(..prefix);
+    }
+    let mut text = String::from_utf8_lossy(&captured)
+        .replace('\0', "�")
+        .to_owned();
+    let mut additionally_truncated = false;
+    if text.len() > CHECKPOINT_CAPTURE_MAX_BYTES {
+        let mut begin = text.len() - CHECKPOINT_CAPTURE_MAX_BYTES;
+        while !text.is_char_boundary(begin) {
+            begin += 1;
+        }
+        text = text[begin..].to_owned();
+        additionally_truncated = true;
+    }
+    Ok((text, start != 0 || additionally_truncated))
+}
+
+fn write_private_json(path: &Path, value: &Json) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| DriverError::new("checkpoint capture path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DriverError::new(format!(
+            "checkpoint capture parent must be a real directory: {}",
+            parent.display()
+        )));
+    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(CHECKPOINT_CAPTURE_FILE),
+        std::process::id(),
+        Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(O_CLOEXEC | O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(value.stringify().as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_CLOEXEC | O_DIRECTORY)
+            .open(parent)?;
+        directory.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result.map_err(|error: std::io::Error| {
+        DriverError::new(format!(
+            "cannot persist checkpoint capture {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn json_integer_or_null(value: Option<&Json>, context: &str) -> Result<Json> {
+    match value {
+        Some(Json::Null) | None => Ok(Json::Null),
+        Some(Json::Number(number))
+            if number
+                .strip_prefix('-')
+                .unwrap_or(number)
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                && number != "-" =>
+        {
+            Ok(Json::Number(number.clone()))
+        }
+        _ => Err(DriverError::new(format!(
+            "{context} must be an integer or null"
+        ))),
+    }
+}
+
+fn persist_checkpoint_capture(
+    capture_root_value: Option<&Json>,
+    execution_value: Option<&Json>,
+    campaign: &str,
+    issue_number: &str,
+    task_id: &str,
+) -> Result<CheckpointCapture> {
+    let capture_root = PathBuf::from(required_string(
+        capture_root_value,
+        "captureRoot",
+        Some(4_096),
+    )?);
+    let valid_root = capture_root.is_absolute()
+        && capture_root
+            .file_name()
+            .is_some_and(|name| name == "archive")
+        && capture_root
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "capture");
+    if !valid_root {
+        return Err(DriverError::new(
+            "captureRoot must name an absolute capture/archive directory",
+        ));
+    }
+    if capture_root.exists() && (is_symlink(&capture_root) || !capture_root.is_dir()) {
+        return Err(DriverError::new("captureRoot must be a real directory"));
+    }
+    let execution_value = execution_value
+        .ok_or_else(|| DriverError::new("checkpoint execution must be an object"))?;
+    let execution = object_exact(
+        execution_value,
+        &["taskUuid", "verdict", "exitCode"],
+        "checkpoint execution",
+    )?;
+    let task_uuid = required_string(
+        execution.get("taskUuid"),
+        "checkpoint execution.taskUuid",
+        None,
+    )?;
+    let parsed = Uuid::parse_str(&task_uuid)
+        .map_err(|_| DriverError::new("checkpoint execution.taskUuid must be a UUID"))?;
+    if parsed.to_string() != task_uuid {
+        return Err(DriverError::new(
+            "checkpoint execution.taskUuid must be a canonical UUID",
+        ));
+    }
+    let verdict = required_string(
+        execution.get("verdict"),
+        "checkpoint execution.verdict",
+        None,
+    )?;
+    if !matches!(
+        verdict.as_str(),
+        "pass"
+            | "substituted"
+            | "failed"
+            | "skipped"
+            | "cancelled"
+            | "pool-vanished"
+            | "preempted"
+            | "runtime-exceeded"
+            | "clean-exit-no-artifact"
+    ) {
+        return Err(DriverError::new(
+            "checkpoint execution.verdict is not a terminal verdict",
+        ));
+    }
+    let exit_code =
+        json_integer_or_null(execution.get("exitCode"), "checkpoint execution.exitCode")?;
+    let capture_stem = format!("{task_uuid}.{task_id}");
+    let current_root = capture_root.parent().expect("validated capture root");
+    let (stdout, stdout_truncated) =
+        read_capture_tail(&current_root.join(format!("{capture_stem}.out")))?;
+    let (stderr, stderr_truncated) =
+        read_capture_tail(&current_root.join(format!("{capture_stem}.adapter.err")))?;
+    let path = capture_root
+        .join(&capture_stem)
+        .join(CHECKPOINT_CAPTURE_FILE);
+    write_private_json(
+        &path,
+        &Json::object([
+            ("schemaVersion", Json::Number("1".to_owned())),
+            ("campaign", Json::from(campaign)),
+            ("issueNumber", Json::from(issue_number)),
+            ("taskId", Json::from(task_id)),
+            ("taskUuid", Json::from(task_uuid)),
+            ("verdict", Json::from(verdict.clone())),
+            ("exitCode", exit_code),
+            ("stdout", Json::from(stdout)),
+            ("stdoutTruncated", Json::from(stdout_truncated)),
+            ("stderr", Json::from(stderr)),
+            ("stderrTruncated", Json::from(stderr_truncated)),
+        ]),
+    )?;
+    Ok(CheckpointCapture {
+        path,
+        stdout_truncated,
+        stderr_truncated,
+        verdict,
+    })
+}
+
+fn read_checkpoint_capture(path: &Path, campaign: &str, task_id: &str) -> Result<Json> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            DriverError::new(format!(
+                "cannot open checkpoint capture {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > 128 * 1024 {
+        return Err(DriverError::new(format!(
+            "checkpoint capture is not a bounded private regular file: {}",
+            path.display()
+        )));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let value = json::parse(&text).map_err(|error| {
+        DriverError::new(format!(
+            "checkpoint capture is not valid JSON: {}: {error}",
+            path.display()
+        ))
+    })?;
+    let capture = object_complete(
+        &value,
+        &[
+            "schemaVersion",
+            "campaign",
+            "issueNumber",
+            "taskId",
+            "taskUuid",
+            "verdict",
+            "exitCode",
+            "stdout",
+            "stdoutTruncated",
+            "stderr",
+            "stderrTruncated",
+        ],
+        "checkpoint capture",
+    )?;
+    if capture.get("schemaVersion").and_then(Json::as_u64) != Some(1)
+        || capture.get("campaign").and_then(Json::as_str) != Some(campaign)
+        || capture.get("taskId").and_then(Json::as_str) != Some(task_id)
+    {
+        return Err(DriverError::new(
+            "checkpoint capture identity does not match the machine receipt",
+        ));
+    }
+    for stream in ["stdout", "stderr"] {
+        if capture
+            .get(stream)
+            .and_then(Json::as_str)
+            .is_none_or(|content| content.len() > CHECKPOINT_CAPTURE_MAX_BYTES)
+        {
+            return Err(DriverError::new(format!(
+                "checkpoint capture {stream} exceeds its 8 KiB bound"
+            )));
+        }
+    }
+    required_bool(
+        capture.get("stdoutTruncated"),
+        "checkpoint capture stdoutTruncated",
+    )?;
+    required_bool(
+        capture.get("stderrTruncated"),
+        "checkpoint capture stderrTruncated",
+    )?;
+    Ok(value)
+}
+
+fn checkpoint_capture_note(value: Option<&Json>, campaign: &str, task_id: &str) -> Result<String> {
+    let value = value.ok_or_else(|| DriverError::new("checkpointCapture must be an object"))?;
+    let publication = object_exact(
+        value,
+        &["path", "postFailureEvidence", "postFailureStderr"],
+        "checkpointCapture",
+    )?;
+    let path_text = required_string(publication.get("path"), "checkpointCapture.path", Some(700))?;
+    let path = PathBuf::from(&path_text);
+    if !path.is_absolute() {
+        return Err(DriverError::new("checkpointCapture.path must be absolute"));
+    }
+    let post_evidence = required_bool(
+        publication.get("postFailureEvidence"),
+        "checkpointCapture.postFailureEvidence",
+    )?;
+    let post_stderr = required_bool(
+        publication.get("postFailureStderr"),
+        "checkpointCapture.postFailureStderr",
+    )?;
+    if post_stderr && !post_evidence {
+        return Err(DriverError::new(
+            "checkpointCapture.postFailureStderr requires postFailureEvidence",
+        ));
+    }
+    let note = format!("Checkpoint capture: {path_text}");
+    if !(post_evidence && post_stderr) {
+        return Ok(note);
+    }
+    let capture = read_checkpoint_capture(&path, campaign, task_id)?;
+    let stderr = capture
+        .as_object()
+        .and_then(|capture| capture.get("stderr"))
+        .and_then(Json::as_str)
+        .expect("validated capture stderr");
+    let lines: Vec<_> = stderr.lines().rev().take(CHECKPOINT_STDERR_LINES).collect();
+    if lines.is_empty() {
+        return Ok(note);
+    }
+    let lines: Vec<_> = lines.into_iter().rev().collect();
+    let mut excerpt = lines
+        .iter()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let heading = format!(
+        "{note}\n\nCheckpoint stderr (last {} line(s), before public redaction):\n\n",
+        lines.len()
+    );
+    let available = CHECKPOINT_PUBLIC_NOTE_MAX_CHARS.saturating_sub(heading.chars().count());
+    if excerpt.chars().count() > available {
+        let marker = "    [... earlier checkpoint stderr lines shortened ...]\n";
+        let tail_width = available.saturating_sub(marker.chars().count());
+        let tail: String = excerpt
+            .chars()
+            .rev()
+            .take(tail_width)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        excerpt = if tail_width == 0 {
+            take_chars(marker, available)
+        } else {
+            format!("{marker}{tail}")
+        };
+    }
+    Ok(format!("{heading}{excerpt}"))
+}
+
+fn append_checkpoint_capture_note(value: &str, note: &str, maximum: usize) -> String {
+    if note.is_empty() {
+        return value.to_owned();
+    }
+    let suffix = format!("\n\n{note}");
+    if value.chars().count() + suffix.chars().count() <= maximum {
+        return format!("{value}{suffix}");
+    }
+    let marker = "\n[... earlier machine detail shortened for checkpoint capture ...]";
+    let available = maximum
+        .saturating_sub(marker.chars().count())
+        .saturating_sub(suffix.chars().count());
+    format!(
+        "{}{}{}",
+        take_chars(value, available).trim_end(),
+        marker,
+        suffix
+    )
+}
+
+fn action_checkpoint(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "campaignIdentity",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "task",
+            "source",
+            "workspace",
+            "baseRevision",
+            "captureRoot",
+            "execution",
+            "specRepository",
+            "issueRepository",
+        ],
+        "checkpoint brief",
+    )?;
+    let capture_present = data.contains_key("captureRoot");
+    if capture_present != data.contains_key("execution") {
+        return Err(DriverError::new(
+            "checkpoint brief must carry captureRoot and execution together",
+        ));
+    }
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let repository = repository_name(data.get("repository"), "repository")?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    campaign_coordinates(data, repository, config.clone())?;
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let task_value = data
+        .get("task")
+        .ok_or_else(|| DriverError::new("checkpoint task must be an object"))?;
+    let task = object_exact(
+        task_value,
+        &[
+            "id",
+            "kind",
+            "title",
+            "argv",
+            "runtimeMaxSec",
+            "dependencies",
+            "brief",
+            "revision",
+        ],
+        "checkpoint task",
+    )?;
+    let task_id = required_string(task.get("id"), "checkpoint task.id", Some(80))?;
+    if !is_task_id(&task_id) || task.get("kind").and_then(Json::as_str) != Some("checkpoint") {
+        return Err(DriverError::new(
+            "checkpoint task must carry a safe id and kind checkpoint",
+        ));
+    }
+    required_string(task.get("title"), "checkpoint task.title", Some(300))?;
+    argv_list(task.get("argv"), "checkpoint task.argv")?;
+    positive_u64(task.get("runtimeMaxSec"), "checkpoint task.runtimeMaxSec")?;
+    string_list(
+        task.get("dependencies"),
+        "checkpoint task.dependencies",
+        false,
+    )?;
+    let source_value = data
+        .get("source")
+        .ok_or_else(|| DriverError::new("source must be an object"))?;
+    let source = object_exact(
+        source_value,
+        &["path", "sha256", "revision", "repository"],
+        "source",
+    )?;
+    required_string(source.get("path"), "source.path", None)?;
+    if source.contains_key("repository") {
+        repository_name(source.get("repository"), "source.repository")?;
+    }
+    let source_sha256 = required_string(source.get("sha256"), "source.sha256", None)?;
+    let source_revision = full_oid(source.get("revision"), "source.revision")?;
+    let code_revision = if data.contains_key("baseRevision") {
+        full_oid(data.get("baseRevision"), "baseRevision")?
+    } else {
+        source_revision
+    };
+    let workspace = prepared_workspace(data.get("workspace"), "workspace")?;
+    if workspace.task_id != task_id {
+        return Err(DriverError::new(
+            "checkpoint task.id does not match workspace.taskId",
+        ));
+    }
+    if !is_full_oid(&workspace.base_rev) {
+        return Err(DriverError::new(
+            "workspace.baseRev must be a full Git object ID",
+        ));
+    }
+    if !workspace.worktree.is_absolute() || !workspace.worktree.is_dir() {
+        return Err(DriverError::new(
+            "workspace.worktreePath must be an absolute existing directory",
+        ));
+    }
+    let capture = if capture_present {
+        Some(persist_checkpoint_capture(
+            data.get("captureRoot"),
+            data.get("execution"),
+            &campaign,
+            &issue_number,
+            &task_id,
+        )?)
+    } else {
+        None
+    };
+    if let Some(capture) = &capture {
+        if capture.verdict != "pass" {
+            return Ok(Json::object([
+                ("taskId", Json::from(task_id)),
+                ("passed", Json::from(false)),
+                ("ref", Json::Null),
+                ("revision", Json::from(workspace.base_rev)),
+                (
+                    "capturePath",
+                    Json::from(capture.path.to_string_lossy().into_owned()),
+                ),
+                ("stdoutTruncated", Json::from(capture.stdout_truncated)),
+                ("stderrTruncated", Json::from(capture.stderr_truncated)),
+            ]));
+        }
+    }
+    if git(&workspace.worktree, ["branch", "--show-current"], true)?.stdout_trimmed()
+        != workspace.branch
+    {
+        return Err(DriverError::new(
+            "checkpoint worktree changed branches during validation",
+        ));
+    }
+    if git(&workspace.worktree, ["rev-parse", "HEAD^{commit}"], true)?.stdout_trimmed()
+        != workspace.base_rev
+    {
+        return Err(DriverError::new(
+            "checkpoint command changed HEAD instead of validating the prepared base",
+        ));
+    }
+    if !git(
+        &workspace.worktree,
+        ["status", "--porcelain", "--untracked-files=no"],
+        true,
+    )?
+    .stdout
+    .is_empty()
+    {
+        return Err(DriverError::new(
+            "checkpoint command changed tracked files instead of validating the prepared base",
+        ));
+    }
+    git(
+        &config.checkout,
+        ["fetch", "--prune", "--no-tags", &config.remote],
+        true,
+    )?;
+    let uses_integration = data.contains_key("campaignIdentity");
+    let current_base = if uses_integration {
+        required_integration_revision(
+            &config,
+            &campaign,
+            &required_string(data.get("campaignIdentity"), "campaignIdentity", Some(128))?,
+        )?
+    } else {
+        git(
+            &config.checkout,
+            [
+                "rev-parse",
+                "--verify",
+                &format!("{}/{}^{{commit}}", config.remote, config.base_branch),
+            ],
+            true,
+        )?
+        .stdout_trimmed()
+    };
+    if !git(
+        &config.checkout,
+        [
+            "merge-base",
+            "--is-ancestor",
+            &code_revision,
+            &workspace.base_rev,
+        ],
+        false,
+    )?
+    .success()
+    {
+        return Err(DriverError::new(
+            "prepared checkpoint base does not descend from the witnessed worklist revision",
+        ));
+    }
+    if !git(
+        &config.checkout,
+        [
+            "merge-base",
+            "--is-ancestor",
+            &workspace.base_rev,
+            &current_base,
+        ],
+        false,
+    )?
+    .success()
+    {
+        return Err(DriverError::new(format!(
+            "{} diverged after the checkpoint command was witnessed",
+            if uses_integration {
+                "integration branch"
+            } else {
+                "remote base"
+            }
+        )));
+    }
+    let reference = checkpoint_ref(
+        &campaign,
+        &issue_number,
+        &task_id,
+        &source_sha256,
+        &workspace.base_rev,
+    )?;
+    let existing = remote_ref_oid(&config.checkout, &config.remote, &reference)?;
+    if existing
+        .as_ref()
+        .is_some_and(|existing| existing != &workspace.base_rev)
+    {
+        return Err(DriverError::new(format!(
+            "immutable checkpoint ref {reference:?} already points to another object"
+        )));
+    }
+    if existing.is_none() {
+        let pushed = git(
+            &workspace.worktree,
+            [
+                "push",
+                &config.remote,
+                &format!("{}:{reference}", workspace.base_rev),
+            ],
+            false,
+        )?;
+        if !pushed.success()
+            && remote_ref_oid(&config.checkout, &config.remote, &reference)?
+                != Some(workspace.base_rev.clone())
+        {
+            return Err(DriverError::new(format!(
+                "cannot create immutable checkpoint ref {reference:?}: {}",
+                pushed.detail()
+            )));
+        }
+    }
+    if remote_ref_oid(&config.checkout, &config.remote, &reference)?
+        != Some(workspace.base_rev.clone())
+    {
+        return Err(DriverError::new(
+            "checkpoint completion ref did not expose the witnessed base revision",
+        ));
+    }
+    if current_base != workspace.base_rev {
+        return Err(DriverError::new(format!(
+            "checkpoint {task_id:?} recorded {} in {reference:?}, but the base branch has already advanced to {current_base}: the receipt cannot complete the task and the base branch is moving faster than this checkpoint runs",
+            workspace.base_rev
+        )));
+    }
+    let mut result = BTreeMap::from([
+        ("taskId".to_owned(), Json::from(task_id)),
+        ("ref".to_owned(), Json::from(reference)),
+        ("revision".to_owned(), Json::from(workspace.base_rev)),
+    ]);
+    if let Some(capture) = capture {
+        result.insert("passed".to_owned(), Json::from(true));
+        result.insert(
+            "capturePath".to_owned(),
+            Json::from(capture.path.to_string_lossy().into_owned()),
+        );
+        result.insert(
+            "stdoutTruncated".to_owned(),
+            Json::from(capture.stdout_truncated),
+        );
+        result.insert(
+            "stderrTruncated".to_owned(),
+            Json::from(capture.stderr_truncated),
+        );
+    }
+    Ok(Json::Object(result))
+}
+
+fn merge_method(value: Option<&Json>, context: &str) -> Result<String> {
+    let Some(value) = value else {
+        return Ok("squash".to_owned());
+    };
+    if matches!(value, Json::Null) {
+        return Ok("squash".to_owned());
+    }
+    let method = required_string(Some(value), context, None)?;
+    if !matches!(method.as_str(), "merge" | "squash") {
+        return Err(DriverError::new(format!(
+            "{context} must be merge or squash"
+        )));
+    }
+    Ok(method)
+}
+
+#[derive(Debug)]
+struct AssistedBy {
+    adapter: String,
+    model: String,
+    task_uuid: String,
+    witness_sequence: u64,
+}
+
+fn assisted_by_record(value: Option<&Json>) -> Result<Option<AssistedBy>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let record = object_exact(
+        value,
+        &["adapter", "model", "taskUuid", "witnessSeq"],
+        "assistedBy",
+    )?;
+    let adapter = required_string(record.get("adapter"), "assistedBy.adapter", Some(128))?;
+    let model = required_string(record.get("model"), "assistedBy.model", Some(128))?;
+    let task_uuid = required_string(record.get("taskUuid"), "assistedBy.taskUuid", Some(36))?;
+    Uuid::parse_str(&task_uuid)
+        .map_err(|_| DriverError::new("assistedBy.taskUuid must be a UUID"))?;
+    let witness_sequence = positive_u64(record.get("witnessSeq"), "assistedBy.witnessSeq")?;
+    for (name, value) in [("adapter", &adapter), ("model", &model)] {
+        if value.contains(['(', ')', '\n']) {
+            return Err(DriverError::new(format!(
+                "assistedBy.{name} must not contain trailer punctuation"
+            )));
+        }
+    }
+    Ok(Some(AssistedBy {
+        adapter,
+        model,
+        task_uuid,
+        witness_sequence,
+    }))
+}
+
+fn assisted_by_trailer(record: Option<&AssistedBy>) -> Result<Option<String>> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let trailer = format!(
+        "{ASSISTED_BY_PREFIX} {}:{} (tally:{} witness:{})",
+        record.adapter, record.model, record.task_uuid, record.witness_sequence
+    );
+    if trailer.chars().count() > 200 {
+        return Err(DriverError::new(
+            "assistedBy renders a trailer over the published cap",
+        ));
+    }
+    Ok(Some(trailer))
+}
+
+fn completion_trailer_block(task_id: &str, revision: &str) -> Result<String> {
+    if !is_task_id(task_id) {
+        return Err(DriverError::new(
+            "completion trailer task must be a safe task ID",
+        ));
+    }
+    let valid = revision.len() == 71
+        && revision.starts_with("sha256:")
+        && revision[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid {
+        return Err(DriverError::new(
+            "completion trailer revision must be a lowercase SHA-256 identity",
+        ));
+    }
+    Ok(format!(
+        "{TALLY_TASK_PREFIX} {task_id}\n{TALLY_REVISION_PREFIX} {revision}"
+    ))
+}
+
+fn local_completion_trailers(data: &BTreeMap<String, Json>) -> Result<String> {
+    let task = data
+        .get("task")
+        .and_then(Json::as_object)
+        .ok_or_else(|| DriverError::new("local merge task must be an object"))?;
+    let revision = task_revision(task)?
+        .ok_or_else(|| DriverError::new("local merge task must carry a completion revision"))?;
+    let task_id = required_string(task.get("id"), "task.id", None)?;
+    completion_trailer_block(&task_id, &revision)
+}
+
+fn valid_trailer_line(line: &str) -> bool {
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && key.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphanumeric()
+            } else {
+                byte.is_ascii_alphanumeric() || byte == b'-'
+            }
+        })
+        && value.starts_with([' ', '\t'])
+        && !value.trim().is_empty()
+        && !value.ends_with(char::is_whitespace)
+}
+
+fn validated_trailer_lines(block: &str, context: &str) -> Result<Vec<String>> {
+    if block.is_empty() || block.contains('\r') || !block.lines().all(valid_trailer_line) {
+        return Err(DriverError::new(format!(
+            "{context} must be one contiguous git trailer block"
+        )));
+    }
+    Ok(block.lines().map(str::to_owned).collect())
+}
+
+fn merge_commit_message(
+    narration: &Json,
+    provenance: Option<&str>,
+    completion: Option<&str>,
+) -> Result<String> {
+    let narration = narration
+        .as_object()
+        .ok_or_else(|| DriverError::new("narration must be an object"))?;
+    let subject = required_string(narration.get("subject"), "narration.subject", None)?;
+    let body = narration.get("body").and_then(Json::as_str).unwrap_or("");
+    let mut trailers = Vec::new();
+    if let Some(completion) = completion {
+        trailers.extend(validated_trailer_lines(completion, "completion trailers")?);
+    }
+    if let Some(provenance) = provenance {
+        trailers.extend(validated_trailer_lines(provenance, "provenance trailers")?);
+    }
+    let trailer_block = trailers.join("\n");
+    let commit_body = match (body.is_empty(), trailer_block.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => body.to_owned(),
+        (true, false) => trailer_block,
+        (false, false) => format!("{body}\n\n{trailer_block}"),
+    };
+    Ok(if commit_body.is_empty() {
+        format!("{subject}\n")
+    } else {
+        format!("{subject}\n\n{commit_body}\n")
+    })
+}
+
+fn merge_receipt_reference(
+    campaign: &str,
+    identity: &str,
+    task_id: &str,
+    revision: Option<&str>,
+) -> String {
+    let suffix = revision.map_or_else(String::new, |revision| {
+        format!("-{}", &revision.trim_start_matches("sha256:")[..16])
+    });
+    format!(
+        "{}/merge/{task_id}{suffix}",
+        local_state_prefix(campaign, identity)
+    )
+}
+
+fn merge_local(
+    data: &BTreeMap<String, Json>,
+    config: &RepoConfig,
+    integration: &BTreeMap<String, Json>,
+    method: &str,
+    narration: &Json,
+    provenance: Option<&str>,
+) -> Result<String> {
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    let identity = campaign_identity(data, &campaign)?;
+    let completion = local_completion_trailers(data)?;
+    let message = merge_commit_message(narration, provenance, Some(&completion))?;
+    let integration_name = integration_branch(&campaign, &identity);
+    let integration_ref = format!("refs/heads/{integration_name}");
+    let published_branch = required_string(integration.get("branch"), "integration.branch", None)?;
+    let published_ref = format!("refs/heads/{published_branch}");
+    let expected_base = full_oid(integration.get("baseRev"), "integration.baseRev")?;
+    let expected_head = full_oid(integration.get("head"), "integration.head")?;
+    let actual_base = local_branch_oid(&config.checkout, &integration_name)?;
+    let actual_head = local_branch_oid(&config.checkout, &published_branch)?;
+    if actual_base.as_deref() != Some(expected_base.as_str()) {
+        return Err(DriverError::new(
+            "local integration branch moved after the rebased head was gated",
+        ));
+    }
+    if actual_head.as_deref() != Some(expected_head.as_str()) {
+        return Err(DriverError::new(
+            "published branch moved after the rebased head was gated",
+        ));
+    }
+    let workspace_root = PathBuf::from(required_string(
+        data.get("workspaceRoot"),
+        "workspaceRoot",
+        None,
+    )?);
+    fs::create_dir_all(&workspace_root)?;
+    let temporary = workspace_root.join(format!("merge-{}", Uuid::new_v4()));
+    let integration_checkout = temporary.join("worktree");
+    fs::create_dir_all(&temporary)?;
+    let checkout_text = integration_checkout.to_string_lossy().into_owned();
+    git(
+        &config.checkout,
+        [
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            &checkout_text,
+            actual_base.as_deref().expect("validated base"),
+        ],
+        true,
+    )?;
+    let merged = (|| {
+        if method == "squash" {
+            git(
+                &integration_checkout,
+                [
+                    "merge",
+                    "--squash",
+                    actual_head.as_deref().expect("validated head"),
+                ],
+                true,
+            )?;
+            if git(
+                &integration_checkout,
+                ["diff", "--cached", "--quiet"],
+                false,
+            )?
+            .success()
+            {
+                return Err(DriverError::new(
+                    "squash merge staged no change against the witnessed base",
+                ));
+            }
+            git_with_input(
+                &integration_checkout,
+                [
+                    "-c",
+                    "user.name=tally spec-build",
+                    "-c",
+                    "user.email=tally-spec-build@invalid",
+                    "commit",
+                    "--quiet",
+                    "--file",
+                    "-",
+                ],
+                message.as_bytes(),
+                true,
+            )?;
+        } else {
+            git(
+                &integration_checkout,
+                [
+                    "-c",
+                    "user.name=tally spec-build",
+                    "-c",
+                    "user.email=tally-spec-build@invalid",
+                    "merge",
+                    "--no-ff",
+                    "--no-commit",
+                    actual_head.as_deref().expect("validated head"),
+                ],
+                true,
+            )?;
+            git_with_input(
+                &integration_checkout,
+                [
+                    "-c",
+                    "user.name=tally spec-build",
+                    "-c",
+                    "user.email=tally-spec-build@invalid",
+                    "commit",
+                    "--quiet",
+                    "--file",
+                    "-",
+                ],
+                message.as_bytes(),
+                true,
+            )?;
+        }
+        let merge_commit =
+            git(&integration_checkout, ["rev-parse", "HEAD"], true)?.stdout_trimmed();
+        let mut transaction = vec![
+            "start".to_owned(),
+            format!("verify {published_ref} {expected_head}"),
+            format!("update {integration_ref} {merge_commit} {expected_base}"),
+        ];
+        if method == "squash" {
+            let task = data
+                .get("task")
+                .and_then(Json::as_object)
+                .ok_or_else(|| DriverError::new("local merge task must be an object"))?;
+            let task_id = required_string(task.get("id"), "task.id", None)?;
+            let revision = task_revision(task)?;
+            let receipt =
+                merge_receipt_reference(&campaign, &identity, &task_id, revision.as_deref());
+            transaction.push(format!("update {receipt} {merge_commit}"));
+        }
+        transaction.extend(["prepare".to_owned(), "commit".to_owned()]);
+        git_with_input(
+            &config.checkout,
+            ["update-ref", "--stdin"],
+            format!("{}\n", transaction.join("\n")).as_bytes(),
+            true,
+        )?;
+        Ok(merge_commit)
+    })();
+    let _ = git(
+        &config.checkout,
+        ["worktree", "remove", "--force", &checkout_text],
+        false,
+    );
+    let _ = fs::remove_dir_all(&temporary);
+    merged
+}
+
+fn action_merge(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "campaignIdentity",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "runId",
+            "workspaceRoot",
+            "task",
+            "workspace",
+            "integration",
+            "domainsRequired",
+            "mergeMethod",
+            "assistedBy",
+            "specRepository",
+            "issueRepository",
+        ],
+        "merge brief",
+    )?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    let workspace = prepared_workspace(data.get("workspace"), "workspace")?;
+    if !is_full_oid(&workspace.base_rev) {
+        return Err(DriverError::new(
+            "workspace.baseRev must be a full Git object ID",
+        ));
+    }
+    if workspace.worktree.exists() && !workspace.worktree.is_dir() {
+        return Err(DriverError::new(
+            "workspace.worktreePath exists but is not a directory",
+        ));
+    }
+    let integration_value = data
+        .get("integration")
+        .ok_or_else(|| DriverError::new("integration must be an object"))?;
+    let integration = object_exact(
+        integration_value,
+        &[
+            "taskId",
+            "baseRev",
+            "branch",
+            "head",
+            "pullRequest",
+            "narration",
+            "regate",
+            "ownership",
+        ],
+        "integration",
+    )?;
+    let method = merge_method(data.get("mergeMethod"), "mergeMethod")?;
+    let narration = narration_record(integration.get("narration"), "integration.narration")?;
+    let assisted_by = assisted_by_record(data.get("assistedBy"))?;
+    let trailer = if method == "squash" {
+        assisted_by_trailer(assisted_by.as_ref())?
+    } else {
+        None
+    };
+    let domains_required = required_bool(data.get("domainsRequired"), "domainsRequired")?;
+    let task_id = required_string(integration.get("taskId"), "integration.taskId", None)?;
+    let base_rev = full_oid(integration.get("baseRev"), "integration.baseRev")?;
+    let branch = required_string(integration.get("branch"), "integration.branch", None)?;
+    let head = full_oid(integration.get("head"), "integration.head")?;
+    let pull_request = required_string(
+        integration.get("pullRequest"),
+        "integration.pullRequest",
+        None,
+    )?;
+    let regate = required_bool(integration.get("regate"), "integration.regate")?;
+    let ownership = normalize_ownership(integration.get("ownership"), "integration.ownership")?;
+    if ownership.task_id != task_id {
+        return Err(DriverError::new(
+            "integration.ownership.taskId does not match integration.taskId",
+        ));
+    }
+    if ownership.domains_required != domains_required {
+        return Err(DriverError::new(
+            "integration.ownership.domainsRequired does not match domainsRequired",
+        ));
+    }
+    if ownership.base_rev != base_rev {
+        return Err(DriverError::new(
+            "integration.ownership.baseRev does not match integration.baseRev",
+        ));
+    }
+    if ownership.head != head {
+        return Err(DriverError::new(
+            "integration.ownership.head does not match integration.head",
+        ));
+    }
+    if task_id != workspace.task_id {
+        return Err(DriverError::new(
+            "integration.taskId does not match workspace.taskId",
+        ));
+    }
+    if branch != workspace.publish_branch {
+        return Err(DriverError::new(
+            "integration.branch does not match workspace.publishBranch",
+        ));
+    }
+    let merge_commit = merge_local(
+        data,
+        &config,
+        integration,
+        &method,
+        &narration,
+        trailer.as_deref(),
+    )?;
+    Ok(Json::object([
+        ("taskId", Json::from(task_id)),
+        ("head", Json::from(head)),
+        ("mergeCommit", Json::from(merge_commit)),
+        ("pullRequest", Json::from(pull_request)),
+        ("regated", Json::from(regate)),
+        ("ownership", ownership.to_json()),
+        ("trailer", trailer.map_or(Json::Null, Json::from)),
+    ]))
+}
+
 fn required_text(value: Option<&Json>, context: &str, maximum: usize) -> Result<String> {
     let value = value
         .and_then(Json::as_str)
@@ -2112,10 +4740,315 @@ fn campaign_attempt_state(
     )
 }
 
+fn attempt_state_all(events: Vec<AttemptEvent>) -> Result<AttemptState> {
+    let task_ids: BTreeSet<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AttemptEvent::Diagnosis(receipt) | AttemptEvent::Retry(receipt) => {
+                Some(receipt.task_id.clone())
+            }
+            AttemptEvent::Escalation { .. } | AttemptEvent::Pardon { .. } => None,
+        })
+        .collect();
+    fold_attempt_receipts(events, &task_ids)
+}
+
+fn campaign_attempt_state_all(
+    source: Option<&Json>,
+    campaign: &str,
+    issue_number: &str,
+) -> Result<AttemptState> {
+    attempt_state_all(read_attempt_receipts(source, campaign, issue_number)?)
+}
+
+fn prepare_attempt_receipts_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| DriverError::new("attemptReceipts.path has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        DriverError::new(format!(
+            "cannot prepare attempt-receipts directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let metadata = fs::symlink_metadata(parent).map_err(|error| {
+        DriverError::new(format!(
+            "cannot prepare attempt-receipts directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DriverError::new(
+            "attempt-receipts parent must be a real directory",
+        ));
+    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        DriverError::new(format!(
+            "cannot prepare attempt-receipts directory {}: {error}",
+            parent.display()
+        ))
+    })
+}
+
+fn read_attempt_records_locked(
+    file: &mut File,
+    path: &Path,
+    campaign: &str,
+    issue_number: &str,
+    repair_tail: bool,
+) -> Result<(Vec<Json>, Vec<AttemptEvent>)> {
+    let metadata = file.metadata().map_err(|error| {
+        DriverError::new(format!(
+            "cannot read attempt-receipts log {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_ATTEMPT_RECEIPTS_LOG_BYTES
+    {
+        return Err(DriverError::new(format!(
+            "attempt-receipts log is not a bounded private regular file: {}",
+            path.display()
+        )));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut raw)?;
+    let complete = raw
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if complete != raw.len() && repair_tail {
+        file.set_len(complete as u64)?;
+        file.sync_all()?;
+    }
+    raw.truncate(complete);
+    let text = std::str::from_utf8(&raw).map_err(|error| {
+        DriverError::new(format!(
+            "attempt-receipts log {} is not UTF-8: {error}",
+            path.display()
+        ))
+    })?;
+    let mut records = Vec::new();
+    let mut events = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            return Err(DriverError::new(format!(
+                "attempt-receipts log {} contains a blank record",
+                path.display()
+            )));
+        }
+        let sequence = index as u64 + 1;
+        let record = json::parse(line).map_err(|error| {
+            DriverError::new(format!(
+                "attempt receipt {sequence} in {} is invalid JSON: {error}",
+                path.display()
+            ))
+        })?;
+        events.push(validate_attempt_receipt(
+            &record,
+            path,
+            sequence,
+            campaign,
+            issue_number,
+        )?);
+        records.push(record);
+    }
+    Ok((records, events))
+}
+
+fn record_with_comment(record: &Json, campaign: &str) -> Result<Json> {
+    let mut object = record
+        .as_object()
+        .cloned()
+        .ok_or_else(|| DriverError::new("attempt receipt must be an object"))?;
+    let sequence = object
+        .get("sequence")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| DriverError::new("attempt receipt sequence is invalid"))?;
+    object.insert(
+        "comment".to_owned(),
+        Json::from(attempt_receipt_url(campaign, sequence)),
+    );
+    Ok(Json::Object(object))
+}
+
+fn comment_sequence(comment: &str) -> Result<usize> {
+    comment
+        .rsplit_once('/')
+        .and_then(|(_, sequence)| sequence.parse::<usize>().ok())
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(|| DriverError::new("attempt receipt comment has no sequence"))
+}
+
+fn append_attempt_receipt(
+    source: Option<&Json>,
+    campaign: &str,
+    issue_number: &str,
+    payload: Json,
+) -> Result<(bool, Json)> {
+    let path = attempt_receipts_path(source, campaign)?;
+    prepare_attempt_receipts_parent(&path)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(O_CLOEXEC | O_NOFOLLOW);
+    let (mut file, created) = match options.create_new(true).open(&path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            options.create_new(false);
+            (
+                options.open(&path).map_err(|error| {
+                    DriverError::new(format!(
+                        "cannot open attempt-receipts log {}: {error}",
+                        path.display()
+                    ))
+                })?,
+                false,
+            )
+        }
+        Err(error) => {
+            return Err(DriverError::new(format!(
+                "cannot create attempt-receipts log {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(DriverError::new(format!(
+            "attempt-receipts log is not a private regular file: {}",
+            path.display()
+        )));
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
+        return Err(DriverError::new(format!(
+            "cannot lock attempt-receipts log {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let result = (|| {
+        if created {
+            let parent = path.parent().expect("validated parent");
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_CLOEXEC | O_DIRECTORY)
+                .open(parent)?;
+            directory.sync_all()?;
+        }
+        let (records, events) =
+            read_attempt_records_locked(&mut file, &path, campaign, issue_number, true)?;
+        let state = attempt_state_all(events)?;
+        let payload_object = payload
+            .as_object()
+            .ok_or_else(|| DriverError::new("attempt receipt payload must be an object"))?;
+        let kind = payload_object
+            .get("kind")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        if matches!(kind, "diagnosis" | "retry") {
+            let active = if kind == "diagnosis" {
+                &state.diagnoses
+            } else {
+                &state.retries
+            };
+            let task_id = payload_object.get("taskId").and_then(Json::as_str);
+            let attempt = payload_object.get("attempt").and_then(Json::as_u64);
+            if let Some(existing) = active.iter().find(|receipt| {
+                Some(receipt.task_id.as_str()) == task_id && Some(receipt.attempt) == attempt
+            }) {
+                let sequence = comment_sequence(&existing.comment)?;
+                return record_with_comment(&records[sequence - 1], campaign)
+                    .map(|record| (false, record));
+            }
+            let spent = active
+                .iter()
+                .filter(|receipt| Some(receipt.task_id.as_str()) == task_id)
+                .count() as u64;
+            if attempt != Some(spent + 1) {
+                return Err(DriverError::new(format!(
+                    "task {:?} {kind} attempt {:?} is not next after {spent} log receipts",
+                    task_id.unwrap_or_default(),
+                    attempt.unwrap_or_default()
+                )));
+            }
+        } else if kind == "escalation" {
+            if let Some(comment) = &state.escalation {
+                let sequence = comment_sequence(comment)?;
+                return record_with_comment(&records[sequence - 1], campaign)
+                    .map(|record| (false, record));
+            }
+        }
+        let sequence = records.len() as u64 + 1;
+        let mut record = BTreeMap::from([
+            ("schemaVersion".to_owned(), Json::Number("1".to_owned())),
+            ("sequence".to_owned(), Json::Number(sequence.to_string())),
+            ("campaign".to_owned(), Json::from(campaign)),
+            ("issueNumber".to_owned(), Json::from(issue_number)),
+        ]);
+        record.extend(payload_object.clone());
+        let record = Json::Object(record);
+        validate_attempt_receipt(&record, &path, sequence, campaign, issue_number)?;
+        let line = format!("{}\n", record.stringify());
+        if file.metadata()?.len() + line.len() as u64 > MAX_ATTEMPT_RECEIPTS_LOG_BYTES {
+            return Err(DriverError::new("attempt-receipts log exceeds 128 MiB"));
+        }
+        file.write_all(line.as_bytes()).map_err(|error| {
+            DriverError::new(format!(
+                "cannot append attempt-receipts log {}: {error}",
+                path.display()
+            ))
+        })?;
+        file.sync_all()?;
+        record_with_comment(&record, campaign).map(|record| (true, record))
+    })();
+    unsafe {
+        flock(file.as_raw_fd(), LOCK_UN);
+    }
+    result
+}
+
+fn record_diagnosis(
+    source: Option<&Json>,
+    campaign: &str,
+    issue_number: &str,
+    task_id: &str,
+    attempt: u64,
+    diagnosis: &str,
+) -> Result<String> {
+    let (_, receipt) = append_attempt_receipt(
+        source,
+        campaign,
+        issue_number,
+        Json::object([
+            ("kind", Json::from("diagnosis")),
+            ("taskId", Json::from(task_id)),
+            ("attempt", Json::Number(attempt.to_string())),
+            ("diagnosis", Json::from(diagnosis)),
+            ("redaction", Json::from(PUBLIC_REDACTION)),
+        ]),
+    )?;
+    Ok(receipt
+        .as_object()
+        .and_then(|receipt| receipt.get("comment"))
+        .and_then(Json::as_str)
+        .expect("append receipt returns a comment")
+        .to_owned())
+}
+
 fn task_revision(task: &BTreeMap<String, Json>) -> Result<Option<String>> {
     let Some(value) = task.get("revision") else {
         return Ok(None);
     };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
     let task_id = task.get("id").and_then(Json::as_str).unwrap_or("None");
     let revision = required_string(Some(value), &format!("task {task_id} revision"), None)?;
     let valid = revision.len() == 71
@@ -4259,6 +7192,112 @@ fn action_prep(brief: &Json) -> Result<Json> {
     )
 }
 
+fn action_preflight(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "runId",
+            "workspaceRoot",
+        ],
+        "preflight brief",
+    )?;
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let repository = repository_name(data.get("repository"), "repository")?;
+    campaign_issue(data.get("issue"))?;
+    let run_id = required_string(data.get("runId"), "runId", Some(512))?;
+    let workspace_root = PathBuf::from(required_string(
+        data.get("workspaceRoot"),
+        "workspaceRoot",
+        None,
+    )?);
+    if !workspace_root.is_absolute() {
+        return Err(DriverError::new("workspaceRoot must be absolute"));
+    }
+    let config = repo_config(data.get("repositoryConfig"))?;
+    let run_hash = &sha256::digest(run_id.as_bytes())[..12];
+    let campaign_slug = safe_slug(&campaign, 24);
+    let repository_slug = safe_slug(
+        repository
+            .split_once('/')
+            .map_or(repository.as_str(), |(_, name)| name),
+        40,
+    );
+    let task_id = "campaign-preflight";
+    let branch = format!("tally-work/{campaign_slug}-{run_hash}/_campaign-preflight");
+    let worktree = resolve(
+        &workspace_root
+            .join(repository_slug)
+            .join(run_hash)
+            .join("_campaign-preflight"),
+    )?;
+    let expected = lane_identity(
+        &campaign,
+        &repository,
+        &run_id,
+        task_id,
+        "preflight",
+        &branch,
+        &branch,
+    );
+
+    let resumed = worktrees::resume(&config.checkout, &worktree, &expected, &["baserev"])?;
+    if let Some(resumed) = &resumed {
+        if resumed.complete {
+            let base_rev = resumed
+                .identity
+                .get("baserev")
+                .cloned()
+                .ok_or_else(|| DriverError::new("preflight lane baseRev is required"))?;
+            return Ok(prepared_result(
+                task_id, &base_rev, &branch, &branch, &worktree, None,
+            ));
+        }
+    }
+
+    git(&config.checkout, ["fetch", "--prune", &config.remote], true)?;
+    let base_ref = format!("{}/{}", config.remote, config.base_branch);
+    let base_tip = git(
+        &config.checkout,
+        ["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+        true,
+    )?
+    .stdout_trimmed();
+    let lane_head = if let Some(resumed) = resumed {
+        resumed.head
+    } else {
+        let start_rev = if worktrees::branch_exists(&config.checkout, &branch)? {
+            format!("refs/heads/{branch}")
+        } else {
+            base_tip.clone()
+        };
+        worktrees::add(&config.checkout, &worktree, &branch, &start_rev)?
+    };
+    let base_rev = git(
+        &config.checkout,
+        ["merge-base", &lane_head, &base_tip],
+        true,
+    )?
+    .stdout_trimmed();
+    if !is_full_oid(&base_rev) {
+        return Err(DriverError::new(format!(
+            "cannot derive a base revision for campaign lane {branch:?}"
+        )));
+    }
+    let mut recorded = expected;
+    recorded.insert("baserev".to_owned(), base_rev.clone());
+    worktrees::write_identity(&worktree, &recorded)?;
+    Ok(prepared_result(
+        task_id, &base_rev, &branch, &branch, &worktree, None,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_preparation(
     config: &RepoConfig,
@@ -4548,7 +7587,7 @@ fn normalize_constraints(value: Option<&Json>, context: &str) -> Result<Vec<Cons
                 )));
             }
         }
-        object
+        let checked_paths = object
             .get("checkedPaths")
             .and_then(Json::as_u64)
             .and_then(|value| usize::try_from(value).ok())
@@ -4561,9 +7600,10 @@ fn normalize_constraints(value: Option<&Json>, context: &str) -> Result<Vec<Cons
         constraints.push(Constraint {
             gate_id,
             patterns,
+            checked_paths,
             base_rev: full_oid(object.get("baseRev"), &format!("{item_context}.baseRev"))?,
+            head,
         });
-        let _ = head;
     }
     Ok(constraints)
 }
@@ -4940,11 +7980,1648 @@ fn evaluate_forbid_paths(
             preview.push_str(&format!("; and {} more", violations.len() - 20));
         }
         return Err(DriverError::new(format!(
-            "forbidPaths gate {gate_id:?} rejected {} path(s) touched in lane history (a later removal does not clear this; the path must never appear in any lane commit): {preview}",
+            "forbidPaths gate '{gate_id}' rejected {} path(s) touched in lane history (a later removal does not clear this; the path must never appear in any lane commit): {preview}",
             violations.len()
         )));
     }
     Ok(changed.len())
+}
+
+fn current_base_revision(worktree: &Path, config: &RepoConfig) -> Result<String> {
+    let reference = format!("refs/heads/{}", config.base_branch);
+    let fetched = git(
+        worktree,
+        [
+            "fetch",
+            "--no-tags",
+            "--end-of-options",
+            &config.remote,
+            &reference,
+        ],
+        false,
+    )?;
+    if !fetched.success() {
+        return Err(DriverError::new(format!(
+            "cannot read base branch {:?} from {:?}: {}",
+            config.base_branch,
+            config.remote,
+            fetched.detail()
+        )));
+    }
+    full_oid(
+        Some(&Json::from(
+            git(
+                worktree,
+                ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+                true,
+            )?
+            .stdout_trimmed(),
+        )),
+        "fetched base branch revision",
+    )
+}
+
+fn action_ownership(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &["task", "domainsRequired", "repositoryConfig", "workspace"],
+        "ownership brief",
+    )?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    let workspace = prepared_workspace(data.get("workspace"), "workspace")?;
+    if !is_task_id(&workspace.task_id) {
+        return Err(DriverError::new("workspace.taskId is not safe"));
+    }
+    if !is_full_oid(&workspace.base_rev) {
+        return Err(DriverError::new(
+            "workspace.baseRev must be a full Git object ID",
+        ));
+    }
+    if !workspace.worktree.is_absolute() || !workspace.worktree.is_dir() {
+        return Err(DriverError::new(
+            "workspace.worktreePath must be an absolute existing directory",
+        ));
+    }
+    git(&workspace.worktree, ["rev-parse", "--git-dir"], true)?;
+    let actual_branch =
+        git(&workspace.worktree, ["branch", "--show-current"], true)?.stdout_trimmed();
+    if actual_branch != workspace.branch {
+        return Err(DriverError::new(format!(
+            "worktree is on branch {actual_branch:?}, expected {:?}",
+            workspace.branch
+        )));
+    }
+    if !git(&workspace.worktree, ["status", "--porcelain"], true)?
+        .stdout
+        .is_empty()
+    {
+        return Err(DriverError::new(
+            "agent left uncommitted changes; commit the task before ownership validation",
+        ));
+    }
+    let head = git(
+        &workspace.worktree,
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        true,
+    )?
+    .stdout_trimmed();
+    if head == workspace.base_rev {
+        return Err(DriverError::new(
+            "agent produced no commit relative to the prepared base",
+        ));
+    }
+    if !git(
+        &workspace.worktree,
+        ["merge-base", "--is-ancestor", &workspace.base_rev, &head],
+        false,
+    )?
+    .success()
+    {
+        return Err(DriverError::new(
+            "task head is not descended from its prepared base revision",
+        ));
+    }
+    let domains_required = required_bool(data.get("domainsRequired"), "domainsRequired")?;
+    let current_base = current_base_revision(&workspace.worktree, &config)?;
+    Ok(enforce_conflict_domains(
+        &workspace.worktree,
+        &workspace.base_rev,
+        &head,
+        data.get("task"),
+        &workspace.task_id,
+        domains_required,
+        Some(&current_base),
+    )?
+    .to_json())
+}
+
+fn action_tree_delta(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &["task", "workspace", "ownedPaths", "ownershipRan"],
+        "tree-delta brief",
+    )?;
+    let ownership_ran = data
+        .get("ownershipRan")
+        .map(|value| required_bool(Some(value), "ownershipRan"))
+        .transpose()?
+        .unwrap_or(true);
+    let task = data
+        .get("task")
+        .and_then(Json::as_object)
+        .ok_or_else(|| DriverError::new("task must be an object"))?;
+    let task_id = required_string(task.get("id"), "task.id", None)?;
+    if !is_task_id(&task_id) {
+        return Err(DriverError::new("task.id is not safe"));
+    }
+    let workspace = data
+        .get("workspace")
+        .ok_or_else(|| DriverError::new("workspace must be an object"))?;
+    let workspace = object_exact(
+        workspace,
+        &[
+            "taskId",
+            "baseRev",
+            "branch",
+            "worktreePath",
+            "conflictDomains",
+        ],
+        "workspace",
+    )?;
+    normalize_paths(
+        workspace.get("conflictDomains"),
+        "workspace.conflictDomains",
+        false,
+    )?;
+    let workspace_task_id = required_string(workspace.get("taskId"), "workspace.taskId", None)?;
+    if workspace_task_id != task_id {
+        return Err(DriverError::new("workspace.taskId does not match task.id"));
+    }
+    let worktree = PathBuf::from(required_string(
+        workspace.get("worktreePath"),
+        "workspace.worktreePath",
+        None,
+    )?);
+    if !worktree.is_absolute() || !worktree.is_dir() {
+        return Err(DriverError::new(
+            "workspace.worktreePath must be an absolute existing directory",
+        ));
+    }
+    git(&worktree, ["rev-parse", "--git-dir"], true)?;
+
+    let (allowlist, basis) = if task.contains_key("conflictDomains") {
+        let domains = normalize_paths(task.get("conflictDomains"), "task.conflictDomains", false)?
+            .expect("present conflictDomains stays present");
+        let basis = if domains.is_empty() {
+            "declared-empty"
+        } else {
+            "declared"
+        };
+        (domains, basis)
+    } else if ownership_ran {
+        let owned = match data.get("ownedPaths") {
+            Some(value) if !matches!(value, Json::Null) => {
+                string_list(Some(value), "ownedPaths", false)?
+            }
+            _ => Vec::new(),
+        };
+        (owned, "owned-paths-fallback")
+    } else {
+        return Err(DriverError::new(format!(
+            "tree-delta gate refuses to judge task {task_id:?}: its agent node failed, so the ownership node never ran and certified no ownedPaths, and the task declares no conflictDomains -- there is no allowlist to judge the worktree against. Declare conflictDomains for this task and re-arm. The pre-agent baseline is left in place, so the writes this pass could not judge are still judgeable then."
+        )));
+    };
+
+    let before = worktrees::read_snapshot(&worktree)?.ok_or_else(|| {
+        DriverError::new(
+            "no change-set snapshot was recorded before the agent node; cannot evaluate the tree-delta gate",
+        )
+    })?;
+    let after = worktrees::change_set_fingerprint(&worktree)?;
+    let deltas = worktrees::change_set_delta(&before, &after);
+    let breaches: Vec<_> = deltas
+        .iter()
+        .filter(|(path, _)| !allowlist.iter().any(|domain| domains_overlap(path, domain)))
+        .collect();
+    worktrees::clear_snapshot(&worktree)?;
+    if !breaches.is_empty() {
+        let mut preview = breaches
+            .iter()
+            .take(20)
+            .map(|(path, kind)| format!("{kind} {}", Json::from(path.clone()).stringify()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if breaches.len() > 20 {
+            preview.push_str(&format!("; and {} more", breaches.len() - 20));
+        }
+        return Err(DriverError::new(format!(
+            "tree-delta gate detected {} out-of-allowlist change(s) ({basis} allowlist): {preview}",
+            breaches.len()
+        )));
+    }
+    Ok(Json::object([
+        ("taskId", Json::from(task_id)),
+        ("checkedPaths", Json::from(deltas.len())),
+        ("allowlistBasis", Json::from(basis)),
+        (
+            "allowlist",
+            Json::Array(allowlist.into_iter().map(Json::from).collect()),
+        ),
+        ("ownershipRan", Json::from(ownership_ran)),
+    ]))
+}
+
+#[derive(Clone, Debug)]
+struct ForbidGate {
+    id: String,
+    patterns: Vec<String>,
+}
+
+fn canonical_forbid_paths_gate(value: Option<&Json>, context: &str) -> Result<ForbidGate> {
+    let value = value.ok_or_else(|| DriverError::new(format!("{context} must be an object")))?;
+    let gate = object_complete(
+        value,
+        &["kind", "id", "forbidPaths", "runtimeMaxSec"],
+        context,
+    )?;
+    if gate.get("kind").and_then(Json::as_str) != Some("forbidPaths") {
+        return Err(DriverError::new(format!(
+            "{context}.kind must equal forbidPaths"
+        )));
+    }
+    let id = required_string(gate.get("id"), &format!("{context}.id"), Some(80))?;
+    if !is_component(&id) {
+        return Err(DriverError::new(format!(
+            "{context}.id is not a safe component"
+        )));
+    }
+    let patterns = string_list(
+        gate.get("forbidPaths"),
+        &format!("{context}.forbidPaths"),
+        true,
+    )?;
+    if patterns.len() > 128 {
+        return Err(DriverError::new(format!(
+            "{context}.forbidPaths exceeds 128 entries"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for (index, pattern) in patterns.iter().enumerate() {
+        let pieces: Vec<_> = pattern.split('/').collect();
+        if pattern.chars().count() > 1_024
+            || pattern.starts_with('/')
+            || pattern.ends_with('/')
+            || pieces.contains(&"..")
+            || pieces
+                .iter()
+                .any(|piece| piece.contains("**") && *piece != "**")
+            || !seen.insert(pattern.clone())
+        {
+            return Err(DriverError::new(format!(
+                "internal campaign contract violation: {context}.forbidPaths[{index}] is not canonical"
+            )));
+        }
+    }
+    positive_u64(
+        gate.get("runtimeMaxSec"),
+        &format!("{context}.runtimeMaxSec"),
+    )?;
+    Ok(ForbidGate { id, patterns })
+}
+
+fn action_constraint(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &["gate", "repositoryConfig", "workspace"],
+        "constraint brief",
+    )?;
+    let gate = canonical_forbid_paths_gate(data.get("gate"), "constraint gate")?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    let workspace_value = data
+        .get("workspace")
+        .ok_or_else(|| DriverError::new("workspace must be an object"))?;
+    let workspace = object_exact(
+        workspace_value,
+        &[
+            "taskId",
+            "baseRev",
+            "branch",
+            "worktreePath",
+            "conflictDomains",
+        ],
+        "workspace",
+    )?;
+    if workspace.contains_key("conflictDomains") {
+        normalize_paths(
+            workspace.get("conflictDomains"),
+            "workspace.conflictDomains",
+            false,
+        )?;
+    }
+    let task_id = required_string(workspace.get("taskId"), "workspace.taskId", None)?;
+    if !is_task_id(&task_id) {
+        return Err(DriverError::new("workspace.taskId is not safe"));
+    }
+    let base_rev = full_oid(workspace.get("baseRev"), "workspace.baseRev")?;
+    let worktree = PathBuf::from(required_string(
+        workspace.get("worktreePath"),
+        "workspace.worktreePath",
+        None,
+    )?);
+    if !worktree.is_absolute() || !worktree.is_dir() {
+        return Err(DriverError::new(
+            "workspace.worktreePath must be an absolute existing directory",
+        ));
+    }
+    git(&worktree, ["rev-parse", "--git-dir"], true)?;
+    git(
+        &worktree,
+        ["rev-parse", "--verify", &format!("{base_rev}^{{commit}}")],
+        true,
+    )?;
+    let head = git(&worktree, ["rev-parse", "--verify", "HEAD^{commit}"], true)?.stdout_trimmed();
+    if !git(
+        &worktree,
+        ["merge-base", "--is-ancestor", &base_rev, &head],
+        false,
+    )?
+    .success()
+    {
+        return Err(DriverError::new(
+            "task head is not descended from its prepared base revision",
+        ));
+    }
+    let current_base = current_base_revision(&worktree, &config)?;
+    let union_base = lane_union_base(&worktree, &base_rev, &head, Some(&current_base))?;
+    let checked_paths =
+        evaluate_forbid_paths(&worktree, &union_base, &head, &gate.id, &gate.patterns)?;
+    Ok(Json::object([
+        ("gateId", Json::from(gate.id)),
+        ("kind", Json::from("forbidPaths")),
+        (
+            "patterns",
+            Json::Array(gate.patterns.into_iter().map(Json::from).collect()),
+        ),
+        ("checkedPaths", Json::from(checked_paths)),
+        ("baseRev", Json::from(base_rev)),
+        ("head", Json::from(head)),
+    ]))
+}
+
+const NARRATION_TYPES: [&str; 11] = [
+    "build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test",
+];
+
+const OUTCOME_FIRST_IRREGULAR_VERBS: &[&str] = &[
+    "began",
+    "bound",
+    "brought",
+    "bought",
+    "built",
+    "came",
+    "caught",
+    "chose",
+    "cut",
+    "did",
+    "fell",
+    "found",
+    "gave",
+    "grew",
+    "held",
+    "hit",
+    "kept",
+    "knew",
+    "left",
+    "lost",
+    "made",
+    "met",
+    "put",
+    "ran",
+    "read",
+    "said",
+    "sat",
+    "saw",
+    "sent",
+    "set",
+    "shut",
+    "spent",
+    "stood",
+    "sold",
+    "sought",
+    "spoke",
+    "taught",
+    "thought",
+    "took",
+    "understood",
+    "went",
+    "won",
+    "wrote",
+];
+
+fn take_chars(value: &str, maximum: usize) -> String {
+    value.chars().take(maximum).collect()
+}
+
+fn trim_end_punctuation(value: &str) -> &str {
+    value.trim_end_matches([' ', '.', ':', ';', '?'])
+}
+
+/// Byte ranges with the exact stage-0 inline-code negation semantics.
+///
+/// Each opener is one non-empty run of backticks and only an equal-width run
+/// closes it. An unmatched or mismatched run grants no exception. Byte offsets
+/// are safe because both the fences and the exclamation predicate are ASCII.
+fn closed_inline_code_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'`') else {
+            break;
+        };
+        let opening = cursor + relative;
+        let mut opening_end = opening;
+        while opening_end < bytes.len() && bytes[opening_end] == b'`' {
+            opening_end += 1;
+        }
+        let fence_width = opening_end - opening;
+        let mut search = opening_end;
+        let mut closing_end = None;
+        while search < bytes.len() {
+            let Some(relative) = bytes[search..].iter().position(|byte| *byte == b'`') else {
+                break;
+            };
+            let closing = search + relative;
+            let mut candidate_end = closing;
+            while candidate_end < bytes.len() && bytes[candidate_end] == b'`' {
+                candidate_end += 1;
+            }
+            if candidate_end - closing == fence_width {
+                closing_end = Some(candidate_end);
+                break;
+            }
+            search = candidate_end;
+        }
+        let Some(closing_end) = closing_end else {
+            cursor = opening_end;
+            continue;
+        };
+        spans.push((opening, closing_end));
+        cursor = closing_end;
+    }
+    spans
+}
+
+fn contains_bare_exclamation_mark(text: &str) -> bool {
+    let mut plain_start = 0;
+    for (code_start, code_end) in closed_inline_code_spans(text) {
+        if text[plain_start..code_start].contains('!') {
+            return true;
+        }
+        plain_start = code_end;
+    }
+    text[plain_start..].contains('!')
+}
+
+fn replace_bare_exclamation_marks(text: &str, replacement: &str) -> String {
+    let mut output = String::new();
+    let mut plain_start = 0;
+    for (code_start, code_end) in closed_inline_code_spans(text) {
+        output.push_str(&text[plain_start..code_start].replace('!', replacement));
+        output.push_str(&text[code_start..code_end]);
+        plain_start = code_end;
+    }
+    output.push_str(&text[plain_start..].replace('!', replacement));
+    output
+}
+
+fn opens_with_list_marker(line: &str) -> bool {
+    let line = line.trim_start();
+    if line
+        .strip_prefix('-')
+        .or_else(|| line.strip_prefix('*'))
+        .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+    {
+        return true;
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    digits != 0
+        && line
+            .as_bytes()
+            .get(digits)
+            .is_some_and(|byte| matches!(byte, b'.' | b')'))
+        && line[digits + 1..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+}
+
+fn validate_outcome_first(text: &str, maximum: usize, context: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return Some(format!("{context} must be non-empty text"));
+    }
+    if text.chars().count() > maximum {
+        return Some(format!("{context} is over the {maximum} character cap"));
+    }
+    if contains_bare_exclamation_mark(text) {
+        return Some(format!("{context} contains an exclamation mark"));
+    }
+    let first_line = text
+        .trim()
+        .split_once('\n')
+        .map_or(text.trim(), |row| row.0)
+        .trim();
+    if opens_with_list_marker(first_line) {
+        return Some(format!("{context} must open with a sentence, not a list"));
+    }
+    let mut split_at = None;
+    let mut prior = None;
+    for (index, character) in first_line.char_indices() {
+        if character.is_whitespace() && matches!(prior, Some('.' | ':')) {
+            split_at = Some(index);
+            break;
+        }
+        prior = Some(character);
+    }
+    let first_sentence = first_line[..split_at.unwrap_or(first_line.len())].trim();
+    if !first_sentence.ends_with(['.', ':']) {
+        return Some(format!("{context} leading sentence must end with a period"));
+    }
+    if first_sentence.chars().count() > OUTCOME_FIRST_LEAD_MAX {
+        return Some(format!(
+            "{context} leading sentence is over {OUTCOME_FIRST_LEAD_MAX} characters"
+        ));
+    }
+    let opening: String = first_sentence
+        .chars()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .collect();
+    let folded = opening.to_ascii_lowercase();
+    if opening.is_empty()
+        || !(folded.ends_with("ed") || OUTCOME_FIRST_IRREGULAR_VERBS.contains(&folded.as_str()))
+    {
+        return Some(format!("{context} must open with a past-tense verb"));
+    }
+    None
+}
+
+fn line_starts_case_insensitive(text: &str, prefixes: &[&str]) -> bool {
+    text.lines().any(|line| {
+        prefixes.iter().any(|prefix| {
+            line.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        })
+    })
+}
+
+fn validated_narration(value: &Json) -> (Option<Json>, Option<String>) {
+    let Some(proposal) = value.as_object() else {
+        return (None, Some("proposal is not a JSON object".to_owned()));
+    };
+    let allowed = BTreeSet::from(["type", "scope", "subject", "body"]);
+    let unknown: Vec<_> = proposal
+        .keys()
+        .filter(|key| !allowed.contains(key.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return (
+            None,
+            Some(format!(
+                "proposal has unknown fields: {}",
+                unknown.join(", ")
+            )),
+        );
+    }
+    let Some(kind) = proposal.get("type").and_then(Json::as_str) else {
+        return (
+            None,
+            Some(format!(
+                "type must be one of {}",
+                NARRATION_TYPES.join(", ")
+            )),
+        );
+    };
+    if !NARRATION_TYPES.contains(&kind) {
+        return (
+            None,
+            Some(format!(
+                "type must be one of {}",
+                NARRATION_TYPES.join(", ")
+            )),
+        );
+    }
+    let scope = match proposal.get("scope") {
+        None | Some(Json::Null) => None,
+        Some(Json::String(scope))
+            if Regex::new(r"^[a-z0-9][a-z0-9._/-]{0,31}$")
+                .expect("static scope regex")
+                .is_match(scope) =>
+        {
+            Some(scope.as_str())
+        }
+        _ => {
+            return (
+                None,
+                Some("scope must be null or a short lowercase identifier".to_owned()),
+            )
+        }
+    };
+    let Some(raw_subject) = proposal.get("subject").and_then(Json::as_str) else {
+        return (None, Some("subject must be non-empty text".to_owned()));
+    };
+    let subject = raw_subject.trim();
+    if subject.is_empty() {
+        return (None, Some("subject must be non-empty text".to_owned()));
+    }
+    if subject
+        .chars()
+        .any(|character| (character as u32) < 32 || character == '\u{7f}')
+    {
+        return (None, Some("subject contains control characters".to_owned()));
+    }
+    if subject.ends_with('.') {
+        return (None, Some("subject must not end with a period".to_owned()));
+    }
+    if subject.chars().next().is_some_and(char::is_uppercase) {
+        return (
+            None,
+            Some("subject must not start with a capital letter".to_owned()),
+        );
+    }
+    let header = scope.map_or_else(
+        || format!("{kind}: {subject}"),
+        |scope| format!("{kind}({scope}): {subject}"),
+    );
+    if header.chars().count() > NARRATION_HEADER_MAX {
+        return (
+            None,
+            Some(format!(
+                "header is {} characters, over the {NARRATION_HEADER_MAX} cap",
+                header.chars().count()
+            )),
+        );
+    }
+    let raw_body = match proposal.get("body") {
+        None | Some(Json::Null) => "",
+        Some(Json::String(body)) => body,
+        _ => return (None, Some("body must be null or a string".to_owned())),
+    };
+    let body = raw_body
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_owned();
+    if body.chars().count() > NARRATION_BODY_MAX {
+        return (
+            None,
+            Some(format!(
+                "body is over the {NARRATION_BODY_MAX} character cap"
+            )),
+        );
+    }
+    if body
+        .chars()
+        .any(|character| ((character as u32) < 32 && character != '\n') || character == '\u{7f}')
+    {
+        return (None, Some("body contains control characters".to_owned()));
+    }
+    if body
+        .split('\n')
+        .any(|line| line.chars().count() > NARRATION_BODY_LINE_MAX)
+    {
+        return (
+            None,
+            Some(format!("body wraps past {NARRATION_BODY_LINE_MAX} columns")),
+        );
+    }
+    let closing = Regex::new(
+        r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*(?:#\d+|GH-\d+|[\w.-]+/[\w.-]+#\d+|https?://\S+/(?:issues|pull)/\d+)",
+    )
+    .expect("static closing-keyword regex");
+    let mention = Regex::new(r"(?:^|[^0-9A-Za-z._-])@[0-9A-Za-z][0-9A-Za-z-]*")
+        .expect("static mention regex");
+    for text in [&header, &body] {
+        if line_starts_case_insensitive(text, &[TALLY_TASK_PREFIX, TALLY_REVISION_PREFIX]) {
+            return (
+                None,
+                Some("proposal contains a managed completion trailer".to_owned()),
+            );
+        }
+        if line_starts_case_insensitive(text, &[ASSISTED_BY_PREFIX]) {
+            return (
+                None,
+                Some("proposal contains an Assisted-by trailer".to_owned()),
+            );
+        }
+        if closing.is_match(text) {
+            return (
+                None,
+                Some("proposal contains a GitHub closing keyword".to_owned()),
+            );
+        }
+        if mention.is_match(text) {
+            return (None, Some("proposal contains an @mention".to_owned()));
+        }
+    }
+    if !body.is_empty() {
+        if let Some(reason) = validate_outcome_first(&body, NARRATION_BODY_MAX, "proposal body") {
+            return (None, Some(reason));
+        }
+    }
+    (
+        Some(Json::object([
+            ("subject", Json::from(header)),
+            ("body", Json::from(body)),
+        ])),
+        None,
+    )
+}
+
+fn template_narration(task: &BTreeMap<String, Json>, body: &str) -> Result<Json> {
+    let task_id = required_string(task.get("id"), "task.id", None)?;
+    let title = required_string(task.get("title"), "task.title", None)?;
+    Ok(Json::object([
+        ("source", Json::from("template")),
+        ("subject", Json::from(format!("{task_id}: {title}"))),
+        ("body", Json::from(body)),
+    ]))
+}
+
+fn narration_fallback_note(transcript: &[Json]) -> String {
+    let reasons = transcript
+        .iter()
+        .filter_map(Json::as_object)
+        .filter_map(|entry| {
+            let reason = entry.get("reason")?.as_str()?;
+            let attempt = entry.get("attempt")?.as_u64()?;
+            let status = entry.get("status")?.as_str()?;
+            Some(format!("attempt {attempt} ({status}): {reason}"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut note = format!(
+        "Rejected {} steward narration proposal(s) and used the task-id template instead. Reasons: {reasons}.",
+        transcript.len()
+    );
+    if note.chars().count() > NARRATION_BODY_MAX {
+        note = format!("{}…", take_chars(&note, NARRATION_BODY_MAX - 1).trim_end());
+    }
+    note
+}
+
+#[derive(Debug)]
+struct StewardRole {
+    argv: Vec<String>,
+    environment: BTreeMap<String, String>,
+    pattern: Regex,
+    runtime_seconds: Option<u64>,
+}
+
+fn environment_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn portable_steward_pattern(pattern: &str, context: &str) -> Result<Regex> {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut in_class = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 1;
+                if index == bytes.len() {
+                    return Err(DriverError::new(format!(
+                        "internal campaign contract violation: {context} ends in an escape"
+                    )));
+                }
+                if bytes[index].is_ascii_digit() || matches!(bytes[index], b'k' | b'g') {
+                    return Err(DriverError::new(format!(
+                        "internal campaign contract violation: {context} contains a backreference"
+                    )));
+                }
+            }
+            b'[' => {
+                if in_class {
+                    return Err(DriverError::new(format!(
+                        "internal campaign contract violation: {context} contains a nested character class"
+                    )));
+                }
+                in_class = true;
+            }
+            b']' => in_class = false,
+            b'(' if !in_class
+                && bytes.get(index + 1) == Some(&b'?')
+                && bytes.get(index + 2) != Some(&b':') =>
+            {
+                return Err(DriverError::new(format!(
+                    "internal campaign contract violation: {context} contains a non-portable group"
+                )));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let compiled = Regex::new(pattern).map_err(|error| {
+        DriverError::new(format!(
+            "internal campaign contract violation: {context} did not compile in Rust: {error}"
+        ))
+    })?;
+    if compiled.captures_len() != 2 {
+        return Err(DriverError::new(format!(
+            "internal campaign contract violation: {context} does not have exactly one capture group"
+        )));
+    }
+    Ok(compiled)
+}
+
+fn steward_role(value: Option<&Json>) -> Result<Option<StewardRole>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let role = object_complete(
+        value,
+        &[
+            "adapter",
+            "argv",
+            "env",
+            "finalMessagePattern",
+            "runtimeMaxSec",
+        ],
+        "campaign steward",
+    )?;
+    let adapter = required_string(role.get("adapter"), "campaign steward.adapter", Some(80))?;
+    if !is_component(&adapter) {
+        return Err(DriverError::new(
+            "campaign steward.adapter is not a safe component",
+        ));
+    }
+    let argv = argv_list(role.get("argv"), "campaign steward.argv")?;
+    let environment = role
+        .get("env")
+        .and_then(Json::as_object)
+        .ok_or_else(|| DriverError::new("campaign steward.env must be an object"))?;
+    if environment.len() > 64 {
+        return Err(DriverError::new(
+            "internal campaign contract violation: campaign steward.env exceeds 64 entries",
+        ));
+    }
+    let mut normalized_environment = BTreeMap::new();
+    for (key, value) in environment {
+        if !environment_name(key) {
+            return Err(DriverError::new(
+                "campaign steward.env names must be environment identifiers",
+            ));
+        }
+        if key == "TALLY_BRIEF" {
+            return Err(DriverError::new(
+                "campaign steward.env must not set reserved variable TALLY_BRIEF",
+            ));
+        }
+        normalized_environment.insert(
+            key.clone(),
+            required_string(
+                Some(value),
+                &format!("campaign steward.env.{key}"),
+                Some(4_096),
+            )?,
+        );
+    }
+    let pattern_text = required_string(
+        role.get("finalMessagePattern"),
+        "campaign steward.finalMessagePattern",
+        Some(1_024),
+    )?;
+    let pattern = portable_steward_pattern(&pattern_text, "campaign steward.finalMessagePattern")?;
+    let runtime_seconds = match role.get("runtimeMaxSec") {
+        Some(Json::Null) => None,
+        value => Some(positive_u64(value, "campaign steward.runtimeMaxSec")?),
+    };
+    Ok(Some(StewardRole {
+        argv,
+        environment: normalized_environment,
+        pattern,
+        runtime_seconds,
+    }))
+}
+
+struct StewardOutput {
+    status: i32,
+    stdout: String,
+}
+
+fn invoke_steward(role: &StewardRole, input: &str) -> Result<StewardOutput> {
+    let mut command = Command::new(&role.argv[0]);
+    command
+        .args(&role.argv[1..])
+        .env_remove("TALLY_BRIEF")
+        .envs(&role.environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| DriverError::new(format!("cannot execute {:?}: {error}", role.argv[0])))?;
+    child
+        .stdin
+        .take()
+        .expect("steward stdin is piped")
+        .write_all(input.as_bytes())
+        .map_err(|error| DriverError::new(format!("cannot write steward stdin: {error}")))?;
+    let mut stdout = child.stdout.take().expect("steward stdout is piped");
+    let mut stderr = child.stderr.take().expect("steward stderr is piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = role
+        .runtime_seconds
+        .map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    let (status, timed_out) = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| DriverError::new(format!("cannot wait for steward: {error}")))?
+        {
+            break (status, false);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let _ = child.kill();
+            let status = child.wait().map_err(|error| {
+                DriverError::new(format!("cannot reap timed-out steward: {error}"))
+            })?;
+            break (status, true);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| DriverError::new("steward stdout reader panicked"))?;
+    let _stderr = stderr_reader
+        .join()
+        .map_err(|_| DriverError::new("steward stderr reader panicked"))?;
+    Ok(StewardOutput {
+        status: if timed_out {
+            124
+        } else {
+            status.code().unwrap_or(128)
+        },
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+    })
+}
+
+fn narration_attempt(attempt: u64, status: &str, reason: Option<&str>) -> Json {
+    Json::object([
+        ("attempt", Json::Number(attempt.to_string())),
+        ("status", Json::from(status)),
+        (
+            "reason",
+            reason.map_or(Json::Null, |reason| {
+                Json::from(take_chars(reason, NARRATION_REASON_MAX))
+            }),
+        ),
+    ])
+}
+
+fn narrate(
+    role: Option<&StewardRole>,
+    task: &BTreeMap<String, Json>,
+    request: &Json,
+) -> Result<(Json, Vec<Json>)> {
+    let Some(role) = role else {
+        return Ok((template_narration(task, "")?, Vec::new()));
+    };
+    let mut transcript = Vec::new();
+    for attempt in 1..=NARRATION_ATTEMPTS {
+        let mut payload = request
+            .as_object()
+            .cloned()
+            .ok_or_else(|| DriverError::new("steward request must be an object"))?;
+        payload.insert("attempt".to_owned(), Json::Number(attempt.to_string()));
+        if let Some(previous) = transcript.last().and_then(Json::as_object) {
+            if let Some(reason) = previous.get("reason").and_then(Json::as_str) {
+                payload.insert("previousRejection".to_owned(), Json::from(reason));
+            }
+        }
+        let invoked = invoke_steward(role, &Json::Object(payload).stringify())?;
+        if invoked.status != 0 {
+            transcript.push(narration_attempt(
+                attempt,
+                "failed",
+                Some(&format!("steward exited {}", invoked.status)),
+            ));
+            continue;
+        }
+        let mut captured = None;
+        for line in invoked.stdout.lines() {
+            if let Some(matched) = role.pattern.captures(line) {
+                captured = matched.get(1).map(|value| value.as_str().to_owned());
+            }
+        }
+        let Some(captured) = captured else {
+            transcript.push(narration_attempt(
+                attempt,
+                "failed",
+                Some("steward produced no final-message line"),
+            ));
+            continue;
+        };
+        let proposal = match json::parse(&captured) {
+            Ok(proposal) => proposal,
+            Err(_) => {
+                transcript.push(narration_attempt(
+                    attempt,
+                    "rejected",
+                    Some("final message is not valid JSON"),
+                ));
+                continue;
+            }
+        };
+        let (narration, reason) = validated_narration(&proposal);
+        let Some(narration) = narration else {
+            transcript.push(narration_attempt(
+                attempt,
+                "rejected",
+                Some(reason.as_deref().unwrap_or("proposal is invalid")),
+            ));
+            continue;
+        };
+        transcript.push(narration_attempt(attempt, "accepted", None));
+        let mut record = narration
+            .as_object()
+            .cloned()
+            .expect("validator returns object");
+        record.insert("source".to_owned(), Json::from("steward"));
+        return Ok((Json::Object(record), transcript));
+    }
+    let fallback_body = narration_fallback_note(&transcript);
+    if let Some(reason) = validate_outcome_first(
+        &fallback_body,
+        NARRATION_BODY_MAX,
+        "narration fallback note",
+    ) {
+        return Err(DriverError::new(format!(
+            "narration fallback note violates its own grammar: {reason}"
+        )));
+    }
+    Ok((template_narration(task, &fallback_body)?, transcript))
+}
+
+const SECRET_TOKEN_PREFIXES: [&str; 10] = [
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+];
+
+const EXTRA_SECRET_TOKEN_PREFIXES: [&str; 1] = ["xoxr-"];
+
+const SENSITIVE_LINE_MARKERS: [&str; 21] = [
+    "authorization",
+    "bearer",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "api_key",
+    "api-key",
+    "apikey",
+    "private key",
+    "access key",
+    "access_key",
+    "secret_key",
+    "client_secret",
+    "client key",
+    "cookie",
+    "dsn",
+    "session_id",
+    "sessionid",
+];
+
+fn public_token_is_sensitive(value: &str) -> bool {
+    let token = value.trim_matches(['\'', '"', '`', '(', ')', '[', ']', '{', '}', ',', ';']);
+    let lower = token.to_ascii_lowercase();
+    if SECRET_TOKEN_PREFIXES
+        .iter()
+        .chain(EXTRA_SECRET_TOKEN_PREFIXES.iter())
+        .any(|prefix| lower.starts_with(prefix))
+        || ((token.starts_with("AKIA") || token.starts_with("ASIA")) && token.chars().count() >= 16)
+        || (token.contains("://") && (token.contains('@') || token.contains('?')))
+    {
+        return true;
+    }
+    let jwt: Vec<_> = token.split('.').collect();
+    if jwt.len() == 3 && jwt.iter().all(|part| part.chars().count() >= 8) {
+        return true;
+    }
+    if token.chars().count() < 32 || !token.is_ascii() {
+        return false;
+    }
+    let has_lower = token.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_upper = token.bytes().any(|byte| byte.is_ascii_uppercase());
+    let has_digit = token.bytes().any(|byte| byte.is_ascii_digit());
+    if token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if token == lower && matches!(token.len(), 40 | 64) {
+            return false;
+        }
+        return true;
+    }
+    let token_like = token.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-' | b'=')
+    });
+    token_like && has_digit && ((has_lower && has_upper) || token.len() >= 40)
+}
+
+fn public_line_is_sensitive(lower: &str) -> bool {
+    for marker in SENSITIVE_LINE_MARKERS {
+        let mut offset = 0;
+        while let Some(relative) = lower[offset..].find(marker) {
+            let mut index = offset + relative + marker.len();
+            while lower
+                .as_bytes()
+                .get(index)
+                .is_some_and(|byte| matches!(byte, b'\'' | b'"' | b'`' | b' ' | b'\t'))
+            {
+                index += 1;
+            }
+            if lower
+                .as_bytes()
+                .get(index)
+                .is_some_and(|byte| matches!(byte, b':' | b'='))
+            {
+                return true;
+            }
+            offset += relative + 1;
+        }
+    }
+    false
+}
+
+fn redact_public_text(value: &str) -> (String, bool) {
+    let mut output = String::new();
+    let mut redacted = false;
+    let mut private_key_block = false;
+    for line in value.split_inclusive('\n') {
+        let lower = line.to_lowercase();
+        if lower.contains("-----begin ") && lower.contains("private key-----") {
+            private_key_block = true;
+        }
+        if private_key_block || public_line_is_sensitive(&lower) {
+            output.push_str("[redacted sensitive diagnosis line]");
+            if line.ends_with('\n') {
+                output.push('\n');
+            }
+            redacted = true;
+        } else {
+            let mut start = 0;
+            let mut whitespace = line.chars().next().is_some_and(char::is_whitespace);
+            for (index, character) in line.char_indices().skip(1) {
+                if character.is_whitespace() != whitespace {
+                    let chunk = &line[start..index];
+                    if !whitespace && public_token_is_sensitive(chunk) {
+                        output.push_str("[redacted-token]");
+                        redacted = true;
+                    } else {
+                        output.push_str(chunk);
+                    }
+                    start = index;
+                    whitespace = character.is_whitespace();
+                }
+            }
+            let chunk = &line[start..];
+            if !chunk.is_empty() && !whitespace && public_token_is_sensitive(chunk) {
+                output.push_str("[redacted-token]");
+                redacted = true;
+            } else {
+                output.push_str(chunk);
+            }
+        }
+        if lower.contains("-----end ") && lower.contains("private key-----") {
+            private_key_block = false;
+        }
+    }
+    (output.trim().to_owned(), redacted)
+}
+
+fn normalized_worker_findings(value: Option<&Json>) -> Result<Option<(String, String)>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let findings = object_complete(value, &["taskUuid", "message"], "workerFindings")?;
+    let task_uuid = required_string(
+        findings.get("taskUuid"),
+        "workerFindings.taskUuid",
+        Some(64),
+    )?;
+    let parsed = Uuid::parse_str(&task_uuid)
+        .map_err(|_| DriverError::new("workerFindings.taskUuid must be a UUID"))?;
+    if parsed.to_string() != task_uuid.to_ascii_lowercase() {
+        return Err(DriverError::new(
+            "workerFindings.taskUuid must use canonical UUID spelling",
+        ));
+    }
+    let message = findings
+        .get("message")
+        .and_then(Json::as_str)
+        .ok_or_else(|| DriverError::new("workerFindings.message must be text"))?;
+    let normalized = message
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .map(|character| {
+            if matches!(character, '\n' | '\t')
+                || !((character as u32) < 32 || (127..160).contains(&(character as u32)))
+            {
+                character
+            } else {
+                '�'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((parsed.to_string(), normalized)))
+}
+
+fn utf8_prefix(value: &str, maximum_bytes: usize) -> &str {
+    let mut end = maximum_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn bound_worker_findings(prefix: &str, text: &str) -> Result<String> {
+    if prefix.len() >= MAX_WORKER_FINDINGS_BYTES {
+        return Err(DriverError::new(
+            "worker findings marker exceeds its receipt bound",
+        ));
+    }
+    let available = MAX_WORKER_FINDINGS_BYTES - prefix.len();
+    if text.len() <= available {
+        return Ok(format!("{prefix}{text}"));
+    }
+    let width = available.saturating_sub(WORKER_FINDINGS_TRUNCATION.len());
+    let clipped = utf8_prefix(text, width).trim_end();
+    let body = format!("{prefix}{clipped}{WORKER_FINDINGS_TRUNCATION}");
+    if body.len() > MAX_WORKER_FINDINGS_BYTES {
+        return Err(DriverError::new(
+            "worker findings escaped its receipt byte bound",
+        ));
+    }
+    Ok(body)
+}
+
+fn publish_worker_findings(data: &BTreeMap<String, Json>) -> Result<Option<String>> {
+    let Some((task_uuid, message)) = normalized_worker_findings(data.get("workerFindings"))? else {
+        return Ok(None);
+    };
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let code_repository = repository_name(data.get("repository"), "repository")?;
+    let code_config = repo_config(data.get("repositoryConfig"))?;
+    let (_, _, target) = campaign_coordinates(data, code_repository, code_config)?;
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let task = data
+        .get("task")
+        .and_then(Json::as_object)
+        .ok_or_else(|| DriverError::new("task must be an object"))?;
+    let task_id = required_string(task.get("id"), "task.id", None)?;
+    if !is_task_id(&task_id) {
+        return Err(DriverError::new("task.id is not safe"));
+    }
+    let (public_text, _) = redact_public_text(&message);
+    let prefix = "### Worker findings\n\n_Captured from the implementation worker's final message; redacted and bounded by tally._\n\n";
+    let body = bound_worker_findings(prefix, &public_text)?;
+    let reference = format!(
+        "{}/findings/{task_id}/{task_uuid}",
+        local_state_prefix(&campaign, &issue_number)
+    );
+    let expected = Json::object([
+        ("schemaVersion", Json::Number("1".to_owned())),
+        ("kind", Json::from("worker-findings")),
+        ("campaign", Json::from(campaign)),
+        ("issueNumber", Json::from(issue_number)),
+        ("taskId", Json::from(task_id)),
+        ("agentTaskUuid", Json::from(task_uuid)),
+        ("body", Json::from(body)),
+        ("redaction", Json::from(PUBLIC_REDACTION)),
+    ]);
+    let (_, observed) = write_local_blob(&target.config, &reference, &expected)?;
+    if observed != expected {
+        return Err(DriverError::new(format!(
+            "local campaign worker findings {reference:?} disagree with this attempt"
+        )));
+    }
+    Ok(Some(format!("local://{}/{reference}", target.repository)))
+}
+
+fn configured_forbid_gates(
+    value: Option<&Json>,
+    context: &str,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let values = value
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new(format!("{context} must be an array")))?;
+    if values.len() > 16 {
+        return Err(DriverError::new(format!("{context} exceeds 16 gates")));
+    }
+    let mut seen = BTreeSet::new();
+    let mut gates = BTreeMap::new();
+    for (index, candidate) in values.iter().enumerate() {
+        let object = candidate
+            .as_object()
+            .ok_or_else(|| DriverError::new(format!("{context}[{index}] must be an object")))?;
+        let id = required_string(
+            object.get("id"),
+            &format!("{context}[{index}].id"),
+            Some(80),
+        )?;
+        if !seen.insert(id.clone()) {
+            return Err(DriverError::new(format!(
+                "{context} repeats gate id {id:?}"
+            )));
+        }
+        if object.get("kind").and_then(Json::as_str) == Some("forbidPaths") {
+            let gate =
+                canonical_forbid_paths_gate(Some(candidate), &format!("{context}[{index}]"))?;
+            gates.insert(gate.id, gate.patterns);
+        }
+    }
+    Ok(gates)
+}
+
+fn enforce_configured_gates(
+    constraints: &[Constraint],
+    configured: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    let witnessed: BTreeMap<_, _> = constraints
+        .iter()
+        .map(|constraint| (constraint.gate_id.clone(), constraint.patterns.clone()))
+        .collect();
+    for (id, patterns) in configured {
+        let Some(observed) = witnessed.get(id) else {
+            return Err(DriverError::new(format!(
+                "forbidPaths gate '{id}' is configured for this campaign but no witnessed receipt reached publication"
+            )));
+        };
+        if observed != patterns {
+            return Err(DriverError::new(format!(
+                "forbidPaths gate '{id}' was witnessed against patterns {}, but the campaign configures {}",
+                Json::Array(observed.iter().cloned().map(Json::from).collect()).stringify(),
+                Json::Array(patterns.iter().cloned().map(Json::from).collect()).stringify()
+            )));
+        }
+    }
+    if let Some(id) = witnessed.keys().find(|id| !configured.contains_key(*id)) {
+        return Err(DriverError::new(format!(
+            "forbidPaths gate '{id}' presented a receipt for a gate this campaign does not configure"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_constraint_results(
+    worktree: &Path,
+    base_rev: &str,
+    union_base: &str,
+    head: &str,
+    constraints: &[Constraint],
+) -> Result<()> {
+    for constraint in constraints {
+        if constraint.base_rev != base_rev {
+            return Err(DriverError::new(format!(
+                "forbidPaths gate '{}' was witnessed against base {}, expected {base_rev}",
+                constraint.gate_id, constraint.base_rev
+            )));
+        }
+        let checked = evaluate_forbid_paths(
+            worktree,
+            union_base,
+            head,
+            &constraint.gate_id,
+            &constraint.patterns,
+        )?;
+        if constraint.head == head && constraint.checked_paths != checked {
+            return Err(DriverError::new(format!(
+                "forbidPaths gate '{}' receipt counted {} paths at {head}, publication counted {checked}",
+                constraint.gate_id, constraint.checked_paths
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn action_publish(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "campaignIdentity",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "runId",
+            "workspaceRoot",
+            "task",
+            "workspace",
+            "constraints",
+            "domainsRequired",
+            "gates",
+            "steward",
+            "workerFindings",
+            "specRepository",
+            "issueRepository",
+        ],
+        "publish brief",
+    )?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    let workspace = prepared_workspace(data.get("workspace"), "workspace")?;
+    if !is_full_oid(&workspace.base_rev) {
+        return Err(DriverError::new(
+            "workspace.baseRev must be a full Git object ID",
+        ));
+    }
+    if !workspace.worktree.is_absolute() || !workspace.worktree.is_dir() {
+        return Err(DriverError::new(
+            "workspace.worktreePath must be an existing directory for publish",
+        ));
+    }
+    git(&workspace.worktree, ["rev-parse", "--git-dir"], true)?;
+    let constraints = normalize_constraints(data.get("constraints"), "publish constraints")?;
+    let configured = configured_forbid_gates(data.get("gates"), "publish gates")?;
+    enforce_configured_gates(&constraints, &configured)?;
+    if !is_task_id(&workspace.task_id) {
+        return Err(DriverError::new("workspace.taskId is not safe"));
+    }
+    let actual_branch =
+        git(&workspace.worktree, ["branch", "--show-current"], true)?.stdout_trimmed();
+    if actual_branch != workspace.branch {
+        return Err(DriverError::new(format!(
+            "worktree is on branch {actual_branch:?}, expected {:?}",
+            workspace.branch
+        )));
+    }
+    if !git(&workspace.worktree, ["status", "--porcelain"], true)?
+        .stdout
+        .is_empty()
+    {
+        return Err(DriverError::new(
+            "agent left uncommitted changes; commit the task before publication",
+        ));
+    }
+    let head = git(&workspace.worktree, ["rev-parse", "HEAD"], true)?.stdout_trimmed();
+    if head == workspace.base_rev {
+        return Err(DriverError::new(
+            "agent produced no commit relative to the prepared base",
+        ));
+    }
+    if !git(
+        &workspace.worktree,
+        ["merge-base", "--is-ancestor", &workspace.base_rev, &head],
+        false,
+    )?
+    .success()
+    {
+        return Err(DriverError::new(
+            "task head is not descended from its prepared base revision",
+        ));
+    }
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    let identity = campaign_identity(data, &campaign)?;
+    let current_base = required_integration_revision(&config, &campaign, &identity)?;
+    let domains_required = required_bool(data.get("domainsRequired"), "domainsRequired")?;
+    let ownership = enforce_conflict_domains(
+        &workspace.worktree,
+        &workspace.base_rev,
+        &head,
+        data.get("task"),
+        &workspace.task_id,
+        domains_required,
+        Some(&current_base),
+    )?;
+    let union_base = lane_union_base(
+        &workspace.worktree,
+        &workspace.base_rev,
+        &head,
+        Some(&current_base),
+    )?;
+    enforce_constraint_results(
+        &workspace.worktree,
+        &workspace.base_rev,
+        &union_base,
+        &head,
+        &constraints,
+    )?;
+    publish_worker_findings(data)?;
+    let task = data
+        .get("task")
+        .and_then(Json::as_object)
+        .ok_or_else(|| DriverError::new("task must be an object"))?;
+    let expected_branch = stable_publish_branch(
+        &campaign,
+        &identity,
+        &workspace.task_id,
+        task_revision(task)?.as_deref(),
+    );
+    if workspace.publish_branch != expected_branch {
+        return Err(DriverError::new(format!(
+            "workspace.publishBranch is {:?}, expected local stable branch {expected_branch:?}",
+            workspace.publish_branch
+        )));
+    }
+    git(
+        &config.checkout,
+        [
+            "update-ref",
+            &format!("refs/heads/{}", workspace.publish_branch),
+            &head,
+        ],
+        true,
+    )?;
+    let steward = steward_role(data.get("steward"))?;
+    let narration_task = {
+        let mut projected = BTreeMap::from([
+            (
+                "id".to_owned(),
+                task.get("id").cloned().unwrap_or(Json::Null),
+            ),
+            (
+                "title".to_owned(),
+                task.get("title").cloned().unwrap_or(Json::Null),
+            ),
+            (
+                "goal".to_owned(),
+                task.get("goal").cloned().unwrap_or(Json::Null),
+            ),
+            ("brief".to_owned(), {
+                task.get("brief")
+                    .and_then(Json::as_object)
+                    .and_then(|brief| brief.get("body"))
+                    .cloned()
+                    .unwrap_or(Json::Null)
+            }),
+        ]);
+        if let Some(domains) = task.get("conflictDomains") {
+            projected.insert("conflictDomains".to_owned(), domains.clone());
+        }
+        Json::Object(projected)
+    };
+    let request = if steward.is_none() {
+        Json::object([] as [(&str, Json); 0])
+    } else {
+        let diff_stat = git(
+            &workspace.worktree,
+            ["diff", "--stat", &format!("{}..{head}", workspace.base_rev)],
+            true,
+        )?
+        .stdout_text();
+        Json::object([
+            ("schemaVersion", Json::Number("1".to_owned())),
+            (
+                "mission",
+                Json::from("Propose the conventional-commit message and pull-request prose for one completed campaign task. Reply with a single line of the form TALLY_FINAL_MESSAGE=<json>, where <json> is an object with the keys type, scope, subject, and body. Text only: you are not running git."),
+            ),
+            ("campaign", Json::from(campaign.clone())),
+            ("task", narration_task),
+            ("diffStat", Json::from(take_chars(&diff_stat, MAX_RETRY_CHARS))),
+            (
+                "grammar",
+                Json::object([
+                    (
+                        "types",
+                        Json::Array(NARRATION_TYPES.iter().copied().map(Json::from).collect()),
+                    ),
+                    ("headerMaxChars", Json::from(NARRATION_HEADER_MAX)),
+                    ("bodyMaxChars", Json::from(NARRATION_BODY_MAX)),
+                    ("bodyMaxColumns", Json::from(NARRATION_BODY_LINE_MAX)),
+                ]),
+            ),
+        ])
+    };
+    let (narration, transcript) = narrate(steward.as_ref(), task, &request)?;
+    let repository = repository_name(data.get("repository"), "repository")?;
+    Ok(Json::object([
+        ("taskId", Json::from(workspace.task_id)),
+        ("branch", Json::from(workspace.publish_branch.clone())),
+        ("head", Json::from(head)),
+        (
+            "pullRequest",
+            Json::from(format!("local://{repository}/{}", workspace.publish_branch)),
+        ),
+        ("narration", narration),
+        ("narrationAttempts", Json::Array(transcript)),
+        ("ownership", ownership.to_json()),
+    ]))
 }
 
 fn integration_result(
@@ -5055,7 +9732,7 @@ fn action_rebase(brief: &Json) -> Result<Json> {
     for constraint in &constraints {
         if constraint.base_rev != workspace.base_rev {
             return Err(DriverError::new(format!(
-                "forbidPaths gate {:?} was witnessed against base {}, expected prepared base {}",
+                "forbidPaths gate '{}' was witnessed against base {}, expected prepared base {}",
                 constraint.gate_id, constraint.base_rev, workspace.base_rev
             )));
         }
@@ -5322,4 +9999,66 @@ fn action_cleanup(brief: &Json) -> Result<Json> {
         ("taskId", Json::from(task_id)),
         ("cleaned", Json::from(true)),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        closed_inline_code_spans, contains_bare_exclamation_mark, replace_bare_exclamation_marks,
+        validate_outcome_first,
+    };
+
+    #[test]
+    fn stage_zero_negation_ignores_only_closed_equal_width_code_fences() {
+        assert!(!contains_bare_exclamation_mark(
+            "Recorded `! grep -n stale test/x.py`."
+        ));
+        assert!(!contains_bare_exclamation_mark(
+            "Recorded ``! grep `literal` test/x.py``."
+        ));
+        assert!(contains_bare_exclamation_mark(
+            "Recorded `! grep -n stale test/x.py."
+        ));
+        assert!(contains_bare_exclamation_mark(
+            "Recorded ``! grep -n stale test/x.py`."
+        ));
+        assert!(contains_bare_exclamation_mark(
+            "Recorded `! grep` and finished!"
+        ));
+    }
+
+    #[test]
+    fn stage_zero_negation_replacement_preserves_closed_code_verbatim() {
+        assert_eq!(
+            replace_bare_exclamation_marks("Failed! Reproduced with `! false`!", "."),
+            "Failed. Reproduced with `! false`."
+        );
+        assert_eq!(
+            replace_bare_exclamation_marks("Failed with ``! echo `x`!``!", "."),
+            "Failed with ``! echo `x`!``."
+        );
+    }
+
+    #[test]
+    fn stage_zero_negation_spans_use_utf8_safe_byte_offsets() {
+        let text = "Préparé `! false` puis vérifié.";
+        assert_eq!(closed_inline_code_spans(text), vec![(10, 19)]);
+        assert!(!contains_bare_exclamation_mark(text));
+    }
+
+    #[test]
+    fn outcome_first_validation_applies_the_same_negation_rule() {
+        assert_eq!(
+            validate_outcome_first(
+                "Reproduced with `! grep -n stale test/x.py`.",
+                1_000,
+                "proposal body"
+            ),
+            None
+        );
+        assert_eq!(
+            validate_outcome_first("Finished the work!", 1_000, "proposal body"),
+            Some("proposal body contains an exclamation mark".to_owned())
+        );
+    }
 }
