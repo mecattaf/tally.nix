@@ -252,6 +252,7 @@ run_ladder() {
     nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
   run_cargo_deny_stage
   run_step "nix flake check" nix flake check -L --keep-going
+  run_step "final-bar" nix run .#final-conformance-bar -- "$worktree"
 
   printf '\n==> evaluated VM check inventory\n'
   run_flow_multi_host_assertion

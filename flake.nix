@@ -174,6 +174,9 @@
           '';
           meta.mainProgram = "tally";
         };
+        finalBarAdapterPresets = pkgs.writeText "tally-final-bar-adapter-presets.json" (
+          builtins.toJSON adapterLibrary.presets
+        );
         finalConformanceBar = pkgs.stdenvNoCC.mkDerivation {
           pname = "tally-final-conformance-bar";
           version = "1";
@@ -3463,11 +3466,15 @@
           stock-home-activation = stockHome.activationPackage;
           module-layer = moduleContract;
           final-conformance-bar-harness = pkgs.runCommand "tally-final-conformance-bar-harness" { } ''
-            ${finalConformanceBar}/bin/tally-final-conformance-bar --list > cases.txt
-            grep -Fq 'campaign-full-pipeline' cases.txt
-            grep -Fq 'parallel-population-wave' cases.txt
-            grep -Fq 'usage-codex-cumulative-delta' cases.txt
-            cp cases.txt "$out"
+            ${finalConformanceBar}/bin/tally-final-conformance-bar \
+              ${self} \
+              --case adapter-argv-corpus \
+              --case campaign-registry-forward-read \
+              --case eval-manifest-zero-covered \
+              --artifacts "$out" \
+              --tally ${tally} \
+              --driver ${specBuildDriver} \
+              --presets-json ${finalBarAdapterPresets}
           '';
           spec-build-driver-tests =
             pkgs.runCommand "tally-spec-build-driver-tests"
