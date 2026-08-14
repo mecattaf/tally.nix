@@ -2,7 +2,7 @@ use super::text::compact_text;
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -51,9 +51,16 @@ const MAX_RETRY_CHARS: usize = 2_000;
 const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
 const LOCAL_ALLOWED_ACTOR: &str = "local";
 const RELEASE_PLAN_SCHEMA_VERSION: u32 = 1;
+const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
+const RELEASE_ARTIFACTS_SCHEMA_VERSION: u32 = 1;
 const RELEASE_SUMMARY_SCHEMA_VERSION: u32 = 1;
 const MAX_RELEASE_REGISTRATION_BYTES: u64 = 1024 * 1024;
+const MAX_RELEASE_RECORD_BYTES: u64 = 1024 * 1024;
+const MAX_RELEASE_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RELEASE_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const RELEASE_RECORD_FILE: &str = "release-record-v1.json";
+const RELEASE_NOTES_FILE: &str = "release-notes.md";
+const RELEASE_ARTIFACTS_FILE: &str = "release-artifacts-v1.json";
 const COMPLETE_SUMMARY_MARKER_PREFIX: &str = "<!-- tally:campaign-complete:v1 source=";
 
 #[derive(Debug, Clone)]
@@ -420,6 +427,80 @@ struct CampaignReleasePlan {
     campaign_summary: String,
 }
 
+/// The forge executable is invocation configuration, never ambient process
+/// state. Keeping it in this small value makes every forge write take the
+/// injected capability explicitly and leaves `gh` on PATH as the sole
+/// production fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CampaignReleaseExecutionConfig {
+    gh_program: PathBuf,
+}
+
+impl CampaignReleaseExecutionConfig {
+    fn resolve(gh_program: Option<PathBuf>) -> Result<Self> {
+        let gh_program = gh_program.unwrap_or_else(|| PathBuf::from("gh"));
+        if gh_program.as_os_str().is_empty() {
+            return Err(invalid("--gh-program must not be empty"));
+        }
+        Ok(Self { gh_program })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CampaignReleaseStepsV1 {
+    tag: bool,
+    release_notes: bool,
+    artifacts: bool,
+}
+
+/// Local authority for release execution. Public release text is deliberately
+/// absent: whether a step ran is answered only by this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CampaignReleaseRecordV1 {
+    schema_version: u32,
+    registration_id: String,
+    campaign: String,
+    repository: String,
+    worklist: String,
+    version: String,
+    revision: String,
+    plan_sha256: String,
+    steps: CampaignReleaseStepsV1,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseExecutionReceipt {
+    schema_version: u32,
+    mode: &'static str,
+    status: &'static str,
+    repository: String,
+    version: String,
+    record: PathBuf,
+    executed_steps: Vec<&'static str>,
+    skipped_steps: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseArtifactsV1<'a> {
+    schema_version: u32,
+    campaign: &'a str,
+    repository: &'a str,
+    version: &'a str,
+    revision: &'a str,
+    closing_summary: &'a CampaignReleaseSummaryProof,
+    gate_proof: &'a CampaignReleaseGateProof,
+    artifacts: &'a [CampaignReleaseArtifact],
+}
+
+struct CampaignReleasePayloads {
+    notes: PathBuf,
+    artifacts: PathBuf,
+}
+
 #[derive(Debug)]
 enum CampaignPollAttempt {
     Dispatched,
@@ -458,23 +539,420 @@ pub(super) async fn run_campaign(
 }
 
 fn run_campaign_release(args: CampaignReleaseArgs) -> Result<()> {
-    if !args.plan {
-        return Err(invalid(
-            "campaign release currently requires --plan; release execution is not enabled",
-        ));
-    }
+    let CampaignReleaseArgs {
+        code_repository,
+        worklist_pattern,
+        plan: plan_only,
+        gh_program,
+        state_dir,
+    } = args;
     let (code_repository, worklist_pattern) =
-        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
-    let state_dir = resolve_state_dir(args.state_dir)?;
+        campaign_identity(&code_repository, &worklist_pattern)?;
+    let state_dir = resolve_state_dir(state_dir)?;
     let plan = render_campaign_release_plan(&state_dir, &code_repository, &worklist_pattern)?;
 
-    // The compact first line is deliberately stable for scripts. Human text
-    // follows after a blank line, so plan mode serves both consumers without
-    // growing a second flag or rendering path.
-    outln!("{}", serde_json::to_string(&plan)?);
-    outln!();
-    outln!("{}", render_campaign_release_human(&plan).trim_end());
+    if plan_only {
+        // The compact first line is deliberately stable for scripts. Human
+        // text follows after a blank line, so plan mode serves both consumers
+        // without growing a second rendering path.
+        outln!("{}", serde_json::to_string(&plan)?);
+        outln!();
+        outln!("{}", render_campaign_release_human(&plan).trim_end());
+    } else {
+        let config = CampaignReleaseExecutionConfig::resolve(gh_program)?;
+        let receipt = execute_campaign_release(&state_dir, &plan, &config)?;
+        outln!("{}", serde_json::to_string(&receipt)?);
+    }
     Ok(())
+}
+
+fn execute_campaign_release(
+    state_dir: &Path,
+    plan: &CampaignReleasePlan,
+    config: &CampaignReleaseExecutionConfig,
+) -> Result<CampaignReleaseExecutionReceipt> {
+    let directory = campaign_release_directory(state_dir, &plan.registration_id)?;
+    fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "cannot create campaign release directory {}",
+            directory.display()
+        )
+    })?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "cannot secure campaign release directory {}",
+            directory.display()
+        )
+    })?;
+    let lock_path = directory.join("release.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .with_context(|| format!("cannot open campaign release lock {}", lock_path.display()))?;
+    let lock_metadata = lock.metadata()?;
+    if !lock_metadata.is_file() || lock_metadata.nlink() != 1 {
+        bail!(
+            "campaign release lock {} is not a private regular file",
+            lock_path.display()
+        );
+    }
+    FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("cannot lock campaign release state {}", lock_path.display()))?;
+
+    let execution = execute_campaign_release_locked(&directory, plan, config);
+    let unlock = FileExt::unlock(&lock).with_context(|| {
+        format!(
+            "cannot unlock campaign release state {}",
+            lock_path.display()
+        )
+    });
+    match (execution, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(receipt), Ok(())) => Ok(receipt),
+    }
+}
+
+fn execute_campaign_release_locked(
+    directory: &Path,
+    plan: &CampaignReleasePlan,
+    config: &CampaignReleaseExecutionConfig,
+) -> Result<CampaignReleaseExecutionReceipt> {
+    let record_path = directory.join(RELEASE_RECORD_FILE);
+    let plan_sha256 = release_plan_sha256(plan)?;
+    let mut record = match read_campaign_release_record(&record_path)? {
+        Some(record) => {
+            validate_campaign_release_record(&record, plan, &plan_sha256, &record_path)?;
+            record
+        }
+        None => {
+            let record = CampaignReleaseRecordV1 {
+                schema_version: RELEASE_RECORD_SCHEMA_VERSION,
+                registration_id: plan.registration_id.clone(),
+                campaign: plan.campaign.clone(),
+                repository: plan.repository.clone(),
+                worklist: plan.worklist.clone(),
+                version: plan.version.clone(),
+                revision: plan.revision.clone(),
+                plan_sha256,
+                steps: CampaignReleaseStepsV1::default(),
+            };
+            write_campaign_release_record(directory, &record_path, &record)?;
+            record
+        }
+    };
+    let payloads = materialize_campaign_release_payloads(directory, plan)?;
+    let mut executed_steps = Vec::new();
+    let mut skipped_steps = Vec::new();
+
+    if record.steps.tag {
+        skipped_steps.push("tag");
+    } else {
+        create_campaign_release_tag(config, plan)?;
+        record.steps.tag = true;
+        write_campaign_release_record(directory, &record_path, &record)?;
+        executed_steps.push("tag");
+    }
+
+    if record.steps.release_notes {
+        skipped_steps.push("release-notes");
+    } else {
+        publish_campaign_release_notes(config, plan, &payloads.notes)?;
+        record.steps.release_notes = true;
+        write_campaign_release_record(directory, &record_path, &record)?;
+        executed_steps.push("release-notes");
+    }
+
+    if record.steps.artifacts {
+        skipped_steps.push("artifacts");
+    } else {
+        attach_campaign_release_artifacts(config, plan, &payloads.artifacts)?;
+        record.steps.artifacts = true;
+        write_campaign_release_record(directory, &record_path, &record)?;
+        executed_steps.push("artifacts");
+    }
+
+    Ok(CampaignReleaseExecutionReceipt {
+        schema_version: RELEASE_RECORD_SCHEMA_VERSION,
+        mode: "execute",
+        status: "complete",
+        repository: plan.repository.clone(),
+        version: plan.version.clone(),
+        record: record_path,
+        executed_steps,
+        skipped_steps,
+    })
+}
+
+fn campaign_release_directory(state_dir: &Path, registration_id: &str) -> Result<PathBuf> {
+    uuid::Uuid::parse_str(registration_id)
+        .context("campaign release registration ID is not a UUID")?;
+    Ok(state_dir.join("campaigns/releases").join(registration_id))
+}
+
+fn release_plan_sha256(plan: &CampaignReleasePlan) -> Result<String> {
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(plan)?)
+    ))
+}
+
+fn read_campaign_release_record(path: &Path) -> Result<Option<CampaignReleaseRecordV1>> {
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open campaign release record {}", path.display()))
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > MAX_RELEASE_RECORD_BYTES {
+        bail!(
+            "campaign release record {} is not a bounded private regular file",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let record = serde_json::from_slice(&bytes)
+        .with_context(|| format!("campaign release record {} is invalid", path.display()))?;
+    Ok(Some(record))
+}
+
+fn validate_campaign_release_record(
+    record: &CampaignReleaseRecordV1,
+    plan: &CampaignReleasePlan,
+    plan_sha256: &str,
+    path: &Path,
+) -> Result<()> {
+    let identity_matches = record.schema_version == RELEASE_RECORD_SCHEMA_VERSION
+        && record.registration_id == plan.registration_id
+        && record.campaign == plan.campaign
+        && record.repository == plan.repository
+        && record.worklist == plan.worklist
+        && record.version == plan.version
+        && record.revision == plan.revision
+        && record.plan_sha256 == plan_sha256;
+    let monotonic = !record.steps.release_notes || record.steps.tag;
+    let monotonic = monotonic && (!record.steps.artifacts || record.steps.release_notes);
+    if !identity_matches || !monotonic {
+        bail!(
+            "campaign release record {} disagrees with the current release plan or step order",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn write_campaign_release_record(
+    directory: &Path,
+    path: &Path,
+    record: &CampaignReleaseRecordV1,
+) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(record)?;
+    bytes.push(b'\n');
+    write_campaign_release_file(directory, path, &bytes, MAX_RELEASE_RECORD_BYTES)
+}
+
+fn write_campaign_release_file(
+    directory: &Path,
+    path: &Path,
+    bytes: &[u8],
+    maximum: u64,
+) -> Result<()> {
+    if u64::try_from(bytes.len())? > maximum {
+        bail!("campaign release payload {} is too large", path.display());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() || metadata.nlink() != 1 => {
+            bail!(
+                "campaign release payload {} is not a private regular file",
+                path.display()
+            )
+        }
+        Ok(_) => {
+            let existing = fs::read(path).with_context(|| {
+                format!("cannot read campaign release payload {}", path.display())
+            })?;
+            if existing == bytes {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot inspect campaign release payload {}", path.display())
+            })
+        }
+    }
+
+    let temporary = directory.join(format!(".release.{}.tmp", uuid::Uuid::now_v7()));
+    let write = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "cannot create campaign release payload {}",
+                    temporary.display()
+                )
+            })?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path).with_context(|| {
+            format!("cannot publish campaign release payload {}", path.display())
+        })?;
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write
+}
+
+fn materialize_campaign_release_payloads(
+    directory: &Path,
+    plan: &CampaignReleasePlan,
+) -> Result<CampaignReleasePayloads> {
+    let notes = directory.join(RELEASE_NOTES_FILE);
+    let artifacts = directory.join(RELEASE_ARTIFACTS_FILE);
+    write_campaign_release_file(
+        directory,
+        &notes,
+        render_campaign_release_notes(plan).as_bytes(),
+        MAX_RELEASE_PAYLOAD_BYTES,
+    )?;
+    let manifest = CampaignReleaseArtifactsV1 {
+        schema_version: RELEASE_ARTIFACTS_SCHEMA_VERSION,
+        campaign: &plan.campaign,
+        repository: &plan.repository,
+        version: &plan.version,
+        revision: &plan.revision,
+        closing_summary: &plan.closing_summary,
+        gate_proof: &plan.gate_proof,
+        artifacts: &plan.artifacts,
+    };
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    manifest_bytes.push(b'\n');
+    write_campaign_release_file(
+        directory,
+        &artifacts,
+        &manifest_bytes,
+        MAX_RELEASE_PAYLOAD_BYTES,
+    )?;
+    Ok(CampaignReleasePayloads { notes, artifacts })
+}
+
+fn run_release_gh(
+    config: &CampaignReleaseExecutionConfig,
+    arguments: &[OsString],
+    context: &str,
+) -> Result<()> {
+    let output = ProcessCommand::new(&config.gh_program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "cannot execute forge program {}",
+                config.gh_program.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    bail!(
+        "{context} through {} exited {}: {}",
+        config.gh_program.display(),
+        output.status,
+        if detail.is_empty() {
+            "no output"
+        } else {
+            &detail
+        }
+    )
+}
+
+fn create_campaign_release_tag(
+    config: &CampaignReleaseExecutionConfig,
+    plan: &CampaignReleasePlan,
+) -> Result<()> {
+    run_release_gh(
+        config,
+        &[
+            "api".into(),
+            "--method".into(),
+            "POST".into(),
+            format!("repos/{}/git/refs", plan.repository).into(),
+            "--raw-field".into(),
+            format!("ref=refs/tags/{}", plan.version).into(),
+            "--raw-field".into(),
+            format!("sha={}", plan.revision).into(),
+        ],
+        "creating the release tag",
+    )
+}
+
+fn publish_campaign_release_notes(
+    config: &CampaignReleaseExecutionConfig,
+    plan: &CampaignReleasePlan,
+    notes: &Path,
+) -> Result<()> {
+    run_release_gh(
+        config,
+        &[
+            "release".into(),
+            "create".into(),
+            plan.version.clone().into(),
+            "--repo".into(),
+            plan.repository.clone().into(),
+            "--verify-tag".into(),
+            "--title".into(),
+            format!("{} {}", plan.campaign, plan.version).into(),
+            "--notes-file".into(),
+            notes.as_os_str().to_owned(),
+        ],
+        "publishing the release notes",
+    )
+}
+
+fn attach_campaign_release_artifacts(
+    config: &CampaignReleaseExecutionConfig,
+    plan: &CampaignReleasePlan,
+    artifacts: &Path,
+) -> Result<()> {
+    run_release_gh(
+        config,
+        &[
+            "release".into(),
+            "upload".into(),
+            plan.version.clone().into(),
+            artifacts.as_os_str().to_owned(),
+            "--repo".into(),
+            plan.repository.clone().into(),
+            "--clobber".into(),
+        ],
+        "attaching the release artifacts",
+    )
 }
 
 fn render_campaign_release_plan(
@@ -1643,6 +2121,45 @@ fn render_campaign_release_human(plan: &CampaignReleasePlan) -> String {
         String::new(),
         plan.campaign_summary.trim_end().to_owned(),
     ]);
+    let mut rendered = lines.join("\n");
+    rendered.push('\n');
+    rendered
+}
+
+fn render_campaign_release_notes(plan: &CampaignReleasePlan) -> String {
+    let mut lines = vec![
+        format!("# {}", plan.version),
+        String::new(),
+        "## Changes".to_owned(),
+        String::new(),
+    ];
+    if plan.release_notes.is_empty() {
+        lines.push("- No implementation changes.".to_owned());
+    } else {
+        lines.extend(
+            plan.release_notes
+                .iter()
+                .map(|note| format!("- {}", note.header)),
+        );
+    }
+    lines.extend([
+        String::new(),
+        "## Verification".to_owned(),
+        String::new(),
+        format!("- Revision: `{}`", plan.revision),
+        format!(
+            "- Gate: `{}` at `{}`",
+            plan.gate_proof.task_id, plan.gate_proof.revision
+        ),
+        String::new(),
+        "## Artifacts".to_owned(),
+        String::new(),
+    ]);
+    lines.extend(
+        plan.artifacts
+            .iter()
+            .map(|artifact| format!("- {}: `{}`", artifact.kind, artifact.locator)),
+    );
     let mut rendered = lines.join("\n");
     rendered.push('\n');
     rendered
@@ -6204,6 +6721,275 @@ mod tests {
                 "Template release note".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn release_execute_resumes_from_the_local_record_through_an_injected_program() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let calls = temporary.path().join("gh-calls");
+        let count = temporary.path().join("gh-count");
+        let fail_on = temporary.path().join("gh-fail-on");
+        fs::write(&fail_on, "2\n").unwrap();
+        let shim = release_recording_gh(temporary.path(), &calls, &count, &fail_on);
+        let config = CampaignReleaseExecutionConfig::resolve(Some(shim.clone())).unwrap();
+        let plan = release_execution_plan_for_test();
+
+        let failure = execute_campaign_release(&state_dir, &plan, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            failure.contains("publishing the release notes"),
+            "{failure}"
+        );
+        assert!(failure.contains("injected failure 2"), "{failure}");
+
+        let release_directory =
+            campaign_release_directory(&state_dir, &plan.registration_id).unwrap();
+        let record_path = release_directory.join(RELEASE_RECORD_FILE);
+        let partial = read_campaign_release_record(&record_path).unwrap().unwrap();
+        assert_eq!(
+            partial.steps,
+            CampaignReleaseStepsV1 {
+                tag: true,
+                release_notes: false,
+                artifacts: false,
+            }
+        );
+
+        let resumed = execute_campaign_release(&state_dir, &plan, &config).unwrap();
+        assert_eq!(resumed.executed_steps, ["release-notes", "artifacts"]);
+        assert_eq!(resumed.skipped_steps, ["tag"]);
+        let complete = read_campaign_release_record(&record_path).unwrap().unwrap();
+        assert_eq!(
+            complete.steps,
+            CampaignReleaseStepsV1 {
+                tag: true,
+                release_notes: true,
+                artifacts: true,
+            }
+        );
+
+        let repeated = execute_campaign_release(&state_dir, &plan, &config).unwrap();
+        assert!(repeated.executed_steps.is_empty());
+        assert_eq!(
+            repeated.skipped_steps,
+            ["tag", "release-notes", "artifacts"]
+        );
+        let recorded = fs::read_to_string(&calls).unwrap();
+        let call_lines = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(call_lines.len(), 4, "{recorded}");
+        assert!(
+            call_lines[0].starts_with("api\t--method\tPOST\trepos/acme/widgets/git/refs"),
+            "{recorded}"
+        );
+        assert!(
+            call_lines[1].starts_with("release\tcreate\t0.0.0+fixture"),
+            "{recorded}"
+        );
+        assert_eq!(
+            call_lines[1], call_lines[2],
+            "the failed notes step must be retried"
+        );
+        assert!(
+            call_lines[3].starts_with("release\tupload\t0.0.0+fixture"),
+            "{recorded}"
+        );
+        assert!(
+            call_lines
+                .iter()
+                .all(|call| !call.contains("view") && !call.contains("GET")),
+            "release idempotency must not inspect public release text: {recorded}"
+        );
+        assert!(release_directory.join(RELEASE_NOTES_FILE).is_file());
+        assert!(release_directory.join(RELEASE_ARTIFACTS_FILE).is_file());
+
+        let mut changed = plan.clone();
+        changed.artifacts.push(CampaignReleaseArtifact {
+            kind: "late".to_owned(),
+            locator: "local://late".to_owned(),
+            object_id: None,
+            sha256: None,
+            bytes: None,
+        });
+        let mismatch = execute_campaign_release(&state_dir, &changed, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("disagrees with the current release plan"));
+        assert_eq!(fs::read_to_string(&calls).unwrap(), recorded);
+    }
+
+    #[test]
+    fn every_release_step_failure_resumes_at_the_first_incomplete_step() {
+        let step_names = ["tag", "release-notes", "artifacts"];
+        for failed_call in 1..=3 {
+            let temporary = tempfile::tempdir().unwrap();
+            let state_dir = temporary.path().join("state");
+            let calls = temporary.path().join("gh-calls");
+            let count = temporary.path().join("gh-count");
+            let fail_on = temporary.path().join("gh-fail-on");
+            fs::write(&fail_on, format!("{failed_call}\n")).unwrap();
+            let shim = release_recording_gh(temporary.path(), &calls, &count, &fail_on);
+            let config = CampaignReleaseExecutionConfig::resolve(Some(shim)).unwrap();
+            let plan = release_execution_plan_for_test();
+
+            assert!(execute_campaign_release(&state_dir, &plan, &config).is_err());
+            let resumed = execute_campaign_release(&state_dir, &plan, &config).unwrap();
+            assert_eq!(
+                resumed.skipped_steps,
+                step_names[..failed_call - 1],
+                "failure at forge call {failed_call}"
+            );
+            assert_eq!(
+                resumed.executed_steps,
+                step_names[failed_call - 1..],
+                "failure at forge call {failed_call}"
+            );
+            let calls_after_resume = fs::read_to_string(&calls).unwrap();
+            assert_eq!(
+                calls_after_resume.lines().count(),
+                4,
+                "failure at forge call {failed_call}: {calls_after_resume}"
+            );
+
+            let repeated = execute_campaign_release(&state_dir, &plan, &config).unwrap();
+            assert!(repeated.executed_steps.is_empty());
+            assert_eq!(repeated.skipped_steps, step_names);
+            assert_eq!(fs::read_to_string(&calls).unwrap(), calls_after_resume);
+        }
+    }
+
+    #[test]
+    fn release_gh_program_is_explicit_and_defaults_only_to_path_gh() {
+        assert_eq!(
+            CampaignReleaseExecutionConfig::resolve(None)
+                .unwrap()
+                .gh_program,
+            PathBuf::from("gh")
+        );
+        let parsed = Opts::try_parse_from([
+            "tally",
+            "campaign",
+            "release",
+            "acme/widgets",
+            "specs/release.json",
+            "--gh-program",
+            "/tmp/recording-gh",
+        ])
+        .unwrap();
+        let Some(Command::Campaign {
+            command: CampaignCommand::Release(args),
+        }) = parsed.command
+        else {
+            panic!("release command did not parse")
+        };
+        assert_eq!(args.gh_program, Some(PathBuf::from("/tmp/recording-gh")));
+    }
+
+    fn release_execution_plan_for_test() -> CampaignReleasePlan {
+        let revision = "a".repeat(40);
+        CampaignReleasePlan {
+            schema_version: RELEASE_PLAN_SCHEMA_VERSION,
+            mode: "plan",
+            campaign: "fixture-release".to_owned(),
+            registration_id: "0198a62b-41ee-7000-8000-000000000777".to_owned(),
+            repository: "acme/widgets".to_owned(),
+            worklist: "specs/release.json".to_owned(),
+            version: "0.0.0+fixture".to_owned(),
+            revision: revision.clone(),
+            integration_ref: "refs/heads/tally/fixture/integration".to_owned(),
+            closing_summary: CampaignReleaseSummaryProof {
+                reference: "refs/tally/campaign/fixture/summary/complete".to_owned(),
+                object_id: "b".repeat(40),
+            },
+            release_notes: vec![CampaignReleaseNote {
+                task_id: "ship-feature".to_owned(),
+                commit: revision.clone(),
+                source_ref: Some("refs/heads/tally/fixture/ship-feature".to_owned()),
+                source_commit: Some(revision.clone()),
+                header: "feat(crates/tally): ship fixture releases".to_owned(),
+                kind: "feat".to_owned(),
+                scope: Some("crates/tally".to_owned()),
+                breaking: false,
+                summary: "ship fixture releases".to_owned(),
+            }],
+            gate_proof: CampaignReleaseGateProof {
+                task_id: "release-gate".to_owned(),
+                reference: "refs/tally/campaign/fixture/checkpoint/release-gate".to_owned(),
+                revision: revision.clone(),
+            },
+            artifacts: vec![CampaignReleaseArtifact {
+                kind: "integration".to_owned(),
+                locator: "refs/heads/tally/fixture/integration".to_owned(),
+                object_id: Some(revision.clone()),
+                sha256: None,
+                bytes: None,
+            }],
+            digest: serde_json::from_value(json!({
+                "schemaVersion": 1,
+                "campaign": "fixture-release",
+                "repository": "acme/widgets",
+                "outcome": "complete",
+                "source": {
+                    "path": "specs/release.json",
+                    "sha256": format!("sha256:{}", "c".repeat(64)),
+                    "revision": revision,
+                },
+                "baseRevision": "a".repeat(40),
+                "taskCount": 1,
+                "merged": [],
+                "checkpoints": [],
+                "blocked": [],
+                "outstanding": [],
+                "steering": [],
+                "retries": [],
+                "deferrals": [],
+                "warnings": [],
+            }))
+            .unwrap(),
+            campaign_summary: "Campaign complete.\n".to_owned(),
+        }
+    }
+
+    fn release_recording_gh(
+        directory: &Path,
+        calls: &Path,
+        count: &Path,
+        fail_on: &Path,
+    ) -> PathBuf {
+        const SHELL_COMMAND_PROVIDER: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test/fixtures/shell-command-provider"
+        );
+        let program = directory.join("recording-gh");
+        let mut source = OsString::from(program.as_os_str());
+        source.push(".tally-test-script");
+        fs::write(
+            PathBuf::from(source),
+            format!(
+                r#"#!/bin/sh
+set -eu
+count=0
+if test -f '{count}'; then count=$(cat '{count}'); fi
+count=$((count + 1))
+printf '%s\n' "$count" > '{count}'
+printf '%s' "$1" >> '{calls}'
+shift
+for argument in "$@"; do printf '\t%s' "$argument" >> '{calls}'; done
+printf '\n' >> '{calls}'
+if test -f '{fail_on}' && test "$(cat '{fail_on}' | tr -d '\n')" = "$count"; then
+  printf 'injected failure %s\n' "$count" >&2
+  exit 23
+fi
+"#,
+                calls = calls.display(),
+                count = count.display(),
+                fail_on = fail_on.display(),
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(SHELL_COMMAND_PROVIDER, &program).unwrap();
+        program
     }
 
     #[test]
