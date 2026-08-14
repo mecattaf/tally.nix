@@ -3,6 +3,8 @@ use std::process::Command;
 
 use serde_json::Value;
 
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
+
 #[test]
 fn lint_history_reports_each_commit_and_fails_a_poisoned_range() {
     let temporary = tempfile::tempdir().unwrap();
@@ -34,6 +36,7 @@ fn lint_history_reports_each_commit_and_fails_a_poisoned_range() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .current_dir(repository)
         .args(["lint-history", "HEAD", "--scope", "crates/tally"])
         .output()
@@ -53,6 +56,7 @@ fn lint_history_reports_each_commit_and_fails_a_poisoned_range() {
     );
 
     let valid = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .current_dir(repository)
         .args(["lint-history", &first, "--scopes", "crates/tally"])
         .output()

@@ -8,9 +8,11 @@ use tally_core::campaign_registry::{
 };
 
 const WORKLIST: &str = "specs/night/tasks.json";
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 fn quiescent(state_dir: &Path, absent_socket: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .args(["campaign", "quiescent", "--state-dir"])
         .arg(state_dir)
         .env("TALLY_SOCKET", absent_socket)

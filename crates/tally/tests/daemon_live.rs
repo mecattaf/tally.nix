@@ -24,12 +24,15 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 
+#[path = "support/configured_tally.rs"]
+mod configured_tally;
 #[path = "support/live.rs"]
 mod live_support;
 #[path = "support/shell_program.rs"]
 mod shell_program;
 
 const BASH: &str = "/run/current-system/sw/bin/bash";
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 struct UnitCleanup(Vec<String>);
 
@@ -155,6 +158,7 @@ async fn enqueue_wait_rearms_after_restart_and_observes_terminal_verdict() {
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new(env!("CARGO_BIN_EXE_tally"))
+            .args(["--config", EMPTY_CONFIG])
             .arg("--socket")
             .arg(&socket)
             .args([
@@ -214,6 +218,7 @@ async fn await_job_exits_unreachable_after_rearm_window_is_exhausted() {
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new(env!("CARGO_BIN_EXE_tally"))
+            .args(["--config", EMPTY_CONFIG])
             .arg("--socket")
             .arg(&socket)
             .args(["--rpc-timeout-sec", "1", "queue", "await-job", TASK_UUID])
@@ -460,13 +465,14 @@ async fn real_user_manager_adapter_capture_scrape() {
                 data_dir: temp.path().join("data"),
             };
             let mut live_config = config();
+            let config_path = temp.path().join("config.json");
             let harness = temp.path().join("checkpoint-harness");
             shell_program::install(
                 &harness,
                 concat!(
                     "#!/bin/sh\n",
                     "set -eu\n",
-                    "hook_status=\"$(\"$LIVE_TALLY_BIN\" lease status)\"\n",
+                    "hook_status=\"$(\"$LIVE_TALLY_BIN\" --config \"$LIVE_TALLY_CONFIG\" lease status)\"\n",
                     "exec \"$LIVE_JQ\" -cn --argjson hookStatus \"$hook_status\" --args ",
                     "'{session_id:\"live-session\",model:\"Live/Model.Exact\",usage:{input_tokens:12345},mode:env.LIVE_ADAPTER_MODE,hook:env.TALLY_YIELD_HOOK,socket:env.TALLY_SOCKET,hook_status:$hookStatus,workload:$ARGS.positional}' -- \"$@\"\n"
                 ),
@@ -558,6 +564,8 @@ async fn real_user_manager_adapter_capture_scrape() {
                     trace: None,
                     yield_hook: Some(vec![
                         env!("CARGO_BIN_EXE_tally").to_owned(),
+                        "--config".to_owned(),
+                        config_path.to_string_lossy().into_owned(),
                         "lease".to_owned(),
                         "status".to_owned(),
                     ]),
@@ -566,6 +574,10 @@ async fn real_user_manager_adapter_capture_scrape() {
                         (
                             "LIVE_TALLY_BIN".to_owned(),
                             env!("CARGO_BIN_EXE_tally").to_owned(),
+                        ),
+                        (
+                            "LIVE_TALLY_CONFIG".to_owned(),
+                            config_path.to_string_lossy().into_owned(),
                         ),
                         ("LIVE_JQ".to_owned(), jq.to_string_lossy().into_owned()),
                     ]),
@@ -580,11 +592,14 @@ async fn real_user_manager_adapter_capture_scrape() {
                     )]),
                 },
             );
+            fs::write(&config_path, serde_json::to_vec(&live_config).unwrap()).unwrap();
+            let recorder =
+                configured_tally::install(&temp.path().join("configured-recorder"));
             let daemon = Daemon::open(
                 live_config,
                 paths.clone(),
                 settings(),
-                PathBuf::from(env!("CARGO_BIN_EXE_tally")),
+                recorder,
             )
             .await
             .unwrap();
@@ -669,6 +684,8 @@ async fn real_user_manager_adapter_capture_scrape() {
                 attestation.payload["captures"]["hook"],
                 serde_json::to_string(&vec![
                     env!("CARGO_BIN_EXE_tally"),
+                    "--config",
+                    config_path.to_str().unwrap(),
                     "lease",
                     "status"
                 ])
@@ -703,7 +720,7 @@ async fn real_user_manager_daemon_contention_restart_soak() {
                 state_dir: temp.path().join("state"),
                 data_dir: temp.path().join("data"),
             };
-            let recorder = PathBuf::from(env!("CARGO_BIN_EXE_tally"));
+            let recorder = configured_tally::install(&temp.path().join("configured-recorder"));
             let mut cleanup = UnitCleanup(Vec::new());
 
             let first = Daemon::open(config(), paths.clone(), settings(), recorder.clone())

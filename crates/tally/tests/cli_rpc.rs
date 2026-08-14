@@ -19,6 +19,7 @@ const FORGE_TASK_T02: &str = "0198f000-0000-7000-8000-000000000042/t02";
 const FORGE_TASK_T03: &str = "0198f000-0000-7000-8000-000000000042/t03";
 const FORGE_TASK_T04: &str = "0198f000-0000-7000-8000-000000000042/t04";
 const FORGE_TASK_T05: &str = "0198f000-0000-7000-8000-000000000042/t05";
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 #[derive(Clone, Copy)]
 struct CliHandler;
@@ -823,6 +824,7 @@ async fn run_tally_with_identity(
 ) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
     command
+        .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(socket)
         .args(args)
@@ -1162,6 +1164,8 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     let success = Command::new(env!("CARGO_BIN_EXE_tally"))
         .args([
             "__record-unit-exit",
+            "--config",
+            EMPTY_CONFIG,
             "--record",
             record.to_str().unwrap(),
             "--unit",
@@ -1192,6 +1196,8 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     let failure = Command::new(env!("CARGO_BIN_EXE_tally"))
         .args([
             "__record-unit-exit",
+            "--config",
+            EMPTY_CONFIG,
             "--record",
             missing.to_str().unwrap(),
             "--unit",
@@ -1913,6 +1919,7 @@ async fn a_human_query_whose_reader_hangs_up_exits_without_a_panic() {
             });
 
             let mut child = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .args(["--config", EMPTY_CONFIG])
                 .arg("--socket")
                 .arg(&socket)
                 .args(["query", "run", "00000000-0000-4000-8000-000000000262"])
@@ -1969,6 +1976,7 @@ async fn tally_writing_into_a_closed_pipe(
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
+    command.args(["--config", EMPTY_CONFIG]);
     if let Some(socket) = socket {
         command.arg("--socket").arg(socket);
     }
@@ -2192,6 +2200,7 @@ async fn a_closed_stream_never_panics_the_help_or_the_error_printer() {
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let unreachable = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(&absent)
         .args(["query", "run", "00000000-0000-4000-8000-000000000262"])
@@ -2221,6 +2230,7 @@ async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
         let name = name.to_owned();
         async move {
             Command::new(env!("CARGO_BIN_EXE_tally"))
+                .args(["--config", EMPTY_CONFIG])
                 .args(["witness", "verify"])
                 .arg(fixtures.join(name))
                 .arg("--attestations")
@@ -2540,6 +2550,7 @@ async fn a_walked_window_whose_reader_hangs_up_exits_quietly_without_notices() {
             });
 
             let mut child = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .args(["--config", EMPTY_CONFIG])
                 .arg("--socket")
                 .arg(&socket)
                 .args([

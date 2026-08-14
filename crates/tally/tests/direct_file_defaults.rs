@@ -17,6 +17,7 @@ use std::process::Output;
 use tokio::process::Command;
 
 const FLOW_RUN: &str = "00000000-0000-4000-8000-000000000abc";
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 const VALID_LEDGER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../test/fixtures/ledger/valid.jsonl"
@@ -34,6 +35,7 @@ async fn invocation(
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
     command
+        .args(["--config", EMPTY_CONFIG])
         .args(args)
         .env("HOME", home)
         .env_remove("XDG_CONFIG_HOME")

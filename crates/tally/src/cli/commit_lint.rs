@@ -266,6 +266,58 @@ pub(super) fn commit_header(message: &str) -> &str {
     header.strip_suffix('\r').unwrap_or(header)
 }
 
+/// Completion proof is stricter than Git's case-insensitive trailer query.
+/// The driver owns this exact leading pair; accepting lookalike spellings or
+/// a pair buried later in the footer would let a hand-authored commit satisfy
+/// the release oracle without carrying the driver-owned proof shape.
+pub(super) fn has_canonical_completion_trailer_pair(
+    message: &str,
+    task_id: &str,
+    revision: &str,
+) -> bool {
+    let normalized = message.replace("\r\n", "\n");
+    let mut lines = normalized.split('\n').collect::<Vec<_>>();
+    while lines.last() == Some(&"") {
+        lines.pop();
+    }
+    let paragraphs = message_paragraphs(&lines);
+    let Some(&(start, end)) = paragraphs.last() else {
+        return false;
+    };
+    if start < 2
+        || !lines[start - 1].is_empty()
+        || !analyze_trailer_paragraph(&lines, start, end).valid
+        || lines[..start]
+            .iter()
+            .any(|line| completion_trailer_key(line).is_some())
+    {
+        return false;
+    }
+
+    let entries = lines[start..end]
+        .iter()
+        .copied()
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .collect::<Vec<_>>();
+    let expected_task = format!("Tally-Task: {task_id}");
+    let expected_revision = format!("Tally-Revision: {revision}");
+    if entries.first().copied() != Some(expected_task.as_str())
+        || entries.get(1).copied() != Some(expected_revision.as_str())
+    {
+        return false;
+    }
+    !entries[2..]
+        .iter()
+        .any(|line| completion_trailer_key(line).is_some())
+}
+
+fn completion_trailer_key(line: &str) -> Option<&str> {
+    let (key, _) = line.split_once(':')?;
+    ["Tally-Task", "Tally-Revision"]
+        .into_iter()
+        .find(|expected| key.eq_ignore_ascii_case(expected))
+}
+
 fn parse_header(
     header: &str,
     scopes: &BTreeSet<String>,
@@ -544,5 +596,36 @@ mod tests {
         let message = "chore(crates/tally): record assistance\n\nCo-authored-by: Model <model@example.invalid>";
         assert!(rules(&validate_commit_message(message, &scopes()))
             .contains("trailer-block-wellformed"));
+    }
+
+    #[test]
+    fn completion_proof_requires_the_canonical_leading_footer_pair() {
+        let revision = format!("sha256:{}", "a".repeat(64));
+        let valid = format!(
+            "task: merge fixture\n\nTally-Task: fixture\nTally-Revision: {revision}\nAssisted-by: fixture"
+        );
+        assert!(has_canonical_completion_trailer_pair(
+            &valid, "fixture", &revision
+        ));
+
+        for poisoned in [
+            format!(
+                "task: merge fixture\n\ntally-task: fixture\ntally-revision: {revision}"
+            ),
+            format!(
+                "task: merge fixture\n\nAssisted-by: fixture\nTally-Task: fixture\nTally-Revision: {revision}"
+            ),
+            format!(
+                "task: merge fixture\n\nTally-Task: fixture\npoison\nTally-Revision: {revision}"
+            ),
+            format!(
+                "task: merge fixture\n\nTally-Task: fixture\nTally-Revision: {revision}\nTally-Task: fixture"
+            ),
+        ] {
+            assert!(
+                !has_canonical_completion_trailer_pair(&poisoned, "fixture", &revision),
+                "poisoned completion proof was accepted:\n{poisoned}"
+            );
+        }
     }
 }

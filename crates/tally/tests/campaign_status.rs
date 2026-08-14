@@ -16,6 +16,7 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 
 const ISSUE_URL: &str = "local://acme/widgets/specs/night/tasks.json";
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 const CODE_REPOSITORY: &str = "acme/widgets";
 const WORKLIST: &str = "specs/night/tasks.json";
 const REGISTRATION_ID: &str = "0198a62b-41ee-7000-8000-000000000542";
@@ -362,6 +363,7 @@ impl RpcHandler for FirstQueuedCampaignStatusHandler {
 
 async fn run_tally(socket: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(socket)
         .args(args)

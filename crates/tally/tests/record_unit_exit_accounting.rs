@@ -16,6 +16,7 @@ use tally_core::executor::{read_exit_record, UNIT_EXIT_SCHEMA_VERSION};
 mod shell_program;
 
 const UNIT: &str = "tally-job-00000000-0000-4000-8000-000000000001.service";
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 /// Install a fake `systemctl` through the immutable provider rather than
 /// writing an executable and `chmod`ing it (#396): a program still open for
@@ -81,6 +82,7 @@ fn an_installed_program_is_a_symlink_to_the_checked_in_provider_not_a_written_fi
 fn record_unit_exit(temp: &Path, systemctl: &Path, record: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tally"))
         .arg("__record-unit-exit")
+        .args(["--config", EMPTY_CONFIG])
         .arg("--record")
         .arg(record)
         .arg("--unit")

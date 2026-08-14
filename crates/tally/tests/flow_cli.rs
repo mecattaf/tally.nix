@@ -11,6 +11,8 @@ use tally_core::config::{
     Config, FlowRegistration, PoolConfig, PoolPredicate, ResourceKind, WindowedConsumptionPredicate,
 };
 
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/flows")
@@ -105,6 +107,7 @@ fn serve_empty_flow_history(
 #[test]
 fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     let valid = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .args(["flow", "check"])
         .arg(fixture("valid.js"))
         .args(["--args", r#"{"task":"ship"}"#, "--catalog"])
@@ -124,6 +127,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     let args_path = temp.path().join("flow-args.json");
     fs::write(&args_path, br#"{"task":"from-path"}"#).unwrap();
     let from_path = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .args(["flow", "check"])
         .arg(fixture("valid.js"))
         .arg("--args-path")
@@ -140,6 +144,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     let relative_link = temp.path().join("args-link.json");
     std::os::unix::fs::symlink(&args_path, &relative_link).unwrap();
     let from_relative_link = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .current_dir(temp.path())
         .args(["flow", "check"])
         .arg(fixture("valid.js"))
@@ -154,6 +159,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     );
 
     let drv = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .args(["flow", "check"])
         .arg(fixture("valid-drv.js"))
         .output()
@@ -173,6 +179,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
         ("bad-args-schema.js", "args-schema-invalid"),
     ] {
         let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+            .args(["--config", EMPTY_CONFIG])
             .args(["flow", "check"])
             .arg(fixture(name))
             .output()
@@ -191,6 +198,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
 #[test]
 fn flow_render_cli_is_static_mermaid_with_check_level_failures() {
     let rendered = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .args(["flow", "render"])
         .arg(fixture("valid-drv.js"))
         .output()
@@ -209,6 +217,7 @@ fn flow_render_cli_is_static_mermaid_with_check_level_failures() {
     );
 
     let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .args(["flow", "render"])
         .arg(fixture("banned-global.js"))
         .output()
@@ -469,13 +478,15 @@ fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event
 }
 
 #[test]
-fn flow_run_without_config_names_the_missing_default_before_connecting() {
+fn flow_run_with_a_missing_explicit_config_names_it_before_connecting() {
     let temp = tempfile::tempdir().unwrap();
     let config_home = temp.path().join("empty-config-home");
     fs::create_dir_all(&config_home).unwrap();
     let expected = config_home.join("tally/config.json");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&expected)
         .arg("--socket")
         .arg(temp.path().join("absent.sock"))
         .args(["flow", "run"])
