@@ -967,6 +967,85 @@ const narrationAttemptsSchema = {
   }
 };
 
+// Semantic identity is separate from the operator-facing label. NodeSpec does
+// not expose arbitrary orchestration fields, so the explicit flow-local key
+// carries this versioned closed schema to tally-core admission; core persists
+// it as orchestration.nodeRole + subjectTaskId before any campaign fold reads
+// the node. Keep this JSON object literal parseable: a tally-core parity test
+// pins its values against the Rust enum.
+const specBuildNodeRole = Object.freeze({
+  "AGENT": "agent",
+  "CHECKPOINT_RECORD": "checkpoint-record",
+  "CLEANUP": "cleanup",
+  "CONSTRAINT": "constraint",
+  "CONTINUE": "continue",
+  "DIAGNOSIS": "diagnosis",
+  "ESCALATE": "escalate",
+  "GATE": "gate",
+  "MERGE": "merge",
+  "OWNERSHIP": "ownership",
+  "PREP": "prep",
+  "PUBLISH": "publish",
+  "REBASE": "rebase",
+  "RECONCILE": "reconcile",
+  "RETRY": "retry",
+  "STEERING": "steering",
+  "SWEEP": "sweep"
+});
+
+const specBuildNodeRoleSchema = Object.freeze({
+  type: "string",
+  enum: Object.freeze(Object.values(specBuildNodeRole))
+});
+
+const driverActionNodeRole = Object.freeze({
+  sweep: specBuildNodeRole.SWEEP,
+  reconcile: specBuildNodeRole.RECONCILE,
+  diff: specBuildNodeRole.DIAGNOSIS,
+  steeringRecheck: specBuildNodeRole.STEERING,
+  steer: specBuildNodeRole.STEERING,
+  retry: specBuildNodeRole.RETRY,
+  escalate: specBuildNodeRole.ESCALATE,
+  continue: specBuildNodeRole.CONTINUE,
+  preflight: specBuildNodeRole.PREP,
+  prep: specBuildNodeRole.PREP,
+  cleanup: specBuildNodeRole.CLEANUP,
+  ownership: specBuildNodeRole.OWNERSHIP,
+  treeDelta: specBuildNodeRole.CONSTRAINT,
+  constraint: specBuildNodeRole.CONSTRAINT,
+  checkpoint: specBuildNodeRole.CHECKPOINT_RECORD,
+  publish: specBuildNodeRole.PUBLISH,
+  rebase: specBuildNodeRole.REBASE,
+  merge: specBuildNodeRole.MERGE
+});
+
+function specBuildNodeIdentity(role, taskRef, key, label) {
+  if (!specBuildNodeRoleSchema.enum.includes(role)) {
+    throw new TypeError(`unknown spec-build node role ${String(role)}`);
+  }
+  if (typeof key !== "string" || key.length === 0 || key.includes(":")) {
+    throw new TypeError("spec-build node key must be a non-empty colon-free string");
+  }
+  if (typeof label !== "string" || label.length === 0) {
+    throw new TypeError("spec-build node label must be a non-empty string");
+  }
+  let subjectTaskId = "";
+  if (taskRef !== null) {
+    if (typeof taskRef !== "string") {
+      throw new TypeError("spec-build node taskRef must be a string or null");
+    }
+    const components = taskRef.split("/");
+    if (components.length !== 2 || components.some(component => component.length === 0)) {
+      throw new TypeError("spec-build node taskRef must contain one non-empty task component");
+    }
+    subjectTaskId = components[1];
+  }
+  return {
+    key: `spec-build:v1:${role}:${subjectTaskId}:${key}`,
+    label
+  };
+}
+
 const publicationSchema = {
   type: "object",
   required: [
@@ -1216,6 +1295,12 @@ function driverNode(
   taskRef,
   runtimeMaxSec = args.driverRuntimeMaxSec
 ) {
+  const identity = specBuildNodeIdentity(
+    driverActionNodeRole[action],
+    taskRef,
+    key,
+    label
+  );
   const spec = {
     argv: [args.driver, action],
     adapter: "spec-build-driver",
@@ -1224,8 +1309,8 @@ function driverNode(
     runtimeMaxSec,
     evidence: ["exit:0"],
     brief,
-    key,
-    label
+    key: identity.key,
+    label: identity.label
   };
   if (resultSchema !== null) {
     spec.resultSchema = resultSchema;
@@ -1691,6 +1776,12 @@ async function runGate(task, gate, workspace, prefix) {
   const key = `${prefix}-${task.id}-${gate.id}`;
   const taskRef = taskRefFor(task.id);
   if (gate.kind === "command") {
+    const identity = specBuildNodeIdentity(
+      specBuildNodeRole.GATE,
+      taskRef,
+      key,
+      key
+    );
     return sh(gate.argv, {
       pools: ["campaign-control"],
       priority: "low",
@@ -1698,8 +1789,8 @@ async function runGate(task, gate, workspace, prefix) {
       env: { CAMPAIGN_TASK_ID: task.id },
       runtimeMaxSec: gate.runtimeMaxSec,
       evidence: ["exit:0"],
-      key,
-      label: key,
+      key: identity.key,
+      label: identity.label,
       settle: true,
       taskRef
     });
@@ -1729,6 +1820,13 @@ async function runGate(task, gate, workspace, prefix) {
 }
 
 async function runPreflightGate(task, gate, workspace) {
+  const taskRef = taskRefFor(task.id);
+  const identity = specBuildNodeIdentity(
+    specBuildNodeRole.GATE,
+    taskRef,
+    `preflight-gate-${gate.id}`,
+    `preflight-gate-${gate.id}`
+  );
   return sh(gate.preflightArgv, {
     pools: ["campaign-control"],
     priority: "low",
@@ -1736,10 +1834,10 @@ async function runPreflightGate(task, gate, workspace) {
     env: { CAMPAIGN_TASK_ID: task.id },
     runtimeMaxSec: gate.runtimeMaxSec,
     evidence: ["exit:0"],
-    key: `preflight-gate-${gate.id}`,
-    label: `preflight-gate-${gate.id}`,
+    key: identity.key,
+    label: identity.label,
     settle: true,
-    taskRef: taskRefFor(task.id)
+    taskRef
   });
 }
 
@@ -1755,16 +1853,23 @@ async function runPreflightGate(task, gate, workspace) {
 // the first agent cycle, while a base that is legitimately red until an agent
 // builds something stays tolerated.
 async function runPreflightWitness(task, gate, workspace) {
+  const taskRef = taskRefFor(task.id);
+  const identity = specBuildNodeIdentity(
+    specBuildNodeRole.GATE,
+    taskRef,
+    `preflight-witness-${gate.id}`,
+    `preflight-witness-${gate.id}`
+  );
   return sh(gate.argv, {
     pools: ["campaign-control"],
     priority: "low",
     workspace,
     env: { CAMPAIGN_TASK_ID: task.id },
     runtimeMaxSec: gate.runtimeMaxSec,
-    key: `preflight-witness-${gate.id}`,
-    label: `preflight-witness-${gate.id}`,
+    key: identity.key,
+    label: identity.label,
     settle: true,
-    taskRef: taskRefFor(task.id)
+    taskRef
   });
 }
 
@@ -2066,6 +2171,12 @@ function sweepDeferral(sweepNode) {
 
     if (task.kind === "checkpoint") {
       const taskBrief = checkpointBrief(task, prepared.result, reconciliation);
+      const checkpointIdentity = specBuildNodeIdentity(
+        specBuildNodeRole.GATE,
+        taskRef,
+        `checkpoint-${task.id}`,
+        `checkpoint-${task.id}`
+      );
       const checkpoint = await sh(task.argv, {
         pools: ["campaign-control"],
         priority: "low",
@@ -2074,8 +2185,8 @@ function sweepDeferral(sweepNode) {
         runtimeMaxSec: task.runtimeMaxSec,
         evidence: ["exit:0"],
         brief: taskBrief,
-        key: `checkpoint-${task.id}`,
-        label: `checkpoint-${task.id}`,
+        key: checkpointIdentity.key,
+        label: checkpointIdentity.label,
         settle: true,
         taskRef
       });
@@ -2219,6 +2330,12 @@ function sweepDeferral(sweepNode) {
       reconciliation,
       attemptSteering
     );
+    const agentIdentity = specBuildNodeIdentity(
+      specBuildNodeRole.AGENT,
+      taskRef,
+      `agent-${task.id}`,
+      `agent-${task.id}`
+    );
     const agentSpec = applyAgentPolicies({
       argv: effective.agent.argv,
       adapter: effective.agent.adapter,
@@ -2227,8 +2344,8 @@ function sweepDeferral(sweepNode) {
       workspace,
       evidence: ["exit:0"],
       brief: taskBrief,
-      key: `agent-${task.id}`,
-      label: `agent-${task.id}`,
+      key: agentIdentity.key,
+      label: agentIdentity.label,
       taskRef
     });
     const agent = await job(agentSpec, { settle: true });
@@ -2831,6 +2948,12 @@ function sweepDeferral(sweepNode) {
       };
       // The diagnosis brief prohibits mutation, so the node is sandboxed to
       // match rather than inheriting the implementation node's writable policy.
+      const diagnosisIdentity = specBuildNodeIdentity(
+        specBuildNodeRole.DIAGNOSIS,
+        taskRef,
+        `diagnose-${task.id}`,
+        `diagnose-${task.id}`
+      );
       const diagnosisSpec = applyAgentPolicies(
         {
           argv: effective.agent.argv,
@@ -2839,8 +2962,8 @@ function sweepDeferral(sweepNode) {
           priority: effective.agent.priority,
           evidence: ["exit:0"],
           brief: diagnosisBrief,
-          key: `diagnose-${task.id}`,
-          label: `diagnose-${task.id}`,
+          key: diagnosisIdentity.key,
+          label: diagnosisIdentity.label,
           taskRef,
           resultSchema: diagnosisResultSchema
         },

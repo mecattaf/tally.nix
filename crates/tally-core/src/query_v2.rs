@@ -18,7 +18,7 @@ use crate::flow_membership::FlowMembership;
 use crate::history::{LifecycleRecord, LifecycleSnapshot, RetentionMetadata};
 use crate::journal::TallyEvent;
 use crate::occupancy::{ContextWindow, ContextWindowSource};
-use crate::provenance::{Orchestration, TaskRef};
+use crate::provenance::{Orchestration, SpecBuildNodeRole, TaskRef};
 use crate::query::{
     HeadroomSignal, RowStatus, StandupDigest, StandupRunUsage, StandupUsageBasis,
     QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
@@ -859,9 +859,22 @@ pub fn query_lifecycle_log(
         .flow_run
         .as_deref()
         .map(|flow_run| flow_run_tasks(flow_run, details, witness, membership));
+    // Journal rows carry task identity but not an orchestration capsule. Join
+    // their label from that task's durable admission row; witness projections
+    // keep the label in their own capsule instead of arbitrating one source's
+    // label onto every fact for the task.
+    let mut detail_labels = BTreeMap::new();
+    for detail in details {
+        if let Some(label) = orchestration_string(detail.orchestration.as_ref(), "nodeLabel") {
+            detail_labels
+                .entry(detail.task_uuid.clone())
+                .or_insert(label);
+        }
+    }
     let mut ordered = Vec::<(DateTime<Utc>, u8, u64, LifecycleEventProjection)>::new();
     for record in &history.records {
-        let projection = lifecycle_projection(record);
+        let mut projection = lifecycle_projection(record);
+        projection.node_label = detail_labels.get(&projection.task_uuid).cloned();
         if lifecycle_matches(&projection, filter, flow_tasks.as_ref(), since, until) {
             ordered.push((
                 parse_timestamp(&projection.timestamp)?,
@@ -880,16 +893,6 @@ pub fn query_lifecycle_log(
                 record.seq,
                 projection,
             ));
-        }
-    }
-    // Label resolution is a scan of every witness and detail row, so it runs
-    // once over the whole corpus and only for records that survived the
-    // filter -- never once per candidate record, which made a `--task <uuid>`
-    // query cost O(records x (witnesses + details)) on the daemon thread.
-    if !ordered.is_empty() {
-        let labels = NodeLabelIndex::build(details, witness);
-        for entry in &mut ordered {
-            entry.3.node_label = labels.lookup(&entry.3.task_uuid);
         }
     }
     ordered.sort_by(|left, right| {
@@ -1450,8 +1453,7 @@ pub fn query_run(
                 orchestration.flow_run_id() == flow_run
                     && orchestration_string(Some(orchestration), "flowName").as_deref()
                         == Some("spec-build")
-                    && orchestration_string(Some(orchestration), "nodeLabel").as_deref()
-                        == Some("spec-build-reconcile")
+                    && is_spec_build_reconciliation(orchestration)
             })
         })
         .filter_map(|detail| {
@@ -1608,8 +1610,12 @@ pub fn query_run(
                 continue;
             }
             let task_id = task_ref.task_id().to_owned();
-            let label = node_label(node);
-            if label == format!("merge-{task_id}") {
+            if completed_spec_build_node(
+                node,
+                SpecBuildNodeRole::Merge,
+                &task_id,
+                &format!("merge-{task_id}"),
+            ) {
                 done_ids.insert(task_id.clone());
                 advanced_ids.insert(task_id.clone());
                 if let Some(pull_request) = detail_by_task
@@ -1625,7 +1631,12 @@ pub fn query_run(
                 {
                     pull_requests.insert(task_id, pull_request);
                 }
-            } else if label == format!("checkpoint-record-{task_id}") {
+            } else if completed_spec_build_node(
+                node,
+                SpecBuildNodeRole::CheckpointRecord,
+                &task_id,
+                &format!("checkpoint-record-{task_id}"),
+            ) {
                 done_ids.insert(task_id.clone());
                 advanced_ids.insert(task_id);
             }
@@ -3438,7 +3449,7 @@ fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProject
             .orchestration
             .as_ref()
             .and_then(Orchestration::task_ref),
-        node_label: None,
+        node_label: orchestration_string(record.orchestration.as_ref(), "nodeLabel"),
         attempt: Some(record.attempt),
         lease_epoch: Some(record.lease_epoch),
         adapter: None,
@@ -3486,48 +3497,41 @@ fn node_label(node: &JobSummary) -> String {
         .unwrap_or_else(|| node.anchor.clone())
 }
 
-/// One pass over the witness ledger and durable rows, answering the same
-/// question `node_label_for_task` answered per call: the label carried by a
-/// task's newest witness, falling back to its oldest durable row.
-struct NodeLabelIndex {
-    witness: BTreeMap<String, Option<String>>,
-    detail: BTreeMap<String, Option<String>>,
-}
-
-impl NodeLabelIndex {
-    fn build(details: &[RowDetailFact], witness: &[WitnessRecord]) -> Self {
-        let mut witness_labels = BTreeMap::new();
-        for record in witness {
-            let Some(task_uuid) = record.task_uuid.as_deref() else {
-                continue;
-            };
-            // Later records overwrite earlier ones, so the newest witness for
-            // a task wins even when it carries no label of its own.
-            witness_labels.insert(
-                task_uuid.to_owned(),
-                orchestration_string(record.orchestration.as_ref(), "nodeLabel"),
-            );
+fn is_spec_build_reconciliation(orchestration: &Orchestration) -> bool {
+    match orchestration.node_role() {
+        Some(role) => {
+            role == SpecBuildNodeRole::Reconcile && orchestration.subject_task_id().is_none()
         }
-        let mut detail_labels = BTreeMap::<String, Option<String>>::new();
-        for detail in details {
-            detail_labels
-                .entry(detail.task_uuid.clone())
-                .or_insert_with(|| {
-                    orchestration_string(detail.orchestration.as_ref(), "nodeLabel")
-                });
-        }
-        Self {
-            witness: witness_labels,
-            detail: detail_labels,
+        None => {
+            orchestration_string(Some(orchestration), "nodeLabel").as_deref()
+                == Some("spec-build-reconcile")
         }
     }
+}
 
-    fn lookup(&self, task_uuid: &str) -> Option<String> {
-        self.witness
-            .get(task_uuid)
-            .cloned()
-            .flatten()
-            .or_else(|| self.detail.get(task_uuid).cloned().flatten())
+/// Typed roles are authoritative whenever present. The label comparison is
+/// only the compatibility path for rows admitted before the additive capsule
+/// fields existed; the display fallback remains independent.
+fn completed_spec_build_node(
+    node: &JobSummary,
+    expected_role: SpecBuildNodeRole,
+    subject_task_id: &str,
+    historical_label: &str,
+) -> bool {
+    match node
+        .orchestration
+        .as_ref()
+        .and_then(Orchestration::node_role)
+    {
+        Some(role) => {
+            role == expected_role
+                && node
+                    .orchestration
+                    .as_ref()
+                    .and_then(|orchestration| orchestration.subject_task_id())
+                    == Some(subject_task_id)
+        }
+        None => node_label(node) == historical_label,
     }
 }
 
@@ -3974,14 +3978,37 @@ mod tests {
         Orchestration::new(value).unwrap()
     }
 
+    fn typed_flow_orchestration(
+        flow_run: &str,
+        ordinal: u64,
+        label: &str,
+        role: SpecBuildNodeRole,
+        task_ref: Option<&str>,
+    ) -> Orchestration {
+        let mut value = serde_json::json!({
+            "flowName": "spec-build",
+            "flowRunId": flow_run,
+            "nodeOrdinal": ordinal,
+            "nodeLabel": label,
+            "nodeRole": role,
+        });
+        if let Some(task_ref) = task_ref {
+            let task_ref = TaskRef::new(task_ref.to_owned()).unwrap();
+            value["subjectTaskId"] = Value::String(task_ref.task_id().to_owned());
+            value["taskRef"] = Value::String(task_ref.as_str().to_owned());
+        }
+        Orchestration::new(value).unwrap()
+    }
+
     fn reconciliation_detail(flow_run: &str) -> RowDetailFact {
         let mut detail = detail(RowStatus::Completed);
         detail.task_uuid = "00000000-0000-4000-8000-000000000250".to_owned();
         detail.description = "spec-build-reconcile".to_owned();
-        detail.orchestration = Some(flow_orchestration(
+        detail.orchestration = Some(typed_flow_orchestration(
             flow_run,
             0,
-            "spec-build-reconcile",
+            "reconcile pass",
+            SpecBuildNodeRole::Reconcile,
             None,
         ));
         detail.final_message = Some(
@@ -4013,10 +4040,11 @@ mod tests {
         let mut detail = detail(status);
         detail.task_uuid = "00000000-0000-4000-8000-000000000251".to_owned();
         detail.description = "agent-t02".to_owned();
-        detail.orchestration = Some(flow_orchestration(
+        detail.orchestration = Some(typed_flow_orchestration(
             flow_run,
             1,
             "agent-t02",
+            SpecBuildNodeRole::Agent,
             Some(FORGE_TASK_T02),
         ));
         detail.runtime_max_sec = Some(60);
@@ -4869,7 +4897,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_labels_resolve_from_the_witness_then_the_durable_row() {
+    fn lifecycle_labels_stay_with_their_own_durable_provenance() {
         let flow_run = "00000000-0000-4000-8000-000000000249";
         let mut labelled = detail(RowStatus::Completed);
         labelled.orchestration = Some(flow_orchestration(
@@ -4889,7 +4917,8 @@ mod tests {
             unrelated,
         ];
 
-        // The durable row answers when no witness carries the task.
+        // A journal record joins the immutable label from its durable
+        // admission row.
         let filtered = query_lifecycle_log(
             &[labelled.clone(), other.clone()],
             &history,
@@ -4904,7 +4933,8 @@ mod tests {
         assert_eq!(filtered.items.len(), 1);
         assert_eq!(filtered.items[0].node_label.as_deref(), Some("agent-t02"));
 
-        // A witness for the same task outranks the row.
+        // The witness carries its own label without rewriting the journal
+        // event's provenance.
         let witness = terminal_witness(
             &labelled.task_uuid,
             Verdict::Pass,
@@ -4921,10 +4951,11 @@ mod tests {
             &FlowMembership::default(),
         )
         .unwrap();
-        assert!(promoted
-            .items
-            .iter()
-            .all(|item| item.node_label.as_deref() == Some("retry-t02")));
+        assert_eq!(promoted.items.len(), 2);
+        assert_eq!(promoted.items[0].origin, "journal");
+        assert_eq!(promoted.items[0].node_label.as_deref(), Some("agent-t02"));
+        assert_eq!(promoted.items[1].origin, "witness");
+        assert_eq!(promoted.items[1].node_label.as_deref(), Some("retry-t02"));
     }
 
     #[test]
@@ -5212,6 +5243,87 @@ mod tests {
             ]
         );
         assert_eq!(view.tasks[2].blocked_by, Vec::<String>::new());
+    }
+
+    #[test]
+    fn run_view_uses_typed_completion_identity_instead_of_label_grammar() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let reconciliation = reconciliation_detail(flow_run);
+        let mut merge = flow_node_detail(flow_run, RowStatus::Completed);
+        merge.orchestration = Some(typed_flow_orchestration(
+            flow_run,
+            2,
+            "a diagnostic label with no task grammar",
+            SpecBuildNodeRole::Merge,
+            Some(FORGE_TASK_T02),
+        ));
+        merge.final_message = Some(
+            serde_json::json!({
+                "taskId": "t02",
+                "pullRequest": "local://campaign/crm/t02"
+            })
+            .to_string(),
+        );
+        let witness = terminal_witness(
+            &merge.task_uuid,
+            Verdict::Pass,
+            merge.orchestration.clone().unwrap(),
+        );
+
+        let typed = query_run(
+            flow_run,
+            &[reconciliation.clone(), merge.clone()],
+            &[],
+            &history(),
+            &[witness],
+            parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+            &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
+        )
+        .unwrap();
+        let task = typed
+            .tasks
+            .iter()
+            .find(|task| task.task_ref.task_id() == "t02")
+            .unwrap();
+        assert_eq!(task.status, RunTaskStatus::Done);
+        assert_eq!(
+            task.pull_request.as_deref(),
+            Some("local://campaign/crm/t02")
+        );
+
+        merge.orchestration = Some(typed_flow_orchestration(
+            flow_run,
+            2,
+            "merge-t02",
+            SpecBuildNodeRole::Agent,
+            Some(FORGE_TASK_T02),
+        ));
+        let witness = terminal_witness(
+            &merge.task_uuid,
+            Verdict::Pass,
+            merge.orchestration.clone().unwrap(),
+        );
+        let misleading = query_run(
+            flow_run,
+            &[reconciliation, merge],
+            &[],
+            &history(),
+            &[witness],
+            parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+            &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
+        )
+        .unwrap();
+        assert_ne!(
+            misleading
+                .tasks
+                .iter()
+                .find(|task| task.task_ref.task_id() == "t02")
+                .unwrap()
+                .status,
+            RunTaskStatus::Done
+        );
     }
 
     #[test]
