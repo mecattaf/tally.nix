@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/spec-build-driver",
+  "crates/tally-client",
+  "crates/tally-core",
+  "crates/tally-flow",
+  "crates/tally",
+]
+default-members = [
   "crates/tally-client",
   "crates/tally-core",
   "crates/tally-flow",
