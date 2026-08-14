@@ -3,6 +3,9 @@
 //! These folds intentionally mirror the deterministic implementations in the
 //! spec-build driver. They accept already-witnessed facts and perform no I/O,
 //! so both the Rust driver and release surfaces can share one implementation.
+//! Their digest and rendering values are derived projections; the registration,
+//! attempt/steering receipts, and repository receipts they consume are
+//! canonical.
 
 use std::collections::{BTreeMap, BTreeSet};
 

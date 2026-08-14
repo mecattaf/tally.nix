@@ -1,4 +1,11 @@
 #![allow(clippy::disallowed_macros)]
+//! Replay coordinator for canonical records and derived runtime state.
+//!
+//! `Context`'s rows, jobs, aliases, and query indexes are derived. Admission
+//! and completion paths persist the corresponding canonical event or witness
+//! before replaying it into those maps; startup rebuilds the same maps from
+//! disk.
+
 // The daemon's stdout/stderr is its log surface, read by journald rather than
 // by an operator's pipeline. `cli::out`'s hang-up mapping is a CLI contract and
 // deliberately does not reach here (#315).

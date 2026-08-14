@@ -13,8 +13,13 @@
 //! `predecessor → successor` records with a closed reason vocabulary.
 //!
 //! The ledger is deliberately not hash-chained. It is not a proof surface — the
-//! witness ledger remains the only canonical one — it is a small durable
+//! witness ledger remains the only proof chain — it is a small durable
 //! index that makes an unattended rollover safe to automate and later auditable.
+//!
+//! **Durability class: canonical.** “Index” describes its lookup purpose, not
+//! derivability: an explicit supersede decision cannot be reconstructed after
+//! losing this ledger. [`FlowLineage`] is the derived in-memory index replayed
+//! from it.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

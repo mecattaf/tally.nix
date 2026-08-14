@@ -17,7 +17,7 @@
 //!
 //! Deliberately shaped after [`crate::flow_lineage`]: an append-only JSONL
 //! index, not hash-chained, not a proof surface. The witness ledger remains the
-//! only canonical one. What this store owns is a membership question that the
+//! only proof chain. What this store owns is a membership question that the
 //! witness ledger cannot answer, because a row-less admission appends no
 //! witness under the submitting run either.
 //!
@@ -27,6 +27,10 @@
 //! is still found by the scan with no record here, and a ledger that is missing
 //! or empty degrades exactly to the pre-#380 behaviour rather than to an empty
 //! run.
+//!
+//! **Durability class: canonical.** A row-less admission's membership cannot
+//! be rebuilt from another store. The parsed [`FlowMembership`] lookup map is
+//! the derived surface replayed from these records.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;

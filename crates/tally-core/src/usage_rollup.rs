@@ -1,5 +1,9 @@
 //! Rolling per-attempt usage up to one flow run.
 //!
+//! The rollup is a derived projection. Durable rows, witness records, and
+//! attestation observations remain its canonical/advisory inputs; no aggregate
+//! here is written back as a second source of truth.
+//!
 //! [`crate::usage`] normalizes what one attempt's harness reported.  This
 //! module answers the next question — "what did this run cost" — and the whole
 //! of its difficulty is that the answer is a sum over evidence that is

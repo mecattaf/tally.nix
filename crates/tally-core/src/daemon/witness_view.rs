@@ -1,3 +1,8 @@
+//! Derived verified indexes over the canonical witness ledger.
+//!
+//! This cache may be dropped and rebuilt from `witness.jsonl`; it never writes
+//! ledger bytes or originates a fact.
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

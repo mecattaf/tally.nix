@@ -1,3 +1,9 @@
+//! Derived RPC query construction.
+//!
+//! Usage-meter files are canonical observations supplied by an external meter
+//! or exactly reduced from canonical per-attempt accounting. Everything sent
+//! as a query response is rebuilt from declared inputs and durable records.
+
 use super::super::*;
 use crate::query_v2::{
     apply_reader_state_to_jobs, apply_reader_state_to_run, apply_reader_state_to_standup,

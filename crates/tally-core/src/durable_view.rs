@@ -28,6 +28,10 @@
 //! `a_durable_read_creates_nothing_anywhere_under_the_state_or_data_dir`
 //! asserts the whole tree before and after, so a store this view later learns
 //! to read is covered without anyone remembering to extend it.
+//!
+//! **Durability class: derived rebuild.** The complete typed input declaration
+//! is [`crate::durability::DURABLE_RUN_VIEW_INPUTS`]; this module never persists
+//! the resulting [`DurableRunView`].
 
 use std::collections::BTreeMap;
 use std::path::Path;

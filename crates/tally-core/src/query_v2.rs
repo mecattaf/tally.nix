@@ -1,3 +1,10 @@
+//! Derived observability facts and projections.
+//!
+//! Source annotations describe where a value came from; they do not make the
+//! enclosing query object authoritative. Every return value in this module is
+//! rebuilt from canonical ledgers, registrations, receipts, refs, captures,
+//! and declared configuration.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
 

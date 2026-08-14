@@ -1,3 +1,10 @@
+//! Canonical lifecycle observations and compaction receipts.
+//!
+//! `lifecycle.jsonl` records original daemon observations. When an old prefix
+//! is intentionally removed, `lifecycle-retention.json` becomes the canonical
+//! receipt for that loss; the parsed vector and shared snapshot are derived by
+//! replaying the retained suffix.
+
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};

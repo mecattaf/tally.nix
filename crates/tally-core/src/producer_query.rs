@@ -1,3 +1,8 @@
+//! Derived producer-status projections.
+//!
+//! These values are rebuilt from declared producer configuration and canonical
+//! producer runtime observations. They are response types, never a store.
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

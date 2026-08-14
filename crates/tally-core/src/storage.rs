@@ -1,3 +1,10 @@
+//! Canonical storage observations and derived query snapshots.
+//!
+//! Persistent samples, warning episodes, and warning records are original
+//! operational observations used by later intake decisions. The `StorageMetrics`
+//! value served to a caller is a derived projection of those records plus the
+//! current filesystem measurement.
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

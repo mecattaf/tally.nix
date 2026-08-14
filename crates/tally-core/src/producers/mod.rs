@@ -1,3 +1,9 @@
+//! Canonical producer ingress and runtime observations.
+//!
+//! Claimed/archived ingress bytes and last-runtime records are original input
+//! or observation surfaces. Producer query values are derived from these files
+//! and declared configuration.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
