@@ -700,6 +700,7 @@ pub(super) fn execution_fact_for_termination(termination: &ExecutionTermination)
 pub(super) fn enqueued_event(job: &Job) -> EmitEvent {
     let mut event = EmitEvent::enqueued(job.stable_key(), job.row.priority, job.row.source);
     event.task_ref = job.task_ref();
+    (event.journal_scope, event.projection_scope) = journal_scopes(job);
     event.agent = Some(job.row.adapter.clone());
     event.session_ref.clone_from(&job.row.session_ref);
     event.unit = Some(job.identity().unit_name());
@@ -713,11 +714,29 @@ pub(super) fn enqueued_event(job: &Job) -> EmitEvent {
     event
 }
 
+fn journal_scopes(
+    job: &Job,
+) -> (
+    Option<String>,
+    Option<crate::journal::JournalProjectionScope>,
+) {
+    let orchestration = job.row.orchestration.as_ref();
+    (
+        orchestration.map(|capsule| capsule.flow_run_id().to_owned()),
+        orchestration
+            .and_then(Orchestration::node_role)
+            .map(crate::journal::JournalProjectionScope::for_spec_build_role),
+    )
+}
+
 fn execution_event(job: &Job, event: TallyEvent) -> EmitEvent {
+    let (journal_scope, projection_scope) = journal_scopes(job);
     EmitEvent {
         event,
         task_uuid: job.stable_key(),
         task_ref: job.task_ref(),
+        journal_scope,
+        projection_scope,
         class: job.row.priority,
         source: job.row.source,
         message: None,
@@ -1023,6 +1042,7 @@ pub(super) fn finalize_forced_locked(
 }
 
 fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
+    let (journal_scope, projection_scope) = journal_scopes(job);
     EmitEvent {
         event: if check.passed {
             TallyEvent::EvidencePass
@@ -1031,6 +1051,8 @@ fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
         },
         task_uuid: job.stable_key(),
         task_ref: job.task_ref(),
+        journal_scope,
+        projection_scope,
         class: job.row.priority,
         source: job.row.source,
         message: Some(check.reason.clone()),
@@ -1056,10 +1078,13 @@ fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
 }
 
 pub(super) fn completed_event(job: &Job, result: &JobResult, evidence: String) -> EmitEvent {
+    let (journal_scope, projection_scope) = journal_scopes(job);
     EmitEvent {
         event: terminal_lifecycle_event(result.verdict, result.artifact_content_hash.is_some()),
         task_uuid: job.stable_key(),
         task_ref: job.task_ref(),
+        journal_scope,
+        projection_scope,
         class: job.row.priority,
         source: job.row.source,
         message: None,

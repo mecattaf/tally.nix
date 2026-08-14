@@ -16,7 +16,7 @@ use thiserror::Error;
 use crate::flow_lineage::{FlowLineage, FlowSupersedeRecord};
 use crate::flow_membership::FlowMembership;
 use crate::history::{LifecycleRecord, LifecycleSnapshot, RetentionMetadata};
-use crate::journal::TallyEvent;
+use crate::journal::{JournalProjectionScope, TallyEvent};
 use crate::occupancy::{ContextWindow, ContextWindowSource};
 use crate::provenance::{Orchestration, SpecBuildNodeRole, TaskRef};
 use crate::query::{
@@ -694,6 +694,10 @@ pub struct EvidenceObservation {
     pub spec: String,
     pub passed: bool,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_scope: Option<JournalProjectionScope>,
     pub authority: FactAuthority,
     pub provenance: String,
 }
@@ -800,6 +804,10 @@ pub struct LifecycleEventProjection {
     pub task_ref: Option<TaskRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_scope: Option<JournalProjectionScope>,
     pub attempt: Option<u32>,
     pub lease_epoch: Option<u64>,
     pub adapter: Option<String>,
@@ -841,6 +849,8 @@ pub struct LifecycleLogFilter {
     pub attempt: Option<u32>,
     pub session: Option<String>,
     pub event: Option<TallyEvent>,
+    pub journal_scope: Option<String>,
+    pub projection_scope: Option<JournalProjectionScope>,
     pub source: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
@@ -3401,6 +3411,8 @@ fn lifecycle_projection(record: &LifecycleRecord) -> LifecycleEventProjection {
         task_uuid: record.fields.task_uuid.clone(),
         task_ref: record.fields.task_ref.clone(),
         node_label: None,
+        journal_scope: record.fields.journal_scope.clone(),
+        projection_scope: record.fields.projection_scope,
         attempt: record.fields.attempt,
         lease_epoch: record.fields.lease_epoch,
         adapter: record.fields.agent.clone(),
@@ -3435,6 +3447,15 @@ fn lifecycle_projection(record: &LifecycleRecord) -> LifecycleEventProjection {
 }
 
 fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProjection {
+    let journal_scope = record
+        .orchestration
+        .as_ref()
+        .map(|orchestration| orchestration.flow_run_id().to_owned());
+    let projection_scope = record
+        .orchestration
+        .as_ref()
+        .and_then(Orchestration::node_role)
+        .map(JournalProjectionScope::for_spec_build_role);
     LifecycleEventProjection {
         origin: "witness".to_owned(),
         event_id: format!("witness:{}", record.seq),
@@ -3450,6 +3471,8 @@ fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProject
             .as_ref()
             .and_then(Orchestration::task_ref),
         node_label: orchestration_string(record.orchestration.as_ref(), "nodeLabel"),
+        journal_scope,
+        projection_scope,
         attempt: Some(record.attempt),
         lease_epoch: Some(record.lease_epoch),
         adapter: None,
@@ -3652,6 +3675,13 @@ fn lifecycle_matches(
             .is_some_and(|value| record.session_ref.as_deref() != Some(value))
         || filter.event.is_some_and(|value| record.event != value)
         || filter
+            .journal_scope
+            .as_deref()
+            .is_some_and(|value| record.journal_scope.as_deref() != Some(value))
+        || filter
+            .projection_scope
+            .is_some_and(|value| record.projection_scope != Some(value))
+        || filter
             .source
             .as_deref()
             .is_some_and(|value| record.source != value)
@@ -3685,6 +3715,8 @@ fn evidence_observations(events: &[&LifecycleRecord]) -> Vec<EvidenceObservation
                     spec: spec.clone(),
                     passed: record.fields.event == TallyEvent::EvidencePass,
                     message: record.fields.message.clone(),
+                    journal_scope: record.fields.journal_scope.clone(),
+                    projection_scope: record.fields.projection_scope,
                     authority: FactAuthority::TallyLifecycleObservation,
                     provenance: "durable-lifecycle-history".to_owned(),
                 })
@@ -3871,6 +3903,8 @@ mod tests {
             event,
             task_uuid: "00000000-0000-4000-8000-000000000024".to_owned(),
             task_ref: None,
+            journal_scope: None,
+            projection_scope: None,
             class: Priority::High,
             source: EnqueueSource::Manual,
             message: Some(format!("fixture {event}")),
@@ -4312,6 +4346,49 @@ mod tests {
             Some("actionable lifecycle failure\n")
         );
         assert_eq!(log.items[0].stderr_truncated, Some(false));
+    }
+
+    #[test]
+    fn lifecycle_log_indexes_campaign_narration_by_flow_and_projection_scope() {
+        const FLOW_RUN: &str = "00000000-0000-4000-8000-000000000249";
+        let mut record = lifecycle_record(1, TallyEvent::Started, 1, 7, "historical-job-24");
+        record.fields.task_ref = Some(TaskRef::new("crm/t02").unwrap());
+        record.fields.journal_scope = Some(FLOW_RUN.to_owned());
+        record.fields.projection_scope = Some(JournalProjectionScope::Attempt);
+        let mut history = history();
+        history.records = vec![record];
+
+        let scoped = query_lifecycle_log(
+            &[detail(RowStatus::Completed)],
+            &history,
+            &[],
+            &LifecycleLogFilter {
+                journal_scope: Some(FLOW_RUN.to_owned()),
+                projection_scope: Some(JournalProjectionScope::Attempt),
+                ..LifecycleLogFilter::default()
+            },
+            &FlowMembership::default(),
+        )
+        .unwrap();
+        assert_eq!(scoped.items.len(), 1);
+        assert_eq!(scoped.items[0].journal_scope.as_deref(), Some(FLOW_RUN));
+        assert_eq!(
+            scoped.items[0].projection_scope,
+            Some(JournalProjectionScope::Attempt)
+        );
+
+        let wrong_scope = query_lifecycle_log(
+            &[detail(RowStatus::Completed)],
+            &history,
+            &[],
+            &LifecycleLogFilter {
+                projection_scope: Some(JournalProjectionScope::Task),
+                ..LifecycleLogFilter::default()
+            },
+            &FlowMembership::default(),
+        )
+        .unwrap();
+        assert!(wrong_scope.items.is_empty());
     }
 
     #[test]
