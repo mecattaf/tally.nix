@@ -1,4 +1,11 @@
 #![allow(clippy::disallowed_macros)]
+//! Canonical execution observations and captures.
+//!
+//! Launch-generation markers, unit exits, raw streams, gate manifests, and
+//! retained archives record facts that cannot be recreated after loss. The
+//! failure-stderr convenience copy and its recovery cursor are derived by
+//! replaying terminal witness records over those captures.
+
 // Executor diagnostics land in the job's captured streams, not on an operator's
 // terminal; they keep the stock macros (#315).
 

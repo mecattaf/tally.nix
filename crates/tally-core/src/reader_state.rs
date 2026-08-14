@@ -28,6 +28,10 @@
 //! one record per run once it grows past [`READER_STATE_COMPACT_THRESHOLD`],
 //! because a mutable flag an operator can flip repeatedly has no natural
 //! append-only bound the way a one-shot rollover does.
+//!
+//! **Durability class: canonical operator intent.** It is advisory to execution
+//! proof, but an archive/tag decision cannot be regenerated after loss. Query
+//! views that apply it remain derived.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

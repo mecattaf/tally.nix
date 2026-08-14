@@ -1,3 +1,11 @@
+//! Canonical bounded change records and their derived watch projection.
+//!
+//! `changes.jsonl` records original notifications and cursor timestamps, so it
+//! is canonical for the bounded window it retains, though it is neither proof
+//! nor a recovery input. Retention or an invalid-log reset may discard that
+//! window without changing task truth. The parsed window and `WatchEnvelope`
+//! values are derived by replaying the retained records.
+
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

@@ -1,3 +1,10 @@
+//! Canonical task-admission events, not a materialized task database.
+//!
+//! `state/events/*.enqueue.json` and the types serialized there are canonical
+//! admission facts. The daemon's rows, jobs, lookup indexes, and query facts
+//! are derived by replaying these events with witness and execution records;
+//! this module never persists that derived database separately.
+
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};

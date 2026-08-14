@@ -1,3 +1,9 @@
+//! Derived query facts and public projections.
+//!
+//! No type in this module is a canonical write target. Row facts, status,
+//! standup, render, and pool values are replayed or rebuilt from the canonical
+//! surfaces declared in [`crate::durability`].
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, SecondsFormat, Utc};

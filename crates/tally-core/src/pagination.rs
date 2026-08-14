@@ -1,3 +1,8 @@
+//! Derived, process-local pagination snapshots.
+//!
+//! A page cache retains no authority and is rebuilt from a query projection;
+//! restart or eviction may expire a cursor without losing a canonical fact.
+
 use std::collections::VecDeque;
 
 use serde_json::Value;

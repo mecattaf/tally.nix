@@ -1,4 +1,10 @@
 //! Core types and validation shared by the tally daemon and CLI.
+//!
+//! Durability has one declared split: original inputs, observations, receipts,
+//! and operator intent are canonical; task state, indexes, and query objects
+//! are derived by replaying or rebuilding from those inputs. See
+//! [`durability`] for the typed catalog and the invariant that keeps derived
+//! state from becoming a second authority.
 
 pub mod adapters;
 pub mod assisted_by;
@@ -10,6 +16,7 @@ pub mod campaign_registry;
 pub mod completion;
 pub mod config;
 pub mod daemon;
+pub mod durability;
 pub mod durable_view;
 pub mod evidence;
 pub mod exec_attestation;

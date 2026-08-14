@@ -1,3 +1,10 @@
+//! Canonical lease receipts and their derived scheduler state.
+//!
+//! The epoch counter and lease-event log record grants, releases, debits, and
+//! yield decisions that cannot be inferred after loss. [`LeaseEngine`] is a
+//! derived task/scheduling database rebuilt from those records, the witness
+//! ledger, and declared pool configuration.
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};

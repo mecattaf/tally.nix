@@ -2,8 +2,9 @@
 //!
 //! Each executing host owns an independent hash-chained ledger.  The chain is
 //! deliberately unauthenticated: its purpose is to make independently observed
-//! execution facts comparable with coordinator canon, not to introduce a second
-//! canonical writer.
+//! execution facts comparable with coordinator proof, not to introduce a second
+//! proof writer. The observations are canonical records for their host but
+//! advisory when compared with `witness.jsonl`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

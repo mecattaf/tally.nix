@@ -1,3 +1,9 @@
+//! Retention over canonical stores and rebuildable references.
+//!
+//! This module does not create a second authority. Nix GC-root links are
+//! derived exclusively by reconciling canonical witness records; brief and
+//! capture deletion preserves the retention rules of their canonical owners.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;

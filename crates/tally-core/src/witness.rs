@@ -1,3 +1,10 @@
+//! Canonical witness and advisory-attestation record stores.
+//!
+//! `witness.jsonl` is the sole hash-chained proof surface. Attestations are
+//! canonical records of their hosts' observations but remain advisory when
+//! compared with coordinator proof. In-memory lookup maps and every query
+//! rendered from either ledger are derived.
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};

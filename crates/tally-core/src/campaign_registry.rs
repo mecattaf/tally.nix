@@ -1,9 +1,13 @@
-//! Durable campaign registrations.
+//! Canonical campaign registrations and approved asset snapshots.
 //!
 //! Authority schema 4 makes the repository binding self-contained. Pre-v4
 //! registrations are refused with an operator remedy instead of recovering
 //! checkout policy from a host campaign declaration. Host-local settings
 //! remain separate from the closed authority shape.
+//!
+//! Authority records, tuning, manifests, and copied snapshots are canonical.
+//! The joined [`CampaignRegistration`] and Nix GC-root links are derived and
+//! are rebuilt by reading/reconciling those canonical files.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;

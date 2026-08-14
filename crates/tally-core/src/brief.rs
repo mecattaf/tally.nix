@@ -1,3 +1,9 @@
+//! Canonical content-addressed brief documents.
+//!
+//! A brief is admitted intent referenced by its canonical enqueue event. The
+//! content store is therefore canonical; retention may remove only documents
+//! no retained canonical record references.
+
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};

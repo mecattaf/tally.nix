@@ -1,3 +1,9 @@
+//! Rebuild derived daemon state from canonical stores.
+//!
+//! The failure-stderr file and its high-water cursor are the one persisted
+//! projection owned here; both are written only by replaying terminal witness
+//! records over canonical captures.
+
 use super::*;
 
 pub(super) struct DaemonLockGuard {
