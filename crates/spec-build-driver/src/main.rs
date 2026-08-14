@@ -6,6 +6,14 @@ use std::process::{Command, ExitCode};
 
 use clap::{Parser, ValueEnum};
 
+mod actions;
+mod error;
+mod git;
+mod json;
+mod path;
+mod sha256;
+mod worktrees;
+
 const PY_FALLBACK_ENV: &str = "SPEC_BUILD_PY_FALLBACK";
 const DEFAULT_PY_FALLBACK: &str = match option_env!("SPEC_BUILD_PY_FALLBACK") {
     Some(path) => path,
@@ -59,6 +67,7 @@ enum Action {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Handler {
+    Native,
     PythonFallback,
 }
 
@@ -99,15 +108,13 @@ impl Action {
             | Self::Escalate
             | Self::Continue
             | Self::Preflight
-            | Self::Prep
-            | Self::Cleanup
             | Self::Ownership
             | Self::TreeDelta
             | Self::Constraint
             | Self::Checkpoint
             | Self::Publish
-            | Self::Rebase
             | Self::Merge => Handler::PythonFallback,
+            Self::Prep | Self::Cleanup | Self::Rebase => Handler::Native,
         }
     }
 }
@@ -134,18 +141,43 @@ fn fallback_command(path: &OsStr, action: Action) -> Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let fallback = fallback_path(std::env::var_os(PY_FALLBACK_ENV));
-
-    let error = match cli.action.handler() {
-        Handler::PythonFallback => fallback_command(&fallback, cli.action).exec(),
-    };
-    let _write_result = writeln!(
-        io::stderr().lock(),
-        "spec-build-driver: could not exec Python fallback {} for action {}: {error}",
-        Path::new(&fallback).display(),
-        cli.action.as_str()
-    );
-    ExitCode::FAILURE
+    match cli.action.handler() {
+        Handler::Native => match actions::load_brief()
+            .and_then(|brief| actions::dispatch(cli.action.as_str(), &brief))
+        {
+            Ok(result) => {
+                let written = writeln!(
+                    io::stdout().lock(),
+                    "TALLY_FINAL_MESSAGE={}",
+                    result.stringify()
+                );
+                if let Err(error) = written {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "spec-build-driver: cannot emit final message: {error}"
+                    );
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(io::stderr().lock(), "spec-build-driver: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Handler::PythonFallback => {
+            let fallback = fallback_path(std::env::var_os(PY_FALLBACK_ENV));
+            let error = fallback_command(&fallback, cli.action).exec();
+            let _write_result = writeln!(
+                io::stderr().lock(),
+                "spec-build-driver: could not exec Python fallback {} for action {}: {error}",
+                Path::new(&fallback).display(),
+                cli.action.as_str()
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
@@ -179,7 +211,7 @@ mod tests {
     ];
 
     #[test]
-    fn every_python_action_is_accepted_and_dispatched() {
+    fn every_action_is_accepted_and_dispatched() {
         let variants = Action::value_variants();
         assert_eq!(variants.len(), ACTION_NAMES.len());
 
@@ -189,8 +221,23 @@ mod tests {
                 .action;
             assert_eq!(parsed, *variant);
             assert_eq!(parsed.as_str(), expected_name);
-            assert_eq!(parsed.handler(), Handler::PythonFallback);
+            let expected_handler = match expected_name {
+                "prep" | "cleanup" | "rebase" => Handler::Native,
+                _ => Handler::PythonFallback,
+            };
+            assert_eq!(parsed.handler(), expected_handler);
         }
+    }
+
+    #[test]
+    fn only_the_worktree_mechanics_actions_are_native() {
+        let native: Vec<_> = Action::value_variants()
+            .iter()
+            .copied()
+            .filter(|action| action.handler() == Handler::Native)
+            .map(Action::as_str)
+            .collect();
+        assert_eq!(native, ["prep", "cleanup", "rebase"]);
     }
 
     #[test]
