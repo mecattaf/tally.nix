@@ -10,3 +10,6 @@ readme = "README.md"
 
 [dependencies]
 clap.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
