@@ -13,9 +13,12 @@ use tally_core::witness::{
 
 const FIRST: &str = "00000000-0000-4000-8000-000000000061";
 const SECOND: &str = "00000000-0000-4000-8000-000000000062";
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 fn tally() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tally"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
+    command.args(["--config", EMPTY_CONFIG]);
+    command
 }
 
 fn run_attested(ledger: &Path, task_uuid: &str, artifact: &Path, payload_hash: &str) -> Output {

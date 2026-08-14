@@ -32,6 +32,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
+#[path = "support/configured_tally.rs"]
+mod configured_tally;
 #[path = "support/shell_program.rs"]
 mod shell_program;
 #[path = "support/timeout_scale.rs"]
@@ -334,7 +336,8 @@ async fn start_daemon_with_systemd_run_and_settings(
     systemd_run: std::path::PathBuf,
     settings: DaemonSettings,
 ) -> RunningDaemon {
-    let executor = Executor::new(&paths.state_dir, env!("CARGO_BIN_EXE_tally"))
+    let recorder = configured_tally::install(&paths.state_dir.join("configured-tally"));
+    let executor = Executor::new(&paths.state_dir, recorder)
         .with_systemd_run(systemd_run)
         .with_direct_fallback()
         .with_unit_probe(ExitFileProbe);
@@ -2485,6 +2488,15 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             config.validate().unwrap();
             let config_path = temp.path().join("config.json");
             fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let configured_tally = temp.path().join("configured-tally");
+            shell_program::install(
+                &configured_tally,
+                format!(
+                    "#!/bin/sh\nexec '{}' --config '{}' \"$@\"\n",
+                    env!("CARGO_BIN_EXE_tally"),
+                    config_path.display()
+                ),
+            );
 
             let daemon_paths = paths(&temp.path().join("daemon"));
             let daemon = start_daemon(&daemon_paths, config).await;
@@ -2548,6 +2560,8 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                     "continuation": {
                         "argv": [
                             env!("CARGO_BIN_EXE_tally"),
+                            "--config",
+                            config_path,
                             "flow",
                             "run",
                             script,
@@ -2564,7 +2578,7 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                     "captureRoot": daemon_paths.state_dir.join("capture/archive"),
                     "postFailureEvidence": false,
                     "postFailureStderr": false,
-                    "tally": env!("CARGO_BIN_EXE_tally"),
+                    "tally": configured_tally,
                     "driver": driver,
                     "driverRuntimeMaxSec": 30,
                     "agent": {
@@ -3094,8 +3108,14 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 "the next pass carries the derived continuation identity"
             );
             assert_eq!(second_event["brief"]["campaign"], "fixture");
+            assert_eq!(second_event["argv"][1], "--config");
             assert_eq!(
-                second_event["argv"][1], "flow",
+                second_event["argv"][2],
+                config_path.to_string_lossy().as_ref(),
+                "the continuation re-enters through the same explicit config"
+            );
+            assert_eq!(
+                second_event["argv"][3], "flow",
                 "a module-declared campaign re-enters through its own flow-run argv"
             );
             assert!(control.join("started-task-1").exists());

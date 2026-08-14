@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -19,6 +19,11 @@ use tally_core::recovery::RecoveryPolicy;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, LocalSet};
+
+#[path = "support/configured_tally.rs"]
+mod configured_tally;
+
+const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 struct AbsentUnitProbe;
 
@@ -89,7 +94,8 @@ fn settings() -> DaemonSettings {
 }
 
 async fn start_daemon(paths: &DaemonPaths) -> RunningDaemon {
-    let executor = Executor::new(&paths.state_dir, PathBuf::from(env!("CARGO_BIN_EXE_tally")))
+    let recorder = configured_tally::install(&paths.state_dir.join("configured-tally"));
+    let executor = Executor::new(&paths.state_dir, recorder)
         .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
         .with_direct_fallback()
         .with_unit_probe(AbsentUnitProbe);
@@ -103,6 +109,7 @@ async fn start_daemon(paths: &DaemonPaths) -> RunningDaemon {
 
 async fn enqueue(socket: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(socket)
         .arg("queue")

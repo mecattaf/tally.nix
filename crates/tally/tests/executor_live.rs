@@ -14,6 +14,8 @@ use tally_core::executor::{
 };
 use tokio::process::Command;
 
+#[path = "support/configured_tally.rs"]
+mod configured_tally;
 #[path = "support/live.rs"]
 mod live_support;
 
@@ -93,7 +95,8 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
 }
 
 fn live_executor(state_dir: &Path) -> Executor {
-    Executor::new(state_dir, env!("CARGO_BIN_EXE_tally"))
+    let recorder = configured_tally::install(&state_dir.join("configured-tally"));
+    Executor::new(state_dir, recorder)
         .with_systemd_run(SYSTEMD_RUN)
         .with_systemctl(SYSTEMCTL)
 }

@@ -67,6 +67,14 @@ const RELEASE_PROBE_RECEIPT_FILE: &str = "probe-receipt-v1.json";
 const RELEASE_PROBE_PREFIX: &str = "tally-probe-";
 const RELEASE_PROBE_TTL_DAYS: i64 = 7;
 const COMPLETE_SUMMARY_MARKER_PREFIX: &str = "<!-- tally:campaign-complete:v1 source=";
+#[cfg(test)]
+const TEST_RELEASE_CRASH_CHILD_ENV: &str = "TALLY_TEST_RELEASE_CRASH_CHILD";
+#[cfg(test)]
+const TEST_RELEASE_CRASH_AFTER_ENV: &str = "TALLY_TEST_RELEASE_CRASH_AFTER";
+#[cfg(test)]
+const TEST_RELEASE_CRASH_STATE_ENV: &str = "TALLY_TEST_RELEASE_CRASH_STATE";
+#[cfg(test)]
+const TEST_RELEASE_CRASH_GH_ENV: &str = "TALLY_TEST_RELEASE_CRASH_GH";
 
 #[derive(Debug, Clone)]
 struct WorklistTask {
@@ -712,6 +720,8 @@ fn execute_campaign_release_locked(
         create_campaign_release_tag(config, plan)?;
         record.steps.tag = true;
         write_campaign_release_record(directory, &record_path, &record)?;
+        #[cfg(test)]
+        release_test_crash_after("tag");
         executed_steps.push("tag");
     }
 
@@ -721,6 +731,8 @@ fn execute_campaign_release_locked(
         publish_campaign_release_notes(config, plan, &payloads.notes)?;
         record.steps.release_notes = true;
         write_campaign_release_record(directory, &record_path, &record)?;
+        #[cfg(test)]
+        release_test_crash_after("release-notes");
         executed_steps.push("release-notes");
     }
 
@@ -730,6 +742,8 @@ fn execute_campaign_release_locked(
         attach_campaign_release_artifacts(config, plan, &payloads.artifacts)?;
         record.steps.artifacts = true;
         write_campaign_release_record(directory, &record_path, &record)?;
+        #[cfg(test)]
+        release_test_crash_after("artifacts");
         executed_steps.push("artifacts");
     }
 
@@ -743,6 +757,18 @@ fn execute_campaign_release_locked(
         executed_steps,
         skipped_steps,
     })
+}
+
+#[cfg(test)]
+fn release_test_crash_after(step: &str) {
+    if std::env::var(TEST_RELEASE_CRASH_CHILD_ENV).as_deref() == Ok("1")
+        && std::env::var(TEST_RELEASE_CRASH_AFTER_ENV).as_deref() == Ok(step)
+    {
+        // This runs only in the isolated child test below. `abort` models a
+        // process disappearing without unwinding after the fsynced record is
+        // published and before the next release step begins.
+        std::process::abort();
+    }
 }
 
 fn campaign_release_directory(state_dir: &Path, registration_id: &str) -> Result<PathBuf> {
@@ -1854,7 +1880,10 @@ fn release_merged_commits(
             commit.task_values.as_slice(),
             commit.revision_values.as_slice(),
         ) {
-            if safe_task_id(task_id) && is_sha256_identity(revision) {
+            if safe_task_id(task_id)
+                && is_sha256_identity(revision)
+                && has_canonical_completion_trailer_pair(&commit.message, task_id, revision)
+            {
                 claims
                     .entry((task_id.clone(), revision.clone()))
                     .or_default()
@@ -1962,7 +1991,9 @@ fn release_checkpoint_refs(
         .iter()
         .any(|checkpoint| checkpoint.revision == integration_tip)
     {
-        bail!("completed campaign has no checkpoint ref for integration tip {integration_tip}");
+        bail!(
+            "completed campaign has no checkpoint ref for integration tip {integration_tip}; restore the gate proof before rendering a release"
+        );
     }
     checkpoints.sort_by(|left, right| left.reference.cmp(&right.reference));
     Ok(checkpoints)
@@ -2019,7 +2050,7 @@ fn release_gate_checkpoint(
     match candidates.as_slice() {
         [checkpoint] => Ok((*checkpoint).clone()),
         [] => bail!(
-            "completed campaign has no gate-proof checkpoint ref at integration tip {integration_tip}"
+            "completed campaign has no gate-proof checkpoint ref at integration tip {integration_tip}; restore the gate proof before rendering a release"
         ),
         _ => bail!(
             "completed campaign has multiple gate-proof checkpoint refs at integration tip {integration_tip}"
@@ -2047,7 +2078,7 @@ fn release_current_checkpoints(
             match matches.as_slice() {
                 [checkpoint] => Ok((*checkpoint).clone()),
                 [] => bail!(
-                    "completed campaign is missing checkpoint ref for task {:?} and source {}",
+                    "completed campaign is missing checkpoint ref for task {:?} and source {}; restore its durable checkpoint ref before rendering a release",
                     task.id,
                     source_sha256
                 ),
@@ -7185,6 +7216,130 @@ mod tests {
     }
 
     #[test]
+    fn truncated_release_attempt_log_fails_loud_with_its_repair() {
+        let temporary = tempfile::tempdir().unwrap();
+        let campaign = "fixture-release";
+        let path = local_attempt_receipts_path(temporary.path(), campaign).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"schemaVersion":1,"sequence":1"#).unwrap();
+
+        let error =
+            read_release_attempt_log(temporary.path(), campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("truncated final record"), "{error}");
+        assert!(
+            error.contains("repair the durable log before rendering a release"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn missing_release_checkpoint_fails_loud_with_its_restore_action() {
+        let temporary = tempfile::tempdir().unwrap();
+        release_fixture_git(temporary.path(), &["init", "-b", "main"]);
+        let (graph, _) = adversarial_release_graph(temporary.path());
+        let source_sha256 = format!("sha256:{}", "a".repeat(64));
+        let revision = "b".repeat(40);
+        let only_gate = ReleaseCheckpoint {
+            task_id: "release-gate".to_owned(),
+            reference: "refs/tally/fixture/checkpoint/release-gate".to_owned(),
+            revision,
+            source_sha256: source_sha256.clone(),
+        };
+
+        let error = release_current_checkpoints(&graph, &[only_gate], &source_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("missing checkpoint ref for task \"smoke\""),
+            "{error}"
+        );
+        assert!(
+            error.contains("restore its durable checkpoint ref before rendering a release"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn release_completion_oracle_rejects_git_trailer_poisoning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("repository");
+        fs::create_dir_all(&checkout).unwrap();
+        release_fixture_git(&checkout, &["init", "-b", "main"]);
+        release_fixture_git(&checkout, &["config", "user.name", "Fixture"]);
+        release_fixture_git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        release_fixture_git(
+            &checkout,
+            &["commit", "--allow-empty", "-m", "base: fixture"],
+        );
+        let base = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
+        let (graph, revision) = adversarial_release_graph(&checkout);
+
+        let valid = format!(
+            "ship-feature: fixture\n\nTally-Task: ship-feature\nTally-Revision: {revision}\nAssisted-by: fixture"
+        );
+        release_fixture_git(&checkout, &["commit", "--allow-empty", "-m", &valid]);
+        let history = release_integration_history(&checkout, "HEAD").unwrap();
+        let revisions = release_task_revisions(&graph).unwrap();
+        assert_eq!(
+            release_merged_commits(&graph, &revisions, &history)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let poisoned = [
+            (
+                "case-folded keys",
+                format!(
+                    "ship-feature: fixture\n\ntally-task: ship-feature\ntally-revision: {revision}"
+                ),
+            ),
+            (
+                "completion pair behind another trailer",
+                format!(
+                    "ship-feature: fixture\n\nAssisted-by: fixture\nTally-Task: ship-feature\nTally-Revision: {revision}"
+                ),
+            ),
+            (
+                "poisoned trailer paragraph",
+                format!(
+                    "ship-feature: fixture\n\nTally-Task: ship-feature\npoison\nTally-Revision: {revision}"
+                ),
+            ),
+            (
+                "split completion pair",
+                format!(
+                    "ship-feature: fixture\n\nTally-Task: ship-feature\n\nTally-Revision: {revision}"
+                ),
+            ),
+            (
+                "duplicate completion claim",
+                format!(
+                    "ship-feature: fixture\n\nTally-Task: ship-feature\nTally-Revision: {revision}\nTally-Task: ship-feature"
+                ),
+            ),
+        ];
+        for (case, message) in poisoned {
+            release_fixture_git(&checkout, &["checkout", "--detach", &base]);
+            release_fixture_git(&checkout, &["commit", "--allow-empty", "-m", &message]);
+            let history = release_integration_history(&checkout, "HEAD").unwrap();
+            let error = release_merged_commits(&graph, &revisions, &history)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("is missing the Tally-Task: ship-feature / Tally-Revision:"),
+                "{case} unexpectedly reached the completion oracle: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn release_execute_resumes_from_the_local_record_through_an_injected_program() {
         let temporary = tempfile::tempdir().unwrap();
         let state_dir = temporary.path().join("state");
@@ -7321,6 +7476,85 @@ mod tests {
     }
 
     #[test]
+    fn release_execute_crash_child() {
+        if std::env::var(TEST_RELEASE_CRASH_CHILD_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        let state_dir = PathBuf::from(
+            std::env::var_os(TEST_RELEASE_CRASH_STATE_ENV)
+                .expect("crash child state directory is set"),
+        );
+        let gh_program = PathBuf::from(
+            std::env::var_os(TEST_RELEASE_CRASH_GH_ENV).expect("crash child forge program is set"),
+        );
+        let config = CampaignReleaseExecutionConfig::resolve(Some(gh_program)).unwrap();
+        let plan = release_execution_plan_for_test();
+        let _ = execute_campaign_release(&state_dir, &plan, &config);
+        panic!("release crash injection returned instead of terminating the child process");
+    }
+
+    #[test]
+    fn process_death_after_every_persisted_release_step_resumes_without_repeating_it() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let step_names = ["tag", "release-notes", "artifacts"];
+        for (index, crashed_after) in step_names.iter().enumerate() {
+            let temporary = tempfile::tempdir().unwrap();
+            let state_dir = temporary.path().join("state");
+            let calls = temporary.path().join("gh-calls");
+            let count = temporary.path().join("gh-count");
+            let fail_on = temporary.path().join("gh-fail-on");
+            let shim = release_recording_gh(temporary.path(), &calls, &count, &fail_on);
+
+            let child = ProcessCommand::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::campaign::tests::release_execute_crash_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(TEST_RELEASE_CRASH_CHILD_ENV, "1")
+                .env(TEST_RELEASE_CRASH_AFTER_ENV, crashed_after)
+                .env(TEST_RELEASE_CRASH_STATE_ENV, &state_dir)
+                .env(TEST_RELEASE_CRASH_GH_ENV, &shim)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.signal(),
+                Some(libc::SIGABRT),
+                "crash after {crashed_after} did not abort the isolated release process: {:?}\nstdout:\n{}\nstderr:\n{}",
+                child.status,
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+
+            let plan = release_execution_plan_for_test();
+            let release_directory =
+                campaign_release_directory(&state_dir, &plan.registration_id).unwrap();
+            let record = read_campaign_release_record(&release_directory.join(RELEASE_RECORD_FILE))
+                .unwrap()
+                .unwrap();
+            assert!(record.steps.tag);
+            assert_eq!(record.steps.release_notes, index >= 1);
+            assert_eq!(record.steps.artifacts, index >= 2);
+            let recorded_before_resume = fs::read_to_string(&calls).unwrap();
+            assert_eq!(recorded_before_resume.lines().count(), index + 1);
+
+            let config = CampaignReleaseExecutionConfig::resolve(Some(shim)).unwrap();
+            let resumed = execute_campaign_release(&state_dir, &plan, &config).unwrap();
+            assert_eq!(resumed.skipped_steps, step_names[..=index]);
+            assert_eq!(resumed.executed_steps, step_names[index + 1..]);
+            let recorded_after_resume = fs::read_to_string(&calls).unwrap();
+            assert_eq!(recorded_after_resume.lines().count(), step_names.len());
+
+            let repeated = execute_campaign_release(&state_dir, &plan, &config).unwrap();
+            assert!(repeated.executed_steps.is_empty());
+            assert_eq!(repeated.skipped_steps, step_names);
+            assert_eq!(fs::read_to_string(&calls).unwrap(), recorded_after_resume);
+        }
+    }
+
+    #[test]
     fn release_gh_program_is_explicit_and_defaults_only_to_path_gh() {
         assert_eq!(
             CampaignReleaseExecutionConfig::resolve(None)
@@ -7441,6 +7675,75 @@ mod tests {
             .unwrap(),
             campaign_summary: "Campaign complete.\n".to_owned(),
         }
+    }
+
+    fn adversarial_release_graph(checkout: &Path) -> (CanonicalCampaignGraphV1, String) {
+        let manifest = admit_manifest_value(json!({
+            "schemaVersion": 1,
+            "name": "fixture-release",
+            "repository": {
+                "checkout": checkout,
+                "baseBranch": "main",
+                "remote": "origin",
+                "forge": "local"
+            },
+            "maxTasks": 4,
+            "maxParallel": 1,
+            "agent": {},
+            "gates": [{
+                "kind": "command",
+                "id": "test",
+                "preflightArgv": ["true"],
+                "argv": ["true"]
+            }],
+            "tasks": [{
+                "id": "ship-feature",
+                "kind": "implementation",
+                "issue": 1,
+                "dependencies": [],
+                "conflictDomains": ["crates/tally"]
+            }, {
+                "id": "smoke",
+                "kind": "checkpoint",
+                "issue": 2,
+                "dependencies": ["ship-feature"],
+                "argv": ["true"],
+                "runtimeMaxSec": 30
+            }, {
+                "id": "release-gate",
+                "kind": "checkpoint",
+                "issue": 3,
+                "dependencies": ["ship-feature", "smoke"],
+                "argv": ["true"],
+                "runtimeMaxSec": 30
+            }]
+        }))
+        .unwrap();
+        let graph = CanonicalCampaignGraphV1::new(
+            manifest,
+            vec![
+                CanonicalCampaignTaskV1 {
+                    number: 1,
+                    title: "Ship the fixture feature".to_owned(),
+                    body: "Implement the fixture release surface.".to_owned(),
+                },
+                CanonicalCampaignTaskV1 {
+                    number: 2,
+                    title: "Smoke the fixture release".to_owned(),
+                    body: "Run the fixture smoke checkpoint.".to_owned(),
+                },
+                CanonicalCampaignTaskV1 {
+                    number: 3,
+                    title: "Prove the fixture release".to_owned(),
+                    body: "Run the fixture release gate.".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+        let revision =
+            task_completion_revision(&graph.manifest, &graph.manifest.tasks[0], &graph.tasks[0])
+                .unwrap();
+        (graph, revision)
     }
 
     fn release_recording_gh(

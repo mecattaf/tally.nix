@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,8 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, LocalSet};
 
+#[path = "support/configured_tally.rs"]
+mod configured_tally;
 #[path = "support/shell_program.rs"]
 mod shell_program;
 
@@ -188,7 +190,8 @@ fn settings() -> DaemonSettings {
 }
 
 async fn start_daemon(paths: &DaemonPaths, config: Config) -> RunningDaemon {
-    let executor = Executor::new(&paths.state_dir, PathBuf::from(env!("CARGO_BIN_EXE_tally")))
+    let recorder = configured_tally::install(&paths.state_dir.join("configured-tally"));
+    let executor = Executor::new(&paths.state_dir, recorder)
         .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
         .with_direct_fallback()
         .with_unit_probe(AbsentUnitProbe);
