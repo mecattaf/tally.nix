@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::config::Priority;
-use crate::provenance::TaskRef;
+use crate::provenance::{SpecBuildNodeRole, TaskRef};
 use crate::taskdb::EnqueueSource;
 use crate::witness::LaborClass;
 
@@ -114,6 +114,52 @@ impl FromStr for TallyEvent {
     }
 }
 
+/// Semantic lifetime of a spec-build node's journal projection.
+///
+/// The human-readable `MESSAGE` remains an outcome-first diagnostic. This
+/// closed field is the machine-readable statement of whether that narration
+/// describes one execution attempt, one worklist task, one reconcile pass, or
+/// the campaign as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JournalProjectionScope {
+    Attempt,
+    Task,
+    Pass,
+    Campaign,
+}
+
+impl JournalProjectionScope {
+    pub const ALL: [Self; 4] = [Self::Attempt, Self::Task, Self::Pass, Self::Campaign];
+
+    /// Classify every role in the closed spec-build vocabulary.
+    ///
+    /// Checks, receipts, and diagnoses qualify one candidate attempt;
+    /// workspace/publication transitions qualify one task; reconciliation and
+    /// continuation describe one pass; sweeping and terminal escalation govern
+    /// the whole campaign.
+    #[must_use]
+    pub const fn for_spec_build_role(role: SpecBuildNodeRole) -> Self {
+        match role {
+            SpecBuildNodeRole::Agent
+            | SpecBuildNodeRole::CheckpointRecord
+            | SpecBuildNodeRole::Constraint
+            | SpecBuildNodeRole::Diagnosis
+            | SpecBuildNodeRole::Gate
+            | SpecBuildNodeRole::Ownership
+            | SpecBuildNodeRole::Retry
+            | SpecBuildNodeRole::Steering => Self::Attempt,
+            SpecBuildNodeRole::Cleanup
+            | SpecBuildNodeRole::Merge
+            | SpecBuildNodeRole::Prep
+            | SpecBuildNodeRole::Publish
+            | SpecBuildNodeRole::Rebase => Self::Task,
+            SpecBuildNodeRole::Continue | SpecBuildNodeRole::Reconcile => Self::Pass,
+            SpecBuildNodeRole::Escalate | SpecBuildNodeRole::Sweep => Self::Campaign,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldRequirement {
     Always,
@@ -130,6 +176,8 @@ pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
     ("TALLY_EVENT", FieldRequirement::Always),
     ("TALLY_TASK_UUID", FieldRequirement::Always),
     ("TALLY_TASK_REF", FieldRequirement::Conditional),
+    ("TALLY_JOURNAL_SCOPE", FieldRequirement::Conditional),
+    ("TALLY_PROJECTION_SCOPE", FieldRequirement::Conditional),
     ("TALLY_CLASS", FieldRequirement::Always),
     ("TALLY_SOURCE", FieldRequirement::Always),
     ("MESSAGE", FieldRequirement::Always),
@@ -199,6 +247,22 @@ pub struct TallyFields {
         skip_serializing_if = "Option::is_none"
     )]
     pub task_ref: Option<TaskRef>,
+    /// Flow-run identity that scopes this record to one campaign pass.
+    ///
+    /// Optional for non-flow jobs and old lifecycle records.
+    #[serde(
+        rename = "TALLY_JOURNAL_SCOPE",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub journal_scope: Option<String>,
+    /// Semantic lifetime of a spec-build node's projected narration.
+    #[serde(
+        rename = "TALLY_PROJECTION_SCOPE",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub projection_scope: Option<JournalProjectionScope>,
     #[serde(rename = "TALLY_CLASS")]
     pub class: Priority,
     #[serde(rename = "TALLY_SOURCE")]
@@ -275,6 +339,8 @@ pub struct EmitEvent {
     pub event: TallyEvent,
     pub task_uuid: String,
     pub task_ref: Option<TaskRef>,
+    pub journal_scope: Option<String>,
+    pub projection_scope: Option<JournalProjectionScope>,
     pub class: Priority,
     pub source: EnqueueSource,
     pub message: Option<String>,
@@ -304,6 +370,8 @@ impl EmitEvent {
             event: TallyEvent::Enqueued,
             task_uuid: task_uuid.into(),
             task_ref: None,
+            journal_scope: None,
+            projection_scope: None,
             class,
             source,
             message: None,
@@ -338,6 +406,8 @@ impl EmitEvent {
             event: self.event,
             task_uuid: self.task_uuid,
             task_ref: self.task_ref,
+            journal_scope: self.journal_scope,
+            projection_scope: self.projection_scope,
             class: self.class,
             source: self.source,
             message,
@@ -463,6 +533,11 @@ fn field_present(fields: &TallyFields, name: &str) -> bool {
         "TALLY_EVENT" | "TALLY_CLASS" | "TALLY_SOURCE" => true,
         "TALLY_TASK_UUID" => !fields.task_uuid.is_empty(),
         "TALLY_TASK_REF" => fields.task_ref.is_some(),
+        "TALLY_JOURNAL_SCOPE" => fields
+            .journal_scope
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_PROJECTION_SCOPE" => fields.projection_scope.is_some(),
         "MESSAGE" => !fields.message.is_empty(),
         "TALLY_AGENT" => fields
             .agent
@@ -534,6 +609,40 @@ pub fn validate_fields(fields: &TallyFields) -> Result<(), JournalError> {
             ));
         }
     }
+    if let Some(flow_run_id) = fields.journal_scope.as_deref() {
+        uuid::Uuid::parse_str(flow_run_id).map_err(|_| {
+            JournalError::Invalid("TALLY_JOURNAL_SCOPE must be a UUID string".to_owned())
+        })?;
+    }
+    if fields.projection_scope.is_some() && fields.journal_scope.is_none() {
+        return Err(JournalError::Invalid(
+            "TALLY_PROJECTION_SCOPE requires TALLY_JOURNAL_SCOPE".to_owned(),
+        ));
+    }
+    match fields.projection_scope {
+        Some(JournalProjectionScope::Attempt)
+            if fields.task_ref.is_none() || fields.attempt.is_none() =>
+        {
+            return Err(JournalError::Invalid(
+                "attempt-scoped journal projections require TALLY_TASK_REF and TALLY_ATTEMPT"
+                    .to_owned(),
+            ));
+        }
+        Some(JournalProjectionScope::Task) if fields.task_ref.is_none() => {
+            return Err(JournalError::Invalid(
+                "task-scoped journal projections require TALLY_TASK_REF".to_owned(),
+            ));
+        }
+        Some(JournalProjectionScope::Pass | JournalProjectionScope::Campaign)
+            if fields.task_ref.is_some() =>
+        {
+            return Err(JournalError::Invalid(
+                "pass- and campaign-scoped journal projections must not carry TALLY_TASK_REF"
+                    .to_owned(),
+            ));
+        }
+        _ => {}
+    }
     for (name, value) in string_fields(fields) {
         if value.contains('\0') {
             return Err(JournalError::Invalid(format!("{name} contains a NUL byte")));
@@ -599,6 +708,9 @@ fn string_fields(fields: &TallyFields) -> Vec<(&'static str, &str)> {
     ];
     if let Some(task_ref) = &fields.task_ref {
         values.push(("TALLY_TASK_REF", task_ref.as_str()));
+    }
+    if let Some(journal_scope) = fields.journal_scope.as_deref() {
+        values.push(("TALLY_JOURNAL_SCOPE", journal_scope));
     }
     for (name, value) in [
         ("TALLY_AGENT", fields.agent.as_deref()),
@@ -792,6 +904,14 @@ fn native_fields(fields: &TallyFields) -> Result<Vec<(&'static str, String)>, Jo
     if let Some(task_ref) = &fields.task_ref {
         values.push(("TALLY_TASK_REF", task_ref.to_string()));
     }
+    push_optional(
+        &mut values,
+        "TALLY_JOURNAL_SCOPE",
+        fields.journal_scope.as_deref(),
+    );
+    if let Some(scope) = fields.projection_scope {
+        values.push(("TALLY_PROJECTION_SCOPE", enum_json_string(scope)?));
+    }
     push_optional(&mut values, "TALLY_AGENT", fields.agent.as_deref());
     push_optional(
         &mut values,
@@ -864,6 +984,8 @@ pub struct JournalFilter {
     pub task: Option<String>,
     pub session: Option<String>,
     pub event: Option<TallyEvent>,
+    pub journal_scope: Option<String>,
+    pub projection_scope: Option<JournalProjectionScope>,
     pub since_realtime_us: Option<u64>,
 }
 
@@ -884,6 +1006,19 @@ impl JournalFilter {
             return false;
         }
         if self.event.is_some_and(|event| entry.fields.event != event) {
+            return false;
+        }
+        if self
+            .journal_scope
+            .as_deref()
+            .is_some_and(|scope| entry.fields.journal_scope.as_deref() != Some(scope))
+        {
+            return false;
+        }
+        if self
+            .projection_scope
+            .is_some_and(|scope| entry.fields.projection_scope != Some(scope))
+        {
             return false;
         }
         if self
@@ -1005,6 +1140,8 @@ mod tests {
             event,
             task_uuid: "task-abc".to_owned(),
             task_ref: None,
+            journal_scope: None,
+            projection_scope: None,
             class: Priority::High,
             source: EnqueueSource::Manual,
             message: None,
@@ -1103,6 +1240,8 @@ mod tests {
         for optional in [
             "TALLY_AGENT",
             "TALLY_TASK_REF",
+            "TALLY_JOURNAL_SCOPE",
+            "TALLY_PROJECTION_SCOPE",
             "TALLY_SESSION_REF",
             "TALLY_CONTEXT_TOKENS",
             "TALLY_CONTEXT_WINDOW",
@@ -1118,6 +1257,119 @@ mod tests {
         assert_eq!(tally_agent_label("codex").unwrap(), "codex");
         assert_eq!(adapter_from_tally_agent("cc").unwrap(), "claude-code");
         assert!(tally_agent_label("bad\nlabel").is_err());
+    }
+
+    #[test]
+    fn spec_build_roles_have_one_exhaustive_projection_scope() {
+        use SpecBuildNodeRole::*;
+
+        let expected = [
+            (Agent, JournalProjectionScope::Attempt),
+            (CheckpointRecord, JournalProjectionScope::Attempt),
+            (Cleanup, JournalProjectionScope::Task),
+            (Constraint, JournalProjectionScope::Attempt),
+            (Continue, JournalProjectionScope::Pass),
+            (Diagnosis, JournalProjectionScope::Attempt),
+            (Escalate, JournalProjectionScope::Campaign),
+            (Gate, JournalProjectionScope::Attempt),
+            (Merge, JournalProjectionScope::Task),
+            (Ownership, JournalProjectionScope::Attempt),
+            (Prep, JournalProjectionScope::Task),
+            (Publish, JournalProjectionScope::Task),
+            (Rebase, JournalProjectionScope::Task),
+            (Reconcile, JournalProjectionScope::Pass),
+            (Retry, JournalProjectionScope::Attempt),
+            (Steering, JournalProjectionScope::Attempt),
+            (Sweep, JournalProjectionScope::Campaign),
+        ];
+        assert_eq!(expected.map(|(role, _)| role), SpecBuildNodeRole::ALL);
+        assert_eq!(
+            expected.map(|(_, scope)| scope),
+            SpecBuildNodeRole::ALL.map(JournalProjectionScope::for_spec_build_role)
+        );
+        assert_eq!(
+            JournalProjectionScope::ALL.map(|scope| enum_json_string(scope).unwrap()),
+            ["attempt", "task", "pass", "campaign"]
+        );
+    }
+
+    #[test]
+    fn campaign_projection_scope_is_structured_native_and_filterable() {
+        const FLOW_RUN: &str = "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321";
+        let mut event = full_event(TallyEvent::Started);
+        event.task_ref = Some(TaskRef::new("crm/t07").unwrap());
+        event.journal_scope = Some(FLOW_RUN.to_owned());
+        event.projection_scope = Some(JournalProjectionScope::Attempt);
+        let fields = event.into_fields().unwrap();
+
+        // Scope is additive structure. The outcome-first narration stays on
+        // the exact pre-scope template.
+        assert_eq!(
+            fields.message,
+            "Started task-abc taskRef=crm/t07 tally-job-task-abc.service attempt=1"
+        );
+        let structured = serde_json::to_value(&fields).unwrap();
+        assert_eq!(structured["TALLY_JOURNAL_SCOPE"], FLOW_RUN);
+        assert_eq!(structured["TALLY_PROJECTION_SCOPE"], "attempt");
+        let native = String::from_utf8(encode_native_record(&fields).unwrap()).unwrap();
+        assert!(native
+            .lines()
+            .any(|line| line == format!("TALLY_JOURNAL_SCOPE={FLOW_RUN}")));
+        assert!(native
+            .lines()
+            .any(|line| line == "TALLY_PROJECTION_SCOPE=attempt"));
+
+        let entry = JournalEntry {
+            fields,
+            realtime_us: Some(7),
+        };
+        assert!(JournalFilter {
+            journal_scope: Some(FLOW_RUN.to_owned()),
+            projection_scope: Some(JournalProjectionScope::Attempt),
+            ..JournalFilter::default()
+        }
+        .matches(&entry));
+        assert!(!JournalFilter {
+            projection_scope: Some(JournalProjectionScope::Task),
+            ..JournalFilter::default()
+        }
+        .matches(&entry));
+    }
+
+    #[test]
+    fn projection_scope_identity_requirements_fail_closed() {
+        const FLOW_RUN: &str = "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321";
+        for scope in JournalProjectionScope::ALL {
+            let mut event = full_event(TallyEvent::Started);
+            event.journal_scope = Some(FLOW_RUN.to_owned());
+            event.projection_scope = Some(scope);
+            if matches!(
+                scope,
+                JournalProjectionScope::Attempt | JournalProjectionScope::Task
+            ) {
+                event.task_ref = Some(TaskRef::new("crm/t07").unwrap());
+            }
+            event.into_fields().unwrap();
+        }
+
+        let mut event = full_event(TallyEvent::Started);
+        event.projection_scope = Some(JournalProjectionScope::Campaign);
+        assert!(event.into_fields().is_err());
+
+        let mut event = full_event(TallyEvent::Started);
+        event.journal_scope = Some(FLOW_RUN.to_owned());
+        event.projection_scope = Some(JournalProjectionScope::Attempt);
+        assert!(event.into_fields().is_err());
+
+        let mut event = full_event(TallyEvent::Started);
+        event.task_ref = Some(TaskRef::new("crm/t07").unwrap());
+        event.journal_scope = Some(FLOW_RUN.to_owned());
+        event.projection_scope = Some(JournalProjectionScope::Campaign);
+        assert!(event.into_fields().is_err());
+
+        let mut event = full_event(TallyEvent::Started);
+        event.journal_scope = Some("not-a-flow-run".to_owned());
+        assert!(event.into_fields().is_err());
     }
 
     #[test]

@@ -906,6 +906,8 @@ impl DaemonHandler {
                     attempt: params.attempt,
                     session: params.session,
                     event: params.event,
+                    journal_scope: None,
+                    projection_scope: None,
                     source: params.source,
                     since: params.since,
                     until: params.until,

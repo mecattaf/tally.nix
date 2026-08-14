@@ -12,7 +12,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::completion::{GateSummaryStatus, SemanticCompletion};
-use crate::journal::{JournalEntry, TallyEvent};
+use crate::journal::{JournalEntry, JournalProjectionScope, TallyEvent};
 use crate::provenance::{Orchestration, TaskRef};
 use crate::query_v2::FactAuthority;
 use crate::taskdb::{RelatedTrigger, WorkspaceMetadata};
@@ -637,6 +637,10 @@ pub struct LogRecord {
     pub event: TallyEvent,
     pub task_uuid: Option<String>,
     pub session_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_scope: Option<JournalProjectionScope>,
     #[serde(
         rename = "pool",
         serialize_with = "crate::poolset::serialize_optional",
@@ -662,6 +666,8 @@ pub struct LogFilter {
     pub task: Option<String>,
     pub session: Option<String>,
     pub event: Option<TallyEvent>,
+    pub journal_scope: Option<String>,
+    pub projection_scope: Option<JournalProjectionScope>,
     pub source: Option<String>,
     pub since: Option<String>,
 }
@@ -691,6 +697,8 @@ pub fn query_log(
                 .session_ref
                 .clone()
                 .or_else(|| row.and_then(|row| row.session_ref.clone())),
+            journal_scope: entry.fields.journal_scope.clone(),
+            projection_scope: entry.fields.projection_scope,
             pools: entry
                 .fields
                 .pools
@@ -725,6 +733,15 @@ pub fn query_log(
             .as_deref()
             .and_then(|task| row_by_task.get(task).copied());
         let parsed = parse_timestamp(&record.transition_timestamp)?;
+        let journal_scope = record
+            .orchestration
+            .as_ref()
+            .map(|orchestration| orchestration.flow_run_id().to_owned());
+        let projection_scope = record
+            .orchestration
+            .as_ref()
+            .and_then(Orchestration::node_role)
+            .map(JournalProjectionScope::for_spec_build_role);
         let output = LogRecord {
             origin: LogOrigin::Witness,
             timestamp: Some(record.transition_timestamp.clone()),
@@ -734,6 +751,8 @@ pub fn query_log(
                 .trace_ref
                 .clone()
                 .or_else(|| row.and_then(|row| row.session_ref.clone())),
+            journal_scope,
+            projection_scope,
             pools: Some(record.pools.clone()),
             executor: record
                 .executor
@@ -781,6 +800,16 @@ fn log_matches(record: &LogRecord, filter: &LogFilter, since: Option<DateTime<Ut
         return false;
     }
     if filter.event.is_some_and(|event| record.event != event) {
+        return false;
+    }
+    if filter
+        .journal_scope
+        .as_deref()
+        .is_some_and(|scope| record.journal_scope.as_deref() != Some(scope))
+        || filter
+            .projection_scope
+            .is_some_and(|scope| record.projection_scope != Some(scope))
+    {
         return false;
     }
     if filter
@@ -1381,6 +1410,8 @@ mod tests {
                 event,
                 task_uuid: task.to_owned(),
                 task_ref: None,
+                journal_scope: None,
+                projection_scope: None,
                 class: Priority::High,
                 source: EnqueueSource::Manual,
                 message: None,
