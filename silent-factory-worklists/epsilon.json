@@ -731,7 +731,7 @@
       "id": "delete-python-driver",
       "kind": "implementation",
       "title": "Delete the Python driver; the suite survives as the seam harness",
-      "goal": "The terminal cut, last in the graph: delete drivers/spec_build_driver.py and remove SPEC_BUILD_PY_FALLBACK (by now the fallback set must be empty \u2014 if it is not, this task's premise fails and you say so rather than deleting). DOUBLE-GRANDFATHER drivers/agency_nightly_driver.py AND drivers/campaign_worktrees.py (line 40 of the former imports the latter): both survive verbatim with a named retirement issue filed in their header comments (D75). The reseated Python-written suite SURVIVES as the language-agnostic seam harness, now running solely against the Rust binary. Sweep the tree for the deleted driver's remaining references (flake packaging of the old driver, docs pointers are D53-exempt only where A4 already owns them).",
+      "goal": "The terminal cut, last in the graph: delete drivers/spec_build_driver.py and remove SPEC_BUILD_PY_FALLBACK (by now the fallback set must be empty \u2014 if it is not, this task's premise fails and you say so rather than deleting). DOUBLE-GRANDFATHER drivers/agency_nightly_driver.py AND drivers/campaign_worktrees.py (line 40 of the former imports the latter): both survive verbatim with a named retirement issue filed in their header comments (D75). The reseated Python-written suite SURVIVES as the language-agnostic seam harness, now running solely against the Rust binary. Sweep the tree for the deleted driver's remaining references (flake packaging of the old driver, docs pointers are D53-exempt only where A4 already owns them). Ownership correction from the lane's own boundary refusal: crates/tally (cli/campaign.rs and tests/flow_live.rs reference the Python driver), crates/tally-flow (tests/spec_build_failed_agent_gate.rs), and nix/lib (campaign-drivers.nix, spec-build-driver.nix \u2014 the Python driver's packaging) are yours.",
       "deliveredBehaviors": [
         "The Python spec-build driver is gone and nothing references it",
         "agency_nightly_driver.py and campaign_worktrees.py survive with the retirement note",
@@ -782,7 +782,10 @@
         "flake.nix",
         "crates/spec-build-driver",
         "Cargo.toml",
-        "Cargo.lock"
+        "Cargo.lock",
+        "crates/tally",
+        "crates/tally-flow",
+        "nix/lib"
       ]
     },
     {
