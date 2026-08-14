@@ -786,6 +786,14 @@ impl GuardrailState {
         payload: EnqueuePayload,
         defaults: &ProducerDefaults,
     ) -> Result<ResolvedEnqueue, WireError> {
+        let mut orchestration = payload.orchestration;
+        if let (Some(orchestration), Some(dedup_key)) =
+            (orchestration.as_mut(), payload.dedup_key.as_deref())
+        {
+            orchestration
+                .admit_spec_build_node_identity(dedup_key)
+                .map_err(WireError::invalid)?;
+        }
         let argv = match (payload.invocation.as_deref(), payload.argv) {
             (Some(invocation), None) => split_invocation(invocation)?,
             (None, Some(argv)) if !argv.is_empty() => argv,
@@ -804,7 +812,7 @@ impl GuardrailState {
             .submission
             .as_ref()
             .is_some_and(|submission| submission.mode == SubmissionMode::Full);
-        if full_submission && payload.orchestration.is_some() {
+        if full_submission && orchestration.is_some() {
             if payload.cwd.is_some() {
                 return Err(WireError::invalid(
                     "full-mode flow submissions require cwd to be absent until NodeSpec exposes it",
@@ -967,7 +975,7 @@ impl GuardrailState {
             resume_from: payload.resume_from,
             source,
             dedup_key: payload.dedup_key,
-            orchestration: payload.orchestration,
+            orchestration,
             parent,
             evidence,
             drv,
@@ -2231,6 +2239,41 @@ mod tests {
                 .message,
             "full-mode flow submissions require gateManifest to be absent until NodeSpec exposes it"
         );
+    }
+
+    #[test]
+    fn full_mode_spec_build_key_becomes_typed_orchestration_identity() {
+        let flow_run = "00000000-0000-4000-8000-000000000145";
+        let mut payload = child_payload();
+        payload.caller_job_id = None;
+        payload.submission = Some(SubmissionOptions {
+            mode: SubmissionMode::Full,
+        });
+        payload.dedup_key = Some(format!(
+            "flow:{flow_run}:k:spec-build:v1:agent:t07:agent-t07"
+        ));
+        payload.orchestration = Some(
+            serde_json::from_value(serde_json::json!({
+                "flowName": "spec-build",
+                "flowRunId": flow_run,
+                "nodeOrdinal": 7,
+                "nodeLabel": "agent-t07",
+                "taskRef": "crm/t07",
+                "maxNodes": 12
+            }))
+            .unwrap(),
+        );
+
+        let resolved = GuardrailState::new(GuardrailConfig::default())
+            .unwrap()
+            .validate_enqueue(payload, &defaults())
+            .unwrap();
+        let orchestration = resolved.orchestration.unwrap();
+        assert_eq!(
+            orchestration.node_role(),
+            Some(crate::provenance::SpecBuildNodeRole::Agent)
+        );
+        assert_eq!(orchestration.subject_task_id(), Some("t07"));
     }
 
     #[test]
