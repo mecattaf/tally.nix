@@ -24,6 +24,10 @@ pub enum CampaignFoldError {
     UnsafeCompletionTaskId,
     #[error("completion trailer revision must be a lowercase SHA-256 identity")]
     InvalidCompletionRevision,
+    #[error("campaign summary scope must be a lowercase SHA-256 identity")]
+    InvalidSummaryScope,
+    #[error("campaign summary outcome must be complete or quiescent")]
+    InvalidSummaryOutcome,
 }
 
 /// Worklist identity carried through a reconciliation and its digest.
@@ -186,6 +190,29 @@ pub fn stable_publish_branch(
         format!("-{}", revision.chars().take(16).collect::<String>())
     });
     format!("tally/{campaign}-campaign-{campaign_id}/{task_id}{suffix}")
+}
+
+/// Return the durable closing-summary ref for one admitted campaign graph.
+///
+/// The campaign/issue prefix deliberately remains stable for merges,
+/// checkpoints, and receipts. Inserting the admitted digest immediately before
+/// `summary` gives each graph its own terminal-outcome namespace while keeping
+/// the longstanding `/summary/{complete,quiescent}` suffix.
+pub fn stage_scoped_summary_ref(
+    state_prefix: &str,
+    admitted_digest: &str,
+    outcome: &str,
+) -> Result<String, CampaignFoldError> {
+    if !is_sha256_identity(admitted_digest) {
+        return Err(CampaignFoldError::InvalidSummaryScope);
+    }
+    if !matches!(outcome, "complete" | "quiescent") {
+        return Err(CampaignFoldError::InvalidSummaryOutcome);
+    }
+    let digest = admitted_digest
+        .strip_prefix("sha256:")
+        .expect("validated SHA-256 identity has its prefix");
+    Ok(format!("{state_prefix}/{digest}/summary/{outcome}"))
 }
 
 /// Render the node-owned completion trailers for a campaign task commit.
@@ -513,5 +540,35 @@ fn extend_summary_rows<T>(
     lines.extend(rows.iter().take(limit).map(&mut render));
     if rows.len() > limit {
         lines.push(format!("- …and {} more", rows.len() - limit));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stage_scoped_summary_ref, CampaignFoldError};
+
+    #[test]
+    fn stage_scoped_summary_ref_uses_the_full_admitted_digest() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            stage_scoped_summary_ref("refs/tally/spec-build/v1/campaign", &digest, "complete")
+                .unwrap(),
+            format!(
+                "refs/tally/spec-build/v1/campaign/{}/summary/complete",
+                "a".repeat(64)
+            )
+        );
+        assert_eq!(
+            stage_scoped_summary_ref(
+                "refs/tally/spec-build/v1/campaign",
+                "sha256:not-a-digest",
+                "complete"
+            ),
+            Err(CampaignFoldError::InvalidSummaryScope)
+        );
+        assert_eq!(
+            stage_scoped_summary_ref("refs/tally/spec-build/v1/campaign", &digest, "archived"),
+            Err(CampaignFoldError::InvalidSummaryOutcome)
+        );
     }
 }

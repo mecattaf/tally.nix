@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration as ChronoDuration, FixedOffset};
 use regex::Regex;
 use tally_core::campaign_folds::{
     campaign_digest as fold_campaign_digest, render_campaign_summary, stable_publish_branch,
-    CampaignReconciliation,
+    stage_scoped_summary_ref, CampaignReconciliation,
 };
 use uuid::Uuid;
 
@@ -5542,11 +5542,12 @@ fn publish_closing_summary(
             "campaign closing summary exceeds 60,000 characters",
         ));
     }
-    let reference = format!(
-        "{}/summary/{}",
-        local_state_prefix(campaign, issue_number),
-        digest.outcome
-    );
+    let reference = stage_scoped_summary_ref(
+        &local_state_prefix(campaign, issue_number),
+        &digest.source.sha256,
+        &digest.outcome,
+    )
+    .map_err(|error| DriverError::new(error.to_string()))?;
     let expected = Json::object([
         ("schemaVersion", Json::Number("1".to_owned())),
         ("kind", Json::from("closing-summary")),
@@ -9980,10 +9981,137 @@ fn action_cleanup(brief: &Json) -> Result<Json> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
     use super::{
-        closed_inline_code_spans, contains_bare_exclamation_mark, replace_bare_exclamation_marks,
-        validate_outcome_first,
+        closed_inline_code_spans, contains_bare_exclamation_mark, publish_closing_summary,
+        read_local_blob, replace_bare_exclamation_marks, validate_outcome_first, Json, RepoConfig,
     };
+    use tally_core::campaign_folds::{campaign_digest, CampaignReconciliation, CampaignSource};
+    use uuid::Uuid;
+
+    fn summary_ref_test_git(directory: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn summary_digest(source_sha256: &str) -> tally_core::campaign_folds::CampaignDigest {
+        campaign_digest(
+            &CampaignReconciliation {
+                campaign: "fixture".to_owned(),
+                repository: "acme/spec".to_owned(),
+                source: CampaignSource {
+                    path: Some("campaign.json".to_owned()),
+                    sha256: source_sha256.to_owned(),
+                    revision: "c".repeat(40),
+                    repository: None,
+                    extra: serde_json::Map::new(),
+                },
+                base_revision: "c".repeat(40),
+                tasks: Vec::new(),
+                merged: Vec::new(),
+                checkpoints: Vec::new(),
+                remaining: Vec::new(),
+                diagnoses: Vec::new(),
+                retries: Vec::new(),
+                deferrals: Vec::new(),
+                blocked: Vec::new(),
+                warnings: Vec::new(),
+            },
+            "complete",
+        )
+    }
+
+    #[test]
+    fn summary_refs_for_two_admitted_digests_do_not_collide() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-summary-ref-test-{}", Uuid::new_v4()));
+        let checkout = temporary.join("checkout");
+        let remote = temporary.join("remote.git");
+        fs::create_dir_all(&checkout).unwrap();
+        summary_ref_test_git(
+            &temporary,
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        summary_ref_test_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        summary_ref_test_git(&checkout, &["config", "user.name", "Summary Ref Test"]);
+        summary_ref_test_git(
+            &checkout,
+            &["config", "user.email", "summary-ref@example.invalid"],
+        );
+        fs::write(checkout.join("README.md"), "fixture\n").unwrap();
+        summary_ref_test_git(&checkout, &["add", "README.md"]);
+        summary_ref_test_git(&checkout, &["commit", "--quiet", "-m", "fixture"]);
+        summary_ref_test_git(
+            &checkout,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        summary_ref_test_git(&checkout, &["push", "--quiet", "origin", "main"]);
+
+        let config = RepoConfig {
+            checkout: checkout.clone(),
+            base_branch: "main".to_owned(),
+            remote: "origin".to_owned(),
+        };
+        let first_digest = format!("sha256:{}", "a".repeat(64));
+        let second_digest = format!("sha256:{}", "b".repeat(64));
+        let first = publish_closing_summary(
+            "acme/spec",
+            &config,
+            "fixture",
+            "7",
+            &summary_digest(&first_digest),
+        )
+        .unwrap();
+        let second = publish_closing_summary(
+            "acme/spec",
+            &config,
+            "fixture",
+            "7",
+            &summary_digest(&second_digest),
+        )
+        .unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.ends_with(&format!("{}/summary/complete", "a".repeat(64))));
+        assert!(second.ends_with(&format!("{}/summary/complete", "b".repeat(64))));
+        let references = BTreeSet::from([
+            first.split("acme/spec/").nth(1).unwrap(),
+            second.split("acme/spec/").nth(1).unwrap(),
+        ]);
+        assert_eq!(references.len(), 2);
+        for reference in references {
+            assert_eq!(
+                read_local_blob(&config, reference)
+                    .unwrap()
+                    .as_object()
+                    .and_then(|summary| summary.get("kind"))
+                    .and_then(Json::as_str),
+                Some("closing-summary")
+            );
+        }
+
+        fs::remove_dir_all(temporary).unwrap();
+    }
 
     #[test]
     fn stage_zero_negation_ignores_only_closed_equal_width_code_fences() {

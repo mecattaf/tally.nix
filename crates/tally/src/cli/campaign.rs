@@ -23,9 +23,10 @@ use tally_core::campaign_contract::{
     MAX_CAMPAIGN_TASKS,
 };
 use tally_core::campaign_folds::{
-    campaign_digest, render_campaign_summary, stable_publish_branch, BlockedFact, CampaignDigest,
-    CampaignReconciliation, CampaignSource, CheckpointFact, DeferralFact, DiagnosisFact,
-    MergedFact, ReconciledTask, RetryFact, TALLY_REVISION_PREFIX, TALLY_TASK_PREFIX,
+    campaign_digest, render_campaign_summary, stable_publish_branch, stage_scoped_summary_ref,
+    BlockedFact, CampaignDigest, CampaignReconciliation, CampaignSource, CheckpointFact,
+    DeferralFact, DiagnosisFact, MergedFact, ReconciledTask, RetryFact, TALLY_REVISION_PREFIX,
+    TALLY_TASK_PREFIX,
 };
 use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
@@ -1519,8 +1520,12 @@ fn render_campaign_release_plan(
         release_current_checkpoints(&graph, &all_checkpoints, &gate_checkpoint.source_sha256)?;
 
     let summaries = release_summary_refs(&registration.checkout, &refs, &state_prefix, campaign)?;
-    let closing_summary =
-        release_closing_summary(&summaries, &state_prefix, &gate_checkpoint.source_sha256)?;
+    let closing_summary = release_closing_summary(
+        &summaries,
+        &state_prefix,
+        &gate_checkpoint.source_sha256,
+        &graph.executable_digest,
+    )?;
     let attempt_log = read_release_attempt_log(state_dir, campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)?;
 
     let task_ids = graph
@@ -2238,9 +2243,8 @@ fn release_summary_refs(
     state_prefix: &str,
     campaign: &str,
 ) -> Result<Vec<ReleaseSummaryRef>> {
-    let prefix = format!("{state_prefix}/summary/");
     refs.iter()
-        .filter(|reference| reference.reference.starts_with(&prefix))
+        .filter(|reference| is_release_summary_ref(&reference.reference, state_prefix))
         .map(|reference| {
             if reference.object_type != "blob" {
                 bail!(
@@ -2287,6 +2291,30 @@ fn release_summary_refs(
         .collect()
 }
 
+fn is_release_summary_ref(reference: &str, state_prefix: &str) -> bool {
+    let Some(suffix) = reference
+        .strip_prefix(state_prefix)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+    else {
+        return false;
+    };
+    if matches!(suffix, "summary/complete" | "summary/quiescent")
+        || suffix
+            .strip_prefix("summary/archive/")
+            .is_some_and(|tag| !tag.is_empty())
+    {
+        return true;
+    }
+    let Some((digest, summary)) = suffix.split_once('/') else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && matches!(summary, "summary/complete" | "summary/quiescent")
+}
+
 fn complete_summary_source(body: &str) -> Result<Option<String>> {
     let Some(first_line) = body.lines().next() else {
         return Ok(None);
@@ -2307,24 +2335,36 @@ fn release_closing_summary<'a>(
     summaries: &'a [ReleaseSummaryRef],
     state_prefix: &str,
     source_sha256: &str,
+    admitted_graph_digest: &str,
 ) -> Result<&'a ReleaseSummaryRef> {
-    let mut matches = summaries
+    let matches = summaries
         .iter()
         .filter(|summary| {
             summary.summary.outcome == "complete"
                 && summary.source_sha256.as_deref() == Some(source_sha256)
         })
         .collect::<Vec<_>>();
-    let current = format!("{state_prefix}/summary/complete");
-    matches.sort_by_key(|summary| summary.reference != current);
+    let mut current = vec![
+        stage_scoped_summary_ref(state_prefix, admitted_graph_digest, "complete")?,
+        stage_scoped_summary_ref(state_prefix, source_sha256, "complete")?,
+        format!("{state_prefix}/summary/complete"),
+    ];
+    current.dedup();
+    for reference in current {
+        if let Some(summary) = matches
+            .iter()
+            .find(|summary| summary.reference == reference)
+        {
+            return Ok(*summary);
+        }
+    }
     match matches.as_slice() {
         [] => bail!(
-            "completed campaign has no local complete-summary ref for source {source_sha256}; restore or archive its durable summary before rendering a release"
+            "completed campaign has no local complete-summary ref for source {source_sha256}; restore its durable summary before rendering a release"
         ),
         [summary] => Ok(*summary),
-        [summary, ..] if summary.reference == current => Ok(*summary),
         _ => bail!(
-            "completed campaign has multiple archived complete summaries for source {source_sha256}"
+            "completed campaign has multiple historical complete summaries for source {source_sha256}"
         ),
     }
 }
@@ -2666,10 +2706,7 @@ fn release_artifacts(
     artifacts.extend(
         summaries
             .iter()
-            .filter(|summary| {
-                summary.reference != closing_summary.reference
-                    && summary.reference.contains("/summary/archive/")
-            })
+            .filter(|summary| summary.reference != closing_summary.reference)
             .map(|summary| CampaignReleaseArtifact {
                 kind: "archived-summary".to_owned(),
                 locator: summary.reference.clone(),
@@ -7362,6 +7399,162 @@ mod tests {
         })
     }
 
+    fn release_summary_ref_for_test(
+        reference: String,
+        source_sha256: Option<&str>,
+        outcome: &str,
+    ) -> ReleaseSummaryRef {
+        ReleaseSummaryRef {
+            reference,
+            object_id: "d".repeat(40),
+            source_sha256: source_sha256.map(str::to_owned),
+            summary: ReleaseClosingSummaryV1 {
+                schema_version: RELEASE_SUMMARY_SCHEMA_VERSION,
+                kind: "closing-summary".to_owned(),
+                campaign: "fixture-release".to_owned(),
+                issue_number: LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+                outcome: outcome.to_owned(),
+                body: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn release_closing_summary_resolves_scoped_and_legacy_summary_refs() {
+        let state_prefix =
+            campaign_state_ref_prefix("fixture-release", LOCAL_CAMPAIGN_ISSUE_NUMBER);
+        let source_sha256 = format!("sha256:{}", "a".repeat(64));
+        let graph_digest = format!("sha256:{}", "b".repeat(64));
+        let source_scoped = release_summary_ref_for_test(
+            stage_scoped_summary_ref(&state_prefix, &source_sha256, "complete").unwrap(),
+            Some(&source_sha256),
+            "complete",
+        );
+        let graph_scoped = release_summary_ref_for_test(
+            stage_scoped_summary_ref(&state_prefix, &graph_digest, "complete").unwrap(),
+            Some(&source_sha256),
+            "complete",
+        );
+        let legacy_current = release_summary_ref_for_test(
+            format!("{state_prefix}/summary/complete"),
+            Some(&source_sha256),
+            "complete",
+        );
+        let legacy_archived = release_summary_ref_for_test(
+            format!("{state_prefix}/summary/archive/old-complete"),
+            Some(&source_sha256),
+            "complete",
+        );
+
+        for summary in [
+            &source_scoped,
+            &graph_scoped,
+            &legacy_current,
+            &legacy_archived,
+        ] {
+            assert!(is_release_summary_ref(&summary.reference, &state_prefix));
+        }
+        assert!(!is_release_summary_ref(
+            &format!("{state_prefix}/merge/not-a-summary"),
+            &state_prefix
+        ));
+
+        for summary in [
+            &source_scoped,
+            &graph_scoped,
+            &legacy_current,
+            &legacy_archived,
+        ] {
+            let resolved = release_closing_summary(
+                std::slice::from_ref(summary),
+                &state_prefix,
+                &source_sha256,
+                &graph_digest,
+            )
+            .unwrap();
+            assert_eq!(resolved.reference, summary.reference);
+        }
+
+        let summaries = vec![
+            legacy_current.clone(),
+            source_scoped.clone(),
+            graph_scoped.clone(),
+        ];
+        assert_eq!(
+            release_closing_summary(&summaries, &state_prefix, &source_sha256, &graph_digest,)
+                .unwrap()
+                .reference,
+            graph_scoped.reference,
+            "the exact admitted-graph ref wins when compatibility copies coexist"
+        );
+    }
+
+    #[test]
+    fn release_artifacts_collect_scoped_and_legacy_summary_refs() {
+        let state_prefix =
+            campaign_state_ref_prefix("fixture-release", LOCAL_CAMPAIGN_ISSUE_NUMBER);
+        let source_sha256 = format!("sha256:{}", "a".repeat(64));
+        let historical_digest = format!("sha256:{}", "b".repeat(64));
+        let closing = release_summary_ref_for_test(
+            stage_scoped_summary_ref(&state_prefix, &source_sha256, "complete").unwrap(),
+            Some(&source_sha256),
+            "complete",
+        );
+        let scoped = release_summary_ref_for_test(
+            stage_scoped_summary_ref(&state_prefix, &historical_digest, "quiescent").unwrap(),
+            None,
+            "quiescent",
+        );
+        let legacy_current = release_summary_ref_for_test(
+            format!("{state_prefix}/summary/quiescent"),
+            None,
+            "quiescent",
+        );
+        let legacy_archived = release_summary_ref_for_test(
+            format!("{state_prefix}/summary/archive/old-quiescent"),
+            None,
+            "quiescent",
+        );
+        let summaries = vec![
+            closing.clone(),
+            scoped.clone(),
+            legacy_current.clone(),
+            legacy_archived.clone(),
+        ];
+        let artifacts = release_artifacts(
+            &ReleaseGitRef {
+                object_id: "c".repeat(40),
+                object_type: "commit".to_owned(),
+                tree_id: Some("e".repeat(40)),
+                reference: "refs/heads/tally/fixture/integration".to_owned(),
+            },
+            &[],
+            &[],
+            &[],
+            &closing,
+            &summaries,
+            &ReleaseAttemptLog {
+                path: PathBuf::new(),
+                present: false,
+                bytes: Vec::new(),
+                records: Vec::new(),
+            },
+        );
+        let archived = artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "archived-summary")
+            .map(|artifact| artifact.locator.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            archived,
+            BTreeSet::from([
+                scoped.reference.as_str(),
+                legacy_current.reference.as_str(),
+                legacy_archived.reference.as_str(),
+            ])
+        );
+    }
+
     #[test]
     fn release_note_derivation_falls_back_for_a_poisoned_trailer_block() {
         let scopes = BTreeSet::from(["crates/tally".to_owned()]);
@@ -8354,8 +8547,14 @@ fi
             )
         });
         let complete_object = release_fixture_blob(&checkout, &complete_summary);
-        let complete_ref = format!("{state_prefix}/summary/complete");
+        let complete_ref =
+            stage_scoped_summary_ref(&state_prefix, &graph.executable_digest, "complete").unwrap();
         release_fixture_git(&checkout, &["update-ref", &complete_ref, &complete_object]);
+        let legacy_complete_ref = format!("{state_prefix}/summary/complete");
+        release_fixture_git(
+            &checkout,
+            &["update-ref", &legacy_complete_ref, &complete_object],
+        );
         let archive_summary = json!({
             "schemaVersion": RELEASE_SUMMARY_SCHEMA_VERSION,
             "kind": "closing-summary",
@@ -8469,6 +8668,11 @@ fi
                 .any(|artifact| artifact.kind == "archived-summary"
                     && artifact.locator == archive_ref)
         );
+        assert!(plan
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "archived-summary"
+                && artifact.locator == legacy_complete_ref));
         assert!(plan
             .artifacts
             .iter()
