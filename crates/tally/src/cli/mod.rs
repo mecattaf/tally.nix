@@ -1,6 +1,7 @@
 mod adapter;
 mod args;
 mod campaign;
+mod commit_lint;
 mod daemon;
 pub(crate) mod enqueue;
 mod exit;
@@ -72,6 +73,7 @@ const RESULT_PROJECTION_TIMEOUT_ENV: &str = "TALLY_RESULT_PROJECTION_TIMEOUT_MS"
 use adapter::*;
 use args::*;
 use campaign::*;
+use commit_lint::*;
 use daemon::*;
 use enqueue::*;
 use exit::*;
@@ -305,6 +307,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         Some(Command::Campaign { command }) => {
             run_campaign(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
+        Some(Command::LintHistory(args)) => run_lint_history(args),
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::History { command }) => run_history(command),
         Some(Command::Attest { command }) => run_attest(command),

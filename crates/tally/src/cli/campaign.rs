@@ -322,7 +322,7 @@ struct ReleaseCommit {
     object_id: String,
     parents: Vec<String>,
     committed_at: i64,
-    subject: String,
+    message: String,
     task_values: Vec<String>,
     revision_values: Vec<String>,
 }
@@ -825,7 +825,7 @@ fn release_integration_history(checkout: &Path, reference: &str) -> Result<Vec<R
     let task_key = TALLY_TASK_PREFIX.trim_end_matches(':');
     let revision_key = TALLY_REVISION_PREFIX.trim_end_matches(':');
     let format = format!(
-        "%H%x00%P%x00%ct%x00%s%x00%(trailers:key={task_key},valueonly,unfold=true,separator=%x1f)%x00%(trailers:key={revision_key},valueonly,unfold=true,separator=%x1f)"
+        "%H%x00%P%x00%ct%x00%B%x00%(trailers:key={task_key},valueonly,unfold=true,separator=%x1f)%x00%(trailers:key={revision_key},valueonly,unfold=true,separator=%x1f)"
     );
     let arguments = vec![
         "log".to_owned(),
@@ -863,7 +863,7 @@ fn release_integration_history(checkout: &Path, reference: &str) -> Result<Vec<R
                 object_id: object_id.to_owned(),
                 parents,
                 committed_at,
-                subject: fields[3].to_owned(),
+                message: fields[3].to_owned(),
                 task_values: split_release_trailers(fields[4]),
                 revision_values: split_release_trailers(fields[5]),
             })
@@ -1408,6 +1408,14 @@ fn release_notes(
     revisions: &BTreeMap<String, String>,
     merged_commits: &[(String, ReleaseCommit)],
 ) -> Result<Vec<CampaignReleaseNote>> {
+    let scopes = graph
+        .manifest
+        .tasks
+        .iter()
+        .filter_map(|task| task.conflict_domains.as_ref())
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let titles = graph
         .manifest
         .tasks
@@ -1428,21 +1436,23 @@ fn release_notes(
             let source = refs
                 .iter()
                 .find(|candidate| candidate.reference == reference);
-            let (source_ref, source_commit, header) = match source {
+            let (source_ref, source_commit, message) = match source {
                 Some(source) if source.object_type == "commit" => (
                     Some(source.reference.clone()),
                     Some(source.object_id.clone()),
-                    release_commit_subject(&registration.checkout, &source.object_id)?,
+                    release_commit_message(&registration.checkout, &source.object_id)?,
                 ),
                 Some(source) => bail!(
                     "campaign task ref {:?} must point directly to a commit, not a {}",
                     source.reference,
                     source.object_type
                 ),
-                None => (None, None, merged.subject.clone()),
+                None => (None, None, merged.message.clone()),
             };
+            let header = commit_header(&message).to_owned();
             let fallback = titles.get(task_id.as_str()).copied().unwrap_or(task_id);
-            let (kind, scope, breaking, summary) = conventional_release_header(&header, fallback);
+            let (kind, scope, breaking, summary) =
+                validated_release_header(&message, &scopes, fallback);
             Ok(CampaignReleaseNote {
                 task_id: task_id.clone(),
                 commit: merged.object_id.clone(),
@@ -1458,58 +1468,33 @@ fn release_notes(
         .collect()
 }
 
-fn release_commit_subject(checkout: &Path, object_id: &str) -> Result<String> {
+fn release_commit_message(checkout: &Path, object_id: &str) -> Result<String> {
     let output = release_git_read(
         checkout,
         &[
             "show".to_owned(),
             "--no-patch".to_owned(),
-            "--format=%s".to_owned(),
+            "--format=%B".to_owned(),
             object_id.to_owned(),
         ],
-        "reading a merged task subject",
+        "reading a merged task commit message",
     )?;
-    let subject = String::from_utf8(output)
-        .context("merged task subject was not UTF-8")?
-        .trim_end_matches(['\r', '\n'])
-        .to_owned();
-    if subject.is_empty() || subject.contains(['\r', '\n', '\0']) {
-        bail!("merged task commit {object_id} has an invalid subject");
-    }
-    Ok(subject)
+    String::from_utf8(output).context("merged task commit message was not UTF-8")
 }
 
-fn conventional_release_header(
-    header: &str,
+fn validated_release_header(
+    message: &str,
+    scopes: &BTreeSet<String>,
     fallback: &str,
 ) -> (String, Option<String>, bool, String) {
-    let Some((raw_prefix, summary)) = header.split_once(": ") else {
-        return ("other".to_owned(), None, false, fallback.to_owned());
-    };
-    if summary.trim().is_empty() {
+    let validation = validate_commit_message(message, scopes);
+    if !validation.is_valid() {
         return ("other".to_owned(), None, false, fallback.to_owned());
     }
-    let breaking = raw_prefix.ends_with('!');
-    let prefix = raw_prefix.strip_suffix('!').unwrap_or(raw_prefix);
-    let (kind, scope) = match prefix.split_once('(') {
-        Some((kind, rest)) if rest.ends_with(')') => {
-            (kind, Some(rest.trim_end_matches(')').to_owned()))
-        }
-        Some(_) => return ("other".to_owned(), None, false, fallback.to_owned()),
-        None => (prefix, None),
-    };
-    let valid_atom = |value: &str| {
-        !value.is_empty()
-            && value.bytes().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'-' | b'_' | b'.' | b'/')
-            })
-    };
-    if !valid_atom(kind) || scope.as_deref().is_some_and(|scope| !valid_atom(scope)) {
+    let Some(header) = validation.header else {
         return ("other".to_owned(), None, false, fallback.to_owned());
-    }
-    (kind.to_owned(), scope, breaking, summary.to_owned())
+    };
+    (header.kind, header.scope, header.breaking, header.subject)
 }
 
 fn release_artifacts(
@@ -6206,6 +6191,22 @@ mod tests {
     }
 
     #[test]
+    fn release_note_derivation_falls_back_for_a_poisoned_trailer_block() {
+        let scopes = BTreeSet::from(["crates/tally".to_owned()]);
+        let message = "feat(crates/tally): parse a plausible header\n\nTally-Task: task\npoison the apparent trailer block\nTally-Revision: sha256:abc";
+
+        assert_eq!(
+            validated_release_header(message, &scopes, "Template release note"),
+            (
+                "other".to_owned(),
+                None,
+                false,
+                "Template release note".to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn completed_fixture_campaign_renders_a_read_only_release_plan() {
         let temporary = tempfile::tempdir().unwrap();
         let checkout = temporary.path().join("repository");
@@ -6290,7 +6291,11 @@ mod tests {
         release_fixture_git(&checkout, &["add", "feature.txt"]);
         release_fixture_git(
             &checkout,
-            &["commit", "-m", "feat(cli): render fixture releases"],
+            &[
+                "commit",
+                "-m",
+                "feat(crates/tally): render fixture releases",
+            ],
         );
         let source_commit = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
         release_fixture_git(&checkout, &["checkout", "main"]);
@@ -6418,10 +6423,10 @@ mod tests {
         );
         assert_eq!(
             plan.release_notes[0].header,
-            "feat(cli): render fixture releases"
+            "feat(crates/tally): render fixture releases"
         );
         assert_eq!(plan.release_notes[0].kind, "feat");
-        assert_eq!(plan.release_notes[0].scope.as_deref(), Some("cli"));
+        assert_eq!(plan.release_notes[0].scope.as_deref(), Some("crates/tally"));
         assert_eq!(plan.digest.merged[0].task_id, "ship-feature");
         assert_eq!(plan.digest.checkpoints[0].task_id, "release-gate");
         assert_eq!(plan.digest.source.revision, source_revision);
