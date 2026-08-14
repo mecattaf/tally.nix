@@ -68,7 +68,7 @@
         }
       ],
       "dependencies": [],
-      "conflictDomains": ["crates/tally-core/src", "crates/tally-core/tests", "crates/spec-build-driver/src", "crates/tally/src", "test/fixtures"]
+      "conflictDomains": ["crates/tally-core/src", "crates/tally-core/tests", "crates/spec-build-driver/src", "crates/tally/src", "crates/tally/tests", "test/fixtures"]
     },
     {
       "id": "epoch-scoped-budgets",
