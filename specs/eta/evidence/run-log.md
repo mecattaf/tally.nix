@@ -16,6 +16,19 @@ lands scraped totals; the window is 10,000 credits, reset ~2026-08-22.
 | 3 | 08-15 15:03–16:10 | job-limits-optional attempt 3 — MERGED ffcb9a15 | flagship | 76 | 138,727 | 46,001 | 0 | ≈332 | ≈9,413 |
 | 4 | 08-15 16:14–16:57 | oom-legibility attempt 1 — MERGED first try | flagship | 66 | 139,379 | 55,220 | 0 | ≈377 | ≈9,036 |
 | 5 | 08-15 17:13–17:55 | excerpt-derivations attempt 1 — MERGED first try | flagship | 101 | 197,959 | 90,205 | 0 | ≈591 | ≈8,445 |
+| 6 | 08-15 18:07–18:46 | adapter-relative-policies attempt 1 — gate-refused | flagship | ~125 | ~200,000 | ~85,000 | 0 | ≈570 | ≈7,875 |
+
+## Attempt 6 — adapter-relative-policies (cargo-tests gate catch; domain gap again)
+
+The lane deleted the three policy consts from the contract but
+crates/tally/src/cli/campaign.rs imports and uses all three — and
+crates/tally was not in S4's declared domains, so the lane could not
+have fixed the consumer it broke. The cargo-tests merge gate refused the
+head with the E0432 lines verbatim; no false green. Amendment 3 adds
+crates/tally to the domain and names the consumer in the goal. Same
+lesson as S1: the vestige ledger's domain lists were authored against
+group shapes, not against the consumer graph — each gap surfaces once,
+legibly, and becomes goal bytes.
 
 ## Calibration verdict (dispatch rule 2, closed)
 
