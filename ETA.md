@@ -68,7 +68,9 @@ replacement named.
   - Diagnosis, judging, sittings, escalations, all authoring: never on the
     metered plan. These are the orchestrator's (Fable) and claude-code's.
   - A lane attempt is budgeted at 300–400k fresh input (measured, Aug 7).
-    The orchestrator keeps a running spend ledger against the weekly window.
+    The orchestrator keeps a running spend ledger against the weekly window
+    and dispatches under the §6 protocol — no dispatch without a spend check,
+    no fan-out before calibration, hard reserve floor.
   - Crystallization (Chapter 1): spend into receipts, effort tier into the
     host catalog, metered-pool capacity=1 into the pool declaration.
 - **E6 — Read the capture tail before any retry burns.** Until S2/S5 deploy,
@@ -182,6 +184,19 @@ grades every gated head, and eta amends Chapters 3–5 to cite real
 | X6 | the lease | X2 |
 | X7 | the inbox: typed-doubt queue as a delivery surface (E8 of the epsilon program) | X2 |
 
+**Chapter 3 authoring amendment (operator ruling, 2026-08-15):** the
+inherited "authored caps off the schema" destination
+(EPSILON-EXTENSION.md:106; final-shape.md:264,:493) is amended for
+`maxParallel` — **the per-worklist concurrency knob is never deleted.**
+It becomes *optional* (absent ⇒ host pool capacity governs), satisfying
+the zero-required-numbers doctrine, with min semantics when present:
+effective width = min(worklist `maxParallel`, host pool capacity,
+disjoint-domain frontier). Desired concurrency is campaign policy (e.g.
+budget containment), not only a host property — the Aug 15 budget week is
+the proof case. The `maxTasks`/`projectionWaitMs` dispositions are
+unaffected. Evidence files stay untouched (record-don't-fix); this ruling
+is the authority the C2-era sitting authors from.
+
 **Checkpoint C2** → seam sitting 2 → **pin-bump 2**. From here a base fix
 reaches a running campaign and a push arms work — the failure mode that
 ended ext0 is structurally extinct.
@@ -213,22 +228,189 @@ ended ext0 is structurally extinct.
 At each checkpoint (C1/C2/C3/P4): (1) checkpoint node green; (2) orchestrator
 drafts the seam sitting — spec ratifications, trace rows, amendments to the
 next chapter's tasks against the observed tree; (3) Tom makes the sitting
-commit and confirms the pin-bump; (4) rebuild switch + drop-in/state
-verification (until S1 deploys at pin-bump 1, re-verify the 24 GiB drop-in
-after every rebuild); (5) orchestrator resumes dispatch. The `campaign
+commit and confirms the pin-bump; (4) rebuild switch + the post-flash
+checklist learned at Phase 0, mandatory at EVERY pin-bump: (a) the flash
+re-arms declared automation — stop `tally-campaign-poll.timer` (unless a
+campaign should poll) and `tally-producer-nightly-fleet-deploy.timer`,
+and clear any benign `fleet-deploy.service` failed state
+(`sudo systemctl reset-failed fleet-deploy.service`) — standing until a
+witnessed quiescence guard lands; (b) the 24 GiB drop-in pins a full
+ExecStart INCLUDING the store path — re-point it at the new deployed path
+and restart the daemon (standing until S1 deploys, after which the
+drop-in is deleted outright); (5) orchestrator resumes dispatch.
+Hardening candidate carried from Phase 0: the #440
+`launch-cwd-ordinary-completion` continue-vs-sessionRef race (flaked once
+at the bootstrap gate, passed on rerun) — queue under Chapter 5 P3. The `campaign
 status` view is authoritative only for the reconciled past —
 `systemctl --user list-units 'tally-job-*'` is liveness (close report §3.7).
 
-## 6. Budget plan (the qwen week)
+## 6. Budget plan (the qwen week) — governed by the Aug 7 lesson
 
-Window: the weekly metered allocation, from Phase-0 close. Estimates at
-300–400k fresh input per lane attempt: Chapter 1 (6 lanes) + Chapter 2
-(5 lanes) ≈ 3.3–4.4M first-attempt, ~5–6M with a 1.3× retry factor;
-Chapter 3 (7 lanes) ≈ 2.1–2.8M. The window plausibly covers Chapters 1–3
-**iff** masquerade-driven retries stay near zero — which is what Phase 0's
-machinery and rule E6 exist to guarantee. Chapters 4–5 ride the next window,
-claude-code, or codex post-Aug-20 (Tom's §8 call). The orchestrator posts
-the spend ledger at every seam.
+**The lesson, restated as law.** On 2026-08-07, four parallel qwen workers
+consumed the plan's entire weekly allowance — 1,373,257 fresh input tokens —
+in ~18 minutes (766 turns; every tool output lands as fresh input; cache
+reads are unmetered and irrelevant; ~300–400k fresh per lane; the failure
+was discovered only after fan-out, so it cost 4× instead of 1×). Nothing
+misbehaved; that is simply the autonomous-implementation regime. Interactive
+intuition does not transfer and is never used for sizing here.
+
+**Discrepancy resolved (2026-08-15, live forensics on
+`~/.pi/agent/sessions/` — supersedes AUGUST-07-LEARNINGS §3's metering
+interpretation).** There was never a 10M-token weekly plan. QwenCloud runs
+two separate billing rails: the **free/PAYG rail** (`sk-ws-` key, standard
+endpoint, ~1M-token free buckets per model) and the **Token Plan rail**
+(`sk-sp-` key, base URL `token-plan.ap-southeast-1.maas.aliyuncs.com`
+`/compatible-mode/v1`, 10,000 credits per 7-day window). The Aug 7 wave
+ran on the **plan rail** — pi's provider config (`qwen-token-plan`,
+key at `/run/agenix/qwencloud-token`, prefix `sk-sp-`) proves it, and the
+lane's terminal error says it verbatim: *"Your token-plan 1-week quota has
+been exhausted. The quota will reset at 08-14 10:06:00 UTC."* The paid
+week WAS spent — in ~18 minutes, by four parallel lanes. The free rail has
+seen exactly one 86-token manual test (Aug 6), so the free buckets are
+intact. The window has since reset: a full 10,000-credit week is available
+now.
+
+**The real cost driver, corrected:** the Aug 7 record's "cache reads —
+unmetered" was wrong on this rail. At cache ≈10% of the input rate, the
+wave's 112.4M cache reads were ~73% of the credit burn (est. ≈9,000 of
+≈12,300 credits at scaled rates, against the 10,000 cap). **Transcript
+length is the cost center**: long lanes re-send everything every turn.
+Binding consequences — small tasks, lane turn-review threshold (~80 turns
+without a push ⇒ supervisor reviews instead of letting it grind),
+implementor thinking level low/medium (output is the priciest token class,
+≈6× input), and serialization so a surprise costs one lane.
+
+**Credit economics (doc-derived; treat as estimate until calibration).**
+Credits scale with each model's PAYG price. From the official qwen3.6-plus
+worked example: input ≈200 credits/M, cache reads ≈10% of input rate,
+output ≈6× input. Scaled to qwen3.8-max's $2/$6 PAYG pricing: input
+≈800/M, cache ≈80/M, output ≈4,800/M (inference, unverified). Applied to
+a measured ext0-shape lane (350k fresh in, ~27M cache reads, ~115k out):
+**≈3,000 credits/lane — and cache reads are the dominant term (~70%)**,
+because agentic transcripts re-send every turn. Two consequences: the
+weekly 10,000 credits fund roughly 3–4 ext0-shape lanes, not dozens; and
+**short lanes are the strongest cost lever on the plan rail** — cache-read
+volume grows superlinearly with turn count, so a task half the size costs
+well under half the credits. Credit Packs ($15/mo per 20,000 credits, up
+to 5, subscribers only) are the sanctioned overflow, ≈ list-price value.
+
+**Account configuration.** The plan rail is ALREADY wired and proven:
+pi provider `qwen-token-plan` → `sk-sp-` key at
+`/run/agenix/qwencloud-token` → token-plan base URL, with qwen3.8-max and
+deepseek-v4-flash-0731 declared. Nothing to fix there. What does NOT yet
+exist is a free-rail provider: pi has no `sk-ws-` key configured, so the
+"free quota" buckets are ruled playground-only (see the free-tier ruling
+above) — no free-rail provider is configured or planned. The metered
+budget is plan credits + optional credit packs. Plan-rail caveats: the weekly window resets on
+its own schedule (observed: reset stamped 7 days after first invocation);
+no programmatic usage endpoint exists and the console lags — the per-lane
+ledger reconstructs from `~/.pi/agent/sessions/` usage records (method
+validated against the Aug 7 numbers exactly), console checked at seams.
+
+**Dispatch protocol (binding on the orchestrator):**
+1. **Metering verification first.** Before any lane dispatches, read the
+   plan's quota surface (pi usage records / provider dashboard) and record:
+   what is metered (fresh input vs input+output vs everything), the true
+   weekly number, and the reset time. Written into the ledger before lane 1.
+2. **Calibration lane.** S1 dispatches SOLO as the first qwen lane. At its
+   close, reconstruct actual burn from pi's usage records (the Aug 7 method)
+   and compute: burn per lane, projected chapter cost, lanes-per-window.
+   The rest of the schedule is derived from that number, not from estimates.
+3. **One worker at a time — no exceptions this week.** Serialization is the
+   containment: any surprise costs one lane, never four. (E5's "two for
+   disjoint cheap pairs" is suspended until calibration and Tom's explicit
+   ok.) Enforcement is committed worklist bytes, not discipline:
+   `eta.json` `maxParallel: 1`, raised only by worklist amendment after
+   calibration. **Operator ruling (2026-08-15): the flow's declared
+   concurrency knob (`maxParallel`) is kept permanently** — the
+   final-shape note about deleting it in favor of pool capacity is
+   overruled; host pool capacity remains the ceiling above it, and V-8's
+   only change is making that default's derivation visible.
+4. **Spend check before every dispatch.** Remaining allowance is read before
+   each lane starts. A lane never dispatches into a window that cannot fund
+   it plus one retry (~2× lane cost).
+5. **Hard reserve floor: 15%** of the window is never dispatched against —
+   it exists so diagnosis-driven reruns and the odd oversized lane don't
+   dead-end the week the way Aug 7 and Aug 14–15 both did (both runs ended
+   on exhausted quota).
+6. **No retry without cause.** A failed qwen lane is never redispatched
+   until the capture tail and unit result are read (E6) and the orchestrator
+   names the cause. Terminal conditions (quota, OOM) stop the ladder — a
+   retry against a wall is the single most expensive no-op in the record.
+7. **Qwen never evaluates.** Diagnosis, judging, verdicts, and all
+   read-everything roles stay off the metered plan, categorically (the
+   evaluator re-reads the whole surface every round — worst possible
+   token-flow shape for metered capacity).
+8. **Ledger cadence: per lane, not per seam.** After every lane: spent,
+   remaining, lanes-left-at-current-burn, posted where Tom sees it.
+9. **Small lanes are the cheapest optimization.** Chapter tasks are scoped
+   to 1–2 conflict domains and tight readFirst sets; ingestion, not
+   thinking, is what the meter charges.
+
+**Model roster ruling (operator, 2026-08-15).** Recorded here as the
+ruling's record; encoded as host-catalog fact at sitting 0 (which model
+answers is a catalog fact, never worklist bytes — L16). The metered plan is
+QwenCloud Token Plan Standard: 10,000 credits / rolling 7 days (clock
+starts at first plan-rail invocation; ≈3,000 credits per ext0-shape lane
+on qwen3.8-max, estimate pending calibration), plus per-model free quotas
+on the separate free rail that auto-stop at exhaustion.
+- **Tier A — lane implementors** (plan credits): qwen3.8-max (flagship;
+  list $2/M in, $6/M out, 1M ctx, 131k max out), qwen3.8-2.4t-a95b
+  (open-source sibling), deepseek-v4-pro-0813.
+- **Tier B — bounded closed-shape utility slots ONLY, and only if a
+  genuinely free, API-reachable quota separate from plan credits is ever
+  proven to exist:** qwen3.7-plus, glm-5.2. Never lane implementors,
+  never evaluators.
+- **Excluded:** everything else in the free-tier roster (image models et
+  al.).
+- **Free-tier ruling (operator, 2026-08-15): the per-model "free quota"
+  buckets are treated as the try-ai webchat playground allowance, NOT
+  API-usable compute.** No free-first stage; the metered budget is plan
+  credits + credit packs, with claude-code as overflow. Cheap
+  falsification if ever wanted: create the `sk-ws-` key, make one tiny
+  API call, see whether the free bucket decrements — ten minutes, zero
+  risk; until then the assumption stands. Parallelism above one worker
+  only after calibration, within the plan's 3–4 agent concurrency.
+- **List-price anchor (sanity only, until calibration):** a measured lane
+  (300–400k fresh in, ~100–140k out) ≈ $1.2–1.6 at qwen3.8-max list;
+  Chapters 1–3 (~23 attempts) ≈ $30–45 at list. What fraction the weekly
+  10,000 credits cover is exactly what the calibration lane measures.
+
+**Operator directive (2026-08-15): the qwen subscription carries the FULL
+buildout, Chapters 1–5, at ZERO additional spend.** No Credit Packs, no
+pay-as-you-go, nothing beyond the active $51/quarter subscription.
+claude-code is contingency only (adapter smoke, emergency continuation if
+the plan rail is down); codex optional after Aug 20. The available
+budget, netted out: 10,000 credits per 7-day window, windows recurring
+until 2026-11-07 ≈ **~12 windows ≈ ~120,000 credits already paid for**.
+Against the buildout's ~30–35 attempts at small-lane discipline
+(~1,000–1,500 credits/lane ≈ 40–55k credits total), the subscription
+covers the whole program with roughly 2× margin — the binding resource is
+windows, not money. When a window exhausts, dispatch pauses until it
+resets; that pause is a planned state, not an incident.
+
+**Model routing inside the plan rail (the biggest "use it WELL" lever):**
+credits scale with each model's PAYG price, so the catalog routes by task
+weight — mechanical/small lanes (salvage-class, doc edits, skill amends,
+fixture work) → deepseek-v4-flash-0731 (already configured in pi;
+flash-class credit rate is a small fraction of max-class); standard
+implementation → deepseek-v4-pro-0813; the genuinely hard lanes
+(spec-lint-core, publish-as-a-machine-stage, product split) →
+qwen3.8-max. The spec layer is the capability amplifier that makes the
+cheaper tiers viable (pre-digested goals, verbatim contracts); S1
+calibrates qwen3.8-max, and the first flash-routed lane calibrates the
+cheap tier the same way.
+
+**Sequencing (no wall-clock commitments — the dependency order and the
+ledger govern, not calendar estimates):** Phase 0 → sitting 0 → the
+chapters run in DAG order, continuously, one lane at a time, for as many
+weekly windows as they take. The plan week starts at Chapter 1's first
+dispatch. Chapter boundaries are seam events (checkpoint → sitting →
+pin-bump), not dates. The buildout is complete when P4 is green and the
+§7 proof ratchet holds — full completion on the qwencloud subscription is
+the aim, and the ~2× credit margin says the subscription can carry it;
+S1 and the first flash-routed lane convert that from estimate to
+measurement, and the per-lane ledger is the only schedule authority.
 
 ## 7. Exit — the ratchets, then v0.0.1
 
