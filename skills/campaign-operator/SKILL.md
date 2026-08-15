@@ -1,6 +1,6 @@
 ---
 name: campaign-operator
-description: Observe, steer, resume, release, or abandon an armed local tally campaign. Use when operating a campaign after tally campaign arm, inspecting its live state, supplying local steering, handling an escalation, or publishing a completed campaign.
+description: Observe, steer, release, or abandon an armed local tally campaign. Use when operating a campaign after tally campaign arm, inspecting its live state, supplying local steering, handling an escalation, or publishing a completed campaign.
 ---
 
 # Operate a silent tally campaign
@@ -29,6 +29,23 @@ to derive the durable view from local stores and unit facts; do not reconstruct
 campaign state by comparing secondary surfaces. Continue until status is complete
 or escalated.
 
+Attribute every observation against the deployed machinery. A campaign is
+graded by the flow and driver on the deployed pin, not by the bytes in the
+tree: merging a change to them alters nothing until the next deploy, and a
+campaign that has started keeps the store path it started under for its whole
+life. Read what is actually running before crediting or blaming any merged
+commit:
+
+```text
+tally campaign quiescent
+```
+
+The verb succeeds only when no campaign is armed; otherwise it prints every
+registration, `flow` and `driver` store path included, and fails. Diff that
+store path against the commit in question first. A live behavior credited to
+code the running pin does not carry is a false finding, and this mistake
+invalidated two findings in a single closing record.
+
 ## Steer
 
 Steer only when the live view identifies a missing outcome or a blocked attempt.
@@ -54,15 +71,20 @@ printf '%s\n' 'Required outcome and evidence' | \
 Steering is append-only and enters the next attempt through tally. Do not edit
 receipts, worktrees, integration branches, or the approved graph by hand.
 
-After correcting the cause of an escalation, record the pardon and resume:
-
-```text
-tally campaign resume OWNER/REPO PATH/TO/WORKLIST.json \
-  --reason 'What changed and why another attempt is sound'
-```
+Steering is also the whole recovery path. Attempt budgets are derived over
+epochs: a receipt counts only while it matches the task's current input — its
+bytes, its gates, and the steering addressed to it — so correcting the cause
+and steering the task moves its epoch and refreshes its budget. There is no
+resume verb and no pardon to record; do not look for either.
 
 To change the campaign contract, edit the worklist, merge and push it, then run
 `tally campaign arm` again to approve the new graph.
+
+Some states are not steerable. A campaign that cannot proceed without a hand
+edit to receipts, refs, or a worktree is failure weather: record the state and
+stop it there. Leave the forensics in place, clean nothing up, and hand the
+ruling to the operator. A structural improvisation outside the armed graph is
+one failed lane away from the same deadlock.
 
 ## Release
 
@@ -82,6 +104,17 @@ rerun the identical command.
 Exercise release probe mode only against a private `tally-probe-*` target. Let
 the verb own creation, teardown, and expiry of that target.
 
+Until the close is a single verb, run it as an ordered checklist and take no
+step out of order:
+
+1. `tally campaign quiescent` — read what is armed and what is grading it.
+2. `tally campaign release --plan` — render the complete close without
+   contacting a forge, and read what it renders.
+3. `tally campaign release --probe` — exercise it against the disposable
+   target.
+4. `tally campaign release` — the one release act.
+5. `tally campaign disarm` — last, and nothing after it.
+
 ## Abandon
 
 If the operator deliberately cancels the campaign, remove its registration with:
@@ -90,4 +123,6 @@ If the operator deliberately cancels the campaign, remove its registration with:
 tally campaign disarm OWNER/REPO PATH/TO/WORKLIST.json
 ```
 
-Do not use disarm as failure recovery.
+Disarm is terminal: registration-scoped state, steering included, does not
+survive it, and a disarm taken before release costs a re-arm and hand-restored
+refs. Do not use disarm as failure recovery.
