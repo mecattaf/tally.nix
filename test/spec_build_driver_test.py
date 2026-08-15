@@ -655,7 +655,12 @@ def prepared_publication(
     }
 
 
-def prepared_lane_context(root: Path, run_id: str = "narration-pass") -> dict[str, Any]:
+def prepared_lane_context(
+    root: Path,
+    run_id: str = "subject-adoption-pass",
+    *,
+    message: str = "implement task 1",
+) -> dict[str, Any]:
     checkout, _ = initialize_repository(root, remote=True)
     workspace_root = root / "workspaces"
     campaign_task = {
@@ -666,7 +671,7 @@ def prepared_lane_context(root: Path, run_id: str = "narration-pass") -> dict[st
     brief = prep_brief(checkout, workspace_root, run_id)
     brief["task"] = campaign_task
     workspace = run_driver("prep", brief)
-    commit_lane(workspace)
+    commit_lane(workspace, message=message)
     return {
         "checkout": checkout,
         "workspaceRoot": workspace_root,
@@ -676,22 +681,15 @@ def prepared_lane_context(root: Path, run_id: str = "narration-pass") -> dict[st
     }
 
 
-def steward_role(argv: list[str], **overrides: object) -> dict[str, object]:
+def steward_catalog_role(argv: list[str], **overrides: object) -> dict[str, object]:
     return {
-        "adapter": "narrator",
+        "adapter": "judge",
         "argv": argv,
         "env": {},
         "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
         "runtimeMaxSec": 30,
         **overrides,
     }
-
-
-def steward_shim(root: Path, name: str, body: str) -> list[str]:
-    path = root / name
-    path.write_text(f"#!{sys.executable}\n" + textwrap.dedent(body), encoding="utf-8")
-    path.chmod(0o755)
-    return [sys.executable, str(path)]
 
 
 def publish_lane(
@@ -708,6 +706,35 @@ def publish_lane(
             steward=steward,
         ),
     )
+
+
+def merge_lane(
+    context: dict[str, Any], steward: dict[str, object] | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    publication = publish_lane(context, steward)
+    integration = run_driver(
+        "rebase",
+        rebase_brief(
+            context["checkout"],
+            context["workspaceRoot"],
+            context["runId"],
+            context["task"],
+            context["workspace"],
+            publication,
+        ),
+    )
+    merged = run_driver(
+        "merge",
+        merge_brief(
+            context["checkout"],
+            context["workspaceRoot"],
+            context["runId"],
+            context["task"],
+            context["workspace"],
+            integration,
+        ),
+    )
+    return publication, merged
 
 
 class FakeTally:
@@ -2434,421 +2461,120 @@ class LaneLifecycleTests(unittest.TestCase):
             )
 
 
-class NarrationValidatorTests(unittest.TestCase):
-    """The narrate slot: model proposes, deterministic validator enforces."""
+class SubjectAdoptionTests(unittest.TestCase):
+    """The squash adopts the lane tip and formats its commit prose."""
 
-    def propose(
-        self, root: Path, context: dict[str, Any], proposal: object, name: str
-    ) -> dict[str, Any]:
-        encoded = json.dumps(proposal)
-        argv = steward_shim(
-            root,
-            name,
-            f"""
-            import json
-            import sys
-
-            sys.stdin.read()
-            proposal = json.loads({encoded!r})
-            print("TALLY_FINAL_MESSAGE=" + json.dumps(proposal))
-            """,
+    def merged_message(
+        self, context: dict[str, Any], merged: dict[str, Any]
+    ) -> str:
+        return git(
+            context["checkout"],
+            "show",
+            "-s",
+            "--format=%B",
+            merged["mergeCommit"],
         )
-        return publish_lane(context, steward_role(argv))
 
-    def test_a_conventional_proposal_is_composed_into_a_header(self) -> None:
+    def test_a_valid_lane_tip_subject_and_body_survive_the_squash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            published = self.propose(
-                root,
-                context,
-                {
-                    "type": "feat",
-                    "scope": "campaign",
-                    "subject": "add the merge method option",
-                    "body": "Delivered one conventional commit per task.",
-                },
-                "conventional",
+            context = prepared_lane_context(
+                Path(temporary),
+                message=(
+                    "feat(driver): adopt the lane subject\n\n"
+                    "Recorded the lane-authored rationale."
+                ),
             )
-            self.assertEqual(
-                published["narration"]["subject"],
-                "feat(campaign): add the merge method option",
+            _, merged = merge_lane(context)
+            message = self.merged_message(context, merged)
+            self.assertEqual(message.splitlines()[0], "feat(driver): adopt the lane subject")
+            self.assertIn("Recorded the lane-authored rationale.", message)
+            self.assertIn(
+                "Adopted the lane-tip commit message without repair.",
+                message,
             )
-            self.assertEqual(
-                published["narration"]["body"],
-                "Delivered one conventional commit per task.",
-            )
-            self.assertEqual(published["narrationAttempts"][0]["status"], "accepted")
 
-    def test_prose_that_only_looks_dangerous_is_still_accepted(self) -> None:
+    def test_an_invalid_lane_tip_falls_back_to_the_task_template(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            for name, body in {
-                "bare-cross-reference": "Linked the context in #42.",
-                "address": "Reported by tally@example.invalid.",
-                "prose-fix": "Fixed the drift the reconciler kept re-reading.",
-            }.items():
-                with self.subTest(name):
-                    published = self.propose(
-                        root,
-                        context,
-                        {
-                            "type": "feat",
-                            "scope": "api",
-                            "subject": "add the widget",
-                            "body": body,
-                        },
-                        name,
-                    )
-                    self.assertEqual(published["narration"]["body"], body)
-                    self.assertEqual(
-                        published["narrationAttempts"][0]["status"], "accepted"
-                    )
-
-    def test_a_scopeless_proposal_keeps_the_bare_type_prefix(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            published = self.propose(
-                root,
-                context,
-                {"type": "fix", "scope": None, "subject": "stop losing the receipt"},
-                "scopeless",
+            context = prepared_lane_context(
+                Path(temporary),
+                message="implement task 1",
             )
-            self.assertEqual(
-                published["narration"]["subject"], "fix: stop losing the receipt"
+            _, merged = merge_lane(context)
+            message = self.merged_message(context, merged)
+            self.assertEqual(message.splitlines()[0], "task-1: Task task-1")
+            self.assertIn(
+                "Rejected the lane-tip commit message and used the task-id "
+                "template instead.",
+                message,
             )
-            self.assertEqual(published["narration"]["body"], "")
+            self.assertIn("does not match", message)
 
-    def test_every_grammar_violation_is_refused_with_one_reason(self) -> None:
+    def test_a_lane_tip_cannot_forge_managed_trailers(self) -> None:
         cases = {
-            "not-an-object": (["feat"], "not a JSON object"),
-            "unknown-field": (
-                {"type": "feat", "subject": "do a thing", "trailer": "Assisted-by: x"},
-                "unknown fields",
-            ),
-            "unknown-type": ({"type": "wip", "subject": "do a thing"}, "type must be one of"),
-            "bad-scope": (
-                {"type": "feat", "scope": "Campaign Core", "subject": "do a thing"},
-                "scope must be null",
-            ),
-            "empty-subject": ({"type": "feat", "subject": "   "}, "subject must be non-empty"),
-            "control-subject": (
-                {"type": "feat", "subject": "do a\tthing"},
-                "control characters",
-            ),
-            "trailing-period": (
-                {"type": "feat", "subject": "do a thing."},
-                "must not end with a period",
-            ),
-            "capitalized": (
-                {"type": "feat", "subject": "Do a thing"},
-                "must not start with a capital",
-            ),
-            "long-header": ({"type": "feat", "subject": "x" * 80}, "over the 72 cap"),
-            "wide-body": (
-                {"type": "feat", "subject": "do a thing", "body": "y" * 120},
-                "wraps past 100 columns",
-            ),
-            "managed-completion-trailer": (
-                {
-                    "type": "feat",
-                    "subject": "do a thing",
-                    "body": "Noted an update.\n\nTally-Task: task-1",
-                },
-                "managed completion trailer",
-            ),
-            "closing-keyword-in-body": (
-                {
-                    "type": "feat",
-                    "subject": "do a thing",
-                    "body": "Reported the change.\n\nCloses #1\nFixes #2",
-                },
-                "GitHub closing keyword",
-            ),
-            "closing-keyword-in-subject": (
-                {"type": "fix", "subject": "fixes #12 at last"},
-                "GitHub closing keyword",
-            ),
-            "cross-repo-closing-keyword": (
-                {
-                    "type": "feat",
-                    "subject": "do a thing",
-                    "body": "Investigated the issue.\n\nThis resolved acme/spec#9.",
-                },
-                "GitHub closing keyword",
-            ),
-            "closing-keyword-by-url": (
-                {
-                    "type": "feat",
-                    "subject": "do a thing",
-                    "body": "Fixed https://github.com/acme/spec/issues/3.",
-                },
-                "GitHub closing keyword",
-            ),
-            "mention": (
-                {
-                    "type": "feat",
-                    "subject": "do a thing",
-                    "body": "Notified reviewers.\n\ncc @torvalds",
-                },
-                "@mention",
-            ),
-            "team-mention": (
-                {
-                    "type": "feat",
-                    "subject": "do a thing",
-                    "body": "Notified the team.\n\nping @acme/security",
-                },
-                "@mention",
-            ),
-            "body-present-tense-opening": (
-                {"type": "feat", "subject": "do a thing", "body": "fixing the drift."},
-                "past-tense verb",
-            ),
-            "body-opens-with-a-list": (
-                {"type": "feat", "subject": "do a thing", "body": "- fixed the drift"},
-                "must open with a sentence, not a list",
-            ),
-            "body-leading-sentence-unterminated": (
-                {"type": "feat", "subject": "do a thing", "body": "Fixed the drift"},
-                "leading sentence must end with a period",
-            ),
-            "body-exclamation": (
-                {"type": "feat", "subject": "do a thing", "body": "Fixed the drift!"},
-                "exclamation mark",
-            ),
+            "assisted": ("aSsIsTeD-bY: forged", "Assisted-by trailer"),
+            "completion": ("tAlLy-TaSk: forged", "managed completion trailer"),
         }
+        for name, (trailer, reason) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as temporary:
+                context = prepared_lane_context(
+                    Path(temporary),
+                    message=(
+                        "feat(driver): attempt trailer injection\n\n"
+                        f"Recorded the attempt.\n\n{trailer}"
+                    ),
+                )
+                _, merged = merge_lane(context)
+                message = self.merged_message(context, merged)
+                self.assertEqual(message.splitlines()[0], "task-1: Task task-1")
+                self.assertIn(reason, message)
+                self.assertNotIn(trailer, message)
+
+    def test_a_101_column_body_is_folded_and_punctuated(self) -> None:
+        wide_body = "Recorded " + ("x" * 92)
+        self.assertEqual(len(wide_body), 101)
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            for name, (proposal, expected) in cases.items():
-                with self.subTest(name):
-                    published = self.propose(root, context, proposal, name)
-                    self.assertEqual(published["narration"]["source"], "template")
-                    attempts = published["narrationAttempts"]
-                    self.assertEqual([item["status"] for item in attempts], ["rejected", "rejected"])
-                    self.assertIn(expected, attempts[0]["reason"])
-
-
-class StewardNarrationTests(unittest.TestCase):
-    """The steward runs as a plain argv and never reaches git."""
-
-    def test_no_steward_uses_the_brief_derived_template(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            context = prepared_lane_context(Path(temporary))
-            published = publish_lane(context, None)
-            self.assertEqual(published["narrationAttempts"], [])
-            self.assertEqual(
-                published["narration"],
-                {"source": "template", "subject": "task-1: Task task-1", "body": ""},
+            context = prepared_lane_context(
+                Path(temporary),
+                message=f"fix(driver): format the lane body\n\n{wide_body}",
             )
+            _, merged = merge_lane(context)
+            message = self.merged_message(context, merged)
+            self.assertEqual(message.splitlines()[0], "fix(driver): format the lane body")
+            self.assertIn("\nRecorded\n", message)
+            self.assertIn("\n" + ("x" * 92) + ".\n", message)
+            self.assertTrue(
+                all(len(line) <= 100 for line in message.splitlines()),
+                message,
+            )
+            self.assertIn("after deterministic formatting", message)
 
-    def test_an_accepted_proposal_is_read_from_the_final_message(self) -> None:
+    def test_the_steward_catalog_role_remains_bound_but_is_not_invoked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            context = prepared_lane_context(root)
-            argv = steward_shim(
+            invoked = root / "steward-was-invoked"
+            executable = root / "unused-steward"
+            executable.write_text(
+                (
+                    f"#!{sys.executable}\n"
+                    "from pathlib import Path\n"
+                    f"Path({str(invoked)!r}).write_text('invoked', encoding='utf-8')\n"
+                    "raise SystemExit(91)\n"
+                ),
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            context = prepared_lane_context(
                 root,
-                "narrate",
-                """
-                import json
-                import sys
-
-                request = json.loads(sys.stdin.read())
-                assert request["attempt"] == 1, request
-                assert request["task"]["id"] == "task-1", request
-                print("chatter the driver must ignore")
-                print("TALLY_FINAL_MESSAGE=" + json.dumps({
-                    "type": "feat",
-                    "scope": "fixture",
-                    "subject": "deliver the task",
-                    "body": "Delivered body prose.",
-                }))
-                """,
+                message="feat(driver): keep the steward catalog seam",
             )
-            published = publish_lane(context, steward_role(argv))
-            self.assertEqual(published["narration"]["source"], "steward")
-            self.assertEqual(
-                published["narration"]["subject"], "feat(fixture): deliver the task"
-            )
-            self.assertEqual(published["narration"]["body"], "Delivered body prose.")
-            self.assertEqual(
-                published["narrationAttempts"],
-                [{"attempt": 1, "status": "accepted", "reason": None}],
-            )
-
-    def test_the_adapter_environment_reaches_the_narrator_and_the_brief_does_not(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            argv = steward_shim(
-                root,
-                "narrate",
-                """
-                import json
-                import os
-                import sys
-
-                sys.stdin.read()
-                print("TALLY_FINAL_MESSAGE=" + json.dumps({
-                    "type": "feat",
-                    "subject": "reach " + os.environ["NARRATOR_ENDPOINT"],
-                    "body": "Read brief=" + os.environ.get("TALLY_BRIEF", "absent") + ".",
-                }))
-                """,
-            )
-            published = publish_lane(
+            _, merged = merge_lane(
                 context,
-                steward_role(argv, env={"NARRATOR_ENDPOINT": "narrator.invalid"}),
+                steward_catalog_role([sys.executable, str(executable)]),
             )
-            self.assertEqual(published["narrationAttempts"][-1]["status"], "accepted")
+            self.assertFalse(invoked.exists())
             self.assertEqual(
-                published["narration"]["subject"], "feat: reach narrator.invalid"
-            )
-            self.assertEqual(published["narration"]["body"], "Read brief=absent.")
-
-    def test_the_adapters_own_final_message_capture_is_what_is_read(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            argv = steward_shim(
-                root,
-                "narrate",
-                """
-                import json
-                import sys
-
-                sys.stdin.read()
-                print("TALLY_FINAL_MESSAGE=" + json.dumps({
-                    "type": "chore",
-                    "subject": "the shipped contract must not win here",
-                }))
-                print("narrator-result: " + json.dumps({
-                    "type": "feat",
-                    "subject": "read from the declared capture",
-                }))
-                """,
-            )
-            published = publish_lane(
-                context,
-                steward_role(argv, finalMessagePattern="^narrator-result: (.*)$"),
-            )
-            self.assertEqual(published["narrationAttempts"][-1]["status"], "accepted")
-            self.assertEqual(
-                published["narration"]["subject"],
-                "feat: read from the declared capture",
-            )
-
-    def test_an_unusable_steward_binding_is_refused_rather_than_degraded(self) -> None:
-        cases = {
-            "reserved-env": ({"env": {"TALLY_BRIEF": "/tmp/x"}}, "reserved variable"),
-            "bad-env-name": ({"env": {"not a name": "x"}}, "environment identifiers"),
-            "bad-pattern": (
-                {"finalMessagePattern": "^unclosed(.*$"},
-                "internal campaign contract violation",
-            ),
-            "no-capture-group": (
-                {"finalMessagePattern": "^narrator-result: .*$"},
-                "exactly one capture group",
-            ),
-            "two-capture-groups": (
-                {"finalMessagePattern": "^(a)(b)$"},
-                "exactly one capture group",
-            ),
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            context = prepared_lane_context(Path(temporary))
-            for name, (override, expected) in cases.items():
-                with self.subTest(name):
-                    with self.assertRaisesRegex(DriverFailure, expected):
-                        publish_lane(context, steward_role(["/bin/true"], **override))
-
-    def test_a_refused_proposal_is_re_requested_with_the_reason(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            argv = steward_shim(
-                root,
-                "narrate",
-                """
-                import json
-                import sys
-
-                request = json.loads(sys.stdin.read())
-                if request["attempt"] == 1:
-                    print("TALLY_FINAL_MESSAGE=" + json.dumps({
-                        "type": "feat",
-                        "subject": "Deliver the task.",
-                    }))
-                else:
-                    assert "period" in request["previousRejection"], request
-                    print("TALLY_FINAL_MESSAGE=" + json.dumps({
-                        "type": "feat",
-                        "subject": "deliver the task",
-                    }))
-                """,
-            )
-            published = publish_lane(context, steward_role(argv))
-            self.assertEqual(published["narration"]["source"], "steward")
-            self.assertEqual(published["narration"]["subject"], "feat: deliver the task")
-            self.assertEqual(
-                [entry["status"] for entry in published["narrationAttempts"]],
-                ["rejected", "accepted"],
-            )
-
-    def test_two_failures_fall_back_to_the_template_and_hide_narrator_stderr(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            argv = steward_shim(
-                root,
-                "narrate",
-                """
-                import sys
-
-                sys.stdin.read()
-                print("token=super-secret endpoint=https://narrator.invalid", file=sys.stderr)
-                raise SystemExit(7)
-                """,
-            )
-            published = publish_lane(context, steward_role(argv))
-            narration = published["narration"]
-            transcript = published["narrationAttempts"]
-            self.assertEqual(narration["source"], "template")
-            self.assertIn("Rejected 2 steward narration proposal(s)", narration["body"])
-            self.assertEqual(
-                transcript,
-                [
-                    {"attempt": 1, "status": "failed", "reason": "steward exited 7"},
-                    {"attempt": 2, "status": "failed", "reason": "steward exited 7"},
-                ],
-            )
-            self.assertNotIn("secret", json.dumps([narration, transcript]))
-            self.assertNotIn("narrator.invalid", json.dumps([narration, transcript]))
-
-    def test_two_invalid_proposals_fall_back_to_the_template(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            context = prepared_lane_context(root)
-            argv = steward_shim(
-                root,
-                "narrate",
-                """
-                import sys
-
-                sys.stdin.read()
-                print("TALLY_FINAL_MESSAGE=not json at all")
-                """,
-            )
-            published = publish_lane(context, steward_role(argv))
-            self.assertEqual(published["narration"]["source"], "template")
-            self.assertEqual(
-                [entry["status"] for entry in published["narrationAttempts"]],
-                ["rejected", "rejected"],
+                self.merged_message(context, merged).splitlines()[0],
+                "feat(driver): keep the steward catalog seam",
             )
 
 
@@ -3163,7 +2889,7 @@ class LocalSteeringRecheckTests(unittest.TestCase):
 
 
 class SteeringGrammarTests(unittest.TestCase):
-    """#385: the narrate slot's contract extended to steering notes."""
+    """#385: the public prose contract also applies to steering notes."""
 
     def brief(self, root: Path, checkout: Path, **overrides: object) -> dict[str, object]:
         base = {
@@ -3798,7 +3524,7 @@ class AssistedByTrailerTests(unittest.TestCase):
         "witnessSeq": 42,
     }
 
-    def test_the_trailer_is_the_published_format_and_a_narrator_may_not_forge_one(self) -> None:
+    def test_the_trailer_is_the_published_format(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             valid = prepared_publication(root / "valid")
@@ -3870,83 +3596,6 @@ class AssistedByTrailerTests(unittest.TestCase):
                             assisted_by=broken,
                         ),
                     )
-
-            narration_root = root / "narration"
-            narration = prepared_lane_context(narration_root)
-            for index, spelling in enumerate(
-                ("Assisted-by", "assisted-by", "ASSISTED-BY", "AsSiStEd-By"), 1
-            ):
-                proposal = {
-                    "type": "feat",
-                    "scope": "fixture",
-                    "subject": "deliver the task",
-                    "body": (
-                        f"Noted context.\n\n{spelling}: someone:something "
-                        "(tally:x witness:1)"
-                    ),
-                }
-                argv = steward_shim(
-                    narration_root,
-                    f"assisted-{index}",
-                    f"""
-                    import json
-                    import sys
-                    sys.stdin.read()
-                    print("TALLY_FINAL_MESSAGE=" + json.loads({json.dumps(json.dumps(proposal))!r}))
-                    """,
-                )
-                published = publish_lane(narration, steward_role(argv))
-                self.assertEqual(published["narration"]["source"], "template")
-                self.assertEqual(
-                    published["narrationAttempts"][0]["reason"],
-                    "proposal contains an Assisted-by trailer",
-                )
-
-            for index, spelling in enumerate(
-                ("Tally-Task", "tally-task", "TALLY-REVISION", "TaLlY-ReViSiOn"), 1
-            ):
-                proposal = {
-                    "type": "feat",
-                    "scope": "fixture",
-                    "subject": "deliver the task",
-                    "body": f"Noted context.\n\n{spelling}: forged",
-                }
-                argv = steward_shim(
-                    narration_root,
-                    f"completion-{index}",
-                    f"""
-                    import json
-                    import sys
-                    sys.stdin.read()
-                    print("TALLY_FINAL_MESSAGE=" + json.loads({json.dumps(json.dumps(proposal))!r}))
-                    """,
-                )
-                published = publish_lane(narration, steward_role(argv))
-                self.assertEqual(
-                    published["narrationAttempts"][0]["reason"],
-                    "proposal contains a managed completion trailer",
-                )
-
-            proposal = {
-                "type": "docs",
-                "scope": "fixture",
-                "subject": "explain the assisted-by pointer",
-                "body": "Documented that the trailer points into the witness ledger.",
-            }
-            argv = steward_shim(
-                narration_root,
-                "valid-docs",
-                f"""
-                import json
-                import sys
-                sys.stdin.read()
-                print("TALLY_FINAL_MESSAGE=" + json.loads({json.dumps(json.dumps(proposal))!r}))
-                """,
-            )
-            published = publish_lane(narration, steward_role(argv))
-            self.assertEqual(published["narration"]["source"], "steward")
-            self.assertEqual(published["narrationAttempts"][0]["status"], "accepted")
-
 
 if __name__ == "__main__":
     unittest.main()

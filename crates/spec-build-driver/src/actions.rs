@@ -5,8 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, SecondsFormat, Utc};
 use regex::Regex;
@@ -28,12 +27,11 @@ use crate::path::{is_symlink, resolve};
 use crate::sha256;
 use crate::worktrees::{self, Identity};
 
-const NARRATION_SUBJECT_MAX: usize = 200;
-const NARRATION_BODY_MAX: usize = 4_000;
-const NARRATION_HEADER_MAX: usize = 72;
-const NARRATION_BODY_LINE_MAX: usize = 100;
-const NARRATION_REASON_MAX: usize = 200;
-const NARRATION_ATTEMPTS: u64 = 2;
+const COMMIT_SUBJECT_MAX: usize = 200;
+const COMMIT_BODY_MAX: usize = 4_000;
+const COMMIT_HEADER_MAX: usize = 72;
+const COMMIT_BODY_LINE_MAX: usize = 100;
+const COMMIT_REASON_MAX: usize = 200;
 const OUTCOME_FIRST_LEAD_MAX: usize = 240;
 const MAX_CAMPAIGN_TASKS: usize = 128;
 const MAX_DIFF_CHARS: usize = 128 * 1024;
@@ -114,6 +112,12 @@ struct Publication {
     pull_request: String,
     narration: Json,
     ownership: Ownership,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommitMessage {
+    subject: String,
+    body: String,
 }
 
 #[derive(Clone, Debug)]
@@ -4355,15 +4359,10 @@ fn validated_trailer_lines(block: &str, context: &str) -> Result<Vec<String>> {
 }
 
 fn merge_commit_message(
-    narration: &Json,
+    message: &CommitMessage,
     provenance: Option<&str>,
     completion: Option<&str>,
 ) -> Result<String> {
-    let narration = narration
-        .as_object()
-        .ok_or_else(|| DriverError::new("narration must be an object"))?;
-    let subject = required_string(narration.get("subject"), "narration.subject", None)?;
-    let body = narration.get("body").and_then(Json::as_str).unwrap_or("");
     let mut trailers = Vec::new();
     if let Some(completion) = completion {
         trailers.extend(validated_trailer_lines(completion, "completion trailers")?);
@@ -4372,16 +4371,16 @@ fn merge_commit_message(
         trailers.extend(validated_trailer_lines(provenance, "provenance trailers")?);
     }
     let trailer_block = trailers.join("\n");
-    let commit_body = match (body.is_empty(), trailer_block.is_empty()) {
+    let commit_body = match (message.body.is_empty(), trailer_block.is_empty()) {
         (true, true) => String::new(),
-        (false, true) => body.to_owned(),
+        (false, true) => message.body.clone(),
         (true, false) => trailer_block,
-        (false, false) => format!("{body}\n\n{trailer_block}"),
+        (false, false) => format!("{}\n\n{trailer_block}", message.body),
     };
     Ok(if commit_body.is_empty() {
-        format!("{subject}\n")
+        format!("{}\n", message.subject)
     } else {
-        format!("{subject}\n\n{commit_body}\n")
+        format!("{}\n\n{commit_body}\n", message.subject)
     })
 }
 
@@ -4405,13 +4404,11 @@ fn merge_local(
     config: &RepoConfig,
     integration: &BTreeMap<String, Json>,
     method: &str,
-    narration: &Json,
     provenance: Option<&str>,
 ) -> Result<String> {
     let campaign = required_string(data.get("campaign"), "campaign", None)?;
     let identity = campaign_identity(data, &campaign)?;
     let completion = local_completion_trailers(data)?;
-    let message = merge_commit_message(narration, provenance, Some(&completion))?;
     let integration_name = integration_branch(&campaign, &identity);
     let integration_ref = format!("refs/heads/{integration_name}");
     let published_branch = required_string(integration.get("branch"), "integration.branch", None)?;
@@ -4430,6 +4427,12 @@ fn merge_local(
             "published branch moved after the rebased head was gated",
         ));
     }
+    let task = data
+        .get("task")
+        .and_then(Json::as_object)
+        .ok_or_else(|| DriverError::new("local merge task must be an object"))?;
+    let adopted = lane_tip_commit_message(&config.checkout, &expected_head, task)?;
+    let message = merge_commit_message(&adopted, provenance, Some(&completion))?;
     let workspace_root = PathBuf::from(required_string(
         data.get("workspaceRoot"),
         "workspaceRoot",
@@ -4608,7 +4611,6 @@ fn action_merge(brief: &Json) -> Result<Json> {
         "integration",
     )?;
     let method = merge_method(data.get("mergeMethod"), "mergeMethod")?;
-    let narration = narration_record(integration.get("narration"), "integration.narration")?;
     let assisted_by = assisted_by_record(data.get("assistedBy"))?;
     let trailer = if method == "squash" {
         assisted_by_trailer(assisted_by.as_ref())?
@@ -4657,14 +4659,7 @@ fn action_merge(brief: &Json) -> Result<Json> {
             "integration.branch does not match workspace.publishBranch",
         ));
     }
-    let merge_commit = merge_local(
-        data,
-        &config,
-        integration,
-        &method,
-        &narration,
-        trailer.as_deref(),
-    )?;
+    let merge_commit = merge_local(data, &config, integration, &method, trailer.as_deref())?;
     Ok(Json::object([
         ("taskId", Json::from(task_id)),
         ("head", Json::from(head)),
@@ -8417,18 +8412,18 @@ fn narration_record(value: Option<&Json>, context: &str) -> Result<Json> {
     let subject = required_string(
         object.get("subject"),
         &format!("{context}.subject"),
-        Some(NARRATION_SUBJECT_MAX),
+        Some(COMMIT_SUBJECT_MAX),
     )?;
     let body = match object.get("body") {
         None => String::new(),
         Some(Json::String(body))
-            if body.chars().count() <= NARRATION_BODY_MAX && !body.contains('\0') =>
+            if body.chars().count() <= COMMIT_BODY_MAX && !body.contains('\0') =>
         {
             body.clone()
         }
         _ => {
             return Err(DriverError::new(format!(
-                "{context}.body must be a string of at most {NARRATION_BODY_MAX} characters"
+                "{context}.body must be a string of at most {COMMIT_BODY_MAX} characters"
             )))
         }
     };
@@ -9285,7 +9280,7 @@ fn action_constraint(brief: &Json) -> Result<Json> {
     ]))
 }
 
-const NARRATION_TYPES: [&str; 11] = [
+const COMMIT_TYPES: [&str; 11] = [
     "build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test",
 ];
 
@@ -9491,127 +9486,120 @@ fn line_starts_case_insensitive(text: &str, prefixes: &[&str]) -> bool {
     })
 }
 
-fn validated_narration(value: &Json) -> (Option<Json>, Option<String>) {
-    let Some(proposal) = value.as_object() else {
-        return (None, Some("proposal is not a JSON object".to_owned()));
-    };
-    let allowed = BTreeSet::from(["type", "scope", "subject", "body"]);
-    let unknown: Vec<_> = proposal
-        .keys()
-        .filter(|key| !allowed.contains(key.as_str()))
-        .cloned()
-        .collect();
-    if !unknown.is_empty() {
-        return (
-            None,
-            Some(format!(
-                "proposal has unknown fields: {}",
-                unknown.join(", ")
-            )),
-        );
+fn fold_commit_line(line: &str, maximum: usize) -> (Vec<String>, bool) {
+    let mut remaining = line.trim_end();
+    let mut folded = Vec::new();
+    let mut changed = false;
+    while remaining.chars().count() > maximum {
+        changed = true;
+        let limit = remaining
+            .char_indices()
+            .nth(maximum)
+            .map_or(remaining.len(), |(index, _)| index);
+        let split = remaining[..limit]
+            .char_indices()
+            .rev()
+            .find(|(index, character)| *index != 0 && character.is_whitespace())
+            .map(|(index, _)| index)
+            .unwrap_or(limit);
+        folded.push(remaining[..split].trim_end().to_owned());
+        remaining = remaining[split..].trim_start();
     }
-    let Some(kind) = proposal.get("type").and_then(Json::as_str) else {
-        return (
-            None,
-            Some(format!(
-                "type must be one of {}",
-                NARRATION_TYPES.join(", ")
-            )),
-        );
-    };
-    if !NARRATION_TYPES.contains(&kind) {
-        return (
-            None,
-            Some(format!(
-                "type must be one of {}",
-                NARRATION_TYPES.join(", ")
-            )),
-        );
+    folded.push(remaining.to_owned());
+    (folded, changed)
+}
+
+fn fold_commit_body(body: &str) -> (String, bool) {
+    let mut lines = Vec::new();
+    let mut changed = false;
+    for line in body.split('\n') {
+        let (folded, line_changed) = fold_commit_line(line, COMMIT_BODY_LINE_MAX);
+        changed |= line_changed;
+        lines.extend(folded);
     }
-    let scope = match proposal.get("scope") {
-        None | Some(Json::Null) => None,
-        Some(Json::String(scope))
-            if Regex::new(r"^[a-z0-9][a-z0-9._/-]{0,31}$")
-                .expect("static scope regex")
-                .is_match(scope) =>
-        {
-            Some(scope.as_str())
-        }
-        _ => {
-            return (
-                None,
-                Some("scope must be null or a short lowercase identifier".to_owned()),
-            )
-        }
-    };
-    let Some(raw_subject) = proposal.get("subject").and_then(Json::as_str) else {
-        return (None, Some("subject must be non-empty text".to_owned()));
-    };
-    let subject = raw_subject.trim();
-    if subject.is_empty() {
-        return (None, Some("subject must be non-empty text".to_owned()));
+    (lines.join("\n"), changed)
+}
+
+fn add_period_to_first_line(body: &str) -> String {
+    body.split_once('\n').map_or_else(
+        || format!("{body}."),
+        |(first, rest)| format!("{first}.\n{rest}"),
+    )
+}
+
+fn validate_lane_tip_message(
+    raw_header: &str,
+    raw_body: &str,
+) -> std::result::Result<(CommitMessage, bool), String> {
+    let mut repaired = false;
+    let header = raw_header.trim();
+    repaired |= header != raw_header;
+    if header.is_empty() {
+        return Err("subject is empty".to_owned());
     }
-    if subject
+    if header
         .chars()
         .any(|character| (character as u32) < 32 || character == '\u{7f}')
     {
-        return (None, Some("subject contains control characters".to_owned()));
+        return Err("subject contains control characters".to_owned());
     }
+    let pattern = Regex::new(r"^([a-z]+)(?:\(([a-z0-9][a-z0-9._/-]{0,31})\))?(!)?: (.+)$")
+        .expect("static conventional-commit regex");
+    let captures = pattern.captures(header).ok_or_else(|| {
+        "subject does not match '<type>(<scope>)[!]: <lowercase subject>'".to_owned()
+    })?;
+    let kind = captures.get(1).expect("type capture").as_str();
+    if !COMMIT_TYPES.contains(&kind) {
+        return Err(format!("type must be one of {}", COMMIT_TYPES.join(", ")));
+    }
+    let scope = captures.get(2).map(|capture| capture.as_str());
+    let breaking = captures.get(3).is_some();
+    let mut subject = captures
+        .get(4)
+        .expect("subject capture")
+        .as_str()
+        .trim()
+        .to_owned();
+    repaired |= subject != captures.get(4).expect("subject capture").as_str();
     if subject.ends_with('.') {
-        return (None, Some("subject must not end with a period".to_owned()));
+        subject.pop();
+        repaired = true;
+    }
+    if subject.is_empty() || subject.ends_with('.') {
+        return Err("subject must be non-empty and not end with a period".to_owned());
     }
     if subject.chars().next().is_some_and(char::is_uppercase) {
-        return (
-            None,
-            Some("subject must not start with a capital letter".to_owned()),
-        );
+        return Err("subject must not start with a capital letter".to_owned());
     }
-    let header = scope.map_or_else(
-        || format!("{kind}: {subject}"),
-        |scope| format!("{kind}({scope}): {subject}"),
-    );
-    if header.chars().count() > NARRATION_HEADER_MAX {
-        return (
-            None,
-            Some(format!(
-                "header is {} characters, over the {NARRATION_HEADER_MAX} cap",
-                header.chars().count()
-            )),
-        );
-    }
-    let raw_body = match proposal.get("body") {
-        None | Some(Json::Null) => "",
-        Some(Json::String(body)) => body,
-        _ => return (None, Some("body must be null or a string".to_owned())),
+    let prefix = match (scope, breaking) {
+        (None, false) => format!("{kind}:"),
+        (None, true) => format!("{kind}!:"),
+        (Some(scope), false) => format!("{kind}({scope}):"),
+        (Some(scope), true) => format!("{kind}({scope})!:"),
     };
-    let body = raw_body
+    let header = format!("{prefix} {subject}");
+    if header.chars().count() > COMMIT_HEADER_MAX {
+        return Err(format!(
+            "header is {} characters, over the {COMMIT_HEADER_MAX} cap",
+            header.chars().count()
+        ));
+    }
+
+    let mut body = raw_body
         .replace("\r\n", "\n")
         .replace('\r', "\n")
         .trim()
         .to_owned();
-    if body.chars().count() > NARRATION_BODY_MAX {
-        return (
-            None,
-            Some(format!(
-                "body is over the {NARRATION_BODY_MAX} character cap"
-            )),
-        );
+    if body.chars().count() > COMMIT_BODY_MAX {
+        return Err(format!("body is over the {COMMIT_BODY_MAX} character cap"));
     }
     if body
         .chars()
         .any(|character| ((character as u32) < 32 && character != '\n') || character == '\u{7f}')
     {
-        return (None, Some("body contains control characters".to_owned()));
+        return Err("body contains control characters".to_owned());
     }
-    if body
-        .split('\n')
-        .any(|line| line.chars().count() > NARRATION_BODY_LINE_MAX)
-    {
-        return (
-            None,
-            Some(format!("body wraps past {NARRATION_BODY_LINE_MAX} columns")),
-        );
-    }
+
     let closing = Regex::new(
         r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*(?:#\d+|GH-\d+|[\w.-]+/[\w.-]+#\d+|https?://\S+/(?:issues|pull)/\d+)",
     )
@@ -9620,79 +9608,93 @@ fn validated_narration(value: &Json) -> (Option<Json>, Option<String>) {
         .expect("static mention regex");
     for text in [&header, &body] {
         if line_starts_case_insensitive(text, &[TALLY_TASK_PREFIX, TALLY_REVISION_PREFIX]) {
-            return (
-                None,
-                Some("proposal contains a managed completion trailer".to_owned()),
-            );
+            return Err("message contains a managed completion trailer".to_owned());
         }
         if line_starts_case_insensitive(text, &[ASSISTED_BY_PREFIX]) {
-            return (
-                None,
-                Some("proposal contains an Assisted-by trailer".to_owned()),
-            );
+            return Err("message contains an Assisted-by trailer".to_owned());
         }
         if closing.is_match(text) {
-            return (
-                None,
-                Some("proposal contains a GitHub closing keyword".to_owned()),
-            );
+            return Err("message contains a GitHub closing keyword".to_owned());
         }
         if mention.is_match(text) {
-            return (None, Some("proposal contains an @mention".to_owned()));
+            return Err("message contains an @mention".to_owned());
         }
     }
     if !body.is_empty() {
-        if let Some(reason) = validate_outcome_first(&body, NARRATION_BODY_MAX, "proposal body") {
-            return (None, Some(reason));
+        if validate_outcome_first(&body, COMMIT_BODY_MAX, "lane-tip body").as_deref()
+            == Some("lane-tip body leading sentence must end with a period")
+        {
+            body = add_period_to_first_line(&body);
+            repaired = true;
         }
+        if let Some(reason) = validate_outcome_first(&body, COMMIT_BODY_MAX, "lane-tip body") {
+            return Err(reason);
+        }
+        let (folded, body_repaired) = fold_commit_body(&body);
+        body = folded;
+        repaired |= body_repaired;
     }
-    (
-        Some(Json::object([
-            ("subject", Json::from(header)),
-            ("body", Json::from(body)),
-        ])),
-        None,
-    )
+
+    Ok((
+        CommitMessage {
+            subject: header,
+            body,
+        },
+        repaired,
+    ))
+}
+
+fn template_commit_message(task: &BTreeMap<String, Json>, body: &str) -> Result<CommitMessage> {
+    let task_id = required_string(task.get("id"), "task.id", None)?;
+    let title = required_string(task.get("title"), "task.title", None)?;
+    Ok(CommitMessage {
+        subject: format!("{task_id}: {title}"),
+        body: body.to_owned(),
+    })
 }
 
 fn template_narration(task: &BTreeMap<String, Json>, body: &str) -> Result<Json> {
-    let task_id = required_string(task.get("id"), "task.id", None)?;
-    let title = required_string(task.get("title"), "task.title", None)?;
+    let message = template_commit_message(task, body)?;
     Ok(Json::object([
         ("source", Json::from("template")),
-        ("subject", Json::from(format!("{task_id}: {title}"))),
-        ("body", Json::from(body)),
+        ("subject", Json::from(message.subject)),
+        ("body", Json::from(message.body)),
     ]))
 }
 
-fn narration_fallback_note(transcript: &[Json]) -> String {
-    let reasons = transcript
-        .iter()
-        .filter_map(Json::as_object)
-        .filter_map(|entry| {
-            let reason = entry.get("reason")?.as_str()?;
-            let attempt = entry.get("attempt")?.as_u64()?;
-            let status = entry.get("status")?.as_str()?;
-            Some(format!("attempt {attempt} ({status}): {reason}"))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let mut note = format!(
-        "Rejected {} steward narration proposal(s) and used the task-id template instead. Reasons: {reasons}.",
-        transcript.len()
-    );
-    if note.chars().count() > NARRATION_BODY_MAX {
-        note = format!("{}…", take_chars(&note, NARRATION_BODY_MAX - 1).trim_end());
+fn lane_tip_commit_message(
+    checkout: &Path,
+    head: &str,
+    task: &BTreeMap<String, Json>,
+) -> Result<CommitMessage> {
+    let raw_header = git(checkout, ["show", "-s", "--format=%s", head], true)?.stdout_text();
+    let raw_header = raw_header.trim_end_matches(['\r', '\n']);
+    let raw_body = git(checkout, ["show", "-s", "--format=%b", head], true)?.stdout_text();
+    match validate_lane_tip_message(raw_header, &raw_body) {
+        Ok((mut message, repaired)) => {
+            let note = if repaired {
+                "Adopted the lane-tip commit message after deterministic formatting."
+            } else {
+                "Adopted the lane-tip commit message without repair."
+            };
+            message.body = if message.body.is_empty() {
+                note.to_owned()
+            } else {
+                format!("{}\n\n{note}", message.body)
+            };
+            Ok(message)
+        }
+        Err(reason) => {
+            let reason = take_chars(&reason, COMMIT_REASON_MAX);
+            let reason = reason.trim_end_matches('.');
+            template_commit_message(
+                task,
+                &format!(
+                    "Rejected the lane-tip commit message and used the task-id template instead. Reason: {reason}."
+                ),
+            )
+        }
     }
-    note
-}
-
-#[derive(Debug)]
-struct StewardRole {
-    argv: Vec<String>,
-    environment: BTreeMap<String, String>,
-    pattern: Regex,
-    runtime_seconds: Option<u64>,
 }
 
 fn environment_name(value: &str) -> bool {
@@ -9757,12 +9759,12 @@ fn portable_steward_pattern(pattern: &str, context: &str) -> Result<Regex> {
     Ok(compiled)
 }
 
-fn steward_role(value: Option<&Json>) -> Result<Option<StewardRole>> {
+fn validate_steward_catalog_role(value: Option<&Json>) -> Result<()> {
     let Some(value) = value else {
-        return Ok(None);
+        return Ok(());
     };
     if matches!(value, Json::Null) {
-        return Ok(None);
+        return Ok(());
     }
     let role = object_complete(
         value,
@@ -9781,7 +9783,7 @@ fn steward_role(value: Option<&Json>) -> Result<Option<StewardRole>> {
             "campaign steward.adapter is not a safe component",
         ));
     }
-    let argv = argv_list(role.get("argv"), "campaign steward.argv")?;
+    argv_list(role.get("argv"), "campaign steward.argv")?;
     let environment = role
         .get("env")
         .and_then(Json::as_object)
@@ -9791,7 +9793,6 @@ fn steward_role(value: Option<&Json>) -> Result<Option<StewardRole>> {
             "internal campaign contract violation: campaign steward.env exceeds 64 entries",
         ));
     }
-    let mut normalized_environment = BTreeMap::new();
     for (key, value) in environment {
         if !environment_name(key) {
             return Err(DriverError::new(
@@ -9803,198 +9804,23 @@ fn steward_role(value: Option<&Json>) -> Result<Option<StewardRole>> {
                 "campaign steward.env must not set reserved variable TALLY_BRIEF",
             ));
         }
-        normalized_environment.insert(
-            key.clone(),
-            required_string(
-                Some(value),
-                &format!("campaign steward.env.{key}"),
-                Some(4_096),
-            )?,
-        );
+        required_string(
+            Some(value),
+            &format!("campaign steward.env.{key}"),
+            Some(4_096),
+        )?;
     }
     let pattern_text = required_string(
         role.get("finalMessagePattern"),
         "campaign steward.finalMessagePattern",
         Some(1_024),
     )?;
-    let pattern = portable_steward_pattern(&pattern_text, "campaign steward.finalMessagePattern")?;
-    let runtime_seconds = match role.get("runtimeMaxSec") {
+    portable_steward_pattern(&pattern_text, "campaign steward.finalMessagePattern")?;
+    let _runtime_seconds = match role.get("runtimeMaxSec") {
         Some(Json::Null) => None,
         value => Some(positive_u64(value, "campaign steward.runtimeMaxSec")?),
     };
-    Ok(Some(StewardRole {
-        argv,
-        environment: normalized_environment,
-        pattern,
-        runtime_seconds,
-    }))
-}
-
-struct StewardOutput {
-    status: i32,
-    stdout: String,
-}
-
-fn invoke_steward(role: &StewardRole, input: &str) -> Result<StewardOutput> {
-    let mut command = Command::new(&role.argv[0]);
-    command
-        .args(&role.argv[1..])
-        .env_remove("TALLY_BRIEF")
-        .envs(&role.environment)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| DriverError::new(format!("cannot execute {:?}: {error}", role.argv[0])))?;
-    child
-        .stdin
-        .take()
-        .expect("steward stdin is piped")
-        .write_all(input.as_bytes())
-        .map_err(|error| DriverError::new(format!("cannot write steward stdin: {error}")))?;
-    let mut stdout = child.stdout.take().expect("steward stdout is piped");
-    let mut stderr = child.stderr.take().expect("steward stderr is piped");
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        bytes
-    });
-    let deadline = role
-        .runtime_seconds
-        .map(|seconds| Instant::now() + Duration::from_secs(seconds));
-    let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| DriverError::new(format!("cannot wait for steward: {error}")))?
-        {
-            break (status, false);
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let _ = child.kill();
-            let status = child.wait().map_err(|error| {
-                DriverError::new(format!("cannot reap timed-out steward: {error}"))
-            })?;
-            break (status, true);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| DriverError::new("steward stdout reader panicked"))?;
-    let _stderr = stderr_reader
-        .join()
-        .map_err(|_| DriverError::new("steward stderr reader panicked"))?;
-    Ok(StewardOutput {
-        status: if timed_out {
-            124
-        } else {
-            status.code().unwrap_or(128)
-        },
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-    })
-}
-
-fn narration_attempt(attempt: u64, status: &str, reason: Option<&str>) -> Json {
-    Json::object([
-        ("attempt", Json::Number(attempt.to_string())),
-        ("status", Json::from(status)),
-        (
-            "reason",
-            reason.map_or(Json::Null, |reason| {
-                Json::from(take_chars(reason, NARRATION_REASON_MAX))
-            }),
-        ),
-    ])
-}
-
-fn narrate(
-    role: Option<&StewardRole>,
-    task: &BTreeMap<String, Json>,
-    request: &Json,
-) -> Result<(Json, Vec<Json>)> {
-    let Some(role) = role else {
-        return Ok((template_narration(task, "")?, Vec::new()));
-    };
-    let mut transcript = Vec::new();
-    for attempt in 1..=NARRATION_ATTEMPTS {
-        let mut payload = request
-            .as_object()
-            .cloned()
-            .ok_or_else(|| DriverError::new("steward request must be an object"))?;
-        payload.insert("attempt".to_owned(), Json::Number(attempt.to_string()));
-        if let Some(previous) = transcript.last().and_then(Json::as_object) {
-            if let Some(reason) = previous.get("reason").and_then(Json::as_str) {
-                payload.insert("previousRejection".to_owned(), Json::from(reason));
-            }
-        }
-        let invoked = invoke_steward(role, &Json::Object(payload).stringify())?;
-        if invoked.status != 0 {
-            transcript.push(narration_attempt(
-                attempt,
-                "failed",
-                Some(&format!("steward exited {}", invoked.status)),
-            ));
-            continue;
-        }
-        let mut captured = None;
-        for line in invoked.stdout.lines() {
-            if let Some(matched) = role.pattern.captures(line) {
-                captured = matched.get(1).map(|value| value.as_str().to_owned());
-            }
-        }
-        let Some(captured) = captured else {
-            transcript.push(narration_attempt(
-                attempt,
-                "failed",
-                Some("steward produced no final-message line"),
-            ));
-            continue;
-        };
-        let proposal = match json::parse(&captured) {
-            Ok(proposal) => proposal,
-            Err(_) => {
-                transcript.push(narration_attempt(
-                    attempt,
-                    "rejected",
-                    Some("final message is not valid JSON"),
-                ));
-                continue;
-            }
-        };
-        let (narration, reason) = validated_narration(&proposal);
-        let Some(narration) = narration else {
-            transcript.push(narration_attempt(
-                attempt,
-                "rejected",
-                Some(reason.as_deref().unwrap_or("proposal is invalid")),
-            ));
-            continue;
-        };
-        transcript.push(narration_attempt(attempt, "accepted", None));
-        let mut record = narration
-            .as_object()
-            .cloned()
-            .expect("validator returns object");
-        record.insert("source".to_owned(), Json::from("steward"));
-        return Ok((Json::Object(record), transcript));
-    }
-    let fallback_body = narration_fallback_note(&transcript);
-    if let Some(reason) = validate_outcome_first(
-        &fallback_body,
-        NARRATION_BODY_MAX,
-        "narration fallback note",
-    ) {
-        return Err(DriverError::new(format!(
-            "narration fallback note violates its own grammar: {reason}"
-        )));
-    }
-    Ok((template_narration(task, &fallback_body)?, transcript))
+    Ok(())
 }
 
 const SECRET_TOKEN_PREFIXES: [&str; 10] = [
@@ -10485,67 +10311,11 @@ fn action_publish(brief: &Json) -> Result<Json> {
         ],
         true,
     )?;
-    let steward = steward_role(data.get("steward"))?;
-    let narration_task = {
-        let mut projected = BTreeMap::from([
-            (
-                "id".to_owned(),
-                task.get("id").cloned().unwrap_or(Json::Null),
-            ),
-            (
-                "title".to_owned(),
-                task.get("title").cloned().unwrap_or(Json::Null),
-            ),
-            (
-                "goal".to_owned(),
-                task.get("goal").cloned().unwrap_or(Json::Null),
-            ),
-            ("brief".to_owned(), {
-                task.get("brief")
-                    .and_then(Json::as_object)
-                    .and_then(|brief| brief.get("body"))
-                    .cloned()
-                    .unwrap_or(Json::Null)
-            }),
-        ]);
-        if let Some(domains) = task.get("conflictDomains") {
-            projected.insert("conflictDomains".to_owned(), domains.clone());
-        }
-        Json::Object(projected)
-    };
-    let request = if steward.is_none() {
-        Json::object([] as [(&str, Json); 0])
-    } else {
-        let diff_stat = git(
-            &workspace.worktree,
-            ["diff", "--stat", &format!("{}..{head}", workspace.base_rev)],
-            true,
-        )?
-        .stdout_text();
-        Json::object([
-            ("schemaVersion", Json::Number("1".to_owned())),
-            (
-                "mission",
-                Json::from("Propose the conventional-commit message and pull-request prose for one completed campaign task. Reply with a single line of the form TALLY_FINAL_MESSAGE=<json>, where <json> is an object with the keys type, scope, subject, and body. Text only: you are not running git."),
-            ),
-            ("campaign", Json::from(campaign.clone())),
-            ("task", narration_task),
-            ("diffStat", Json::from(take_chars(&diff_stat, MAX_RETRY_CHARS))),
-            (
-                "grammar",
-                Json::object([
-                    (
-                        "types",
-                        Json::Array(NARRATION_TYPES.iter().copied().map(Json::from).collect()),
-                    ),
-                    ("headerMaxChars", Json::from(NARRATION_HEADER_MAX)),
-                    ("bodyMaxChars", Json::from(NARRATION_BODY_MAX)),
-                    ("bodyMaxColumns", Json::from(NARRATION_BODY_LINE_MAX)),
-                ]),
-            ),
-        ])
-    };
-    let (narration, transcript) = narrate(steward.as_ref(), task, &request)?;
+    // The steward remains a bound catalog role for diagnosis. Publication
+    // validates that binding but does not occupy it: the squash reads its
+    // message from the lane tip at merge time.
+    validate_steward_catalog_role(data.get("steward"))?;
+    let narration = template_narration(task, "")?;
     let repository = repository_name(data.get("repository"), "repository")?;
     Ok(Json::object([
         ("taskId", Json::from(workspace.task_id)),
@@ -10556,7 +10326,9 @@ fn action_publish(brief: &Json) -> Result<Json> {
             Json::from(format!("local://{repository}/{}", workspace.publish_branch)),
         ),
         ("narration", narration),
-        ("narrationAttempts", Json::Array(transcript)),
+        // Retained as an empty compatibility field for the deployed flow
+        // schema. There is no narration request and therefore no transcript.
+        ("narrationAttempts", Json::Array(Vec::new())),
         ("ownership", ownership.to_json()),
     ]))
 }
@@ -10942,16 +10714,16 @@ fn action_cleanup(brief: &Json) -> Result<Json> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use super::{
         action_steer, action_worker_outcome, append_attempt_receipt, append_diagnosis_report,
         campaign_attempt_state, campaign_attempt_state_all, classify_worker_outcome,
         closed_inline_code_spans, contains_bare_exclamation_mark, fold_attempt_receipts,
-        publish_closing_summary, read_local_blob, replace_bare_exclamation_marks,
-        validate_attempt_receipt, validate_outcome_first, DiagnosisVerdict, Json, RepoConfig,
-        WorkerOutcome,
+        git_with_input, integration_branch, merge_local, publish_closing_summary, read_local_blob,
+        replace_bare_exclamation_marks, validate_attempt_receipt, validate_outcome_first,
+        DiagnosisVerdict, Json, RepoConfig, WorkerOutcome,
     };
     use tally_core::attempt_receipts::{
         AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR,
@@ -10973,6 +10745,132 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn squash_subject_adoption(message: &str) -> (PathBuf, PathBuf, String) {
+        let root =
+            std::env::temp_dir().join(format!("tally-subject-adoption-test-{}", Uuid::new_v4()));
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        summary_ref_test_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        summary_ref_test_git(&checkout, &["config", "user.name", "Subject Adoption Test"]);
+        summary_ref_test_git(
+            &checkout,
+            &["config", "user.email", "subject-adoption@example.invalid"],
+        );
+        fs::write(checkout.join("README.md"), "fixture\n").unwrap();
+        summary_ref_test_git(&checkout, &["add", "README.md"]);
+        summary_ref_test_git(&checkout, &["commit", "--quiet", "-m", "fixture"]);
+        let base = summary_ref_test_git(&checkout, &["rev-parse", "HEAD"]);
+        let integration = integration_branch("fixture", "subject-adoption");
+        summary_ref_test_git(&checkout, &["branch", &integration, &base]);
+        summary_ref_test_git(&checkout, &["switch", "--quiet", "-c", "published"]);
+        fs::write(checkout.join("task.txt"), "implemented\n").unwrap();
+        summary_ref_test_git(&checkout, &["add", "task.txt"]);
+        git_with_input(
+            &checkout,
+            [
+                "-c",
+                "user.name=Subject Adoption Test",
+                "-c",
+                "user.email=subject-adoption@example.invalid",
+                "commit",
+                "--quiet",
+                "--file",
+                "-",
+            ],
+            format!("{message}\n").as_bytes(),
+            true,
+        )
+        .unwrap();
+        let head = summary_ref_test_git(&checkout, &["rev-parse", "HEAD"]);
+        let data = BTreeMap::from([
+            ("campaign".to_owned(), Json::from("fixture")),
+            (
+                "campaignIdentity".to_owned(),
+                Json::from("subject-adoption"),
+            ),
+            (
+                "workspaceRoot".to_owned(),
+                Json::from(root.join("workspaces").display().to_string()),
+            ),
+            (
+                "task".to_owned(),
+                Json::object([
+                    ("id", Json::from("task-1")),
+                    ("title", Json::from("Task one")),
+                    ("revision", Json::from(format!("sha256:{}", "a".repeat(64)))),
+                ]),
+            ),
+        ]);
+        let published = BTreeMap::from([
+            ("baseRev".to_owned(), Json::from(base)),
+            ("branch".to_owned(), Json::from("published")),
+            ("head".to_owned(), Json::from(head)),
+        ]);
+        let config = RepoConfig {
+            checkout: checkout.clone(),
+            base_branch: "main".to_owned(),
+            remote: "origin".to_owned(),
+        };
+        let merged = merge_local(&data, &config, &published, "squash", None).unwrap();
+        (root, checkout, merged)
+    }
+
+    #[test]
+    fn subject_adoption_squash_preserves_a_valid_lane_tip() {
+        let (root, checkout, merged) = squash_subject_adoption(
+            "feat(driver): adopt the lane subject\n\nRecorded the lane-authored rationale.",
+        );
+        assert_eq!(
+            summary_ref_test_git(&checkout, &["show", "-s", "--format=%s", &merged]),
+            "feat(driver): adopt the lane subject"
+        );
+        let message = summary_ref_test_git(&checkout, &["show", "-s", "--format=%B", &merged]);
+        assert!(message.contains("Recorded the lane-authored rationale."));
+        assert!(message.contains("Adopted the lane-tip commit message without repair."));
+        assert_eq!(
+            summary_ref_test_git(&checkout, &["show", "-s", "--format=%P", &merged])
+                .split_whitespace()
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subject_adoption_squash_falls_back_for_an_invalid_lane_tip() {
+        let (root, checkout, merged) = squash_subject_adoption("implement task one");
+        assert_eq!(
+            summary_ref_test_git(&checkout, &["show", "-s", "--format=%s", &merged]),
+            "task-1: Task one"
+        );
+        let message = summary_ref_test_git(&checkout, &["show", "-s", "--format=%B", &merged]);
+        assert!(message.contains(
+            "Rejected the lane-tip commit message and used the task-id template instead."
+        ));
+        assert!(message.contains("does not match"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subject_adoption_squash_folds_a_101_column_body_and_adds_its_period() {
+        let body = format!("Recorded {}", "x".repeat(92));
+        assert_eq!(body.chars().count(), 101);
+        let (root, checkout, merged) =
+            squash_subject_adoption(&format!("fix(driver): format the lane body\n\n{body}"));
+        assert_eq!(
+            summary_ref_test_git(&checkout, &["show", "-s", "--format=%s", &merged]),
+            "fix(driver): format the lane body"
+        );
+        let message = summary_ref_test_git(&checkout, &["show", "-s", "--format=%B", &merged]);
+        assert!(message.lines().any(|line| line == "Recorded"));
+        assert!(message
+            .lines()
+            .any(|line| line == format!("{}.", "x".repeat(92))));
+        assert!(message.lines().all(|line| line.chars().count() <= 100));
+        assert!(message.contains("after deterministic formatting"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn summary_digest(source_sha256: &str) -> tally_core::campaign_folds::CampaignDigest {
