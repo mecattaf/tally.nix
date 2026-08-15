@@ -5,6 +5,12 @@
     "maxTasks": 12,
     "maxParallel": 3,
     "steward": "narrator",
+    "agent": {
+      "adapter": "claude-code",
+      "approvalPolicy": null,
+      "sandboxPolicy": null,
+      "diagnosisSandboxPolicy": null
+    },
     "gates": [
       {
         "kind": "command",
