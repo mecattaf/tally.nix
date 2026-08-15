@@ -771,18 +771,6 @@
             exec ${pkgs.bash}/bin/bash ${./doc/publish.sh} ${documentation} "$@"
           '';
         };
-        agencyNightlyDriverSources = import ./nix/lib/campaign-drivers.nix { inherit pkgs; };
-        agencyNightlyDriver = pkgs.writeShellApplication {
-          name = "agency-nightly-driver";
-          runtimeInputs = [
-            pkgs.gh
-            pkgs.git
-            pkgs.python3
-          ];
-          text = ''
-            exec ${pkgs.python3}/bin/python3 ${agencyNightlyDriverSources}/agency_nightly_driver.py "$@"
-          '';
-        };
         specBuildDriver = pkgs.rustPlatform.buildRustPackage {
           pname = "spec-build-driver";
           version = "0.1.0";
@@ -2060,7 +2048,7 @@
 
             machine.succeed("touch /srv/tally/production-agent/release")
             hardened = json.loads(machine.succeed(
-              "${tally}/bin/tally --socket /run/tally/tally.sock --rpc-timeout-sec 60 "
+              "${tally}/bin/tally --socket /run/tally/tally.sock "
               f"queue await-job {hardened_task}"
             ))
             assert hardened["verdict"] == "pass", hardened
@@ -2131,7 +2119,7 @@
               "runuser -u tally -- ${pkgs.coreutils}/bin/env "
               "HOME=" + poll_root + "/home XDG_RUNTIME_DIR=/run/user/" + uid + " "
               "${tally}/bin/tally --config /etc/tally/config.json "
-              "--socket /run/tally/tally.sock --rpc-timeout-sec 120"
+              "--socket /run/tally/tally.sock"
             )
             campaign_identity = "acme/poll-liveness"
             campaign_state = "/srv/tally/state"
@@ -3436,7 +3424,6 @@
           inherit tally;
           final-conformance-bar = finalConformanceBar;
           doc = documentation;
-          agency-nightly-driver = agencyNightlyDriver;
           spec-build-driver = specBuildDriver;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
@@ -3465,6 +3452,62 @@
           hardening-doc-drift = hardeningDocDrift;
           stock-home-activation = stockHome.activationPackage;
           module-layer = moduleContract;
+          substrate-numerals =
+            pkgs.runCommand "tally-substrate-numerals" { nativeBuildInputs = [ pkgs.gawk ]; }
+              ''
+                # The whole-class guard from specs/substrate/evidence/vestige-sweep.md
+                # (V-6/V-7/V-13/V-14): a systemd resource or limit directive, a pool
+                # capacity default, or an argv numeral in the module and adapter-library
+                # layers must carry a provenance marker (ruling:/given:/measured:) in its
+                # own line or in the comment block directly above it. A bare numeral is
+                # a constraint nobody authored until its authorship is visible.
+                mkdir -p nix
+                cp -r ${./nix/modules} nix/modules
+                cp -r ${./nix/lib} nix/lib
+                awk '
+                  function marked(i,    j) {
+                    if (lines[i] ~ /(ruling|given|measured):/) return 1
+                    for (j = i - 1; j >= 1; j--) {
+                      if (files[j] != files[i]) break
+                      if (lines[j] ~ /^[[:space:]]*#/) {
+                        if (lines[j] ~ /(ruling|given|measured):/) return 1
+                      } else if (lines[j] ~ /^[[:space:]]*$/) {
+                        continue
+                      } else break
+                    }
+                    return 0
+                  }
+                  { lines[NR] = $0; files[NR] = FILENAME; flines[NR] = FNR }
+                  END {
+                    bad = 0
+                    for (i = 1; i <= NR; i++) {
+                      line = lines[i]
+                      if (line ~ /^[[:space:]]*#/) continue
+                      hit = ""
+                      if (line ~ /^[[:space:]]*(Memory(Max|High|Low|Min|SwapMax)|CPUWeight|CPUQuota|TasksMax|IOWeight|OOMScoreAdjust|WatchdogSec|TimeoutStartSec|TimeoutStopSec|RestartSec|StartLimitIntervalSec|StartLimitBurst|Limit[A-Z][A-Za-z]*)[[:space:]]*=/)
+                        hit = "systemd resource/limit directive"
+                      else if (line ~ /^[[:space:]]*(.*\.)?(capacity|fanoutCap)[[:space:]]*=[[:space:]]*lib\.mkDefault[[:space:]]+[0-9]/)
+                        hit = "pool capacity default"
+                      else if (line ~ /--[a-z][a-z0-9-]*=[0-9]/ || line ~ /--[a-z][a-z0-9-]*[ \t]+[0-9]/)
+                        hit = "argv numeral"
+                      else if (line ~ /^[[:space:]]*"?[0-9]+(\.[0-9]+)?"?[[:space:]]*,?[[:space:]]*$/) {
+                        for (j = i - 1; j >= 1 && j >= i - 3; j--) {
+                          if (files[j] != files[i]) break
+                          if (lines[j] ~ /^[[:space:]]*$/) continue
+                          if (lines[j] ~ /--[a-z][a-z0-9-]*"[[:space:]]*$/) hit = "argv numeral"
+                          break
+                        }
+                      }
+                      if (hit != "" && !marked(i)) {
+                        printf "%s:%d: unmarked %s: %s\n", files[i], flines[i], hit, line > "/dev/stderr"
+                        bad = 1
+                      }
+                    }
+                    if (bad) exit 1
+                  }
+                ' nix/modules/*.nix nix/lib/*.nix
+                touch "$out"
+              '';
           final-conformance-bar-harness = pkgs.runCommand "tally-final-conformance-bar-harness" { } ''
             ${finalConformanceBar}/bin/tally-final-conformance-bar \
               ${self} \
@@ -3942,21 +3985,6 @@
                 test "$(printf '%s' "$agency_meta" | jq -r '.iterationCap')" = 8
                 test "$(printf '%s' "$agency_meta" | jq -c '.pools')" = \
                   '["agency-control","codex-window","claude-window"]'
-                touch "$out"
-              '';
-          agency-nightly-driver =
-            pkgs.runCommand "tally-agency-nightly-driver"
-              {
-                nativeBuildInputs = [
-                  pkgs.git
-                  pkgs.python3
-                ];
-                AGENCY_NIGHTLY_DRIVER = "${agencyNightlyDriverSources}/agency_nightly_driver.py";
-              }
-              ''
-                export HOME="$TMPDIR/home"
-                mkdir -p "$HOME"
-                ${pkgs.python3}/bin/python3 ${./test/agency_nightly_driver_test.py}
                 touch "$out"
               '';
           spec-build-task-ref-identity =

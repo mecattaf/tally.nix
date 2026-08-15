@@ -65,6 +65,14 @@ use tally_flow::{
 
 use crate::flow_live::{LiveFlowClient, RunnerIdentity};
 
+/// ruling: vestige-sweep V-7 — the single authority for the client RPC
+/// deadline. It bounds one deadline-bounded round trip: enqueue admission,
+/// `__campaign.status`, and `query.*` reads, all of which the daemon answers
+/// from durable state. The worst honest operation in the flake VM checks —
+/// `campaign arm --wait` holding through a whole pass — waits behind an armed
+/// `queue.await_job` long-poll that carries no deadline once armed, so 60s
+/// covers every deadline-bounded call; a call site never overrides this, and
+/// an operator who genuinely needs more widens it here.
 const DEFAULT_RPC_TIMEOUT_SEC: u64 = 60;
 const RPC_TIMEOUT_ENV: &str = "TALLY_RPC_TIMEOUT_SEC";
 /// How long `flow run` waits for an advisory finalMessage projection after a

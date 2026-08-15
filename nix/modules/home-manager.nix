@@ -79,6 +79,9 @@ let
               Description = "tally ${producer.kind} producer ${name}";
               After = [ "tally-daemon.service" ];
               ConditionPathExists = "${program}/bin/${program.meta.mainProgram}";
+              # given: a producer that crash-loops keeps starting on its own
+              # cadence; a start-rate limit would retire it silently instead of
+              # letting the next start name the failure.
               StartLimitIntervalSec = 0;
             };
           };
@@ -190,6 +193,8 @@ let
                   Description = "tally external usage meter for ${pool}";
                   After = [ "tally-daemon.service" ];
                   ConditionPathExists = marker;
+                  # given: same ruling as the producer units — a meter that
+                  # crash-loops keeps starting so the pool's usage stays visible.
                   StartLimitIntervalSec = 0;
                 };
                 Service = {
@@ -203,6 +208,8 @@ let
                   ];
                   ExecStart = lib.escapeShellArgs meter.argv;
                   Restart = "always";
+                  # given: the meter restarts on its own poll interval, which the
+                  # operator sets per pool.
                   RestartSec = "${toString meter.pollIntervalSec}s";
                   Environment = [
                     "TALLY_METER_POOL=${pool}"
@@ -369,13 +376,15 @@ in
           Service = {
             Type = "notify";
             NotifyAccess = "main";
-            # The daemon derives its liveness budgets from this period: it pings
+            # given: operator-set watchdog period. The daemon derives its
+            # liveness budgets from this period: it pings
             # every WatchdogSec/4, reports a dispatch loop that has not come
             # back around for 2x WatchdogSec, and stops pinging at 10x, after
             # which systemd takes one more period to restart. Moving this number
             # moves all four; daemon::notify pins them at 30s.
             WatchdogSec = "30s";
-            # Startup is charged here and never to WatchdogSec, because the
+            # given: operator-set startup budget. Startup is charged here and
+            # never to WatchdogSec, because the
             # service watchdog is not armed until READY=1. The daemon now sends
             # EXTEND_TIMEOUT_USEC= at every startup phase boundary, so this is
             # the budget for one phase rather than for the whole of
@@ -385,6 +394,8 @@ in
             # manager happens to carry.
             TimeoutStartSec = "90s";
             Restart = "always";
+            # given: operator-set restart spacing; Restart=always is the
+            # recovery, this is only the pause before it.
             RestartSec = "2s";
             Environment = [
               "TALLY_CONFIG_GENERATION=${checkedConfig}"
@@ -412,7 +423,8 @@ in
               "${toString cfg.stateDir}/capture/archive"
             ];
             ExecStart = lib.escapeShellArgs daemonArgv;
-            # Ruled backstop (vestige-sweep V-12), not a job cap: the daemon is a
+            # ruling: vestige-sweep V-12 — a ruled backstop, not a job cap: the
+            # daemon is a
             # small process, and if it ever reaches this limit the recovery stays
             # legible — Restart=always brings it back and the 30s watchdog bounds
             # the wedged interval. The CPUWeight line was deleted as a restatement
@@ -502,6 +514,8 @@ in
           };
           Service = {
             Type = "oneshot";
+            # given: the sweep is bounded by its work, not a clock; killing a
+            # prune mid-sweep would only repeat the same scan next run.
             TimeoutStartSec = "infinity";
             ExecStart = lib.escapeShellArgs (common.mkRetentionArgv cfg);
             Environment = [
@@ -531,7 +545,8 @@ in
           };
           Service = {
             Type = "oneshot";
-            # The scan holds the registry lock while reconciling durable Git
+            # given: operator-set reconcile budget. The scan holds the registry
+            # lock while reconciling durable Git
             # state, so a wedged call would block interactive arm, disarm, and
             # list until this fires.
             TimeoutStartSec = cfg.campaignPoll.timeout;

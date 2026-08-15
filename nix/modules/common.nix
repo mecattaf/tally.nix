@@ -1618,6 +1618,7 @@ let
             };
             horizon = mkOption {
               type = types.str;
+              # given: operator retention horizon for the witness-liveness floor.
               default = "30d";
               example = "90d";
               description = "Systemd timespan for the witness-liveness retention floor.";
@@ -1630,6 +1631,8 @@ let
             };
             captureArchiveHorizon = mkOption {
               type = types.str;
+              # given: operator retention horizon — archives are replay material,
+              # pruned once the witness record outlives them.
               default = "30d";
               example = "7d";
               description = ''
@@ -1641,6 +1644,8 @@ let
             };
             eventsDoneHorizon = mkOption {
               type = types.str;
+              # given: operator retention horizon — the ingress audit trail keeps
+              # a longer window than ordinary evidence.
               default = "180d";
               example = "1y";
               description = ''
@@ -1651,6 +1656,8 @@ let
             };
             eventsRejectedHorizon = mkOption {
               type = types.str;
+              # given: operator retention horizon — rejected events are
+              # adversarially drivable, so they expire sooner than the audit trail.
               default = "30d";
               example = "7d";
               description = ''
@@ -1661,6 +1668,8 @@ let
             };
             eventsRejectedMaxCount = mkOption {
               type = types.ints.unsigned;
+              # given: operator count bound — whichever of this and the horizon is
+              # exceeded first prunes, oldest file first.
               default = 10000;
               example = 1000;
               description = ''
@@ -1671,6 +1680,8 @@ let
             };
             lifecycleHorizon = mkOption {
               type = types.str;
+              # given: operator retention floor kept across byte-triggered
+              # lifecycle-log compaction.
               default = "30d";
               example = "90d";
               description = ''
@@ -1680,6 +1691,8 @@ let
             };
             lifecycleMaxBytes = mkOption {
               type = types.ints.positive;
+              # given: operator byte trigger for online lifecycle-log prefix
+              # compaction (256 MiB).
               default = 268435456;
               example = 67108864;
               description = ''
@@ -2224,6 +2237,8 @@ let
 
   flowPoolDefaults = {
     resource = lib.mkDefault "cpu-slot";
+    # given: operator pool capacity — the host declares how many flow slots it
+    # offers; worklist maxParallel sits under this ceiling.
     capacity = lib.mkDefault 8;
     enforce = lib.mkDefault "cooperative";
     hardPreempt = lib.mkDefault false;
@@ -2231,6 +2246,8 @@ let
 
   buildPoolDefaults = {
     resource = lib.mkDefault "build-slot";
+    # given: operator pool capacity — builds serialize aggressively by
+    # default; a host that wants parallel builds raises this explicitly.
     capacity = lib.mkDefault 2;
     enforce = lib.mkDefault "cooperative";
     hardPreempt = lib.mkDefault false;
@@ -2240,17 +2257,21 @@ let
   # validates that the host has enough generic execution capacity. Keep these
   # defaults independent of the retired per-campaign module declarations.
   mkCampaignRuntimeConfig = cfg: {
+    # given: operator envelope — one pass may fan out at most this many
+    # enqueue admissions before the daemon pushes back.
     enqueue.fanoutCap = lib.mkDefault 64;
     pools = {
       flow = flowPoolDefaults;
       campaign-control = {
         resource = lib.mkDefault "cpu-slot";
+        # given: operator pool capacity for campaign control lanes.
         capacity = lib.mkDefault 4;
         enforce = lib.mkDefault "cooperative";
         hardPreempt = lib.mkDefault false;
       };
       campaign-agent = {
         resource = lib.mkDefault "slot";
+        # given: operator pool capacity for campaign agent lanes.
         capacity = lib.mkDefault 4;
         enforce = lib.mkDefault "cooperative";
         hardPreempt = lib.mkDefault false;

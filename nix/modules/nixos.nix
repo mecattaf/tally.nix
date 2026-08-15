@@ -189,13 +189,15 @@ in
           User = cfg.user;
           Group = cfg.group;
           NotifyAccess = "main";
-          # The daemon derives its liveness budgets from this period: it pings
+          # given: operator-set watchdog period. The daemon derives its
+          # liveness budgets from this period: it pings
           # every WatchdogSec/4, reports a dispatch loop that has not come back
           # around for 2x WatchdogSec, and stops pinging at 10x, after which
           # systemd takes one more period to restart. Moving this number moves
           # all four; daemon::notify pins them at 30s.
           WatchdogSec = "30s";
-          # Startup is charged here and never to WatchdogSec, because the
+          # given: operator-set startup budget. Startup is charged here and
+          # never to WatchdogSec, because the
           # service watchdog is not armed until READY=1. The daemon now sends
           # EXTEND_TIMEOUT_USEC= at every startup phase boundary, so this is
           # the budget for one phase rather than for the whole of Daemon::open;
@@ -204,6 +206,8 @@ in
           # whichever DefaultTimeoutStartSec the manager happens to carry.
           TimeoutStartSec = "90s";
           Restart = "always";
+          # given: operator-set restart spacing; Restart=always is the
+          # recovery, this is only the pause before it.
           RestartSec = "2s";
           Environment = [
             "TALLY_CONFIG_GENERATION=${checkedConfig}"
@@ -234,7 +238,8 @@ in
             captureArchiveDir
           ];
           ExecStart = daemonWrapper;
-          # Ruled backstop (vestige-sweep V-12), not a job cap: the daemon is a
+          # ruling: vestige-sweep V-12 — a ruled backstop, not a job cap: the
+          # daemon is a
           # small process, and if it ever reaches this limit the recovery stays
           # legible — Restart=always brings it back and the 30s watchdog bounds
           # the wedged interval. The CPUWeight line was deleted as a restatement
@@ -328,6 +333,8 @@ in
           Type = "oneshot";
           User = cfg.user;
           Group = cfg.group;
+          # given: the sweep is bounded by its work, not a clock; killing a
+          # prune mid-sweep would only repeat the same scan next run.
           TimeoutStartSec = "infinity";
           ExecStart = lib.escapeShellArgs (common.mkRetentionArgv cfg);
           Environment = [
@@ -371,7 +378,8 @@ in
           Type = "oneshot";
           User = cfg.user;
           Group = cfg.group;
-          # The scan holds the registry lock while reconciling durable Git
+          # given: operator-set reconcile budget. The scan holds the registry
+          # lock while reconciling durable Git
           # state, so a wedged call would block interactive arm, disarm, and
           # list until this fires.
           TimeoutStartSec = cfg.campaignPoll.timeout;
