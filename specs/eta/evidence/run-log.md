@@ -19,6 +19,55 @@ lands scraped totals; the window is 10,000 credits, reset ~2026-08-22.
 | 6 | 08-15 18:07–18:46 | adapter-relative-policies attempt 1 — gate-refused | flagship | ~125 | ~200,000 | ~85,000 | 0 | ≈570 | ≈7,875 |
 | 7 | 08-15 18:55–19:42 | adapter-relative-policies attempt 2 — typed refusal (driver corpus outside domains) | flagship | 187 | — | — | 0 | ≈670 | ≈7,205 |
 | 8 | 08-15 19:45–20:20 | substrate-numerals-guard attempt 1 — MERGED first try | flagship | 59 | 92,262 | 35,793 | 0 | ≈246 | ≈6,959 |
+| 9 | 08-15 20:16–21:20 | adapter-relative-policies attempt 3 — committed, orphaned (see below) | flagship | 274 | — | — | 0 | — | — |
+| 10 | 08-15 21:47–21:56 | adapter-relative-policies attempt 4 — DIED ON THE WALL: 429 quota exhausted | flagship | 69 | — | — | 0 | — | 0 |
+
+## WINDOW EXHAUSTED — 08-15 21:56 UTC. Reset: 08-22 13:34 UTC.
+
+Attempt 4's stream ended with the verbatim wall: "Your token-plan 1-week
+quota has been exhausted. The quota will reset at 08-22 13:34:00 UTC."
+(pi exited 0, empty stderr, no envelope — the V-16 shape, now witnessed
+on pi; S5's fixture case exists in the wild.) The window's clock started
+with the 13:34 UTC adapter smoke.
+
+**Rate reconciliation — the estimate was wrong and this table's credit
+column understates ~2.5x.** True window consumption: 11 sessions, 1,019
+turns, 1,691,115 input + 556,392 output, zero cache reads = the full
+10,000 credits. Implied real rates if the 6x output ratio holds: input
+≈2,000 credits/M, output ≈12,000 credits/M — roughly 2.5x the
+qwen3.6-plus-scaled guess. Corrected planning number: a merged
+small-lane task costs ≈700–1,200 real credits; a weekly window funds
+≈8–12 such lanes, or roughly one chapter. The "chapters 1–2 in one
+window" projection was wrong; "one chapter per window" is the honest
+number. The Aug 7 doctrine held where it mattered: serialized dispatch,
+per-lane receipts, and the wall cost one 9-minute attempt instead of
+four parallel lanes — every credit of this window bought recorded,
+merged work or recorded findings.
+
+## S4 attempt 3 postmortem — committed but orphaned
+
+Attempt 3 DID commit (274 turns; git add -A && git commit verified in
+its session) in its prepared worktree at digest 4804c490722c, yet the
+driver recorded "agent produced no commit relative to the prepared
+base" and the worktree was recycled before salvage. Working hypothesis:
+the mid-flight re-arm (amendment 4, queued while S6 ran) re-keyed the
+admitted digest, and the attempt's ownership check evaluated against a
+fresh checkout — the commit landed in an orphaned universe. Standing
+supervisor rule until understood: NEVER re-arm while a lane is mid
+attempt; queue amendments for the gap between attempts. Candidate
+machinery finding for a later sitting: an attempt whose worktree digest
+no longer matches the admitted graph should fail legibly as
+digest-mismatch, not as agent-produced-no-commit.
+
+## Dispatch state
+
+Paused per ETA.md §6 — a planned state, not an incident. Campaign armed,
+zero units, S4 blocked on its epoch budget (refreshes at next
+amendment), spec-lint chain and doc task pending. Nothing dispatches
+until the window resets or the operator rules on the claude-code
+fallback (charter §3 names it the standing fallback pool when the
+metered window is the constraint; §6 names it contingency-only — the
+tension is the operator's to resolve).
 
 ## Attempts 6–7 postmortem: the drip stops with a supervisor enumeration
 
