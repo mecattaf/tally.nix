@@ -1,306 +1,344 @@
-# ext0 — main-thread run report (zeta operator session)
+# ext0 — main-thread run report and stop-state
 
-Written 2026-08-15 during the run, by the supervising operator session that
-armed ext0 on the evening of Aug 14. Scope: acts A1–A4 of `ZETA.md`, plus the
-supervision of `epsilon-extension` up to the chapter gate. Purpose: put every
-mishap of this run into committed bytes, with its cause and its remedy, so the
-same classes stop dragging on the project.
+Written 2026-08-14/15 by the supervising operator session that armed ext0.
+Scope: `ZETA.md` acts A1–A4 and the supervision of `epsilon-extension` up to
+the chapter gate. **Updated at a full stop on 2026-08-15**, at the operator's
+instruction, so no learning paid for in this run is lost.
 
-Status at time of writing: **8 of 10 tasks merged**, `authoring-doctrine-skills`
-running, `chapter-gate` blocked behind it. The campaign has not been released;
-A5 is deliberately not performed.
-
----
-
-## 1. What landed
-
-| act | result |
-|---|---|
-| A1 | `ca77150a` — the lineage record (E6): eight day-docs, `aug12-campaign-prep/`, `EPSILON-EXTENSION.md`, the worklist, all of `zeta-learnings/` |
-| A2 | `8c42762b` — the spec layer: `specs/README.md` v2, `specs/constitution.md` v2, eight `epsilon-extension/evidence/` ledgers, `specs/zeta/` (proposed, empty trace, contracts), `skills/author-spec/`, `ZETA.md` |
-| A3 | no act required — see §2.1 |
-| A4 | ext0 armed, 10 tasks admitted |
-
-Merged ext0 tasks (8): `receipt-authority-stamp`, `epoch-scoped-budgets`,
-`summary-ref-stage-digest`, `outcome-envelope`, `judge-verdict`,
-`subject-adoption-narrator-retire`, `final-bar-executes`,
-`fleet-gate-cheap-first`. The entire machinery half of the extension is in.
-
-Operator amendments during the run (all one-value, no schema keys, no gate
-definitions touched):
-
-| commit | change |
-|---|---|
-| `8e13bf1c` | `crates/tally/tests` → `receipt-authority-stamp` domains |
-| `70697347` | `test/spec_build_driver_test.py` → `subject-adoption-narrator-retire` domains |
-| `54371c81` | `test/spec_build_driver_test.py` → `receipt-authority-stamp` domains |
-| `511117fd` | `campaign.agent` bound to the `claude-code` adapter |
+**Bottom line: nine of ten ext0 tasks are merged and none of them is running
+anywhere. The chapter gate has never gone green, so the chapter is unproven,
+and the deployed pin still predates every line of it.** The campaign is
+stopped, not disarmed.
 
 ---
 
-## 2. Findings — the mishaps, by class
+## 0. Stop state (read this first)
 
-### 2.1 The declared fleet has been behind the running fleet for three days
+| thing | state |
+|---|---|
+| campaign | `needs-attention`, **still armed**, registration `01a001a3-2c64…` — deliberately NOT disarmed (disarm is terminal) |
+| tasks | **9 done, 1 blocked** (`chapter-gate`) |
+| job units | none active |
+| poll timer | **stopped** (`tally-campaign-poll.timer`) — no new pass can dispatch |
+| nightly deploy timer | **stopped** (`tally-producer-nightly-fleet-deploy.timer`) |
+| daemon | active, per-job cap **24 GiB** via runtime drop-in |
+| deployed pin | `e921cccc`, generation 128 — **unchanged for the entire run** |
+| `main` | `1384ea38`, pushed |
+| integration | `3c9600c3`, forked from `main` at `8c42762b` |
+| supervision watcher | stopped |
 
-Deploy-3 was already live when this session began: generation 128 (Aug 14
-16:40) evaluates byte-identical to the dotfiles working tree, pinned at tally
-`e921cccc`. No deploy act was needed.
+To resume later: `systemctl --user start tally-campaign-poll.timer`, then
+`tally campaign resume …`. To abandon: `tally campaign disarm …`.
 
-But the deploy exists **only in the dotfiles working tree**. `dotfiles/main`
-still pins `78dd4871`. This matters because `fleet-deploy.service` resolves its
-candidate from `github:mecattaf/dotfiles/main`:
+### The nine merged lanes (on the integration branch, not on `main`)
 
-> running `fleet-deploy` today would move the fleet **backward** off deploy-3,
-> mid-campaign.
+    3c9600c3  authoring-doctrine-skills
+    056502b7  epoch-scoped-budgets
+    5456b806  subject-adoption-narrator-retire
+    492a05ef  receipt-authority-stamp
+    eb257f08  judge-verdict
+    57c5f717  fleet-gate-cheap-first
+    d09b3b36  outcome-envelope
+    205f5bd5  summary-ref-stage-digest
+    166ce059  final-bar-executes
 
-**Remedy owed:** commit the dotfiles deploy (pin bump + the coredump-exclusion
-work + the `gitAi` removal) so the declared fleet matches the running one.
-Until then `fleet-deploy` is a trap, not a tool.
+Every one of these is **inert**. The deployed store path grades, and the pin
+has not moved. Nothing ext0 built is running anywhere.
 
-### 2.2 The nightly fleet deploy had no quiescence guard
+### Operator commits on `main` this run
 
-`AUG14-LEARNINGS.md` records: *"the unit's `ExecCondition` is now D63's `tally
-campaign quiescent`. The nightly deploy guards itself; nothing needs
-re-stamping."*
+    1384ea38  record: admit the ch1 ready-diff under the language charter
+    c87136b3  record: the ext0 main-thread run report
+    511117fd  epsilon-extension: move the agent slot to the claude-code adapter
+    54371c81  epsilon-extension: grant the driver harness to receipt-authority-stamp too
+    70697347  epsilon-extension: grant the driver harness to subject-adoption-narrator-retire
+    8e13bf1c  epsilon-extension: declare crates/tally/tests for receipt-authority-stamp
+    8c42762b  spec-layer: land the authority plane as authored bytes  (A2)
+    ca77150a  record: commit the lineage record (E6)                  (A1)
 
-**That is false against generation 128.** Verified during this run:
+### Ledger
 
-- `fleet-deploy.service` carries only `ExecStart` — no `ExecCondition`, no
-  `Condition*`, no `Assert*`
-- the `fleet-deploy` script contains no quiescence check
-- the tally producer `nightly-fleet-deploy` has no condition field; it fires at
-  `onCalendar: 02:00` and enqueues
-  `sudo -n systemctl --wait start fleet-deploy.service`
+26 attempt receipts: 15 diagnoses, **7 pardons**, 3 machinery retries, 1
+escalation. Seven pardons is the number to look at — see §3.
 
-The Aug-13 journal shows the guard working, so it was removed or lost between
-then and gen 128. Combined with §2.1, the 02:00 timer would have regressed the
-pin under a running campaign — the exact "never move the substrate
-mid-campaign" hazard, in the one defect class (F39) with no coverage at all.
+---
 
-**Action taken:** the timer was stopped for the duration of the run.
+## 1. The blocker that stopped the run
 
-    systemctl --user stop tally-producer-nightly-fleet-deploy.timer
+The chapter gate cannot pass, and not for a reason any lane controls.
 
-**Remedy owed — two, and the second is the real one:**
+    integration tip:       3c9600c3      ← the tree the gate tests
+    merge-base with main:  8c42762b      ← A2
+    main tip:              1384ea38      ← where the fix lives
+    fix present in integration?  NO
 
-1. **Restart the timer** when the run is over:
-   `systemctl --user start tally-producer-nightly-fleet-deploy.timer`
-2. **Restore the guard in committed bytes.** A doc claiming a guard exists is
-   worth nothing; the guard must be an `ExecCondition` (or an equivalent
-   predicate) that a check can witness. This is A15 applied to the deploy path:
-   a bar without a gate is not a bar.
+The gate failed on `checks.x86_64-linux.language-entry-policy` rejecting
+`aug12-campaign-prep/ch1-module-declaration.diff` — a file **I committed at
+A1**, because `.diff` is absent from the admitted extension list at
+`flake.nix:429`. In the same transcript: `PASS cargo test`, `PASS cargo
+clippy`, `PASS cargo deny check`. The code was green; the record commit was
+not.
 
-### 2.3 Four escalations, one defect class: acceptance criteria outside declared domains
+I fixed it on `main` (`1384ea38`, rename to `.txt`, zero offenders remain).
+**The fix cannot reach the gate.** The integration branch forked at A2 and only
+accumulates lane merges; an operator tree fix landing on `main` afterward never
+enters it. Worklist amendments worked all run because those are read from
+`main` at admission — a *tree* fix has to be inside the branch being gated.
 
-Every ext0 escalation before the quota wall was the same structural defect — a
-task whose own `acceptanceCriteria` require a path its `conflictDomains` omit,
-making the task **unsatisfiable inside its ownership boundary**.
+Merging `main` into integration by hand would take thirty seconds and is
+exactly what `skills/campaign-operator` forbids: *"Do not edit receipts,
+worktrees, integration branches, or the approved graph by hand."* The rule is
+right — a hand-touched integration branch destroys the audit the gate exists to
+produce.
 
-| task | criterion | path it needed | omitted |
-|---|---|---|---|
-| `receipt-authority-stamp` | `workspace-green` → `cargo test --workspace` | `crates/tally/tests/flow_live.rs` (asserts `schemaVersion == Some(1)`, which the task must bump) | `crates/tally/tests` |
-| `subject-adoption-narrator-retire` | `driver-suite-green` → `python3 test/spec_build_driver_test.py` | the harness, whose `NarrationValidatorTests` assert the narration the goal orders deleted | `test/spec_build_driver_test.py` |
-| `receipt-authority-stamp` (again) | `driver-suite` | the same harness, which never provisions the `receipt-authority-v1.json` the newly stamped writer requires | `test/spec_build_driver_test.py` |
+**This is a structural gap in the deployed machinery, and it is the single most
+important finding of the run:**
 
-**The lanes were right every time.** Each diagnosed its own boundary correctly
-and refused to breach it; `subject-adoption-narrator-retire` twice declined to
-reintroduce the narrator to make a stale test pass, and
-`receipt-authority-stamp` declined to weaken the receipt writer to get a green
-gate. This is F22/H1 behaving exactly as designed. The defect is in worklist
-authoring, not in the agents.
+> On the deployed pin, there is no sanctioned path for an operator tree fix to
+> reach a running campaign's integration branch. The content-disjoint rebase
+> and re-gate of the rebased head is `publish-as-a-machine-stage`, which is
+> **ext1** — not built, not deployed.
 
-**Remedy owed:** an authoring rule, and it belongs in `skills/assign-tally`
-alongside the existing "rehearse admission" step —
+A campaign whose base needs a one-line correction after lanes have merged has
+no way to accept it. That is why this run ended stopped rather than closed.
 
-> Before arming, check every task's `acceptanceCriteria` argv against its
-> declared `conflictDomains`. Any path an acceptance command reads or writes
-> that the task does not own is an under-declaration, and the task cannot pass.
+---
 
-This is mechanically checkable and should become one. It is the same shape as
-the phantom-pointer class (`L13`) that `spec-lint-resolution` already exists to
-catch, and it is worth pricing as a zeta follow-on: the worklist ↔ acceptance ↔
-domain join is exactly the kind of enumeration the authority plane is for.
+## 2. What this run cost, honestly
 
-### 2.4 Attempt counters are not epoch-keyed, and the receipts cannot date themselves
+Wall clock: roughly 16 hours from arm to stop. Delivered: nine merged lanes,
+none deployed, and an unproven chapter.
 
-`receipt-authority-stamp` was recorded as having failed twice. Both diagnoses
-were **byte-identical**, cited the same pre-amendment `taskUuid`, and carried
-evidence reading `"attempt":1`. The counter never reset when the amended graph
-was re-admitted, so a single pre-amendment breach was counted twice and latched
-the campaign.
+Consumed and not recoverable:
 
-Establishing that took a journal reconstruction, because **v1 receipts carry no
-timestamp** — the operator could not prove from the ledger that the burned
-attempts predated the amendment that fixed them.
+- **The codex account's quota**, exhausted mid-run, resetting **Aug 20 05:29**.
+  Every codex-adapter task is blocked until then.
+- Hours of attribution effort spent on faults that were disguised (§3.2, §3.5).
+- Seven pardons. Each one is an operator act the destination says should not
+  exist.
 
-That sentence is, verbatim, the CA-3 rationale in `receipt-authority-stamp`'s
-own goal, and the counter behaviour is the CA-2/PA-05 defect
-`epoch-scoped-budgets` exists to delete. **The campaign burned its own first
-task on the two defects that task and its successor were written to fix.** Both
-are now merged; neither is deployed, because the deployed store path grades
-(frozen-flow rule). They take effect at the A6 boundary deploy.
+The user's summary of the position is accurate and worth writing down: tally
+has been mutating for a month and there is still no fully-green tool. The
+chapter gate — the thing that would prove a chapter — has not gone green in
+this run.
 
-No remedy owed beyond deploying them — but it is worth recording that this is
-what "the machinery cannot describe its own failure" costs in operator hours.
+---
 
-### 2.5 The per-job memory cap is 8 GiB and it is hardcoded
+## 3. Findings, with cause and remedy
+
+### 3.1 A1/A2 were never gated, and the chapter gate paid for it
+
+50 files were committed straight to `main` across two operator commits with no
+check run against them. The defect surfaced 18 hours later at the most
+expensive possible place: the campaign's final checkpoint.
+
+**Remedy:** an operator commit that lands on the base of an armed campaign must
+face the bar the lanes face. Minimum viable version, before any push:
+
+    nix build --no-link .#checks.x86_64-linux.language-entry-policy
+
+This is cheap, mechanical, and belongs in `skills/campaign-operator` next to
+the arming steps. The general rule: *the operator is not exempt from the gate
+ladder; the operator is simply the lane with no diagnosis loop.*
+
+### 3.2 The per-job memory cap disguised itself as adapter flakiness
 
 The kernel OOM-killed `rustc` inside `tally-job-*` cgroups
-(`constraint=CONSTRAINT_MEMCG`) **14 times in five hours** on
-`epoch-scoped-budgets` alone, and again on `authoring-doctrine-skills`'s
-`cargo-tests` gate. Earlier in the run it killed `fleet-gate-cheap-first`'s
-`cargo-tests` too.
+(`constraint=CONSTRAINT_MEMCG`) 14 times in five hours on
+`epoch-scoped-budgets`, and again on two other lanes' `cargo-tests` gates. The
+host was never near pressure: 125 GiB total, ~100 GiB free. The cap was 8 GiB
+against a **32-core** host where `cargo test --workspace` fans out 32 `rustc`
+processes.
 
-The host is nowhere near pressure: 125 GiB total, ~100 GiB available. The limit
-is the per-job cap, `--memory-max-bytes 8589934592`, against a **32-core** host
-where `cargo test --workspace` fans out 32 `rustc` processes in a cold
-worktree.
+The kill surfaced as `apply_patch verification failed`, `exec_command failed`,
+`finalMessage not projected within 10000 ms`, and empty-stderr agent faults.
+**None of them says "out of memory."** Hours went into blaming the codex
+adapter.
 
-**The damage was not the OOM — it was the disguise.** The kill surfaced as:
+**Action taken:** cap raised to 24 GiB via
+`~/.config/systemd/user/tally-daemon.service.d/override-memory-cap.conf` and a
+daemon restart. Verified live on running job units.
 
-- `codex_core::tools::router: error=apply_patch verification failed`
-- `exec_command failed ... CreateProcess Rejected`
-- `finalMessage capture was not projected within 10000 ms`
-- agent stages failing with an empty stderr tail
+**Remedy owed:** this is runtime state and dies at the next rebuild. The value
+is hardcoded at `nix/modules/home-manager.nix:29` and `nix/modules/nixos.nix:29`
+with no option to set it. Make it a module option before the boundary deploy —
+which is when it would take effect anyway, since the module comes from the
+pinned flake input.
 
-Every one of those reads as adapter flakiness. None of them says "out of
-memory". Hours went into attributing this to the codex adapter before the
-cgroup evidence surfaced.
+**Second-order remedy, more valuable than the first:** an OOM-killed job must
+be *classified* as one. `systemd` records `Failed with result 'oom-kill'` at the
+moment the unit dies; nothing reads it. A machinery fault that presents as a
+tool fault will burn attempts every time it happens. This is ext1-shaped work
+and it is cheap.
 
-A steer telling the lane to constrain build parallelism
-(`CARGO_BUILD_JOBS=2`) worked — kills fell 14 → 3 and the lane completed. But
-**a steer cannot reach a gate**: gate argv is fixed worklist bytes
-(`nix develop --command cargo test --workspace`, no job limit), and a gate is
-never changed mid-run.
+### 3.3 Four escalations, one defect class: acceptance criteria outside declared domains
 
-**Action taken (operator-authorized):** the cap was raised to 24 GiB by systemd
-drop-in and the daemon restarted.
+Every escalation before the quota wall was the same: a task whose
+`acceptanceCriteria` require a path its `conflictDomains` omit, making it
+**unsatisfiable inside its ownership boundary**.
 
-    ~/.config/systemd/user/tally-daemon.service.d/override-memory-cap.conf
-    systemctl --user restart tally-daemon.service
+| task | criterion | path needed | omitted |
+|---|---|---|---|
+| `receipt-authority-stamp` | `workspace-green` | `crates/tally/tests/flow_live.rs` (pins `schemaVersion == Some(1)`, which the task must bump) | `crates/tally/tests` |
+| `subject-adoption-narrator-retire` | `driver-suite-green` | the driver harness, whose `NarrationValidatorTests` assert the narration the goal deletes | `test/spec_build_driver_test.py` |
+| `receipt-authority-stamp` (again) | `driver-suite` | the same harness, which never provisions the authority file the stamped writer requires | `test/spec_build_driver_test.py` |
 
-Verified live: `--memory-max-bytes 25769803776`, and running `tally-job-*`
-units now report `MemoryMax=25769803776`.
+**The lanes were right every time.** Each diagnosed its boundary correctly and
+refused to breach it; `subject-adoption-narrator-retire` twice declined to
+reintroduce the narrator to satisfy a stale test, and `receipt-authority-stamp`
+declined to weaken the receipt writer for a green gate. F22/H1 behaving exactly
+as designed. The defect is worklist authoring.
 
-**Remedy owed — this is runtime state and will not survive a rebuild.** The
-value is hardcoded at `nix/modules/home-manager.nix:29` (and `nixos.nix:29`)
-with no option to set it:
+**Remedy:** mechanical, and it should become a lint rule —
 
-    "--memory-max-bytes"
-    "8589934592"
+> Every path an acceptance argv reads or writes must be inside the task's
+> declared `conflictDomains`.
 
-The durable fix is a tally.nix change making the per-job cap a module option
-with a sane default for the host class, landed **before the A6 boundary
-deploy** — which is when it would take effect anyway, since the module comes
-from the pinned flake input. Delete the drop-in once that is deployed.
+Same shape as the phantom-pointer class (`L13`) that `spec-lint-resolution`
+already targets. Apply by hand to `zeta.json` before it is ever armed.
 
-Two second-order findings worth carrying:
+### 3.4 Attempt counters are not epoch-keyed, and receipts cannot date themselves
 
-- **A memory cap that manifests as adapter errors is a diagnosis defect.** An
-  OOM-killed job should be classified as such in the attempt receipt, not left
-  to look like a tool fault. This is `outcome-envelope`/`judge-verdict`
-  territory and is a candidate ext1 task: the kill is visible in the journal
-  (`Failed with result 'oom-kill'`) at the moment the unit dies.
-- **Gates inherit the cap and cannot be steered.** Any per-lane environmental
-  constraint that a gate cannot express is a hazard by construction.
+`receipt-authority-stamp` was recorded as failing twice. Both diagnoses were
+byte-identical, cited the same pre-amendment `taskUuid`, and carried evidence
+reading `"attempt":1`. One pre-amendment breach counted twice, and latched the
+campaign. Proving it required reconstructing the timeline from the journal,
+because **v1 receipts carry no timestamp**.
 
-### 2.6 The codex account hit its usage limit mid-run
+That is verbatim the CA-3 rationale in `receipt-authority-stamp`'s own goal,
+and the counter behaviour is the CA-2/PA-05 defect `epoch-scoped-budgets`
+deletes. **The campaign burned its first task on the two defects that task and
+its successor were written to fix.** Both are merged. Neither is deployed.
 
-`authoring-doctrine-skills` could not start a turn at all. Six captures under
-`~/.local/state/tally/capture/` carry the error verbatim:
+### 3.5 The codex account hit its usage limit mid-run
 
-    {"type":"error","message":"You've hit your usage limit. ...
-     or try again at Aug 20th, 2026 5:29 AM."}
+`authoring-doctrine-skills` could not start a turn. Six captures under
+`~/.local/state/tally/capture/` carry it verbatim: *"You've hit your usage
+limit … try again at Aug 20th, 2026 5:29 AM."* It presented as empty-stderr
+agent faults and projection timeouts — the same disguise as §3.2, different
+cause.
 
-It surfaced as empty-stderr agent faults and 10-second projection timeouts —
-the same disguise as §2.5, from a different cause.
+**Action taken:** `campaign.agent` bound to the `claude-code` adapter
+(`511117fd`). Two non-obvious requirements:
 
-**Action taken (operator-directed):** `campaign.agent` was bound to the host
-catalog's `claude-code` adapter (`511117fd`). Two things would have broken a
-naive switch:
+- the schema policy defaults are codex-shaped (`"never"`,
+  `"danger-full-access"`, `"read-only"`); `claude-code` declares no policies,
+  and `render_policy` rejects any policy an adapter has not declared, so all
+  three must be explicitly `null`
+- `cwdArgv: null` is harmless — the executor sets the lane working directory
+  via systemd-run `--working-directory`
 
-- the schema defaults are codex-shaped (`approvalPolicy: "never"`,
-  `sandboxPolicy: "danger-full-access"`, `diagnosisSandboxPolicy: "read-only"`)
-  and `claude-code` declares no policies; `render_policy` rejects any named
-  policy an adapter has not declared, so all three must be explicitly `null`
-- `cwdArgv: null` looks disqualifying but is not — the executor sets the lane
-  working directory itself via systemd-run `--working-directory`
+The adapter had **zero prior attestations**, so it was verified first:
+`tally adapter smoke claude-code --assert-commit --pool campaign-agent` →
+`verdict: pass`, `commitProbe: verified`. No model name entered authority
+bytes; `~/.claude/settings.json` already resolves `opus`. It then merged the
+task that codex could not start.
 
-The adapter had **zero prior attestations** on this host, so it was verified
-before arming rather than assumed:
+**Remedy owed:** the capture archive held the answer from the first failure.
+The escalation report should quote the adapter capture tail — one glance would
+have named this instead of three escalations of misattribution.
 
-    tally adapter smoke claude-code --assert-commit --pool campaign-agent
+### 3.6 The nightly fleet deploy had no quiescence guard
 
-returned `verdict: pass`, `commitProbe: verified` — one commit descended from
-the seeded base, clean worktree, both captures scraped. No model name entered
-authority bytes; `~/.claude/settings.json` already resolves `opus`.
+`AUG14-LEARNINGS.md` records *"the nightly deploy guards itself."* **False
+against generation 128.** `fleet-deploy.service` carries only `ExecStart`; the
+script has no quiescence check; the producer has no condition and fires at
+02:00, enqueuing `sudo -n systemctl --wait start fleet-deploy.service`.
 
-**Remedy owed:** the capture archive is where this was visible from the first
-failure. The run doctrine already says captures are first-line forensics; this
-session did not open them until the third escalation of the class. Worth
-hardening into the escalation path itself — an escalation report that quoted
-the tail of the adapter capture would have named this in one glance.
+Worse, `fleet-deploy` resolves from `github:mecattaf/dotfiles/main`, which
+still pins tally `78dd4871`, while the running fleet is at `e921cccc` from an
+**uncommitted** dotfiles working tree. Firing it would have moved the fleet
+*backward* under a running campaign.
 
-### 2.7 `campaign status` lags a live pass, and its failure list re-renders history
+**Action taken:** timer stopped. **Remedy owed:** restart it when appropriate,
+commit the dotfiles deploy so declared matches running, and restore the guard
+as committed bytes a check can witness — a doc claiming a guard is worth
+nothing (A15).
 
-`tally campaign status` reports the last **reconciled** pass. While a newer
-pass is in flight it shows `running=0` with stale counts, and re-reports old
-failures as if new. This produced one false "stall" reading and one false
-wake-up in this session's tooling.
+### 3.7 `campaign status` lags, and its failure list re-renders history
 
-The reliable liveness signal is `systemctl --user list-units 'tally-job-*'`.
-The supervision watcher was corrected twice: to derive liveness from active job
-units rather than `counts`, and to key new-failure detection on the newest
-failure **timestamp** rather than the failure count.
+The status view reports the last **reconciled** pass. While a newer pass is in
+flight it shows `running=0` with stale counts and re-reports old failures as
+new. It produced one false stall reading and one false wake in this session's
+tooling. Reliable liveness is `systemctl --user list-units 'tally-job-*'`.
 
-**Remedy owed:** worth a line in `skills/campaign-operator` — the status view
-is authoritative for the reconciled past, not for the present, and a supervisor
-polling it must not treat `running=0` as quiescence.
+**Remedy:** a line in `skills/campaign-operator` — the status view is
+authoritative for the reconciled past, never for the present; `running=0` is
+not quiescence.
 
-### 2.8 A model name is already in the worklist bytes
+### 3.8 A model name is already in worklist bytes
 
-`silent-factory-worklists/epsilon-extension.json` line 184, inside
-`judge-verdict`'s goal:
-
-> `AUGUST-01-DESIGN.md:138 assigned it to Sonnet and the implementation
-> drifted`
-
-Pre-existing, historical citation, in an already-merged task, and not edited
-mid-run (record-don't-fix). It is a genuine instance of the `L16` class —
-*model names in spec or governing worklist bytes* — and useful evidence that
-the rule zeta is building has real targets in the existing corpus.
+`silent-factory-worklists/epsilon-extension.json`, inside `judge-verdict`'s
+goal: *"AUGUST-01-DESIGN.md:138 assigned it to Sonnet and the implementation
+drifted."* Pre-existing historical citation in an already-merged task; left
+alone (record-don't-fix). A genuine `L16` instance, and evidence the rule zeta
+is building has real targets.
 
 ---
 
-## 3. State handed forward
+## 4. Another session is writing into this checkout
 
-- **Base tip:** `511117fd` on `main`, pushed.
-- **Campaign:** `epsilon-extension` armed, 8/10 merged, `authoring-doctrine-skills`
-  running on `claude-code`, `chapter-gate` blocked behind it. Not released.
-- **Deployed pin:** `e921cccc`, generation 128. Unchanged all run — no
-  substrate moved under a running campaign.
-- **Daemon:** per-job cap 24 GiB via runtime drop-in (§2.5).
-- **Timer:** `tally-producer-nightly-fleet-deploy.timer` **stopped** (§2.2).
+Untracked and not authored by this session:
 
-### Outstanding, in priority order
+    AUG15-SESSION-FINDINGS.md
+    specs/substrate/
+    zeta-learnings/12-local-models-synthesis.md
+    zeta-learnings/13-final-state-portrait.md
+    zeta-learnings/raw/tandem-architect.md
+    zeta-learnings/raw/tandem-plane.md
 
-1. Restart the nightly fleet-deploy timer.
-2. Commit the dotfiles deploy so `fleet-deploy` stops being a trap (§2.1).
-3. Land the per-job memory cap as a module option before the A6 deploy (§2.5).
-4. Restore a witnessed quiescence guard on the deploy path (§2.2).
-5. Add the acceptance-argv ↔ conflictDomains check to `skills/assign-tally`,
-   and price it as a mechanical rule for the linter (§2.3).
+`specs/substrate/` matters: it is a second identity directory under `specs/`,
+which the linter will read and which the A7 falsity pass would meet as observed
+tree. Not committed here — not this session's to commit — but it must be
+reconciled before any spec-layer work proceeds.
 
-### Carried into the zeta sitting (A7)
+---
 
-- Zeta's five implementation tasks are agent tasks. On the `claude-code`
-  adapter they are unblocked; on codex they would wait until Aug 20.
-- Apply §2.3's rule to `zeta.json` before arming: every acceptance argv checked
-  against declared domains. Zeta's tasks run `cargo test -p spec-lint`,
-  `nix build .#checks.x86_64-linux.spec-lint`, and a doc check — each needs its
-  read/write set owned.
-- `DECISION-1` (the `steward` field value) and `UNKNOWN-1` (read-first brief
-  rendering coverage) remain undrained, to be settled against the merged
-  post-ext0 tree.
-- The chapter-gate duration cap (10800s) should be re-checked against the
-  merged `final-bar-executes` reality, per `ZETA.md` §Risks.
+## 5. The decisions this run has surfaced
+
+Stated as forks, not recommendations, because they are yours.
+
+1. **Can a chapter close without a green chapter gate?** Nine lanes are merged
+   and unproven as a set. Deploying them (A6) without the gate means the
+   frozen-flow rule starts grading code that no bar ever accepted. Refusing
+   means ext0 stays open until §1's structural gap is closed.
+
+2. **How does an operator tree fix reach a running campaign?** Today: it
+   cannot. Either `publish-as-a-machine-stage` (ext1) gets pulled forward, or a
+   narrow sanctioned verb is built for it, or campaigns must be re-armed from
+   scratch whenever the base needs a correction — which discards merged lane
+   work.
+
+3. **Does ext0 re-run, or does its merged work get salvaged?** The nine lane
+   commits exist and are good. A fresh campaign on the corrected base would
+   re-derive them at full cost. Salvaging them needs a path that does not
+   involve hand-editing an integration branch.
+
+4. **Is the campaign the right instrument for machinery that the campaign
+   itself runs on?** ext0 burned its first task on the two defects that task
+   was written to fix, and its chapter gate on a file the operator committed.
+   Every fix it produced is inert until a deploy that cannot happen until the
+   gate it cannot pass goes green. That circularity is the month's central
+   lesson and deserves an explicit ruling.
+
+5. **Adapter strategy.** codex is unavailable until Aug 20. `claude-code` is
+   proven on this host now — smoke-verified and it merged a real task. Zeta's
+   five tasks are all agent tasks; on codex they wait, on `claude-code` they do
+   not.
+
+---
+
+## 6. Outstanding, in priority order
+
+1. Decide §5.1 and §5.2 — everything else waits on them.
+2. Restart the poll timer and the nightly deploy timer when the run resumes
+   (`systemctl --user start tally-campaign-poll.timer`,
+   `… tally-producer-nightly-fleet-deploy.timer`).
+3. Commit the dotfiles deploy so `fleet-deploy` stops being a trap (§3.6).
+4. Land the per-job memory cap as a module option before the boundary deploy
+   (§3.2).
+5. Restore a witnessed quiescence guard on the deploy path (§3.6).
+6. Add the acceptance-argv ↔ `conflictDomains` check to `skills/assign-tally`,
+   and price it as a lint rule (§3.3).
+7. Classify OOM kills as machinery faults in the receipt (§3.2).
+8. Reconcile the other session's untracked files, `specs/substrate/` first (§4).
