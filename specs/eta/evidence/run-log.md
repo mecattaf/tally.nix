@@ -18,6 +18,7 @@ lands scraped totals; the window is 10,000 credits, reset ~2026-08-22.
 | 5 | 08-15 17:13–17:55 | excerpt-derivations attempt 1 — MERGED first try | flagship | 101 | 197,959 | 90,205 | 0 | ≈591 | ≈8,445 |
 | 6 | 08-15 18:07–18:46 | adapter-relative-policies attempt 1 — gate-refused | flagship | ~125 | ~200,000 | ~85,000 | 0 | ≈570 | ≈7,875 |
 | 7 | 08-15 18:55–19:42 | adapter-relative-policies attempt 2 — typed refusal (driver corpus outside domains) | flagship | 187 | — | — | 0 | ≈670 | ≈7,205 |
+| 8 | 08-15 19:45–20:20 | substrate-numerals-guard attempt 1 — MERGED first try | flagship | 59 | 92,262 | 35,793 | 0 | ≈246 | ≈6,959 |
 
 ## Attempts 6–7 postmortem: the drip stops with a supervisor enumeration
 
