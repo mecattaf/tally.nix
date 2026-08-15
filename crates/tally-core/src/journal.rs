@@ -1499,6 +1499,30 @@ mod tests {
     }
 
     #[test]
+    fn stderr_tail_bound_reanchors_on_the_excerpt_derivation() {
+        // The bound validated above is not a free number: it is the
+        // executor's derivation over this file's envelope (vestige-sweep
+        // V-4). Re-derive it here from the consumer side so a hand-retyped
+        // numeral on either end diverges and fails.
+        assert_eq!(
+            crate::executor::CAPTURE_EXCERPT_MAX_BYTES
+                + crate::executor::CAPTURE_EXCERPT_FRAMING_MARGIN,
+            MAX_STDOUT_RECORD_BYTES
+        );
+
+        // A maximal excerpt is admitted, and a Failed record carrying it
+        // still renders inside the envelope with every other field present:
+        // the framing margin the derivation reserves is real headroom.
+        let mut event = full_event(TallyEvent::Failed);
+        event.stderr_tail = Some("x".repeat(crate::executor::CAPTURE_EXCERPT_MAX_BYTES));
+        event.stderr_truncated = Some(true);
+        let fields = event.into_fields().unwrap();
+        let rendered = render_stdout_record(&fields).unwrap();
+        assert!(rendered.len() <= MAX_STDOUT_RECORD_BYTES);
+        assert!(encode_native_record(&fields).is_ok());
+    }
+
+    #[test]
     fn stdout_is_one_json_line_and_preserves_message_newlines() {
         let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
         event.message = Some("line one\nline two".to_owned());
@@ -1512,6 +1536,14 @@ mod tests {
     #[test]
     fn stdout_limit_cannot_cross_journalds_default_line_max() {
         assert_eq!(MAX_STDOUT_RECORD_BYTES, 48 * 1024);
+        // The capture excerpt peephole is a derivation over this envelope
+        // (vestige-sweep V-4); a hand-retyped CAPTURE_EXCERPT_MAX_BYTES
+        // drifts from the envelope it must render inside and fails here.
+        assert_eq!(
+            crate::executor::CAPTURE_EXCERPT_MAX_BYTES
+                + crate::executor::CAPTURE_EXCERPT_FRAMING_MARGIN,
+            MAX_STDOUT_RECORD_BYTES
+        );
         let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
         event.message = Some("x".repeat(MAX_STDOUT_RECORD_BYTES));
         let fields = event.into_fields().unwrap();

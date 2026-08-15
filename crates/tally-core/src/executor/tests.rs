@@ -1101,6 +1101,121 @@ fn failure_capture_excerpt_is_a_bounded_private_tail() {
 }
 
 #[test]
+fn capture_excerpt_bound_is_a_derivation_over_the_journal_envelope() {
+    // The peephole is an expression over its consumer (vestige-sweep V-4):
+    // the journal envelope minus the stated framing margin. A hand-retyped
+    // numeral diverges from the derivation and fails.
+    assert_eq!(
+        CAPTURE_EXCERPT_MAX_BYTES + CAPTURE_EXCERPT_FRAMING_MARGIN,
+        crate::journal::MAX_STDOUT_RECORD_BYTES
+    );
+}
+
+#[test]
+fn buried_causal_error_five_kb_above_the_tail_survives_the_failure_excerpt() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let paths = executor.prepare_paths(&request.identity).unwrap();
+    write_capture_generation(
+        &paths.capture_generation,
+        CaptureGeneration {
+            attempt: request.attempt,
+            lease_epoch: request.lease_epoch,
+        },
+    )
+    .unwrap();
+
+    // A gate-shaped capture: setup noise, then the causal error exactly five
+    // kilobytes above the tail, then exit chatter. Under the historical
+    // 2 KiB peephole the rendered failure fact showed only the exit chatter
+    // and the causal error never reached the channel attribution reads
+    // (vestige-sweep V-4).
+    let tail_line = "noise: process exited with status 1\n";
+    let causal = "error: the causal fixture failure (excerpt-derivations)\n";
+    let mut capture = Vec::new();
+    while capture.len() < CAPTURE_EXCERPT_MAX_BYTES + 16 * 1024 - 5_000 - causal.len() {
+        capture.extend_from_slice(b"note: harness setup noise line\n");
+    }
+    capture.extend_from_slice(causal.as_bytes());
+    let error_end = capture.len();
+    let chatter = b"noise: trailing chatter after the causal error\n";
+    let mut remaining = 5_000 - tail_line.len();
+    while remaining >= chatter.len() {
+        capture.extend_from_slice(chatter);
+        remaining -= chatter.len();
+    }
+    if remaining > 0 {
+        let filler: String = std::iter::repeat_n('x', remaining - 1).collect();
+        capture.extend_from_slice(format!("{filler}\n").as_bytes());
+    }
+    capture.extend_from_slice(tail_line.as_bytes());
+    assert_eq!(
+        capture.len() - error_end,
+        5_000,
+        "the causal error sits exactly five kilobytes above the tail"
+    );
+    std::fs::write(&paths.stderr, &capture).unwrap();
+
+    let excerpt = read_capture_excerpt(&paths.stderr).unwrap();
+    assert!(excerpt.truncated);
+    assert!(excerpt.text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
+    assert!(excerpt.text.contains(causal.trim_end()));
+    assert!(excerpt.text.ends_with(tail_line));
+
+    // The rendered failure fact — the persisted `.err` projection the
+    // durable view and the Failed lifecycle event both read — carries the
+    // buried causal error, not only the tail.
+    let persisted = executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&paths.failure_stderr).unwrap(),
+        persisted.text.as_bytes()
+    );
+    assert!(persisted.text.contains(causal.trim_end()));
+    assert!(persisted.text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
+}
+
+#[test]
+fn error_aware_excerpt_lifts_the_first_error_block_from_above_the_tail_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let paths = executor.prepare_paths(&request.identity).unwrap();
+
+    // The causal error block sits near the head of the capture, more than a
+    // full window above the tail: the tail window alone cannot reach it, so
+    // only the error-aware lift surfaces it.
+    let mut capture = Vec::new();
+    capture.extend_from_slice(b"note: harness setup noise line\n");
+    capture.extend_from_slice(b"error[E0308]: mismatched types\n");
+    capture.extend_from_slice(b" --> src/main.rs:4:5\n");
+    capture.extend_from_slice(b"  |\n");
+    capture.extend_from_slice(b"4 |     let answer: u32 = \"forty-two\";\n");
+    capture.extend_from_slice(
+        b"  |                         ^^^^^^^^^^ expected `u32`, found `&str`\n",
+    );
+    capture.extend_from_slice(b"\n");
+    let block_end = capture.len();
+    while capture.len() < block_end + 3 * CAPTURE_EXCERPT_MAX_BYTES {
+        capture.extend_from_slice(b"warning: intervening noise that came later\n");
+    }
+    capture.extend_from_slice(b"noise: process exited with status 101\n");
+    std::fs::write(&paths.stderr, &capture).unwrap();
+
+    let excerpt = read_capture_excerpt(&paths.stderr).unwrap();
+    assert!(excerpt.truncated);
+    assert!(excerpt.text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
+    assert!(excerpt.text.contains("error[E0308]: mismatched types"));
+    assert!(excerpt.text.contains("expected `u32`, found `&str`"));
+    assert!(excerpt
+        .text
+        .ends_with("noise: process exited with status 101\n"));
+}
+
+#[test]
 fn raw_and_failure_stderr_archive_as_distinct_generation_files() {
     let temp = tempfile::tempdir().unwrap();
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");

@@ -41,11 +41,24 @@ const MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES: u64 = 64 * 1024;
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
 const MAX_MACHINE_RETRIES: usize = 2;
-const MAX_WORKER_FINDINGS_BYTES: usize = 8 * 1024;
+// The diagnosis slot's peepholes, each a derivation over the slot it feeds
+// (vestige-sweep V-5) — the bare 8 KiB / 10-line / 8 KiB numerals these
+// replaced sized the verdict that gates attempt 2 through a 10-line window
+// of up-to-3-hour gate runs.
+//
+// One worker's findings may fill at most two thirds of the diagnosis slot
+// the findings inform; the rest of the slot stays room for the diagnosis
+// prose itself. The slot counts chars and this bound counts bytes, so any
+// multibyte text surviving redaction fits with room to spare.
+const MAX_WORKER_FINDINGS_BYTES: usize = MAX_DIAGNOSIS_CHARS * 2 / 3;
 const MAX_CONTINUATION_EVENT_BYTES: usize = 1024 * 1024;
-const CHECKPOINT_CAPTURE_MAX_BYTES: usize = 8 * 1024;
-const CHECKPOINT_STDERR_LINES: usize = 10;
-const CHECKPOINT_PUBLIC_NOTE_MAX_CHARS: usize = 1_000;
+// One stored checkpoint-capture stream may fill the diagnosis slot it
+// feeds: the capture is the evidence one diagnosis reads.
+const CHECKPOINT_CAPTURE_MAX_BYTES: usize = MAX_DIAGNOSIS_CHARS;
+// The checkpoint note reserves one third of the diagnosis slot for the
+// capture's error-aware stderr excerpt and leaves the rest to the
+// diagnosis prose the note is appended to.
+const CHECKPOINT_STDERR_WINDOW_CHARS: usize = MAX_DIAGNOSIS_CHARS / 3;
 const ATTEMPT_RECEIPTS_FILE: &str = "attempt-receipts-v1.jsonl";
 const PUBLIC_REDACTION: &str = "conservative-v2";
 const PUBLIC_DIAGNOSIS_TRUNCATION: &str = "\n[... diagnosis truncated after redaction ...]";
@@ -3701,13 +3714,36 @@ fn read_capture_tail(path: &Path) -> Result<(String, bool)> {
             path.display()
         )));
     }
-    let start = metadata
-        .len()
-        .saturating_sub(CHECKPOINT_CAPTURE_MAX_BYTES as u64);
+    let window = CHECKPOINT_CAPTURE_MAX_BYTES as u64;
+    if metadata.len() <= window {
+        let mut captured = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut captured)?;
+        let text = String::from_utf8_lossy(&captured)
+            .replace('\0', "�")
+            .to_owned();
+        return Ok((text, false));
+    }
+    // Error-aware, like the executor's failure excerpt (vestige-sweep V-5):
+    // a probe of the capture's head, where the first error block sits, plus
+    // the tail — composed by the same derivation-aware renderer the executor
+    // uses, so both homes speak one vocabulary. Both reads are bounded by
+    // the window no matter how long the gate ran.
+    let probe_len = window.min(metadata.len() - window);
+    let probe = read_capture_window(&mut file, 0, probe_len)?;
+    let tail = read_capture_window(&mut file, metadata.len() - window, window)?;
+    let excerpt = tally_core::executor::compose_capture_excerpt(
+        &String::from_utf8_lossy(&probe).replace('\0', "�"),
+        &String::from_utf8_lossy(&tail).replace('\0', "�"),
+        probe_len == metadata.len() - window,
+        CHECKPOINT_CAPTURE_MAX_BYTES,
+    );
+    Ok((excerpt.text, true))
+}
+
+fn read_capture_window(file: &mut File, start: u64, len: u64) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(start))?;
-    let mut captured = Vec::new();
-    file.take(CHECKPOINT_CAPTURE_MAX_BYTES as u64)
-        .read_to_end(&mut captured)?;
+    let mut captured = Vec::with_capacity(len as usize);
+    file.take(len).read_to_end(&mut captured)?;
     if start != 0 {
         let prefix = captured
             .iter()
@@ -3715,19 +3751,35 @@ fn read_capture_tail(path: &Path) -> Result<(String, bool)> {
             .count();
         captured.drain(..prefix);
     }
-    let mut text = String::from_utf8_lossy(&captured)
-        .replace('\0', "�")
-        .to_owned();
-    let mut additionally_truncated = false;
-    if text.len() > CHECKPOINT_CAPTURE_MAX_BYTES {
-        let mut begin = text.len() - CHECKPOINT_CAPTURE_MAX_BYTES;
-        while !text.is_char_boundary(begin) {
-            begin += 1;
-        }
-        text = text[begin..].to_owned();
-        additionally_truncated = true;
+    Ok(captured)
+}
+
+/// An error-aware excerpt of an in-memory capture text within `window`,
+/// mirroring the executor's windowed read: a probe of the head plus the
+/// tail, composed by the same derivation-aware renderer, so a causal error
+/// far above the tail survives here exactly as it does in the failure fact.
+fn excerpt_text_window(text: &str, window: usize) -> tally_core::executor::CaptureExcerpt {
+    if text.len() <= window {
+        return tally_core::executor::CaptureExcerpt {
+            text: text.to_owned(),
+            truncated: false,
+        };
     }
-    Ok((text, start != 0 || additionally_truncated))
+    let probe_len = window.min(text.len() - window);
+    let mut probe_end = probe_len;
+    while !text.is_char_boundary(probe_end) {
+        probe_end -= 1;
+    }
+    let mut tail_start = text.len() - window;
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    tally_core::executor::compose_capture_excerpt(
+        &text[..probe_end],
+        &text[tail_start..],
+        probe_end == tail_start,
+        window,
+    )
 }
 
 fn write_private_json(path: &Path, value: &Json) -> Result<()> {
@@ -3958,7 +4010,7 @@ fn read_checkpoint_capture(path: &Path, campaign: &str, task_id: &str) -> Result
             .is_none_or(|content| content.len() > CHECKPOINT_CAPTURE_MAX_BYTES)
         {
             return Err(DriverError::new(format!(
-                "checkpoint capture {stream} exceeds its 8 KiB bound"
+                "checkpoint capture {stream} exceeds its {CHECKPOINT_CAPTURE_MAX_BYTES} byte bound"
             )));
         }
     }
@@ -4008,25 +4060,42 @@ fn checkpoint_capture_note(value: Option<&Json>, campaign: &str, task_id: &str) 
         .and_then(|capture| capture.get("stderr"))
         .and_then(Json::as_str)
         .expect("validated capture stderr");
-    let lines: Vec<_> = stderr.lines().rev().take(CHECKPOINT_STDERR_LINES).collect();
-    if lines.is_empty() {
+    // Error-aware inside the derived window (vestige-sweep V-5): the note
+    // carries the first error block plus the tail, not the last ten lines
+    // of whatever noise came last.
+    let windowed = excerpt_text_window(stderr, CHECKPOINT_STDERR_WINDOW_CHARS);
+    if windowed.text.trim().is_empty() {
         return Ok(note);
     }
-    let lines: Vec<_> = lines.into_iter().rev().collect();
-    let mut excerpt = lines
-        .iter()
+    let mut excerpt = windowed
+        .text
+        .lines()
         .map(|line| format!("    {line}"))
         .collect::<Vec<_>>()
         .join("\n");
     let heading = format!(
-        "{note}\n\nCheckpoint stderr (last {} line(s), before public redaction):\n\n",
-        lines.len()
+        "{note}\n\nCheckpoint stderr (first error block and tail, before public redaction):\n\n"
     );
-    let available = CHECKPOINT_PUBLIC_NOTE_MAX_CHARS.saturating_sub(heading.chars().count());
+    let available = CHECKPOINT_STDERR_WINDOW_CHARS.saturating_sub(heading.chars().count());
     if excerpt.chars().count() > available {
         let marker = "    [... earlier checkpoint stderr lines shortened ...]\n";
-        let tail_width = available.saturating_sub(marker.chars().count());
-        let tail: String = excerpt
+        // An error-aware shortening: the lifted first-error block is exactly
+        // the evidence the old 10-line window buried, so when the excerpt
+        // lifted one, the shortening preserves the block and the gap marker
+        // and cuts only the tail region, keeping its end (vestige-sweep V-5).
+        let gap_marker = format!(
+            "    {}\n",
+            tally_core::executor::CAPTURE_EXCERPT_GAP_MARKER.trim_end_matches('\n')
+        );
+        let tail_region_start = excerpt
+            .find(&gap_marker)
+            .map(|index| index + gap_marker.len())
+            .unwrap_or(0);
+        let preserved = &excerpt[..tail_region_start];
+        let tail_width = available
+            .saturating_sub(preserved.chars().count())
+            .saturating_sub(marker.chars().count());
+        let tail: String = excerpt[tail_region_start..]
             .chars()
             .rev()
             .take(tail_width)
@@ -4034,10 +4103,10 @@ fn checkpoint_capture_note(value: Option<&Json>, campaign: &str, task_id: &str) 
             .into_iter()
             .rev()
             .collect();
-        excerpt = if tail_width == 0 {
-            take_chars(marker, available)
+        excerpt = if preserved.chars().count() + marker.chars().count() >= available {
+            take_chars(&format!("{preserved}{marker}"), available)
         } else {
-            format!("{marker}{tail}")
+            format!("{preserved}{marker}{tail}")
         };
     }
     Ok(format!("{heading}{excerpt}"))
@@ -11046,12 +11115,13 @@ mod tests {
 
     use super::{
         action_steer, action_worker_outcome, append_attempt_receipt, append_diagnosis_report,
-        campaign_attempt_state, campaign_attempt_state_all, classify_worker_outcome,
-        closed_inline_code_spans, contains_bare_exclamation_mark, current_task_input_epochs,
-        fold_attempt_receipts, git_with_input, integration_branch, merge_local,
-        publish_closing_summary, read_local_blob, replace_bare_exclamation_marks,
-        validate_attempt_receipt, validate_outcome_first, DiagnosisVerdict, Json, RepoConfig,
-        WorkerOutcome,
+        campaign_attempt_state, campaign_attempt_state_all, checkpoint_capture_note,
+        classify_worker_outcome, closed_inline_code_spans, contains_bare_exclamation_mark,
+        current_task_input_epochs, excerpt_text_window, fold_attempt_receipts, git_with_input,
+        integration_branch, merge_local, publish_closing_summary, read_capture_tail,
+        read_local_blob, replace_bare_exclamation_marks, validate_attempt_receipt,
+        validate_outcome_first, DiagnosisVerdict, Json, RepoConfig, WorkerOutcome,
+        CHECKPOINT_CAPTURE_MAX_BYTES, CHECKPOINT_STDERR_WINDOW_CHARS,
     };
     use tally_core::attempt_receipts::{
         AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR,
@@ -12245,5 +12315,130 @@ mod tests {
             validate_outcome_first("Finished the work!", 1_000, "proposal body"),
             Some("proposal body contains an exclamation mark".to_owned())
         );
+    }
+
+    fn excerpt_test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tally-{label}-test-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn checkpoint_capture_tail_excerpt_lifts_a_causal_error_buried_above_the_window() {
+        // A gate-run capture whose causal error sits far above the tail: the
+        // stored checkpoint stream must carry the lifted error block, not
+        // only whatever noise came last (vestige-sweep V-5).
+        let root = excerpt_test_root("checkpoint-tail-excerpt");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("capture.adapter.err");
+        let mut capture = Vec::new();
+        capture.extend_from_slice(b"note: gate setup noise line\n");
+        capture.extend_from_slice(b"error: the buried causal fixture line (checkpoint excerpt)\n");
+        capture.extend_from_slice(b"\n");
+        let block_end = capture.len();
+        while capture.len() < block_end + 4 * CHECKPOINT_CAPTURE_MAX_BYTES {
+            capture.extend_from_slice(b"warning: intervening gate noise that came later\n");
+        }
+        capture.extend_from_slice(b"noise: gate process exited with status 1\n");
+        fs::write(&path, &capture).unwrap();
+
+        let result = read_capture_tail(&path);
+        fs::remove_dir_all(&root).unwrap();
+        let (text, truncated) = result.unwrap();
+        assert!(truncated);
+        assert!(text.len() <= CHECKPOINT_CAPTURE_MAX_BYTES);
+        assert!(text.contains("error: the buried causal fixture line (checkpoint excerpt)"));
+        assert!(text.ends_with("noise: gate process exited with status 1\n"));
+    }
+
+    #[test]
+    fn checkpoint_note_excerpt_surfaces_a_causal_error_five_kb_above_the_tail() {
+        // The stored checkpoint stderr carries its causal error exactly five
+        // kilobytes above the tail: inside the stored stream's derived bound,
+        // but far outside any plain tail window of the note, so only the
+        // note's error-aware excerpt surfaces it (vestige-sweep V-5).
+        let root = excerpt_test_root("checkpoint-note-excerpt");
+        fs::create_dir_all(&root).unwrap();
+        let capture_path = root.join("checkpoint.json");
+
+        let causal = "error: the buried causal fixture line (checkpoint note)";
+        let tail_line = "noise: gate process exited with status 1";
+        let mut stderr = String::new();
+        while stderr.len() < 3 * 1024 {
+            stderr.push_str("note: gate setup noise line\n");
+        }
+        stderr.push_str(causal);
+        stderr.push('\n');
+        let error_end = stderr.len();
+        let chatter = "noise: trailing gate chatter after the causal error\n";
+        let mut remaining = 5_000 - tail_line.len() - 1;
+        while remaining >= chatter.len() {
+            stderr.push_str(chatter);
+            remaining -= chatter.len();
+        }
+        if remaining > 0 {
+            stderr.push_str(&"x".repeat(remaining - 1));
+            stderr.push('\n');
+        }
+        stderr.push_str(tail_line);
+        stderr.push('\n');
+        assert_eq!(
+            stderr.len() - error_end,
+            5_000,
+            "the causal error sits exactly five kilobytes above the tail"
+        );
+        assert!(stderr.len() <= CHECKPOINT_CAPTURE_MAX_BYTES);
+
+        let capture_json = format!(
+            concat!(
+                "{{\"schemaVersion\":1,\"campaign\":\"camp\",\"issueNumber\":7,",
+                "\"taskId\":\"task-a\",",
+                "\"taskUuid\":\"00000000-0000-4000-8000-000000000001\",",
+                "\"verdict\":\"failed\",\"exitCode\":1,\"stdout\":\"\",",
+                "\"stdoutTruncated\":false,\"stderr\":{stderr_json},",
+                "\"stderrTruncated\":true}}"
+            ),
+            stderr_json = serde_json::to_string(&stderr).unwrap()
+        );
+        fs::write(&capture_path, capture_json).unwrap();
+
+        let brief = Json::object([
+            ("path", Json::from(capture_path.display().to_string())),
+            ("postFailureEvidence", Json::from(true)),
+            ("postFailureStderr", Json::from(true)),
+        ]);
+        let note = checkpoint_capture_note(Some(&brief), "camp", "task-a");
+        fs::remove_dir_all(&root).unwrap();
+        let note = note.unwrap();
+        assert!(
+            note.contains(causal),
+            "the buried causal error must reach the checkpoint note"
+        );
+        assert!(note.contains(tail_line));
+    }
+
+    #[test]
+    fn text_window_excerpt_is_bounded_and_error_aware() {
+        // The in-memory window the checkpoint note applies keeps the same
+        // shape as the executor's file-backed excerpt: bounded, truncated,
+        // first-error-block-plus-tail.
+        let mut text = String::new();
+        text.push_str("note: setup noise\n");
+        text.push_str("fatal: the buried cause (text window)\n");
+        text.push('\n');
+        let block_end = text.len();
+        while text.len() < block_end + 3 * CHECKPOINT_STDERR_WINDOW_CHARS {
+            text.push_str("warning: noise that came later\n");
+        }
+        text.push_str("noise: exit chatter\n");
+        let excerpt = excerpt_text_window(&text, CHECKPOINT_STDERR_WINDOW_CHARS);
+        assert!(excerpt.truncated);
+        assert!(excerpt.text.len() <= CHECKPOINT_STDERR_WINDOW_CHARS);
+        assert!(excerpt
+            .text
+            .contains("fatal: the buried cause (text window)"));
+        assert!(excerpt.text.ends_with("noise: exit chatter\n"));
+
+        let small = excerpt_text_window("short capture\n", CHECKPOINT_STDERR_WINDOW_CHARS);
+        assert!(!small.truncated);
+        assert_eq!(small.text, "short capture\n");
     }
 }

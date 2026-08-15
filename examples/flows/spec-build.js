@@ -2138,6 +2138,11 @@ function bounded(value, limit) {
   return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
+// One window for gate-failure evidence and failure reports, derived from the
+// schema bound of the retry fact this evidence feeds instead of typed twice
+// as a bare numeral (vestige-sweep V-5).
+const GATE_FAILURE_DETAIL_MAX_CHARS = retryFactSchema.properties.reason.maxLength;
+
 const FORBID_PATHS_FAILURE =
   /forbidPaths gate \S+ rejected \d+ path\(s\) touched in lane history \(a later removal does not clear this; the path must never appear in any lane commit\): "((?:[^"\\]|\\.)*)"/;
 
@@ -2161,7 +2166,7 @@ function gateEvidenceForFailure(failure) {
     // error can obscure the stderr detail that names the forbidPaths breach.
     // Prefer the captured gate output: the diagnosis prompt and validator must
     // derive their literal path from the same failure the operator sees.
-    detail: bounded(detail, 2000)
+    detail: bounded(detail, GATE_FAILURE_DETAIL_MAX_CHARS)
   };
 }
 
@@ -2208,7 +2213,7 @@ function failureReport(task, stage, node) {
     taskId: task.id,
     stage,
     verdict: node && node.verdict ? node.verdict : "flow-error",
-    detail: bounded(node && node.error ? node.error : node, 2000)
+    detail: bounded(node && node.error ? node.error : node, GATE_FAILURE_DETAIL_MAX_CHARS)
   };
 }
 
@@ -3017,7 +3022,8 @@ function sweepDeferral(sweepNode) {
       ];
       // Record every terminal attempt, red or green. The command node's raw
       // files are private executor state; this deterministic node snapshots
-      // their final 8 KiB into capture/archive before cleanup removes the lane.
+      // an error-aware window of them (derived from the diagnosis slot it
+      // feeds) into capture/archive before cleanup removes the lane.
       const execution = {
         taskUuid: checkpoint.taskUuid,
         verdict: checkpoint.verdict,

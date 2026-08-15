@@ -1,7 +1,34 @@
 use super::*;
 
-pub const CAPTURE_EXCERPT_MAX_BYTES: usize = 2 * 1024;
+/// The framing margin the journal envelope reserves against the excerpt.
+///
+/// Every field of the Failed lifecycle record besides `TALLY_STDERR_TAIL`,
+/// plus the JSON framing, must fit inside this allowance so a maximal
+/// excerpt always renders inside the envelope it rides
+/// (`journal::MAX_STDOUT_RECORD_BYTES`). journal.rs re-anchors the
+/// derivation on this constant from the consumer side, so a hand-retyped
+/// numeral on either end diverges and fails.
+pub const CAPTURE_EXCERPT_FRAMING_MARGIN: usize = 16 * 1024;
+
+/// The stderr peephole every failure is read through — a derivation over
+/// its consumer, not a number somebody sized (vestige-sweep V-4). The
+/// excerpt rides in `TALLY_STDERR_TAIL` on the Failed lifecycle event, and
+/// that record's envelope is `journal::MAX_STDOUT_RECORD_BYTES`; the
+/// envelope minus the framing margin is the widest an excerpt can be and
+/// still always fit the record it feeds. The 2 KiB bare numeral this
+/// replaced rendered ~20 lines of tail, so the causal error of a cargo run
+/// — thousands of lines up — never reached the channel attribution reads.
+pub const CAPTURE_EXCERPT_MAX_BYTES: usize =
+    crate::journal::MAX_STDOUT_RECORD_BYTES - CAPTURE_EXCERPT_FRAMING_MARGIN;
+
 const CAPTURE_EXCERPT_TRUNCATION_MARKER: &str = "[... earlier captured stderr omitted ...]\n";
+/// The marker separating a lifted first-error block from the tail in an
+/// error-aware excerpt. Public because the spec-build driver's checkpoint
+/// note renders the same composition and must recognize the seam when it
+/// shortens the excerpt for the diagnosis slot.
+pub const CAPTURE_EXCERPT_GAP_MARKER: &str =
+    "[... captured stderr omitted between the first error and the tail ...]\n";
+const CAPTURE_EXCERPT_BLOCK_TRUNCATION_MARKER: &str = "[... first error block truncated ...]\n";
 
 /// How long a caller will wait for the per-unit capture lock before giving up.
 ///
@@ -331,12 +358,25 @@ pub(super) fn capture_lock_still_named(file: &File, path: &Path) -> Result<bool,
     }
 }
 
-/// Read the bounded tail of a retained stream without following links.
+/// Read a bounded, error-aware excerpt of a retained stream without
+/// following links.
 ///
 /// Failure diagnostics favor the tail because command harnesses commonly emit
-/// setup chatter before the actionable process error. Invalid UTF-8 is
-/// lossily represented for terminal display; the retained capture remains the
-/// byte-authoritative copy.
+/// setup chatter before the actionable process error — but the tail alone
+/// presents every failure as whatever noise came last, because the causal
+/// error of a long run sits thousands of lines above it (vestige-sweep V-4).
+/// Once a capture outgrows the window the excerpt is therefore error-aware:
+/// a probe of the capture's head, where the FIRST error block is lifted
+/// from, plus the tail. Invalid UTF-8 is lossily represented for terminal
+/// display; the retained capture remains the byte-authoritative copy, and
+/// the failure fact carries its path — nothing is lost by widening a
+/// rendering.
+///
+/// Both reads are bounded by the window no matter how large the capture is:
+/// the probe reads at most one window from the head of the capture and the
+/// tail reads the final window. A causal error deeper than one window into
+/// the head and higher than one window above the tail stays on disk at the
+/// capture path the failure fact carries.
 pub fn read_capture_excerpt(path: &Path) -> Result<CaptureExcerpt, ExecutorError> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -351,11 +391,44 @@ pub fn read_capture_excerpt(path: &Path) -> Result<CaptureExcerpt, ExecutorError
         )));
     }
     let max = CAPTURE_EXCERPT_MAX_BYTES as u64;
-    let start = metadata.len().saturating_sub(max);
+    if metadata.len() <= max {
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|source| io_error(path, source))?;
+        return Ok(CaptureExcerpt {
+            text: excerpt_text_of(&bytes),
+            truncated: false,
+        });
+    }
+    let probe_len = max.min(metadata.len() - max);
+    let probe = read_capture_window(&mut file, path, 0, probe_len)?;
+    let tail = read_capture_window(&mut file, path, metadata.len() - max, max)?;
+    let excerpt = compose_capture_excerpt(
+        &excerpt_text_of(&probe),
+        &excerpt_text_of(&tail),
+        probe_len == metadata.len() - max,
+        CAPTURE_EXCERPT_MAX_BYTES,
+    );
+    if excerpt.text.len() > CAPTURE_EXCERPT_MAX_BYTES {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "capture excerpt exceeded the {CAPTURE_EXCERPT_MAX_BYTES} byte bound"
+        )));
+    }
+    Ok(excerpt)
+}
+
+/// Read one window of a capture without following links, dropping a partial
+/// UTF-8 prefix when the window starts mid-codepoint.
+fn read_capture_window(
+    file: &mut File,
+    path: &Path,
+    start: u64,
+    len: u64,
+) -> Result<Vec<u8>, ExecutorError> {
     file.seek(SeekFrom::Start(start))
         .map_err(|source| io_error(path, source))?;
-    let mut bytes = Vec::with_capacity((metadata.len() - start) as usize);
-    file.take(max)
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(len)
         .read_to_end(&mut bytes)
         .map_err(|source| io_error(path, source))?;
     if start > 0 {
@@ -365,33 +438,121 @@ pub fn read_capture_excerpt(path: &Path) -> Result<CaptureExcerpt, ExecutorError
             .count();
         bytes.drain(..partial_prefix);
     }
-    let mut truncated = start > 0;
-    let mut text = String::from_utf8_lossy(&bytes).replace('\0', "�");
-    let plain_limit = if truncated {
-        CAPTURE_EXCERPT_MAX_BYTES - CAPTURE_EXCERPT_TRUNCATION_MARKER.len()
-    } else {
-        CAPTURE_EXCERPT_MAX_BYTES
-    };
-    if text.len() > plain_limit {
-        truncated = true;
-    }
-    if truncated {
-        let tail_limit = CAPTURE_EXCERPT_MAX_BYTES - CAPTURE_EXCERPT_TRUNCATION_MARKER.len();
-        if text.len() > tail_limit {
-            let mut start = text.len() - tail_limit;
-            while !text.is_char_boundary(start) {
-                start += 1;
+    Ok(bytes)
+}
+
+fn excerpt_text_of(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace('\0', "�")
+}
+
+/// Compose the error-aware excerpt of one capture from two already-read
+/// windows of it: `probe`, the capture's head, where the causal error of a
+/// build-shaped failure sits, and `tail`, the final window, where harnesses
+/// emit the exit noise. The composition fits `max_bytes` and carries the
+/// first error block found in the probe plus the tail — or, for a capture
+/// whose probe names no error, the tail alone, exactly the historical shape.
+/// `windows_contiguous` says whether the probe ends exactly where the tail
+/// begins; when it does and the lifted block reaches the probe's end, no
+/// bytes were omitted between block and tail and no gap marker is written.
+pub fn compose_capture_excerpt(
+    probe: &str,
+    tail: &str,
+    windows_contiguous: bool,
+    max_bytes: usize,
+) -> CaptureExcerpt {
+    let mut text = match first_error_block(probe) {
+        Some((block_start, block_end)) => {
+            let mut text = String::new();
+            if block_start > 0 {
+                text.push_str(CAPTURE_EXCERPT_TRUNCATION_MARKER);
             }
-            text.drain(..start);
+            // The lifted block receives at most half the window so the tail
+            // always keeps the other half.
+            let block_budget = max_bytes / 2;
+            let mut block = &probe[block_start..block_end];
+            if block.len() > block_budget {
+                let mut cut = block_budget;
+                while !block.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                block = &block[..cut];
+                text.push_str(block);
+                text.push_str(CAPTURE_EXCERPT_BLOCK_TRUNCATION_MARKER);
+            } else {
+                text.push_str(block);
+            }
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            let omitted_after_block = !windows_contiguous || block_end < probe.len();
+            if omitted_after_block {
+                text.push_str(CAPTURE_EXCERPT_GAP_MARKER);
+            }
+            let tail_budget = max_bytes.saturating_sub(text.len());
+            text.push_str(fit_window_tail(tail, tail_budget));
+            text
         }
-        text.insert_str(0, CAPTURE_EXCERPT_TRUNCATION_MARKER);
+        None => {
+            let tail_budget = max_bytes.saturating_sub(CAPTURE_EXCERPT_TRUNCATION_MARKER.len());
+            let mut text = CAPTURE_EXCERPT_TRUNCATION_MARKER.to_owned();
+            text.push_str(fit_window_tail(tail, tail_budget));
+            text
+        }
+    };
+    if text.len() > max_bytes {
+        text = fit_window_tail(&text, max_bytes).to_owned();
     }
-    if text.len() > CAPTURE_EXCERPT_MAX_BYTES {
-        return Err(ExecutorError::InvalidRequest(format!(
-            "capture excerpt exceeded the {CAPTURE_EXCERPT_MAX_BYTES} byte bound"
-        )));
+    CaptureExcerpt {
+        text,
+        truncated: true,
     }
-    Ok(CaptureExcerpt { text, truncated })
+}
+
+/// The suffix of `text` that fits `budget`, snapped to a char boundary.
+fn fit_window_tail(text: &str, budget: usize) -> &str {
+    if text.len() <= budget {
+        return text;
+    }
+    let mut start = text.len() - budget;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// The byte range of the first error block in `text`, when one is present:
+/// the first error-marker line through the line before the next blank line
+/// or the next error marker (or the end of the text).
+fn first_error_block(text: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut block_start: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        match block_start {
+            None => {
+                if is_excerpt_error_marker(line) {
+                    block_start = Some(start);
+                }
+            }
+            Some(begin) => {
+                if line.trim().is_empty() || is_excerpt_error_marker(line) {
+                    return Some((begin, start));
+                }
+            }
+        }
+    }
+    block_start.map(|begin| (begin, text.len()))
+}
+
+/// The line shapes that name a causal failure in the toolchains the fleet
+/// runs: rustc and cargo name the error itself (`error: ...`,
+/// `error[E0308]: ...`) and git names a fatal condition (`fatal: ...`). The
+/// FIRST such line of a capture is the one attribution wants; everything
+/// after it is the noise that came last.
+fn is_excerpt_error_marker(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("error:") || trimmed.starts_with("error[") || trimmed.starts_with("fatal:")
 }
 
 pub(super) fn write_capture_generation(
