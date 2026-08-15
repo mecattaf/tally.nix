@@ -52,8 +52,8 @@ fn request() -> ExecutionRequest {
             ("zeta".to_owned(), PathBuf::from("/run/keys/zeta")),
         ]),
         limits: UnitLimits {
-            cpu_weight: 250,
-            memory_max_bytes: 1_073_741_824,
+            cpu_weight: Some(250),
+            memory_max_bytes: Some(1_073_741_824),
         },
         runtime_max_sec: Some(30),
     }
@@ -532,6 +532,42 @@ fn systemd_argv_is_direct_stable_and_complete() {
 }
 
 #[test]
+fn absent_limits_render_no_memory_cap_or_cpu_weight_on_the_job_unit() {
+    // A job nobody gave limits to renders neither directive: the unit runs
+    // under the host's own accounting (vestige-sweep V-1). Red before the
+    // cap was deleted, when both directives were stamped unconditionally.
+    let mut request = request();
+    request.limits = UnitLimits::default();
+    let args = strings(
+        &executor(Path::new("/state"))
+            .build_systemd_argv(&request)
+            .unwrap(),
+    );
+    let joined = args.join("\n");
+    assert!(!joined.contains("MemoryMax="), "{joined}");
+    assert!(!joined.contains("CPUWeight="), "{joined}");
+}
+
+#[test]
+fn a_declared_memory_cap_renders_without_an_undeclared_cpu_weight() {
+    let mut request = request();
+    request.limits = UnitLimits {
+        cpu_weight: None,
+        memory_max_bytes: Some(2_147_483_648),
+    };
+    let args = strings(
+        &executor(Path::new("/state"))
+            .build_systemd_argv(&request)
+            .unwrap(),
+    );
+    assert!(args
+        .windows(2)
+        .any(|pair| pair == ["--property", "MemoryMax=2147483648"]));
+    let joined = args.join("\n");
+    assert!(!joined.contains("CPUWeight="), "{joined}");
+}
+
+#[test]
 fn campaign_task_ref_names_the_unit_captures_gate_and_child_environment() {
     let mut request = request();
     request.identity.task_ref = Some(TaskRef::new("crm/t07").unwrap());
@@ -895,13 +931,13 @@ fn invalid_limits_runtime_paths_and_credentials_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let executor = executor(temp.path());
     let mut invalid = request();
-    invalid.limits.cpu_weight = 0;
+    invalid.limits.cpu_weight = Some(0);
     assert!(executor.build_systemd_argv(&invalid).is_err());
     invalid = request();
-    invalid.limits.memory_max_bytes = 0;
+    invalid.limits.memory_max_bytes = Some(0);
     assert!(executor.build_systemd_argv(&invalid).is_err());
     invalid = request();
-    invalid.limits.memory_max_bytes = u64::MAX;
+    invalid.limits.memory_max_bytes = Some(u64::MAX);
     assert!(executor.build_systemd_argv(&invalid).is_err());
     invalid = request();
     invalid.runtime_max_sec = Some(0);
@@ -2381,8 +2417,8 @@ fn fixture_request(pool: &str) -> ExecutionRequest {
         extra_writable_paths: Vec::new(),
         credentials: BTreeMap::new(),
         limits: UnitLimits {
-            cpu_weight: 100,
-            memory_max_bytes: 1024 * 1024,
+            cpu_weight: Some(100),
+            memory_max_bytes: Some(1024 * 1024),
         },
         runtime_max_sec: None,
     }

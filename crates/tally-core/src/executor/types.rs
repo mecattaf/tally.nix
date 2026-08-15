@@ -103,11 +103,20 @@ impl ExecutionIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Resource limits for a job unit, each one optional.
+///
+/// A `None` field renders no systemd directive at all, and the unit runs
+/// under the host's own accounting. Absence is a first-class, expressible
+/// state and never a validation error: an unauthored global cap once
+/// SIGKILLed every compiling lane and gate on the host (vestige-sweep V-1),
+/// so a limit reaches a unit only when someone declared it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UnitLimits {
-    pub cpu_weight: u16,
-    pub memory_max_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_weight: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

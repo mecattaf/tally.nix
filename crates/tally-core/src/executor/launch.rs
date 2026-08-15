@@ -20,16 +20,19 @@ impl Executor {
             "--expand-environment=no".into(),
         ];
         push_pair(&mut args, "--property", "Type=exec");
-        push_pair(
-            &mut args,
-            "--property",
-            format!("CPUWeight={}", request.limits.cpu_weight),
-        );
-        push_pair(
-            &mut args,
-            "--property",
-            format!("MemoryMax={}", request.limits.memory_max_bytes),
-        );
+        // A limit reaches a unit only when someone declared it: a `None`
+        // field emits no directive at all, and the job runs under the host's
+        // own accounting (vestige-sweep V-1).
+        if let Some(cpu_weight) = request.limits.cpu_weight {
+            push_pair(&mut args, "--property", format!("CPUWeight={cpu_weight}"));
+        }
+        if let Some(memory_max_bytes) = request.limits.memory_max_bytes {
+            push_pair(
+                &mut args,
+                "--property",
+                format!("MemoryMax={memory_max_bytes}"),
+            );
+        }
         if let Some(seconds) = request.runtime_max_sec {
             push_pair(&mut args, "--property", format!("RuntimeMaxSec={seconds}s"));
         }

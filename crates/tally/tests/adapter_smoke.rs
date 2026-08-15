@@ -187,8 +187,8 @@ fn policy_adapter(root: &Path, file: &str, body: &str) -> AdapterConfig {
 fn settings() -> DaemonSettings {
     DaemonSettings {
         unit_limits: UnitLimits {
-            cpu_weight: 100,
-            memory_max_bytes: 64 * 1024 * 1024,
+            cpu_weight: Some(100),
+            memory_max_bytes: Some(64 * 1024 * 1024),
         },
         yield_grace: Duration::from_secs(1),
         recovery_policy: RecoveryPolicy {

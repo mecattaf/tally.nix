@@ -82,8 +82,8 @@ fn config() -> Config {
 fn settings() -> DaemonSettings {
     DaemonSettings {
         unit_limits: UnitLimits {
-            cpu_weight: 100,
-            memory_max_bytes: 256 * 1024 * 1024,
+            cpu_weight: Some(100),
+            memory_max_bytes: Some(256 * 1024 * 1024),
         },
         yield_grace: Duration::from_secs(2),
         recovery_policy: RecoveryPolicy {

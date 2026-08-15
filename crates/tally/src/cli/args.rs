@@ -963,8 +963,12 @@ pub(super) enum DaemonCommand {
     Run {
         #[arg(long)]
         mock: bool,
+        /// CPUWeight for job units. Optional: a value nobody passed renders
+        /// no directive on the unit (vestige-sweep V-1).
         #[arg(long)]
         cpu_weight: Option<u16>,
+        /// MemoryMax for job units, in bytes. Optional: a value nobody
+        /// passed renders no cap on the unit (vestige-sweep V-1).
         #[arg(long)]
         memory_max_bytes: Option<u64>,
         #[arg(long, value_name = "PATH")]

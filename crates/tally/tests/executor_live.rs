@@ -87,8 +87,8 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         extra_writable_paths: Vec::new(),
         credentials: BTreeMap::new(),
         limits: UnitLimits {
-            cpu_weight: 250,
-            memory_max_bytes: 512 * 1024 * 1024,
+            cpu_weight: Some(250),
+            memory_max_bytes: Some(512 * 1024 * 1024),
         },
         runtime_max_sec: Some(10),
     }

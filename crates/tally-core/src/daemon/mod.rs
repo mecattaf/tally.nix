@@ -347,15 +347,21 @@ pub struct DaemonSettings {
 
 impl DaemonSettings {
     pub fn validate(self) -> Result<Self, DaemonError> {
-        if !(1..=10_000).contains(&self.unit_limits.cpu_weight) {
-            return Err(DaemonError::Invalid(
-                "CPUWeight must be in 1..=10000".to_owned(),
-            ));
+        // Declared limits must be expressible in systemd; absent ones are
+        // valid by construction (vestige-sweep V-1).
+        if let Some(cpu_weight) = self.unit_limits.cpu_weight {
+            if !(1..=10_000).contains(&cpu_weight) {
+                return Err(DaemonError::Invalid(
+                    "CPUWeight must be in 1..=10000".to_owned(),
+                ));
+            }
         }
-        if self.unit_limits.memory_max_bytes == 0 || self.unit_limits.memory_max_bytes == u64::MAX {
-            return Err(DaemonError::Invalid(
-                "MemoryMax must be positive and finite".to_owned(),
-            ));
+        if let Some(memory_max_bytes) = self.unit_limits.memory_max_bytes {
+            if memory_max_bytes == 0 || memory_max_bytes == u64::MAX {
+                return Err(DaemonError::Invalid(
+                    "MemoryMax must be positive and finite".to_owned(),
+                ));
+            }
         }
         if self.yield_grace.is_zero() {
             return Err(DaemonError::Invalid(

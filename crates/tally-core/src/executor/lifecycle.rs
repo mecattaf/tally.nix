@@ -675,15 +675,21 @@ impl Executor {
                 )));
             }
         }
-        if !(1..=10_000).contains(&request.limits.cpu_weight) {
-            return Err(ExecutorError::InvalidRequest(
-                "CPUWeight must be in 1..=10000".to_owned(),
-            ));
+        // Declared limits must be expressible in systemd; absent ones are
+        // valid by construction (vestige-sweep V-1).
+        if let Some(cpu_weight) = request.limits.cpu_weight {
+            if !(1..=10_000).contains(&cpu_weight) {
+                return Err(ExecutorError::InvalidRequest(
+                    "CPUWeight must be in 1..=10000".to_owned(),
+                ));
+            }
         }
-        if request.limits.memory_max_bytes == 0 || request.limits.memory_max_bytes == u64::MAX {
-            return Err(ExecutorError::InvalidRequest(
-                "MemoryMax must be positive and finite".to_owned(),
-            ));
+        if let Some(memory_max_bytes) = request.limits.memory_max_bytes {
+            if memory_max_bytes == 0 || memory_max_bytes == u64::MAX {
+                return Err(ExecutorError::InvalidRequest(
+                    "MemoryMax must be positive and finite".to_owned(),
+                ));
+            }
         }
         if let Some(seconds) = request.runtime_max_sec {
             if seconds == 0 || seconds >= u64::MAX / 1_000_000 {

@@ -24,10 +24,6 @@ let
     socketPath
     "daemon"
     "run"
-    "--cpu-weight"
-    "100"
-    "--memory-max-bytes"
-    "8589934592"
     "--state-dir"
     (toString cfg.stateDir)
     "--data-dir"
@@ -101,7 +97,25 @@ in
   config = lib.mkMerge [
     {
       services.tally.adapters = common.adapterDefaults;
-      assertions = unsupportedConfigAssertions;
+      assertions = unsupportedConfigAssertions ++ [
+        # A job carries no limit nobody declared (vestige-sweep V-1): the
+        # daemon argv renders no job-limit flags at all. This evaluation-time
+        # assertion pins the flag set the argv may carry, so no limit flag
+        # can ride back into the unit rendering; the module-layer flake
+        # check forces this module's config, so it grades under
+        # checks.<system>.module-layer.
+        {
+          assertion =
+            builtins.filter (token: lib.hasPrefix "--" token) daemonArgv == [
+              "--config"
+              "--socket"
+              "--state-dir"
+              "--data-dir"
+              "--yield-grace-sec"
+            ];
+          message = "services.tally: the daemon argv must carry no flag beyond the sanctioned set — job limits are declared per job or not at all (vestige-sweep V-1)";
+        }
+      ];
     }
     # The generic runtime contract shared with Home Manager: resource pools,
     # driver adapter, and fanout floor. `tally campaign arm` validates this host
@@ -220,7 +234,12 @@ in
             captureArchiveDir
           ];
           ExecStart = daemonWrapper;
-          CPUWeight = 100;
+          # Ruled backstop (vestige-sweep V-12), not a job cap: the daemon is a
+          # small process, and if it ever reaches this limit the recovery stays
+          # legible — Restart=always brings it back and the 30s watchdog bounds
+          # the wedged interval. The CPUWeight line was deleted as a restatement
+          # of systemd's own default weight; job units carry no limit nobody
+          # declared (V-1) and receive no limit flags in the argv above.
           MemoryMax = "8G";
           UMask = "0077";
           NoNewPrivileges = true;
