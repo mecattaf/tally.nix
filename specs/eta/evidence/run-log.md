@@ -17,6 +17,20 @@ lands scraped totals; the window is 10,000 credits, reset ~2026-08-22.
 | 4 | 08-15 16:14–16:57 | oom-legibility attempt 1 — MERGED first try | flagship | 66 | 139,379 | 55,220 | 0 | ≈377 | ≈9,036 |
 | 5 | 08-15 17:13–17:55 | excerpt-derivations attempt 1 — MERGED first try | flagship | 101 | 197,959 | 90,205 | 0 | ≈591 | ≈8,445 |
 | 6 | 08-15 18:07–18:46 | adapter-relative-policies attempt 1 — gate-refused | flagship | ~125 | ~200,000 | ~85,000 | 0 | ≈570 | ≈7,875 |
+| 7 | 08-15 18:55–19:42 | adapter-relative-policies attempt 2 — typed refusal (driver corpus outside domains) | flagship | 187 | — | — | 0 | ≈670 | ≈7,205 |
+
+## Attempts 6–7 postmortem: the drip stops with a supervisor enumeration
+
+S4's true consumer surface is eighteen files across six crates, the JS
+flow, the presets, the python driver corpus, and the final-bar cases —
+the cross-adapter literals are baked everywhere, which is what made V-15
+the severity it was. The vestige ledger's four-domain list undersized the
+blast radius, and each attempt found exactly one more wall (correct
+behavior, expensive recon). Amendment 4 grants the grep-enumerated
+surface and writes the file list into the goal so attempt 3 spends its
+turns editing, not re-deriving. Standing lesson for later sittings:
+before arming a delete-a-default task, grep the default's name and put
+every hit inside the boundary.
 
 ## Attempt 6 — adapter-relative-policies (cargo-tests gate catch; domain gap again)
 
