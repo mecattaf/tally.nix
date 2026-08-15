@@ -712,6 +712,71 @@ pub fn executable_digest(
     Ok(format!("sha256:{:x}", Sha256::digest(bytes.as_bytes())))
 }
 
+/// Stable identity of the authored inputs that belong to one task.
+///
+/// Capacity, repository, agent, and merge policy are deliberately absent.
+/// They do not constitute new instructions to this task. The task reference
+/// and content are its own admitted bytes, while the campaign gate set is the
+/// one global input whose change alters every task attempt.
+pub fn task_input_hash(
+    manifest: &CampaignManifest,
+    reference: &CampaignTaskReference,
+    content: &CanonicalCampaignTaskV1,
+) -> Result<String, CampaignContractError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TaskInput<'a> {
+        contract_version: u32,
+        task: &'a CampaignTaskReference,
+        content: &'a CanonicalCampaignTaskV1,
+        gates: &'a [CampaignGate],
+    }
+
+    let bytes = canonical_json(TaskInput {
+        contract_version: 1,
+        task: reference,
+        content,
+        gates: &manifest.gates,
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes.as_bytes())))
+}
+
+/// Epoch identity for one task attempt input.
+///
+/// Steering record IDs are one campaign-wide append-only sequence. The high
+/// water supplied here is the greatest record addressed either campaign-wide
+/// or directly to this task.
+pub fn task_input_epoch(
+    task_input_hash: &str,
+    steering_high_water: u64,
+) -> Result<String, CampaignContractError> {
+    if task_input_hash.len() != 71
+        || !task_input_hash.starts_with("sha256:")
+        || !task_input_hash[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "task input hash must be a lowercase SHA-256 identity",
+        ));
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AttemptInput<'a> {
+        contract_version: u32,
+        task_input_hash: &'a str,
+        steering_high_water: u64,
+    }
+
+    let bytes = canonical_json(AttemptInput {
+        contract_version: 1,
+        task_input_hash,
+        steering_high_water,
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes.as_bytes())))
+}
+
 /// Revision identity for one task's durable completion proof.
 ///
 /// The campaign's full executable digest remains the admission boundary, but
@@ -1016,6 +1081,78 @@ mod tests {
             revision,
             "global execution policy changes must invalidate prior task proof"
         );
+    }
+
+    #[test]
+    fn task_input_epoch_changes_only_for_task_gates_or_addressed_steering() {
+        let manifest: CampaignManifest = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "name": "fixture",
+            "repository": {"checkout": "/srv/fixture", "forge": "github"},
+            "agent": {},
+            "gates": [{
+                "kind": "command",
+                "id": "tests",
+                "preflightArgv": ["true"],
+                "argv": ["cargo", "test"]
+            }],
+            "tasks": [{
+                "id": "build",
+                "kind": "implementation",
+                "issue": 8,
+                "dependencies": [],
+                "conflictDomains": ["src/build"]
+            }]
+        }))
+        .unwrap();
+        let content = CanonicalCampaignTaskV1 {
+            number: 8,
+            title: "Build the feature".to_owned(),
+            body: "Implement the admitted feature.".to_owned(),
+        };
+        let input = task_input_hash(&manifest, &manifest.tasks[0], &content).unwrap();
+        let epoch = task_input_epoch(&input, 4).unwrap();
+
+        let mut unrelated = manifest.clone();
+        unrelated.max_parallel = 8;
+        unrelated.tasks.push(
+            serde_json::from_value(json!({
+                "id": "docs",
+                "kind": "implementation",
+                "issue": 9,
+                "dependencies": []
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            task_input_hash(&unrelated, &unrelated.tasks[0], &content).unwrap(),
+            input
+        );
+
+        let mut changed_task = content.clone();
+        changed_task.body.push_str(" Add the amended behavior.");
+        assert_ne!(
+            task_input_hash(&manifest, &manifest.tasks[0], &changed_task).unwrap(),
+            input
+        );
+
+        let mut changed_gates = manifest.clone();
+        changed_gates.gates[0] = CampaignGate::Command {
+            id: "tests".to_owned(),
+            preflight_argv: vec!["true".to_owned()],
+            argv: vec![
+                "cargo".to_owned(),
+                "test".to_owned(),
+                "--workspace".to_owned(),
+            ],
+            runtime_max_sec: 900,
+        };
+        assert_ne!(
+            task_input_hash(&changed_gates, &changed_gates.tasks[0], &content).unwrap(),
+            input
+        );
+        assert_ne!(task_input_epoch(&input, 5).unwrap(), epoch);
+        assert_eq!(task_input_epoch(&input, 4).unwrap(), epoch);
     }
 
     #[test]

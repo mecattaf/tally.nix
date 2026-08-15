@@ -13,6 +13,8 @@ pub const ATTEMPT_RECEIPT_SCHEMA_VERSION: u64 = 2;
 pub const ATTEMPT_RECEIPT_AUTHORITY_SCHEMA_VERSION: u32 = 1;
 pub const ATTEMPT_RECEIPT_AUTHORITY_FILE: &str = "receipt-authority-v1.json";
 pub const ATTEMPT_RECEIPT_MACHINE_ACTOR: &str = "spec-build-driver";
+/// Un-authored safety latch across every input epoch for one stable task ID.
+pub const MAX_TASK_LIFETIME_ATTEMPTS: usize = 10;
 
 /// The arm authority published beside one campaign's attempt-receipts log.
 ///

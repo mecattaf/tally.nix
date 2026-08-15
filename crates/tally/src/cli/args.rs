@@ -183,8 +183,6 @@ pub(super) enum CampaignCommand {
     Arm(CampaignArmArgs),
     /// Append human steering to an armed campaign's local ordered log.
     Steer(CampaignSteerArgs),
-    /// Pardon an escalated campaign's counters, record why, and re-arm it.
-    Resume(CampaignResumeArgs),
     /// Render or execute the release represented by a completed campaign.
     Release(CampaignReleaseArgs),
     /// Reconcile changed armed campaigns into fresh bounded flow passes.
@@ -230,25 +228,6 @@ pub(super) struct CampaignSteerArgs {
         required_unless_present = "message"
     )]
     pub(super) message_file: Option<PathBuf>,
-    /// Durable registration root; defaults beneath tally state.
-    #[arg(long, value_name = "PATH")]
-    pub(super) state_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-pub(super) struct CampaignResumeArgs {
-    /// Code repository coordinate of an existing armed campaign.
-    #[arg(value_name = "OWNER/REPO")]
-    pub(super) code_repository: String,
-    /// Committed worklist pattern identifying the campaign.
-    #[arg(value_name = "WORKLIST")]
-    pub(super) worklist_pattern: String,
-    /// Audit reason recorded on the campaign before its counters are pardoned.
-    #[arg(long, value_name = "TEXT")]
-    pub(super) reason: String,
-    /// Wait for the newly admitted reconcile pass to become terminal.
-    #[arg(long)]
-    pub(super) wait: bool,
     /// Durable registration root; defaults beneath tally state.
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
@@ -900,7 +879,8 @@ pub(super) enum QueueCommand {
         #[arg(long)]
         all: bool,
     },
-    Resume {
+    #[command(name = "resume")]
+    Unpause {
         pool: Option<String>,
         #[arg(long)]
         all: bool,

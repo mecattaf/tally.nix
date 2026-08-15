@@ -10,10 +10,11 @@ use std::process::Command;
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, SecondsFormat, Utc};
 use regex::Regex;
 use tally_core::attempt_receipts::{
-    validate_attempt_receipt_stamp, AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE,
-    ATTEMPT_RECEIPT_MACHINE_ACTOR, ATTEMPT_RECEIPT_SCHEMA_VERSION,
-    LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+    is_sha256_identity, validate_attempt_receipt_stamp, AttemptReceiptAuthorityV1,
+    ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR, ATTEMPT_RECEIPT_SCHEMA_VERSION,
+    LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION, MAX_TASK_LIFETIME_ATTEMPTS,
 };
+use tally_core::campaign_contract::task_input_epoch;
 use tally_core::campaign_folds::{
     campaign_digest as fold_campaign_digest, render_campaign_summary, stable_publish_branch,
     stage_scoped_summary_ref, CampaignReconciliation,
@@ -1206,6 +1207,124 @@ fn case_sensitive_component_glob(text: &str, pattern: &str) -> bool {
 
 fn canonical_sha256(value: &Json) -> String {
     format!("sha256:{}", sha256::digest(value.stringify().as_bytes()))
+}
+
+fn current_task_input_epochs(
+    tasks: &[Json],
+    gate_set: Option<&Json>,
+    steering_high_water: Option<&Json>,
+    admitted_hashes: Option<&Json>,
+) -> Result<BTreeMap<String, String>> {
+    if gate_set.is_none() && steering_high_water.is_none() && admitted_hashes.is_none() {
+        // Compatibility action briefs predate epoch derivation. Their stamped
+        // and unstamped receipts remain conservative until a current flow
+        // supplies the complete input tuple.
+        return Ok(BTreeMap::new());
+    }
+    let gates = gate_set
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new("gateSet must be an array for epoch derivation"))?;
+    let mut gate_ids = BTreeSet::new();
+    for (index, gate) in gates.iter().enumerate() {
+        let id = validate_campaign_gate(gate, &format!("gateSet[{index}]"))?;
+        if !gate_ids.insert(id.clone()) {
+            return Err(DriverError::new(format!("gateSet repeats gate id {id:?}")));
+        }
+    }
+
+    let high_water = object_complete(
+        steering_high_water.ok_or_else(|| {
+            DriverError::new("steeringHighWater is required for epoch derivation")
+        })?,
+        &["campaign", "tasks"],
+        "steeringHighWater",
+    )?;
+    let campaign_high_water = high_water
+        .get("campaign")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| DriverError::new("steeringHighWater.campaign must be an integer"))?;
+    let task_high_waters = high_water
+        .get("tasks")
+        .and_then(Json::as_object)
+        .ok_or_else(|| DriverError::new("steeringHighWater.tasks must be an object"))?;
+    if task_high_waters.len() > MAX_CAMPAIGN_TASKS
+        || task_high_waters.keys().any(|task_id| !is_task_id(task_id))
+        || task_high_waters
+            .values()
+            .any(|value| value.as_u64().is_none())
+    {
+        return Err(DriverError::new(
+            "steeringHighWater.tasks must map at most 128 safe task IDs to integers",
+        ));
+    }
+
+    let admitted_hashes = admitted_hashes.map(|value| {
+        let hashes = value
+            .as_object()
+            .ok_or_else(|| DriverError::new("taskInputHashes must be an object"))?;
+        if hashes.len() > MAX_CAMPAIGN_TASKS {
+            return Err(DriverError::new("taskInputHashes exceeds 128 tasks"));
+        }
+        hashes
+            .iter()
+            .map(|(task_id, value)| {
+                if !is_task_id(task_id) {
+                    return Err(DriverError::new(
+                        "taskInputHashes contains an unsafe task ID",
+                    ));
+                }
+                let hash =
+                    required_string(Some(value), &format!("taskInputHashes.{task_id}"), Some(71))?;
+                if !is_sha256_identity(&hash) {
+                    return Err(DriverError::new(format!(
+                        "taskInputHashes.{task_id} must be a lowercase SHA-256 identity"
+                    )));
+                }
+                Ok((task_id.clone(), hash))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+    });
+    let admitted_hashes = admitted_hashes.transpose()?;
+
+    let task_ids = tasks
+        .iter()
+        .map(|task| task_id(task).map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
+    if let Some(hashes) = &admitted_hashes {
+        if hashes.keys().cloned().collect::<BTreeSet<_>>() != task_ids {
+            return Err(DriverError::new(
+                "taskInputHashes must name exactly the reconciled tasks",
+            ));
+        }
+    }
+    tasks
+        .iter()
+        .map(|task| {
+            let task_id = task_id(task)?.to_owned();
+            let input_hash = if let Some(hashes) = &admitted_hashes {
+                hashes
+                    .get(&task_id)
+                    .expect("the admitted hash key set was checked")
+                    .clone()
+            } else {
+                let mut authored_task = task_object(task, "epoch task")?.clone();
+                authored_task.remove("revision");
+                canonical_sha256(&Json::object([
+                    ("contractVersion", Json::Number("1".to_owned())),
+                    ("task", Json::Object(authored_task)),
+                    ("gates", Json::Array(gates.to_vec())),
+                ]))
+            };
+            let addressed = task_high_waters
+                .get(&task_id)
+                .and_then(Json::as_u64)
+                .unwrap_or(campaign_high_water)
+                .max(campaign_high_water);
+            let epoch = task_input_epoch(&input_hash, addressed)
+                .map_err(|error| DriverError::new(error.to_string()))?;
+            Ok((task_id, epoch))
+        })
+        .collect()
 }
 
 fn file_task_completion_revision(
@@ -3070,6 +3189,9 @@ fn action_escalate(brief: &Json) -> Result<Json> {
             "worklist",
             "maxTasks",
             "maxParallel",
+            "gateSet",
+            "steeringHighWater",
+            "taskInputHashes",
             "attemptReceipts",
             "specRepository",
             "issueRepository",
@@ -4830,6 +4952,7 @@ struct VisibleAttempt {
     attempt: u64,
     comment: String,
     text: String,
+    input_epoch: Option<String>,
     verdict: Option<DiagnosisVerdict>,
     proposal: Option<Json>,
 }
@@ -4911,6 +5034,7 @@ struct VisibleWorkerOutcome {
     task_revision: String,
     task_uuid: String,
     comment: String,
+    input_epoch: Option<String>,
     outcome: WorkerOutcome,
 }
 
@@ -4948,6 +5072,8 @@ struct AttemptState {
     retries: Vec<VisibleAttempt>,
     outcomes: Vec<VisibleWorkerOutcome>,
     escalation: Option<String>,
+    lifetime_attempts: BTreeMap<String, usize>,
+    lifetime_exhausted: BTreeSet<String>,
     warnings: Vec<String>,
 }
 
@@ -4956,11 +5082,16 @@ struct AttemptKinds<'a, T> {
     retries: &'a mut BTreeMap<String, Vec<T>>,
 }
 
+struct AttemptFoldInputs<'a> {
+    task_revisions: &'a BTreeMap<String, Option<String>>,
+    current_epochs: &'a BTreeMap<String, String>,
+}
+
 fn attempt_receipts_path(value: Option<&Json>, campaign: &str) -> Result<PathBuf> {
     let source = value.ok_or_else(|| DriverError::new("attemptReceipts must be an object"))?;
     let source = object_exact(
         source,
-        &["schemaVersion", "kind", "path"],
+        &["schemaVersion", "kind", "path", "inputEpochs"],
         "attemptReceipts",
     )?;
     if source.get("schemaVersion").and_then(Json::as_u64) != Some(1)
@@ -4996,6 +5127,47 @@ fn attempt_receipts_path(value: Option<&Json>, campaign: &str) -> Result<PathBuf
         ));
     }
     Ok(path)
+}
+
+fn attempt_receipt_input_epochs(value: Option<&Json>) -> Result<BTreeMap<String, String>> {
+    let source = value.ok_or_else(|| DriverError::new("attemptReceipts must be an object"))?;
+    let source = object_exact(
+        source,
+        &["schemaVersion", "kind", "path", "inputEpochs"],
+        "attemptReceipts",
+    )?;
+    let Some(epochs) = source.get("inputEpochs") else {
+        return Ok(BTreeMap::new());
+    };
+    let epochs = epochs
+        .as_object()
+        .ok_or_else(|| DriverError::new("attemptReceipts.inputEpochs must be an object"))?;
+    if epochs.len() > MAX_CAMPAIGN_TASKS {
+        return Err(DriverError::new(
+            "attemptReceipts.inputEpochs exceeds 128 tasks",
+        ));
+    }
+    epochs
+        .iter()
+        .map(|(task_id, epoch)| {
+            if !is_task_id(task_id) {
+                return Err(DriverError::new(
+                    "attemptReceipts.inputEpochs contains an unsafe task ID",
+                ));
+            }
+            let epoch = required_string(
+                Some(epoch),
+                &format!("attemptReceipts.inputEpochs.{task_id}"),
+                Some(71),
+            )?;
+            if !is_sha256_identity(&epoch) {
+                return Err(DriverError::new(format!(
+                    "attemptReceipts.inputEpochs.{task_id} must be a lowercase SHA-256 identity"
+                )));
+            }
+            Ok((task_id.clone(), epoch))
+        })
+        .collect()
 }
 
 fn attempt_receipt_url(campaign: &str, sequence: u64) -> String {
@@ -5118,6 +5290,11 @@ fn validate_attempt_receipt(
             )))
         }
     }
+    if schema_version == ATTEMPT_RECEIPT_SCHEMA_VERSION
+        && matches!(kind, "diagnosis" | "retry" | "worker-outcome")
+    {
+        fields.push("inputEpoch");
+    }
     let record = object_exact(candidate, &fields, &context)?;
     if record.get("sequence").and_then(Json::as_u64) != Some(expected_sequence)
         || record.get("campaign").and_then(Json::as_str) != Some(campaign)
@@ -5136,6 +5313,18 @@ fn validate_attempt_receipt(
         )
         .map_err(|error| DriverError::new(format!("{context} has invalid stamp: {error}")))?;
     }
+    let input_epoch = record
+        .get("inputEpoch")
+        .map(|value| {
+            let epoch = required_string(Some(value), &format!("{context}.inputEpoch"), Some(71))?;
+            if !is_sha256_identity(&epoch) {
+                return Err(DriverError::new(format!(
+                    "{context}.inputEpoch must be a lowercase SHA-256 identity"
+                )));
+            }
+            Ok(epoch)
+        })
+        .transpose()?;
     let comment = attempt_receipt_url(campaign, expected_sequence);
     match kind {
         "diagnosis" | "retry" => {
@@ -5194,6 +5383,7 @@ fn validate_attempt_receipt(
                         MAX_RETRY_CHARS
                     },
                 )?,
+                input_epoch,
                 verdict,
                 proposal,
             };
@@ -5278,6 +5468,7 @@ fn validate_attempt_receipt(
                 task_revision,
                 task_uuid,
                 comment,
+                input_epoch,
                 outcome,
             }))
         }
@@ -5413,7 +5604,12 @@ fn read_attempt_receipts(
 fn fold_attempt_receipts(
     events: Vec<AttemptEvent>,
     task_revisions: &BTreeMap<String, Option<String>>,
+    current_epochs: &BTreeMap<String, String>,
 ) -> Result<AttemptState> {
+    let inputs = AttemptFoldInputs {
+        task_revisions,
+        current_epochs,
+    };
     let mut visible_diagnoses = BTreeMap::<String, Vec<VisibleAttempt>>::new();
     let mut visible_retries = BTreeMap::<String, Vec<VisibleAttempt>>::new();
     let mut visible_outcomes = BTreeMap::<String, Vec<VisibleWorkerOutcome>>::new();
@@ -5421,22 +5617,44 @@ fn fold_attempt_receipts(
     let mut retry_counters = BTreeMap::<String, Vec<u64>>::new();
     let mut authority_counters = BTreeSet::<String>::new();
     let mut escalations = Vec::<(String, BTreeSet<String>, BTreeSet<String>)>::new();
+    let mut lifetime_attempts = BTreeMap::<String, usize>::new();
     let mut warnings = Vec::new();
+
+    fn belongs_to_current_epoch(
+        task_id: &str,
+        receipt_epoch: Option<&str>,
+        current_epochs: &BTreeMap<String, String>,
+    ) -> bool {
+        current_epochs.is_empty()
+            || receipt_epoch.is_none()
+            || current_epochs.get(task_id).map(String::as_str) == receipt_epoch
+    }
 
     fn keep_attempt(
         receipt: VisibleAttempt,
         diagnosis: bool,
-        task_revisions: &BTreeMap<String, Option<String>>,
+        inputs: &AttemptFoldInputs<'_>,
+        lifetime_attempts: &mut BTreeMap<String, usize>,
         counters: AttemptKinds<'_, u64>,
         visible: AttemptKinds<'_, VisibleAttempt>,
         warnings: &mut Vec<String>,
     ) {
         let kind = if diagnosis { "diagnosis" } else { "retry" };
-        if !task_revisions.contains_key(&receipt.task_id) {
+        *lifetime_attempts
+            .entry(receipt.task_id.clone())
+            .or_default() += 1;
+        if !inputs.task_revisions.contains_key(&receipt.task_id) {
             warnings.push(format!(
                 "dropped machine {kind} for '{}': the worklist no longer names that task",
                 receipt.task_id
             ));
+            return;
+        }
+        if !belongs_to_current_epoch(
+            &receipt.task_id,
+            receipt.input_epoch.as_deref(),
+            inputs.current_epochs,
+        ) {
             return;
         }
         let counters = if diagnosis {
@@ -5470,7 +5688,8 @@ fn fold_attempt_receipts(
             AttemptEvent::Diagnosis(receipt) => keep_attempt(
                 receipt,
                 true,
-                task_revisions,
+                &inputs,
+                &mut lifetime_attempts,
                 AttemptKinds {
                     diagnoses: &mut diagnosis_counters,
                     retries: &mut retry_counters,
@@ -5484,7 +5703,8 @@ fn fold_attempt_receipts(
             AttemptEvent::Retry(receipt) => keep_attempt(
                 receipt,
                 false,
-                task_revisions,
+                &inputs,
+                &mut lifetime_attempts,
                 AttemptKinds {
                     diagnoses: &mut diagnosis_counters,
                     retries: &mut retry_counters,
@@ -5515,6 +5735,13 @@ fn fold_attempt_receipts(
                     ));
                     continue;
                 }
+                if !belongs_to_current_epoch(
+                    &receipt.task_id,
+                    receipt.input_epoch.as_deref(),
+                    current_epochs,
+                ) {
+                    continue;
+                }
                 if matches!(receipt.outcome, WorkerOutcome::NeedsAuthority { .. }) {
                     authority_counters.insert(receipt.task_id.clone());
                 }
@@ -5530,7 +5757,18 @@ fn fold_attempt_receipts(
                     .map(|(task_id, _)| task_id.clone())
                     .collect();
                 contributors.extend(authority_counters.iter().cloned());
-                escalations.push((comment, contributors, BTreeSet::new()));
+                contributors.extend(
+                    lifetime_attempts
+                        .iter()
+                        .filter(|(task_id, attempts)| {
+                            task_revisions.contains_key(*task_id)
+                                && **attempts >= MAX_TASK_LIFETIME_ATTEMPTS
+                        })
+                        .map(|(task_id, _)| task_id.clone()),
+                );
+                if !contributors.is_empty() {
+                    escalations.push((comment, contributors, BTreeSet::new()));
+                }
             }
             AttemptEvent::Pardon { tasks, comment } => {
                 let mut pardoned = 0usize;
@@ -5609,11 +5847,29 @@ fn fold_attempt_receipts(
             .cmp(&right.task_id)
             .then(left.attempt.cmp(&right.attempt))
     });
+    let lifetime_exhausted = lifetime_attempts
+        .iter()
+        .filter(|(task_id, attempts)| {
+            task_revisions.contains_key(*task_id) && **attempts >= MAX_TASK_LIFETIME_ATTEMPTS
+        })
+        .map(|(task_id, _)| task_id.clone())
+        .collect::<BTreeSet<_>>();
+    for task_id in &lifetime_exhausted {
+        let attempts = lifetime_attempts
+            .get(task_id)
+            .copied()
+            .expect("an exhausted task has a lifetime count");
+        warnings.push(format!(
+            "task {task_id} latched for human attention after {attempts} lifetime attempt receipts (hard limit {MAX_TASK_LIFETIME_ATTEMPTS})"
+        ));
+    }
     Ok(AttemptState {
         diagnoses,
         retries,
         outcomes,
         escalation: escalations.into_iter().next().map(|row| row.0),
+        lifetime_attempts,
+        lifetime_exhausted,
         warnings,
     })
 }
@@ -5623,14 +5879,19 @@ fn campaign_attempt_state(
     campaign: &str,
     issue_number: &str,
     task_revisions: &BTreeMap<String, Option<String>>,
+    current_epochs: &BTreeMap<String, String>,
 ) -> Result<AttemptState> {
     fold_attempt_receipts(
         read_attempt_receipts(source, campaign, issue_number)?,
         task_revisions,
+        current_epochs,
     )
 }
 
-fn attempt_state_all(events: Vec<AttemptEvent>) -> Result<AttemptState> {
+fn attempt_state_all(
+    events: Vec<AttemptEvent>,
+    current_epochs: &BTreeMap<String, String>,
+) -> Result<AttemptState> {
     let mut task_revisions = BTreeMap::new();
     for event in &events {
         match event {
@@ -5645,7 +5906,7 @@ fn attempt_state_all(events: Vec<AttemptEvent>) -> Result<AttemptState> {
             AttemptEvent::Escalation { .. } | AttemptEvent::Pardon { .. } => {}
         }
     }
-    fold_attempt_receipts(events, &task_revisions)
+    fold_attempt_receipts(events, &task_revisions, current_epochs)
 }
 
 fn campaign_attempt_state_all(
@@ -5653,7 +5914,11 @@ fn campaign_attempt_state_all(
     campaign: &str,
     issue_number: &str,
 ) -> Result<AttemptState> {
-    attempt_state_all(read_attempt_receipts(source, campaign, issue_number)?)
+    let current_epochs = attempt_receipt_input_epochs(source)?;
+    attempt_state_all(
+        read_attempt_receipts(source, campaign, issue_number)?,
+        &current_epochs,
+    )
 }
 
 fn prepare_attempt_receipts_parent(path: &Path) -> Result<()> {
@@ -5783,6 +6048,7 @@ fn append_attempt_receipt(
     issue_number: &str,
     payload: Json,
 ) -> Result<(bool, Json)> {
+    let input_epochs = attempt_receipt_input_epochs(source)?;
     let path = attempt_receipts_path(source, campaign)?;
     prepare_attempt_receipts_parent(&path)?;
     let mut options = OpenOptions::new();
@@ -5839,10 +6105,15 @@ fn append_attempt_receipt(
         }
         let (records, events) =
             read_attempt_records_locked(&mut file, &path, campaign, issue_number, true)?;
-        let state = attempt_state_all(events)?;
+        let state = attempt_state_all(events, &input_epochs)?;
         let payload_object = payload
             .as_object()
             .ok_or_else(|| DriverError::new("attempt receipt payload must be an object"))?;
+        if payload_object.contains_key("inputEpoch") {
+            return Err(DriverError::new(
+                "attempt receipt inputEpoch is derived from attemptReceipts authority",
+            ));
+        }
         let kind = payload_object
             .get("kind")
             .and_then(Json::as_str)
@@ -5861,6 +6132,17 @@ fn append_attempt_receipt(
                 let sequence = comment_sequence(&existing.comment)?;
                 return record_with_comment(&records[sequence - 1], campaign)
                     .map(|record| (false, record));
+            }
+            if task_id
+                .and_then(|task_id| state.lifetime_attempts.get(task_id))
+                .copied()
+                .unwrap_or_default()
+                >= MAX_TASK_LIFETIME_ATTEMPTS
+            {
+                return Err(DriverError::new(format!(
+                    "task {:?} reached the hard lifetime limit of {MAX_TASK_LIFETIME_ATTEMPTS} attempt receipts",
+                    task_id.unwrap_or_default()
+                )));
             }
             let spent = active
                 .iter()
@@ -5919,6 +6201,19 @@ fn append_attempt_receipt(
             ),
         ]);
         record.extend(payload_object.clone());
+        if matches!(kind, "diagnosis" | "retry" | "worker-outcome") {
+            let task_id = payload_object
+                .get("taskId")
+                .and_then(Json::as_str)
+                .ok_or_else(|| DriverError::new("attempt receipt taskId is required"))?;
+            if let Some(epoch) = input_epochs.get(task_id) {
+                record.insert("inputEpoch".to_owned(), Json::from(epoch.clone()));
+            } else if !input_epochs.is_empty() {
+                return Err(DriverError::new(format!(
+                    "attemptReceipts.inputEpochs has no current epoch for task {task_id:?}"
+                )));
+            }
+        }
         let record = Json::Object(record);
         validate_attempt_receipt(&record, &path, sequence, campaign, issue_number)?;
         let line = format!("{}\n", record.stringify());
@@ -6652,6 +6947,9 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
         "worklist",
         "maxTasks",
         "maxParallel",
+        "gateSet",
+        "steeringHighWater",
+        "taskInputHashes",
         "attemptReceipts",
     ];
     if brief
@@ -6758,11 +7056,24 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
             ))
         })
         .collect::<Result<_>>()?;
+    let input_epochs = current_task_input_epochs(
+        &tasks,
+        data.get("gateSet"),
+        data.get("steeringHighWater"),
+        data.get("taskInputHashes"),
+    )?;
+    let carried_epochs = attempt_receipt_input_epochs(data.get("attemptReceipts"))?;
+    if !carried_epochs.is_empty() && carried_epochs != input_epochs {
+        return Err(DriverError::new(
+            "attemptReceipts.inputEpochs disagrees with the reconciled input",
+        ));
+    }
     let mut attempts = campaign_attempt_state(
         data.get("attemptReceipts"),
         &campaign,
         &issue_number,
         &task_revisions,
+        &input_epochs,
     )?;
     let order: BTreeMap<_, _> = tasks
         .iter()
@@ -6807,6 +7118,13 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
                     && !completed_ids.contains(&outcome.task_id)
             })
             .map(|outcome| outcome.task_id.clone()),
+    );
+    direct_blocked.extend(
+        attempts
+            .lifetime_exhausted
+            .iter()
+            .filter(|task_id| !completed_ids.contains(*task_id))
+            .cloned(),
     );
     let mut blocked_by = BTreeMap::<String, BTreeSet<String>>::new();
     let mut blocked = Vec::new();
@@ -6898,6 +7216,15 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
         ),
         ("baseRevision".to_owned(), Json::from(base_rev)),
         ("tasks".to_owned(), Json::Array(tasks)),
+        (
+            "inputEpochs".to_owned(),
+            Json::Object(
+                input_epochs
+                    .into_iter()
+                    .map(|(task_id, epoch)| (task_id, Json::from(epoch)))
+                    .collect(),
+            ),
+        ),
         ("merged".to_owned(), Json::Array(merged)),
         ("checkpoints".to_owned(), Json::Array(checkpoints)),
         ("remaining".to_owned(), Json::Array(remaining_ids)),
@@ -10720,14 +11047,15 @@ mod tests {
     use super::{
         action_steer, action_worker_outcome, append_attempt_receipt, append_diagnosis_report,
         campaign_attempt_state, campaign_attempt_state_all, classify_worker_outcome,
-        closed_inline_code_spans, contains_bare_exclamation_mark, fold_attempt_receipts,
-        git_with_input, integration_branch, merge_local, publish_closing_summary, read_local_blob,
-        replace_bare_exclamation_marks, validate_attempt_receipt, validate_outcome_first,
-        DiagnosisVerdict, Json, RepoConfig, WorkerOutcome,
+        closed_inline_code_spans, contains_bare_exclamation_mark, current_task_input_epochs,
+        fold_attempt_receipts, git_with_input, integration_branch, merge_local,
+        publish_closing_summary, read_local_blob, replace_bare_exclamation_marks,
+        validate_attempt_receipt, validate_outcome_first, DiagnosisVerdict, Json, RepoConfig,
+        WorkerOutcome,
     };
     use tally_core::attempt_receipts::{
         AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR,
-        ATTEMPT_RECEIPT_SCHEMA_VERSION,
+        ATTEMPT_RECEIPT_SCHEMA_VERSION, MAX_TASK_LIFETIME_ATTEMPTS,
     };
     use tally_core::campaign_folds::{campaign_digest, CampaignReconciliation, CampaignSource};
     use uuid::Uuid;
@@ -10929,6 +11257,91 @@ mod tests {
                 "path",
                 Json::from(test_receipt_path(root).display().to_string()),
             ),
+        ])
+    }
+
+    fn test_receipt_source_with_epochs(root: &Path, epochs: &BTreeMap<String, String>) -> Json {
+        let mut source = test_receipt_source(root)
+            .as_object()
+            .expect("test receipt source is an object")
+            .clone();
+        source.insert(
+            "inputEpochs".to_owned(),
+            Json::Object(
+                epochs
+                    .iter()
+                    .map(|(task_id, epoch)| (task_id.clone(), Json::from(epoch.clone())))
+                    .collect(),
+            ),
+        );
+        Json::Object(source)
+    }
+
+    fn epoch_test_task(goal: &str) -> Json {
+        Json::object([
+            ("id", Json::from("task-1")),
+            ("kind", Json::from("implementation")),
+            ("title", Json::from("Task one")),
+            ("goal", Json::from(goal)),
+            ("deliveredBehaviors", Json::Array(vec![Json::from("Works")])),
+            (
+                "readFirst",
+                Json::object([
+                    ("specSections", Json::Array(vec![Json::from("Spec one")])),
+                    ("styleReferences", Json::Array(Vec::new())),
+                ]),
+            ),
+            (
+                "acceptanceCriteria",
+                Json::Array(vec![Json::object([
+                    ("id", Json::from("green")),
+                    ("description", Json::from("The check passes.")),
+                    ("argv", Json::Array(vec![Json::from("true")])),
+                ])]),
+            ),
+            ("dependencies", Json::Array(Vec::new())),
+            (
+                "conflictDomains",
+                Json::Array(vec![Json::from("crates/example/src")]),
+            ),
+            ("revision", Json::from(format!("sha256:{}", "e".repeat(64)))),
+        ])
+    }
+
+    fn epoch_test_gates() -> Json {
+        Json::Array(vec![Json::object([
+            ("kind", Json::from("command")),
+            ("id", Json::from("tests")),
+            ("preflightArgv", Json::Array(vec![Json::from("true")])),
+            (
+                "argv",
+                Json::Array(vec![Json::from("cargo"), Json::from("test")]),
+            ),
+            ("runtimeMaxSec", Json::Number("900".to_owned())),
+        ])])
+    }
+
+    fn epoch_test_steering(task_high_water: u64) -> Json {
+        Json::object([
+            ("campaign", Json::Number("0".to_owned())),
+            (
+                "tasks",
+                Json::object([("task-1", Json::Number(task_high_water.to_string()))]),
+            ),
+        ])
+    }
+
+    fn diagnosis_payload(verdict: &str) -> Json {
+        Json::object([
+            ("kind", Json::from("diagnosis")),
+            ("taskId", Json::from("task-1")),
+            ("attempt", Json::Number("1".to_owned())),
+            (
+                "diagnosis",
+                Json::from("Identified the task-scoped failure."),
+            ),
+            ("verdict", Json::from(verdict)),
+            ("redaction", Json::from("conservative-v2")),
         ])
     }
 
@@ -11163,12 +11576,210 @@ mod tests {
         let state = fold_attempt_receipts(
             vec![event],
             &BTreeMap::from([("chapter-gate".to_owned(), None)]),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(state.diagnoses.len(), 1);
         assert_eq!(state.diagnoses[0].task_id, "chapter-gate");
         assert_eq!(state.diagnoses[0].attempt, 1);
         assert!(state.warnings.is_empty());
+    }
+
+    #[test]
+    fn epoch_refresh_reopens_an_amended_task_without_a_pardon() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-epoch-refresh-test-{}", Uuid::new_v4()));
+        write_test_receipt_authority(&temporary);
+        let gates = epoch_test_gates();
+        let steering = epoch_test_steering(0);
+        let original_tasks = vec![epoch_test_task("Implement the original behavior.")];
+        let original_epochs =
+            current_task_input_epochs(&original_tasks, Some(&gates), Some(&steering), None)
+                .unwrap();
+        let unrelated_steering = Json::object([
+            ("campaign", Json::Number("0".to_owned())),
+            (
+                "tasks",
+                Json::object([("retired-task", Json::Number("8".to_owned()))]),
+            ),
+        ]);
+        assert_eq!(
+            current_task_input_epochs(
+                &original_tasks,
+                Some(&gates),
+                Some(&unrelated_steering),
+                None,
+            )
+            .unwrap(),
+            original_epochs,
+            "steering for another task cannot spend this task's budget"
+        );
+        assert_ne!(
+            current_task_input_epochs(
+                &original_tasks,
+                Some(&gates),
+                Some(&epoch_test_steering(8)),
+                None,
+            )
+            .unwrap(),
+            original_epochs,
+            "task-addressed steering is new attempt input"
+        );
+        let original_source = test_receipt_source_with_epochs(&temporary, &original_epochs);
+        assert!(
+            append_attempt_receipt(
+                Some(&original_source),
+                "fixture",
+                "7",
+                diagnosis_payload("blocked"),
+            )
+            .unwrap()
+            .0
+        );
+        let revisions = BTreeMap::from([(
+            "task-1".to_owned(),
+            Some(format!("sha256:{}", "e".repeat(64))),
+        )]);
+        let spent = campaign_attempt_state(
+            Some(&original_source),
+            "fixture",
+            "7",
+            &revisions,
+            &original_epochs,
+        )
+        .unwrap();
+        assert!(spent.diagnoses[0].blocks_task());
+
+        // Re-admission changed the task's own authored bytes. The old receipt
+        // remains immutable but is no longer part of the active budget.
+        let amended_tasks = vec![epoch_test_task(
+            "Implement the original behavior and the amended edge case.",
+        )];
+        let amended_epochs =
+            current_task_input_epochs(&amended_tasks, Some(&gates), Some(&steering), None).unwrap();
+        assert_ne!(original_epochs, amended_epochs);
+        let amended_source = test_receipt_source_with_epochs(&temporary, &amended_epochs);
+        let refreshed = campaign_attempt_state(
+            Some(&amended_source),
+            "fixture",
+            "7",
+            &revisions,
+            &amended_epochs,
+        )
+        .unwrap();
+        assert!(
+            refreshed.diagnoses.is_empty(),
+            "the amended task is dispatchable with a fresh active budget"
+        );
+        assert_eq!(refreshed.lifetime_attempts.get("task-1"), Some(&1));
+
+        assert!(
+            append_attempt_receipt(
+                Some(&amended_source),
+                "fixture",
+                "7",
+                diagnosis_payload("retry"),
+            )
+            .unwrap()
+            .0,
+            "attempt one is available again in the derived epoch"
+        );
+        let log = fs::read_to_string(test_receipt_path(&temporary)).unwrap();
+        let records = log
+            .lines()
+            .map(|line| crate::json::parse(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| {
+            record
+                .as_object()
+                .and_then(|record| record.get("kind"))
+                .and_then(Json::as_str)
+                != Some("pardon")
+        }));
+        assert_eq!(
+            records[0]
+                .as_object()
+                .and_then(|record| record.get("inputEpoch"))
+                .and_then(Json::as_str),
+            original_epochs.get("task-1").map(String::as_str)
+        );
+        assert_eq!(
+            records[1]
+                .as_object()
+                .and_then(|record| record.get("inputEpoch"))
+                .and_then(Json::as_str),
+            amended_epochs.get("task-1").map(String::as_str)
+        );
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn epoch_lifetime_backstop_latches_and_reports_after_ten_attempts() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-epoch-lifetime-test-{}", Uuid::new_v4()));
+        write_test_receipt_authority(&temporary);
+        let mut current_source = Json::Null;
+        for ordinal in 1..=MAX_TASK_LIFETIME_ATTEMPTS {
+            let epochs = BTreeMap::from([("task-1".to_owned(), format!("sha256:{ordinal:064x}"))]);
+            current_source = test_receipt_source_with_epochs(&temporary, &epochs);
+            assert!(
+                append_attempt_receipt(
+                    Some(&current_source),
+                    "fixture",
+                    "7",
+                    diagnosis_payload("retry"),
+                )
+                .unwrap()
+                .0
+            );
+        }
+        assert!(
+            append_attempt_receipt(
+                Some(&current_source),
+                "fixture",
+                "7",
+                Json::object([
+                    ("kind", Json::from("escalation")),
+                    (
+                        "body",
+                        Json::from("The lifetime attempt latch requires human attention."),
+                    ),
+                ]),
+            )
+            .unwrap()
+            .0
+        );
+        let state = campaign_attempt_state_all(Some(&current_source), "fixture", "7").unwrap();
+        assert_eq!(
+            state.lifetime_attempts.get("task-1"),
+            Some(&MAX_TASK_LIFETIME_ATTEMPTS)
+        );
+        assert!(state.lifetime_exhausted.contains("task-1"));
+        assert!(state.escalation.is_some());
+        assert!(state
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("latched for human attention")));
+
+        let next_epochs = BTreeMap::from([(
+            "task-1".to_owned(),
+            format!("sha256:{:064x}", MAX_TASK_LIFETIME_ATTEMPTS + 1),
+        )]);
+        let next_source = test_receipt_source_with_epochs(&temporary, &next_epochs);
+        let error = append_attempt_receipt(
+            Some(&next_source),
+            "fixture",
+            "7",
+            diagnosis_payload("retry"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("hard lifetime limit"), "{error}");
+        let log = fs::read_to_string(test_receipt_path(&temporary)).unwrap();
+        assert_eq!(log.lines().count(), MAX_TASK_LIFETIME_ATTEMPTS + 1);
+        assert!(!log.lines().any(|line| line.contains("\"kind\":\"pardon\"")));
+        fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
@@ -11275,6 +11886,7 @@ mod tests {
             "fixture",
             "7",
             &revisions,
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(state.diagnoses.is_empty());

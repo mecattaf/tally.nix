@@ -30,7 +30,7 @@ pub(super) async fn run_queue(
             )
             .await
         }
-        QueueCommand::Resume { pool, all } => {
+        QueueCommand::Unpause { pool, all } => {
             print_rpc(
                 socket,
                 config_path,

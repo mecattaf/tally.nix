@@ -149,43 +149,18 @@ fn campaign_steer_supports_task_scope_and_the_ssh_stdin_contract() {
 }
 
 #[test]
-fn campaign_resume_requires_and_preserves_its_audit_reason() {
-    let options = Opts::try_parse_from([
-        "tally",
-        "campaign",
-        "resume",
-        "acme/widgets",
-        "specs/night/tasks.json",
-        "--reason",
-        "Reviewed the escalation and corrected the external dependency.",
-        "--wait",
-        "--state-dir",
-        "/var/lib/tally/state",
-    ])
-    .unwrap();
-    assert!(matches!(
-        options.command,
-        Some(Command::Campaign {
-            command: CampaignCommand::Resume(CampaignResumeArgs {
-                code_repository,
-                worklist_pattern,
-                reason,
-                wait: true,
-                state_dir: Some(state_dir),
-            })
-        }) if code_repository == "acme/widgets"
-            && worklist_pattern == "specs/night/tasks.json"
-            && reason == "Reviewed the escalation and corrected the external dependency."
-            && state_dir == Path::new("/var/lib/tally/state")
-    ));
-    assert!(Opts::try_parse_from([
+fn campaign_resume_is_not_a_command() {
+    let error = Opts::try_parse_from([
         "tally",
         "campaign",
         "resume",
         "acme/widgets",
         "specs/night/tasks.json",
     ])
-    .is_err());
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unrecognized subcommand 'resume'"));
 }
 
 #[test]

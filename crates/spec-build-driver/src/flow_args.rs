@@ -422,6 +422,11 @@ struct SteeringSource {
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct Sha256Identity(#[schemars(regex(pattern = r"^sha256:[0-9a-f]{64}$"))] String);
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(inline)]
 enum LocalJsonlKind {
     #[serde(rename = "local-jsonl")]
@@ -465,6 +470,9 @@ pub struct SpecBuildFlowArgs {
     #[serde(default)]
     #[schemars(!default)]
     campaign_graph: Optional<CanonicalCampaignGraph>,
+    #[serde(default)]
+    #[schemars(!default, extend("maxProperties" = 128))]
+    task_input_hashes: Optional<BTreeMap<String, Sha256Identity>>,
     armed_manifest: Option<CanonicalCampaignManifest>,
     #[serde(default)]
     #[schemars(!default)]

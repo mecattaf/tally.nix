@@ -4363,10 +4363,11 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 "phase-one-checkpoint",
                 "the checkpoint rebinds to the edited worklist digest"
             );
-            assert!(renamed_value["reconciled"]["escalation"]
-                .as_str()
-                .unwrap()
-                .ends_with("/attempt-receipts/5"));
+            assert_eq!(
+                renamed_value["reconciled"]["escalation"],
+                Value::Null,
+                "the dropped task's escalation must not survive into the renamed input epoch"
+            );
 
             // Campaign machinery, not the task's work: an unwritable workspace
             // root denies the merge node the integration checkout it stages

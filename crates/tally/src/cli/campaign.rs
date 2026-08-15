@@ -16,15 +16,16 @@ use tally_core::adapters::{AdapterConfig, AdapterHardening, ScrapeMode, ScrapeSt
 use tally_core::attempt_receipts::{
     validate_attempt_receipt_stamp, AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE,
     ATTEMPT_RECEIPT_SCHEMA_VERSION, LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+    MAX_TASK_LIFETIME_ATTEMPTS,
 };
 use tally_core::campaign_contract::{
-    admit_manifest_value, task_completion_revision, validate_agent, validate_argv, validate_gates,
-    CampaignAgent, CampaignGate, CampaignManifest, CampaignRepository, CampaignSteward,
-    CanonicalCampaignGraphV1, CanonicalCampaignTaskV1, BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION,
-    DEFAULT_AGENT_APPROVAL_POLICY, DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY, DEFAULT_AGENT_PRIORITY,
-    DEFAULT_AGENT_RUNTIME_MAX_SEC, DEFAULT_AGENT_SANDBOX_POLICY, DEFAULT_DRIVER_RUNTIME_MAX_SEC,
-    DEFAULT_MAX_TASKS, DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN, DEFAULT_STEWARD_RUNTIME_MAX_SEC,
-    MAX_CAMPAIGN_TASKS,
+    admit_manifest_value, task_completion_revision, task_input_epoch, task_input_hash,
+    validate_agent, validate_argv, validate_gates, CampaignAgent, CampaignGate, CampaignManifest,
+    CampaignRepository, CampaignSteward, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1,
+    BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION, DEFAULT_AGENT_APPROVAL_POLICY,
+    DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY, DEFAULT_AGENT_PRIORITY, DEFAULT_AGENT_RUNTIME_MAX_SEC,
+    DEFAULT_AGENT_SANDBOX_POLICY, DEFAULT_DRIVER_RUNTIME_MAX_SEC, DEFAULT_MAX_TASKS,
+    DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN, DEFAULT_STEWARD_RUNTIME_MAX_SEC, MAX_CAMPAIGN_TASKS,
 };
 use tally_core::campaign_folds::{
     campaign_digest, render_campaign_summary, stable_publish_branch, stage_scoped_summary_ref,
@@ -50,7 +51,6 @@ const MAX_CAMPAIGN_STEERING_BODY_CHARS: usize = 64_000;
 const MAX_CAMPAIGN_STEERING_PER_TARGET: usize = 1_000;
 const ATTEMPT_RECEIPTS_FILE: &str = "attempt-receipts-v1.jsonl";
 const MAX_ATTEMPT_RECEIPTS_LOG_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES: u64 = 64 * 1024;
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
 const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
@@ -153,6 +153,7 @@ struct CampaignGraph {
     canonical: CanonicalCampaignGraphV1,
     ownership_preflight_warnings: Vec<String>,
     worklist_sha256: String,
+    task_input_hashes: BTreeMap<String, String>,
 }
 
 const fn default_worklist_max_tasks() -> usize {
@@ -283,32 +284,22 @@ struct ApprovedGraphSnapshotV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PlannedAutoPardon {
-    task_id: String,
-    added_dependencies: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AutoPardonReceipt {
-    task_id: String,
-    added_dependencies: Vec<String>,
-    resume_receipt: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PardonScope {
-    All,
-    Tasks(BTreeSet<String>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalAttemptReceiptV1 {
-    Diagnosis { task_id: String, attempt: u8 },
-    Retry,
+    Diagnosis {
+        task_id: String,
+        attempt: u8,
+        input_epoch: Option<String>,
+        blocks_task: bool,
+    },
+    Retry {
+        task_id: String,
+        input_epoch: Option<String>,
+    },
     WorkerOutcome(LocalWorkerOutcome),
     Escalation,
-    Pardon { tasks: Option<BTreeSet<String>> },
+    Pardon {
+        tasks: Option<BTreeSet<String>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,6 +308,7 @@ struct LocalWorkerOutcome {
     task_id: String,
     task_revision: String,
     task_uuid: String,
+    input_epoch: Option<String>,
     outcome: WorkerOutcomePayload,
 }
 
@@ -341,11 +333,13 @@ enum ReleaseAttemptReceipt {
         task_id: String,
         attempt: u64,
         diagnosis: String,
+        input_epoch: Option<String>,
     },
     Retry {
         task_id: String,
         attempt: u64,
         reason: String,
+        input_epoch: Option<String>,
     },
     WorkerOutcome,
     Escalation,
@@ -635,9 +629,6 @@ pub(super) async fn run_campaign(
             run_campaign_arm(socket, config_path, rpc_timeout, args).await
         }
         CampaignCommand::Steer(args) => run_campaign_steer(args),
-        CampaignCommand::Resume(args) => {
-            run_campaign_resume(socket, config_path, rpc_timeout, args).await
-        }
         CampaignCommand::Release(args) => run_campaign_release(args),
         CampaignCommand::Poll(args) => {
             run_campaign_poll(socket, config_path, rpc_timeout, args).await
@@ -1566,7 +1557,11 @@ fn render_campaign_release_plan(
         .iter()
         .map(|task| task.id.clone())
         .collect::<BTreeSet<_>>();
-    let (diagnoses, retries, warnings) = release_attempt_facts(&attempt_log.records, &task_ids);
+    let steering = read_existing_local_steering(state_dir, &registration)?;
+    let task_input_hashes = canonical_task_input_hashes(&graph)?;
+    let input_epochs = current_task_input_epochs(&task_input_hashes, &steering)?;
+    let (diagnoses, retries, warnings) =
+        release_attempt_facts(&attempt_log.records, &task_ids, &input_epochs);
     let merged = merged_commits
         .iter()
         .map(|merged| MergedFact {
@@ -2482,21 +2477,25 @@ fn read_release_attempt_log(
                 .as_object()
                 .expect("validated attempt receipt is an object");
             let record = match validated {
-                LocalAttemptReceiptV1::Diagnosis { task_id, attempt } => {
-                    ReleaseAttemptReceipt::Diagnosis {
-                        task_id,
-                        attempt: u64::from(attempt),
-                        diagnosis: object["diagnosis"]
-                            .as_str()
-                            .expect("validated diagnosis is text")
-                            .to_owned(),
-                    }
-                }
-                LocalAttemptReceiptV1::Retry => ReleaseAttemptReceipt::Retry {
-                    task_id: object["taskId"]
+                LocalAttemptReceiptV1::Diagnosis {
+                    task_id,
+                    attempt,
+                    input_epoch,
+                    ..
+                } => ReleaseAttemptReceipt::Diagnosis {
+                    task_id,
+                    attempt: u64::from(attempt),
+                    diagnosis: object["diagnosis"]
                         .as_str()
-                        .expect("validated retry task is text")
+                        .expect("validated diagnosis is text")
                         .to_owned(),
+                    input_epoch,
+                },
+                LocalAttemptReceiptV1::Retry {
+                    task_id,
+                    input_epoch,
+                } => ReleaseAttemptReceipt::Retry {
+                    task_id,
                     attempt: object["attempt"]
                         .as_u64()
                         .expect("validated retry attempt is an integer"),
@@ -2504,6 +2503,7 @@ fn read_release_attempt_log(
                         .as_str()
                         .expect("validated retry reason is text")
                         .to_owned(),
+                    input_epoch,
                 },
                 LocalAttemptReceiptV1::WorkerOutcome(_) => ReleaseAttemptReceipt::WorkerOutcome,
                 LocalAttemptReceiptV1::Escalation => ReleaseAttemptReceipt::Escalation,
@@ -2533,6 +2533,7 @@ fn read_release_attempt_log(
 fn release_attempt_facts(
     records: &[ReleaseAttemptReceipt],
     task_ids: &BTreeSet<String>,
+    current_epochs: &BTreeMap<String, String>,
 ) -> (Vec<DiagnosisFact>, Vec<RetryFact>, Vec<String>) {
     let mut diagnoses = Vec::<DiagnosisFact>::new();
     let mut retries = Vec::<RetryFact>::new();
@@ -2543,20 +2544,30 @@ fn release_attempt_facts(
                 task_id,
                 attempt,
                 diagnosis,
-            } if task_ids.contains(task_id) => diagnoses.push(DiagnosisFact {
-                task_id: task_id.clone(),
-                attempt: *attempt,
-                diagnosis: diagnosis.clone(),
-            }),
+                input_epoch,
+            } if task_ids.contains(task_id)
+                && receipt_epoch_is_current(task_id, input_epoch.as_deref(), current_epochs) =>
+            {
+                diagnoses.push(DiagnosisFact {
+                    task_id: task_id.clone(),
+                    attempt: *attempt,
+                    diagnosis: diagnosis.clone(),
+                })
+            }
             ReleaseAttemptReceipt::Retry {
                 task_id,
                 attempt,
                 reason,
-            } if task_ids.contains(task_id) => retries.push(RetryFact {
-                task_id: task_id.clone(),
-                attempt: *attempt,
-                reason: reason.clone(),
-            }),
+                input_epoch,
+            } if task_ids.contains(task_id)
+                && receipt_epoch_is_current(task_id, input_epoch.as_deref(), current_epochs) =>
+            {
+                retries.push(RetryFact {
+                    task_id: task_id.clone(),
+                    attempt: *attempt,
+                    reason: reason.clone(),
+                })
+            }
             ReleaseAttemptReceipt::Pardon { sequence, tasks } => {
                 let before = diagnoses.len() + retries.len();
                 match tasks {
@@ -3015,14 +3026,13 @@ fn require_local_actor(registration: &CampaignRegistration) -> Result<()> {
     Ok(())
 }
 
-fn arm_receipt(result: &Value, auto_pardons: &[AutoPardonReceipt], warnings: &[String]) -> Value {
+fn arm_receipt(result: &Value, warnings: &[String]) -> Value {
     let mut value = if result.is_object() {
         result.clone()
     } else {
         json!({"result": result})
     };
     let object = value.as_object_mut().expect("arm receipt is an object");
-    object.insert("autoPardons".to_owned(), json!(auto_pardons));
     let mut combined = object
         .remove("warnings")
         .and_then(|value| value.as_array().cloned())
@@ -3038,6 +3048,44 @@ fn arm_receipt(result: &Value, auto_pardons: &[AutoPardonReceipt], warnings: &[S
 struct CampaignSteering {
     master: Vec<Value>,
     tasks: BTreeMap<String, Vec<Value>>,
+}
+
+fn steering_comment_high_water(comments: &[Value]) -> u64 {
+    comments
+        .iter()
+        .filter_map(|comment| comment.get("id").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0)
+}
+
+fn current_task_input_epochs(
+    task_input_hashes: &BTreeMap<String, String>,
+    steering: &CampaignSteering,
+) -> Result<BTreeMap<String, String>> {
+    let campaign_high_water = steering_comment_high_water(&steering.master);
+    task_input_hashes
+        .iter()
+        .map(|(task_id, input_hash)| {
+            let task_high_water = steering
+                .tasks
+                .get(task_id)
+                .map_or(0, |comments| steering_comment_high_water(comments));
+            Ok((
+                task_id.clone(),
+                task_input_epoch(input_hash, campaign_high_water.max(task_high_water))?,
+            ))
+        })
+        .collect()
+}
+
+fn receipt_epoch_is_current(
+    task_id: &str,
+    receipt_epoch: Option<&str>,
+    current_epochs: &BTreeMap<String, String>,
+) -> bool {
+    current_epochs.is_empty()
+        || receipt_epoch.is_none()
+        || current_epochs.get(task_id).map(String::as_str) == receipt_epoch
 }
 
 fn local_steering_paths(state_dir: &Path, registration_id: &str) -> LocalSteeringPaths {
@@ -3416,6 +3464,76 @@ fn read_local_steering_snapshot(
     }
 }
 
+/// Read steering for projections without creating the steering directory or
+/// lock file. A real source always has its lock; a partially present source is
+/// rejected rather than read without synchronization.
+fn read_existing_local_steering(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> Result<CampaignSteering> {
+    fn path_is_present(path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("cannot inspect steering path {}", path.display())),
+        }
+    }
+
+    let paths = local_steering_paths(state_dir, &registration.registration_id);
+    let lock = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&paths.lock)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if path_is_present(&paths.log)? || path_is_present(&paths.cursor)? {
+                bail!(
+                    "campaign steering source exists without its lock: {}",
+                    paths.lock.display()
+                );
+            }
+            return Ok(CampaignSteering::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot open campaign steering lock {}",
+                    paths.lock.display()
+                )
+            })
+        }
+    };
+    if !lock.metadata()?.is_file() {
+        bail!(
+            "campaign steering lock {} is not a regular file",
+            paths.lock.display()
+        );
+    }
+    FileExt::lock_shared(&lock).with_context(|| {
+        format!(
+            "cannot lock campaign steering source {}",
+            paths.lock.display()
+        )
+    })?;
+    let read = (|| {
+        let records = read_local_steering_records_locked(&paths, registration)?;
+        Ok(local_steering_snapshot_from_records(&paths, registration, &records)?.steering)
+    })();
+    let unlock = FileExt::unlock(&lock).with_context(|| {
+        format!(
+            "cannot unlock campaign steering source {}",
+            paths.lock.display()
+        )
+    });
+    match (read, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(steering), Ok(())) => Ok(steering),
+    }
+}
+
 fn ensure_local_steering_log_locked(paths: &LocalSteeringPaths) -> Result<()> {
     let existed = paths.log.exists();
     let file = fs::OpenOptions::new()
@@ -3683,52 +3801,6 @@ fn local_attempt_receipt_authority_path(state_dir: &Path, campaign: &str) -> Res
         .join(ATTEMPT_RECEIPT_AUTHORITY_FILE))
 }
 
-fn read_local_attempt_receipt_authority(
-    state_dir: &Path,
-    campaign: &str,
-    issue_number: u64,
-) -> Result<AttemptReceiptAuthorityV1> {
-    let path = local_attempt_receipt_authority_path(state_dir, campaign)?;
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-        .with_context(|| {
-            format!(
-                "cannot write a stamped attempt receipt without authority {}",
-                path.display()
-            )
-        })?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.len() > MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES
-    {
-        bail!(
-            "attempt receipt authority is not a bounded private regular file: {}",
-            path.display()
-        );
-    }
-    let mut raw = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut raw)?;
-    if raw.len() as u64 > MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES {
-        bail!(
-            "attempt receipt authority exceeds 64 KiB: {}",
-            path.display()
-        );
-    }
-    let authority: AttemptReceiptAuthorityV1 = serde_json::from_slice(&raw).with_context(|| {
-        format!(
-            "attempt receipt authority {} is invalid JSON",
-            path.display()
-        )
-    })?;
-    authority
-        .validate_for(campaign, &issue_number.to_string())
-        .map_err(|error| invalid(format!("attempt receipt authority is invalid: {error}")))?;
-    Ok(authority)
-}
-
 fn write_local_attempt_receipt_authority(
     state_dir: &Path,
     graph: &CampaignGraph,
@@ -3902,6 +3974,12 @@ fn validate_local_attempt_receipt(
         }
         _ => return Err(invalid(format!("{context} has unknown kind {kind:?}"))),
     };
+    let mut allowed = allowed;
+    if schema_version == ATTEMPT_RECEIPT_SCHEMA_VERSION
+        && matches!(kind, "diagnosis" | "retry" | "worker-outcome")
+    {
+        allowed.insert("inputEpoch");
+    }
     if let Some(field) = object
         .keys()
         .find(|field| !allowed.contains(field.as_str()))
@@ -3934,6 +4012,20 @@ fn validate_local_attempt_receipt(
         )
         .map_err(|error| invalid(format!("{context} has invalid stamp: {error}")))?;
     }
+    let input_epoch = object
+        .get("inputEpoch")
+        .map(|value| {
+            let epoch = value
+                .as_str()
+                .filter(|epoch| is_sha256_identity(epoch))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{context}.inputEpoch must be a lowercase SHA-256 identity"
+                    ))
+                })?;
+            Ok::<String, anyhow::Error>(epoch.to_owned())
+        })
+        .transpose()?;
 
     let task_attempt = |payload: &str, maximum: usize| -> Result<(String, u8)> {
         let task_id = object
@@ -3966,11 +4058,32 @@ fn validate_local_attempt_receipt(
     match kind {
         "diagnosis" => {
             let (task_id, attempt) = task_attempt("diagnosis", MAX_DIAGNOSIS_CHARS)?;
-            Ok(LocalAttemptReceiptV1::Diagnosis { task_id, attempt })
+            let verdict = match object.get("verdict") {
+                None => None,
+                Some(Value::String(verdict))
+                    if matches!(verdict.as_str(), "retry" | "blocked" | "transient") =>
+                {
+                    Some(verdict.as_str())
+                }
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "{context}.verdict must be retry, blocked, or transient"
+                    )))
+                }
+            };
+            Ok(LocalAttemptReceiptV1::Diagnosis {
+                task_id,
+                attempt,
+                input_epoch,
+                blocks_task: attempt == 2 || verdict == Some("blocked"),
+            })
         }
         "retry" => {
-            task_attempt("reason", MAX_RETRY_CHARS)?;
-            Ok(LocalAttemptReceiptV1::Retry)
+            let (task_id, _) = task_attempt("reason", MAX_RETRY_CHARS)?;
+            Ok(LocalAttemptReceiptV1::Retry {
+                task_id,
+                input_epoch,
+            })
         }
         "worker-outcome" => {
             let task_id = object
@@ -4074,6 +4187,7 @@ fn validate_local_attempt_receipt(
                 task_id,
                 task_revision,
                 task_uuid,
+                input_epoch,
                 outcome,
             }))
         }
@@ -4229,6 +4343,7 @@ fn read_local_attempt_receipts(
 fn active_escalated_tasks_from_receipts(
     records: &[LocalAttemptReceiptV1],
     current_revisions: &BTreeMap<String, String>,
+    current_epochs: &BTreeMap<String, String>,
 ) -> Result<BTreeSet<String>> {
     #[derive(Default)]
     struct Escalation {
@@ -4238,18 +4353,37 @@ fn active_escalated_tasks_from_receipts(
 
     let mut diagnoses = BTreeMap::<String, Vec<u8>>::new();
     let mut authority_requests = BTreeSet::<String>::new();
+    let mut lifetime_attempts = BTreeMap::<String, usize>::new();
     let mut escalations = Vec::<Escalation>::new();
     for record in records {
         match record {
             LocalAttemptReceiptV1::Diagnosis {
-                task_id, attempt, ..
-            } if current_revisions.contains_key(task_id) => {
-                diagnoses.entry(task_id.clone()).or_default().push(*attempt);
+                task_id,
+                input_epoch,
+                blocks_task,
+                ..
+            } if current_revisions.contains_key(task_id)
+                && receipt_epoch_is_current(task_id, input_epoch.as_deref(), current_epochs) =>
+            {
+                *lifetime_attempts.entry(task_id.clone()).or_default() += 1;
+                diagnoses
+                    .entry(task_id.clone())
+                    .or_default()
+                    .push(u8::from(*blocks_task));
             }
-            LocalAttemptReceiptV1::Diagnosis { .. } => {}
-            LocalAttemptReceiptV1::Retry => {}
+            LocalAttemptReceiptV1::Diagnosis { task_id, .. } => {
+                *lifetime_attempts.entry(task_id.clone()).or_default() += 1;
+            }
+            LocalAttemptReceiptV1::Retry { task_id, .. } => {
+                *lifetime_attempts.entry(task_id.clone()).or_default() += 1;
+            }
             LocalAttemptReceiptV1::WorkerOutcome(outcome)
                 if current_revisions.get(&outcome.task_id) == Some(&outcome.task_revision)
+                    && receipt_epoch_is_current(
+                        &outcome.task_id,
+                        outcome.input_epoch.as_deref(),
+                        current_epochs,
+                    )
                     && matches!(outcome.outcome, WorkerOutcomePayload::NeedsAuthority { .. }) =>
             {
                 authority_requests.insert(outcome.task_id.clone());
@@ -4258,16 +4392,25 @@ fn active_escalated_tasks_from_receipts(
             LocalAttemptReceiptV1::Escalation => {
                 let mut contributors: BTreeSet<_> = diagnoses
                     .iter()
-                    .filter(|(_, attempts)| {
-                        attempts.iter().copied().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2])
-                    })
+                    .filter(|(_, blocking)| blocking.contains(&1))
                     .map(|(task_id, _)| task_id.clone())
                     .collect();
                 contributors.extend(authority_requests.iter().cloned());
-                escalations.push(Escalation {
-                    contributors,
-                    covered: BTreeSet::new(),
-                });
+                contributors.extend(
+                    lifetime_attempts
+                        .iter()
+                        .filter(|(task_id, attempts)| {
+                            current_revisions.contains_key(*task_id)
+                                && **attempts >= MAX_TASK_LIFETIME_ATTEMPTS
+                        })
+                        .map(|(task_id, _)| task_id.clone()),
+                );
+                if !contributors.is_empty() {
+                    escalations.push(Escalation {
+                        contributors,
+                        covered: BTreeSet::new(),
+                    });
+                }
             }
             LocalAttemptReceiptV1::Pardon { tasks: None, .. } => {
                 diagnoses.clear();
@@ -4312,6 +4455,7 @@ fn active_escalated_tasks_from_receipts(
 fn active_local_escalated_tasks(
     state_dir: &Path,
     graph: &CampaignGraph,
+    registration: &CampaignRegistration,
 ) -> Result<BTreeSet<String>> {
     let current_revisions = release_task_revisions(&graph.canonical)?;
     let records = read_local_attempt_receipts(
@@ -4319,18 +4463,26 @@ fn active_local_escalated_tasks(
         &graph.canonical.manifest.name,
         LOCAL_CAMPAIGN_ISSUE_NUMBER,
     )?;
-    active_escalated_tasks_from_receipts(&records, &current_revisions)
+    let steering = read_local_steering_snapshot(state_dir, registration)?;
+    let current_epochs = current_task_input_epochs(&graph.task_input_hashes, &steering.steering)?;
+    active_escalated_tasks_from_receipts(&records, &current_revisions, &current_epochs)
 }
 
 fn active_worker_outcomes_from_receipts(
     records: &[LocalAttemptReceiptV1],
     current_revisions: &BTreeMap<String, String>,
+    current_epochs: &BTreeMap<String, String>,
 ) -> BTreeMap<String, LocalWorkerOutcome> {
     let mut outcomes = BTreeMap::new();
     for record in records {
         match record {
             LocalAttemptReceiptV1::WorkerOutcome(outcome)
-                if current_revisions.get(&outcome.task_id) == Some(&outcome.task_revision) =>
+                if current_revisions.get(&outcome.task_id) == Some(&outcome.task_revision)
+                    && receipt_epoch_is_current(
+                        &outcome.task_id,
+                        outcome.input_epoch.as_deref(),
+                        current_epochs,
+                    ) =>
             {
                 outcomes.insert(outcome.task_id.clone(), outcome.clone());
             }
@@ -4341,7 +4493,7 @@ fn active_worker_outcomes_from_receipts(
                 }
             }
             LocalAttemptReceiptV1::Diagnosis { .. }
-            | LocalAttemptReceiptV1::Retry
+            | LocalAttemptReceiptV1::Retry { .. }
             | LocalAttemptReceiptV1::WorkerOutcome(_)
             | LocalAttemptReceiptV1::Escalation => {}
         }
@@ -4375,8 +4527,9 @@ fn project_campaign_status_outcomes(
     campaign: &str,
     records: &[LocalAttemptReceiptV1],
     current_revisions: &BTreeMap<String, String>,
+    current_epochs: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let active = active_worker_outcomes_from_receipts(records, current_revisions);
+    let active = active_worker_outcomes_from_receipts(records, current_revisions, current_epochs);
     let tasks = status
         .get_mut("tasks")
         .and_then(Value::as_array_mut)
@@ -4416,6 +4569,7 @@ fn project_campaign_status_outcomes(
 fn attach_campaign_status_outcomes(
     state_dir: &Path,
     graph: Option<&CanonicalCampaignGraphV1>,
+    registration: Option<&CampaignRegistration>,
     status: &mut Value,
 ) -> Result<()> {
     let Some(graph) = graph else {
@@ -4423,200 +4577,21 @@ fn attach_campaign_status_outcomes(
     };
     let campaign = &graph.manifest.name;
     let current_revisions = release_task_revisions(graph)?;
+    let current_epochs = if let Some(registration) = registration {
+        let task_input_hashes = canonical_task_input_hashes(graph)?;
+        let steering = read_existing_local_steering(state_dir, registration)?;
+        current_task_input_epochs(&task_input_hashes, &steering)?
+    } else {
+        BTreeMap::new()
+    };
     let records = read_local_attempt_receipts(state_dir, campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)?;
-    project_campaign_status_outcomes(status, campaign, &records, &current_revisions)
-}
-
-fn append_local_campaign_pardon(
-    state_dir: &Path,
-    graph: &CampaignGraph,
-    actor: &str,
-    reason: &str,
-    scope: &PardonScope,
-) -> Result<String> {
-    let campaign = &graph.canonical.manifest.name;
-    let issue_number = LOCAL_CAMPAIGN_ISSUE_NUMBER;
-    let path = local_attempt_receipts_path(state_dir, campaign)?;
-    let directory = path
-        .parent()
-        .expect("attempt-receipts path always has a parent");
-    fs::create_dir_all(directory).with_context(|| {
-        format!(
-            "cannot create attempt-receipts directory {}",
-            directory.display()
-        )
-    })?;
-    let directory_metadata = fs::symlink_metadata(directory)?;
-    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
-        bail!(
-            "attempt-receipts parent must be a real directory: {}",
-            directory.display()
-        );
-    }
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-
-    let normalized_reason = reason
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .trim()
-        .to_owned();
-    validate_attempt_receipt_text(
-        &Value::String(normalized_reason.clone()),
-        "campaign pardon reason",
-        4_000,
-    )?;
-    validate_attempt_receipt_string(
-        &Value::String(actor.to_owned()),
-        "campaign pardon actor",
-        128,
-    )?;
-    let nonce = uuid::Uuid::now_v7().to_string();
-    let tasks = match scope {
-        PardonScope::All => Value::Null,
-        PardonScope::Tasks(tasks) => {
-            if tasks.is_empty() || tasks.iter().any(|task_id| !safe_task_id(task_id)) {
-                return Err(invalid("campaign pardon scope must name safe task ids"));
-            }
-            json!(tasks)
-        }
-    };
-
-    let create = fs::OpenOptions::new()
-        .create(true)
-        .create_new(true)
-        .read(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path);
-    let (mut file, created) = match create {
-        Ok(file) => (file, true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .append(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)
-                .with_context(|| format!("cannot open attempt-receipts log {}", path.display()))?;
-            (file, false)
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("cannot create attempt-receipts log {}", path.display()))
-        }
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        bail!(
-            "attempt-receipts log is not a private regular file: {}",
-            path.display()
-        );
-    }
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    FileExt::lock_exclusive(&file)
-        .with_context(|| format!("cannot lock attempt-receipts log {}", path.display()))?;
-    if created {
-        file.sync_all()?;
-        fs::File::open(directory)?.sync_all()?;
-    }
-    let append = (|| -> Result<String> {
-        let records =
-            read_local_attempt_receipts_locked(&mut file, &path, campaign, issue_number, true)?;
-        let sequence = u64::try_from(records.len())?
-            .checked_add(1)
-            .ok_or_else(|| invalid("attempt-receipts sequence is exhausted"))?;
-        let authority = read_local_attempt_receipt_authority(state_dir, campaign, issue_number)?;
-        let candidate = json!({
-            "schemaVersion": ATTEMPT_RECEIPT_SCHEMA_VERSION,
-            "sequence": sequence,
-            "kind": "pardon",
-            "campaign": campaign,
-            "issueNumber": issue_number.to_string(),
-            "armSerial": authority.arm_serial,
-            "worklistSha256": authority.worklist_sha256,
-            "writtenAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            "actor": actor,
-            "tasks": tasks,
-            "reason": normalized_reason,
-            "nonce": nonce,
-        });
-        validate_local_attempt_receipt(candidate.clone(), &path, sequence, campaign, issue_number)?;
-        let mut encoded = serde_json::to_vec(&candidate)?;
-        encoded.push(b'\n');
-        let final_size = file
-            .metadata()?
-            .len()
-            .checked_add(u64::try_from(encoded.len())?)
-            .ok_or_else(|| invalid("attempt-receipts log size is exhausted"))?;
-        if final_size > MAX_ATTEMPT_RECEIPTS_LOG_BYTES {
-            bail!("attempt-receipts log exceeds 128 MiB");
-        }
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        Ok(local_attempt_receipt_url(campaign, sequence))
-    })();
-    let unlock = FileExt::unlock(&file)
-        .with_context(|| format!("cannot unlock attempt-receipts log {}", path.display()));
-    match (append, unlock) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(receipt), Ok(())) => Ok(receipt),
-    }
-}
-
-fn amendment_pardon_plan(
-    prior: Option<&CanonicalCampaignGraphV1>,
-    current: &CanonicalCampaignGraphV1,
-    escalated: &BTreeSet<String>,
-) -> (Vec<PlannedAutoPardon>, Vec<String>) {
-    let prior_dependencies = prior
-        .map(|graph| {
-            graph
-                .manifest
-                .tasks
-                .iter()
-                .map(|task| {
-                    (
-                        task.id.as_str(),
-                        task.dependencies
-                            .iter()
-                            .map(String::as_str)
-                            .collect::<BTreeSet<_>>(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let mut pardons = Vec::new();
-    let mut addressed = BTreeSet::new();
-    for task in &current.manifest.tasks {
-        if !escalated.contains(&task.id) {
-            continue;
-        }
-        let Some(previous) = prior_dependencies.get(task.id.as_str()) else {
-            continue;
-        };
-        let added_dependencies = task
-            .dependencies
-            .iter()
-            .filter(|dependency| !previous.contains(dependency.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !added_dependencies.is_empty() {
-            addressed.insert(task.id.clone());
-            pardons.push(PlannedAutoPardon {
-                task_id: task.id.clone(),
-                added_dependencies,
-            });
-        }
-    }
-    let warnings = escalated
-        .difference(&addressed)
-        .map(|task_id| {
-            format!("task {task_id} remains escalated; run tally campaign resume to unblock")
-        })
-        .collect();
-    (pardons, warnings)
+    project_campaign_status_outcomes(
+        status,
+        campaign,
+        &records,
+        &current_revisions,
+        &current_epochs,
+    )
 }
 
 fn sha256_json(value: &Value) -> Result<String> {
@@ -4805,7 +4780,7 @@ async fn campaign_poll_liveness_arm(
     let status = client
         .call_with_deadline("__campaign.status", Some(params), host.rpc_timeout)
         .await?;
-    let escalated = active_local_escalated_tasks(host.state_dir, graph)?;
+    let escalated = active_local_escalated_tasks(host.state_dir, graph, registration)?;
     dispatchable_poll_liveness_arm(graph, &registration.registration_id, &escalated, &status)
 }
 
@@ -5225,11 +5200,30 @@ fn local_campaign_graph(
         })
         .collect::<Vec<_>>();
     let canonical = CanonicalCampaignGraphV1::new(validated.manifest, task_content)?;
+    let task_input_hashes = canonical_task_input_hashes(&canonical)?;
     Ok(CampaignGraph {
         canonical,
         ownership_preflight_warnings,
         worklist_sha256,
+        task_input_hashes,
     })
+}
+
+fn canonical_task_input_hashes(
+    graph: &CanonicalCampaignGraphV1,
+) -> Result<BTreeMap<String, String>> {
+    graph
+        .manifest
+        .tasks
+        .iter()
+        .zip(&graph.tasks)
+        .map(|(reference, content)| {
+            Ok((
+                reference.id.clone(),
+                task_input_hash(&graph.manifest, reference, content)?,
+            ))
+        })
+        .collect()
 }
 
 fn approved_graph_directory(state_dir: &Path, registration_id: &str) -> PathBuf {
@@ -6207,6 +6201,10 @@ async fn dispatch_campaign(
         // consumes this envelope; it never reparses another manifest into a
         // second executable contract.
         "campaignGraph": &graph.canonical,
+        // Per-task authored input identity excludes sibling task and capacity
+        // edits. The flow combines it with the addressed steering high-water
+        // to derive the exact attempt epoch carried by new receipts.
+        "taskInputHashes": &graph.task_input_hashes,
         "steering": steering.master,
         "taskSteering": steering.tasks,
         // The pre-agent re-check reads the same append-only source. The local
@@ -6433,21 +6431,9 @@ async fn run_campaign_arm(
         &adapters,
     )?;
     let allowed_actors = normalize_allowed_actors(&args.allowed_actors, LOCAL_ALLOWED_ACTOR)?;
-    let prior_graph = prior
-        .as_ref()
-        .map(|registration| read_approved_graph_snapshot(&state_dir, registration))
-        .transpose()?
-        .flatten();
-    let escalated = if prior.is_none() {
-        BTreeSet::new()
-    } else {
-        active_local_escalated_tasks(&state_dir, &graph)?
-    };
-    let (pardon_plan, mut arm_warnings) =
-        amendment_pardon_plan(prior_graph.as_ref(), &graph.canonical, &escalated);
     // Arm-time conflictDomains warnings are advisory: they share the receipt
     // surface with host warnings but never participate in graph admission.
-    arm_warnings.extend(graph.ownership_preflight_warnings.iter().cloned());
+    let mut arm_warnings = graph.ownership_preflight_warnings.clone();
     let workspace_root = args.workspace_root.unwrap_or_else(|| {
         state_dir
             .join("campaigns")
@@ -6495,19 +6481,8 @@ async fn run_campaign_arm(
         &registration.flow,
         &registration.driver,
     )?);
-    // Publish the arm's epoch key before any automatic pardon for that arm is
-    // appended. The separately packaged driver reads this same sibling file.
+    // Publish the arm authority before a pass can append stamped receipts.
     write_local_attempt_receipt_authority(&state_dir, &graph, registration.arm_serial)?;
-    let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
-    for pardon in &pardon_plan {
-        let receipt =
-            post_campaign_auto_pardon(&state_dir, &graph, &registration.local_actor, pardon)?;
-        auto_pardons.push(AutoPardonReceipt {
-            task_id: pardon.task_id.clone(),
-            added_dependencies: pardon.added_dependencies.clone(),
-            resume_receipt: receipt,
-        });
-    }
     write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
     prune_approved_graph_snapshots(&state_dir, &registration)?;
@@ -6525,7 +6500,7 @@ async fn run_campaign_arm(
         });
         outln!(
             "{}",
-            serde_json::to_string(&arm_receipt(&receipt, &auto_pardons, &arm_warnings,))?
+            serde_json::to_string(&arm_receipt(&receipt, &arm_warnings))?
         );
         return Ok(());
     }
@@ -6547,7 +6522,7 @@ async fn run_campaign_arm(
     registry.write(&mut registration)?;
     outln!(
         "{}",
-        serde_json::to_string(&arm_receipt(&result, &auto_pardons, &arm_warnings,))?
+        serde_json::to_string(&arm_receipt(&result, &arm_warnings))?
     );
     if args.wait {
         let code = waited_exit_code(&result);
@@ -6555,138 +6530,6 @@ async fn run_campaign_arm(
             return Err(anyhow::Error::new(ExitFailure {
                 code,
                 message: "campaign reconcile pass returned a non-zero verdict".to_owned(),
-            }));
-        }
-    }
-    Ok(())
-}
-
-fn auto_pardon_reason(pardon: &PlannedAutoPardon) -> String {
-    let shown = pardon
-        .added_dependencies
-        .iter()
-        .take(12)
-        .map(|dependency| format!("`{dependency}`"))
-        .collect::<Vec<_>>();
-    let remainder = pardon.added_dependencies.len().saturating_sub(shown.len());
-    let dependencies = if remainder == 0 {
-        shown.join(", ")
-    } else {
-        format!("{}, and {remainder} more", shown.join(", "))
-    };
-    format!(
-        "Re-armed graph added dependency {} to escalated task `{}`; the amendment is the operator's structural steering response.",
-        dependencies, pardon.task_id
-    )
-}
-
-fn post_campaign_auto_pardon(
-    state_dir: &Path,
-    graph: &CampaignGraph,
-    actor: &str,
-    pardon: &PlannedAutoPardon,
-) -> Result<String> {
-    let reason = auto_pardon_reason(pardon);
-    let scope = PardonScope::Tasks(BTreeSet::from([pardon.task_id.clone()]));
-    append_local_campaign_pardon(state_dir, graph, actor, &reason, &scope)
-}
-
-async fn run_campaign_resume(
-    socket: &Path,
-    config_path: Option<&Path>,
-    rpc_timeout: Duration,
-    args: CampaignResumeArgs,
-) -> Result<()> {
-    let (code_repository, worklist_pattern) =
-        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
-    let state_dir = resolve_state_dir(args.state_dir)?;
-    let registry = CampaignRegistry::open(&state_dir)?;
-    let mut registration = registry
-        .read_campaign(&code_repository, &worklist_pattern)?
-        .ok_or_else(|| {
-        invalid(format!(
-            "campaign {code_repository}/{worklist_pattern} is not armed; arm it before attempting resume"
-        ))
-    })?;
-    require_local_actor(&registration)?;
-    let repository = campaign_repository_from_registration(&registration);
-    let adapters = load_client_config(config_path)?.adapters;
-    let graph = local_campaign_graph_from_worklist(
-        repository,
-        &code_repository,
-        &worklist_pattern,
-        &adapters,
-    )?;
-    let _ = validate_host(
-        &graph,
-        config_path,
-        &registration.flow,
-        &registration.driver,
-    )?;
-
-    let next_arm_serial = registration
-        .arm_serial
-        .checked_add(1)
-        .ok_or_else(|| invalid("campaign resume counter is exhausted"))?;
-    let prior_digest = registration.approved_graph_digest.clone();
-    let receipt = append_local_campaign_pardon(
-        &state_dir,
-        &graph,
-        &registration.local_actor,
-        &args.reason,
-        &PardonScope::All,
-    )?;
-    registration.arm_serial = next_arm_serial;
-    registration.armed_at = Utc::now().to_rfc3339();
-    registration.approved_graph_digest = graph.canonical.executable_digest.clone();
-    // Publish the new authority before dispatch. Once this write succeeds, the
-    // timer can recover an interrupted dispatch without another manual state
-    // edit.
-    write_local_attempt_receipt_authority(&state_dir, &graph, registration.arm_serial)?;
-    write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
-    registry.write(&mut registration)?;
-    prune_approved_graph_snapshots(&state_dir, &registration)?;
-
-    let repository_progress = repository_progress_value(&graph)?;
-    let result = dispatch_campaign(
-        CampaignHost {
-            socket,
-            config_path,
-            state_dir: &state_dir,
-            rpc_timeout,
-        },
-        &graph,
-        &repository_progress,
-        &mut registration,
-        args.wait,
-        None,
-    )
-    .await?;
-    registry.write(&mut registration)?;
-
-    let mut output = if result.is_object() {
-        result.clone()
-    } else {
-        json!({"result": result})
-    };
-    if let Some(object) = output.as_object_mut() {
-        object.insert("status".to_owned(), json!("resumed"));
-        object.insert("resumeReceipt".to_owned(), json!(receipt));
-        object.insert("reason".to_owned(), json!(args.reason.trim()));
-        object.insert("priorGraphDigest".to_owned(), json!(prior_digest));
-        object.insert(
-            "graphDigest".to_owned(),
-            json!(registration.approved_graph_digest),
-        );
-    }
-    outln!("{}", serde_json::to_string(&output)?);
-    if args.wait {
-        let code = waited_exit_code(&result);
-        if code != 0 {
-            return Err(anyhow::Error::new(ExitFailure {
-                code,
-                message: "campaign resumed, but its reconcile pass returned a non-zero verdict"
-                    .to_owned(),
             }));
         }
     }
@@ -6863,7 +6706,12 @@ async fn run_campaign_status(
         &worklist_pattern,
     )
     .await?;
-    attach_campaign_status_outcomes(&state_dir, approved_graph.as_ref(), &mut status)?;
+    attach_campaign_status_outcomes(
+        &state_dir,
+        approved_graph.as_ref(),
+        registration.as_ref(),
+        &mut status,
+    )?;
     if args.json {
         outln!("{}", serde_json::to_string(&status)?);
         return Ok(());
@@ -9233,47 +9081,15 @@ fi
     }
 
     #[test]
-    fn amendment_pardons_only_escalated_tasks_that_gained_a_dependency() {
-        let prior = canonical_graph_for_pardon(&[]);
-        let amended = canonical_graph_for_pardon(&["prerequisite"]);
-        let escalated = BTreeSet::from(["task-a".to_owned(), "task-b".to_owned()]);
-
-        let (pardons, warnings) = amendment_pardon_plan(Some(&prior), &amended, &escalated);
-        assert_eq!(
-            pardons,
-            [PlannedAutoPardon {
-                task_id: "task-a".to_owned(),
-                added_dependencies: vec!["prerequisite".to_owned()],
-            }]
-        );
-        assert_eq!(
-            warnings,
-            ["task task-b remains escalated; run tally campaign resume to unblock"]
-        );
-
-        let receipt = arm_receipt(
-            &json!({"status": "armed"}),
-            &[AutoPardonReceipt {
-                task_id: pardons[0].task_id.clone(),
-                added_dependencies: pardons[0].added_dependencies.clone(),
-                resume_receipt: "local://campaign/night-build/attempt-receipts/7".to_owned(),
-            }],
-            &warnings,
-        );
-        assert_eq!(receipt["autoPardons"][0]["taskId"], json!("task-a"));
-        assert_eq!(
-            receipt["autoPardons"][0]["addedDependencies"],
-            json!(["prerequisite"])
-        );
-        assert_eq!(
-            receipt["autoPardons"][0]["resumeReceipt"],
-            json!("local://campaign/night-build/attempt-receipts/7")
-        );
+    fn arm_receipt_has_no_counter_clearing_surface() {
+        let warnings = vec!["ownership warning".to_owned()];
+        let receipt = arm_receipt(&json!({"status": "armed"}), &warnings);
+        assert!(!receipt.as_object().unwrap().contains_key("autoPardons"));
         assert_eq!(receipt["warnings"], json!(warnings));
     }
 
     #[test]
-    fn local_attempt_receipts_drive_escalation_and_scoped_pardons() {
+    fn legacy_pardon_receipts_remain_readable_but_epochs_supersede_old_attempts() {
         let temporary = tempfile::tempdir().unwrap();
         let campaign = "night-build";
         let issue_number = LOCAL_CAMPAIGN_ISSUE_NUMBER;
@@ -9333,59 +9149,53 @@ fi
             ),
         ]);
         assert_eq!(
-            active_escalated_tasks_from_receipts(&loaded, &current).unwrap(),
+            active_escalated_tasks_from_receipts(&loaded, &current, &BTreeMap::new()).unwrap(),
             BTreeSet::from(["finish".to_owned()])
         );
 
-        let graph = local_graph_for_test();
-        write_local_attempt_receipt_authority(temporary.path(), &graph, 9).unwrap();
-        let receipt = append_local_campaign_pardon(
-            temporary.path(),
-            &graph,
-            "uid:1000",
-            "The amended graph now addresses the failed task.",
-            &PardonScope::Tasks(BTreeSet::from(["finish".to_owned()])),
-        )
-        .unwrap();
-        assert_eq!(receipt, "local://campaign/night-build/attempt-receipts/7");
-        let repaired = fs::read_to_string(&path).unwrap();
-        assert!(!repaired.contains("interrupted"));
-        let pardon: Value = serde_json::from_str(repaired.lines().last().unwrap()).unwrap();
-        assert_eq!(
-            pardon["schemaVersion"],
-            json!(ATTEMPT_RECEIPT_SCHEMA_VERSION)
-        );
-        assert_eq!(pardon["armSerial"], json!(9));
-        assert_eq!(pardon["worklistSha256"], json!(graph.worklist_sha256));
-        assert_eq!(pardon["actor"], json!("uid:1000"));
-        assert!(DateTime::parse_from_rfc3339(pardon["writtenAt"].as_str().unwrap()).is_ok());
-        let loaded = read_local_attempt_receipts(temporary.path(), campaign, issue_number).unwrap();
-        assert_eq!(loaded.len(), 7);
-        assert!(
-            active_escalated_tasks_from_receipts(&loaded, &current)
-                .unwrap()
-                .is_empty(),
-            "the two scoped pardons jointly cover the escalation contributors"
-        );
-
-        let removed_task_history = [
+        let old_epoch = format!("sha256:{}", "c".repeat(64));
+        let current_epoch = format!("sha256:{}", "d".repeat(64));
+        let old_epoch_history = [
             LocalAttemptReceiptV1::Diagnosis {
-                task_id: "removed".to_owned(),
+                task_id: "finish".to_owned(),
                 attempt: 1,
+                input_epoch: Some(old_epoch.clone()),
+                blocks_task: false,
             },
             LocalAttemptReceiptV1::Diagnosis {
-                task_id: "removed".to_owned(),
+                task_id: "finish".to_owned(),
                 attempt: 2,
-            },
-            LocalAttemptReceiptV1::Escalation,
-            LocalAttemptReceiptV1::Pardon {
-                tasks: Some(BTreeSet::from(["removed".to_owned()])),
+                input_epoch: Some(old_epoch),
+                blocks_task: true,
             },
             LocalAttemptReceiptV1::Escalation,
         ];
-        assert!(
-            active_escalated_tasks_from_receipts(&removed_task_history, &BTreeMap::new()).is_err(),
-            "removed tasks are dropped before escalation causality is folded"
+        assert!(active_escalated_tasks_from_receipts(
+            &old_epoch_history,
+            &current,
+            &BTreeMap::from([("finish".to_owned(), current_epoch)]),
+        )
+        .unwrap()
+        .is_empty());
+
+        let mut lifetime_history = (1..=MAX_TASK_LIFETIME_ATTEMPTS)
+            .map(|ordinal| LocalAttemptReceiptV1::Diagnosis {
+                task_id: "finish".to_owned(),
+                attempt: 1,
+                input_epoch: Some(format!("sha256:{ordinal:064x}")),
+                blocks_task: false,
+            })
+            .collect::<Vec<_>>();
+        lifetime_history.push(LocalAttemptReceiptV1::Escalation);
+        assert_eq!(
+            active_escalated_tasks_from_receipts(
+                &lifetime_history,
+                &current,
+                &BTreeMap::from([("finish".to_owned(), format!("sha256:{}", "f".repeat(64)),)]),
+            )
+            .unwrap(),
+            BTreeSet::from(["finish".to_owned()]),
+            "the lifetime latch survives every epoch refresh"
         );
     }
 
@@ -9402,6 +9212,7 @@ fi
                 sequence: 1,
                 task_id: "authority-task".to_owned(),
                 task_revision: authority_revision,
+                input_epoch: None,
                 task_uuid: "00000000-0000-4000-8000-000000000801".to_owned(),
                 outcome: WorkerOutcomePayload::NeedsAuthority {
                     paths: vec![
@@ -9414,6 +9225,7 @@ fi
                 sequence: 2,
                 task_id: "impossible-task".to_owned(),
                 task_revision: impossible_revision,
+                input_epoch: None,
                 task_uuid: "00000000-0000-4000-8000-000000000802".to_owned(),
                 outcome: WorkerOutcomePayload::Impossible {
                     reason: "The required upstream proof does not exist.".to_owned(),
@@ -9436,7 +9248,14 @@ fi
                 }
             ]
         });
-        project_campaign_status_outcomes(&mut status, "fixture", &records, &revisions).unwrap();
+        project_campaign_status_outcomes(
+            &mut status,
+            "fixture",
+            &records,
+            &revisions,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             status["tasks"][0]["outcome"]["kind"],
             json!("needs-authority")
@@ -9452,7 +9271,8 @@ fi
         let mut escalated = records;
         escalated.push(LocalAttemptReceiptV1::Escalation);
         assert_eq!(
-            active_escalated_tasks_from_receipts(&escalated, &revisions).unwrap(),
+            active_escalated_tasks_from_receipts(&escalated, &revisions, &BTreeMap::new(),)
+                .unwrap(),
             BTreeSet::from(["authority-task".to_owned()]),
             "needs-authority blocks without manufacturing diagnosis attempts"
         );
@@ -9634,22 +9454,25 @@ fi
             "conflictDomains": []
         }])))
         .unwrap();
+        let canonical = CanonicalCampaignGraphV1::new(
+            manifest,
+            vec![CanonicalCampaignTaskV1 {
+                number: 43,
+                title: "Foundation".to_owned(),
+                body: "Build the foundation.".to_owned(),
+            }],
+        )
+        .unwrap();
+        let task_input_hashes = canonical_task_input_hashes(&canonical).unwrap();
         CampaignGraph {
-            canonical: CanonicalCampaignGraphV1::new(
-                manifest,
-                vec![CanonicalCampaignTaskV1 {
-                    number: 43,
-                    title: "Foundation".to_owned(),
-                    body: "Build the foundation.".to_owned(),
-                }],
-            )
-            .unwrap(),
+            canonical,
             ownership_preflight_warnings: Vec::new(),
             worklist_sha256: format!("sha256:{}", "a".repeat(64)),
+            task_input_hashes,
         }
     }
 
-    fn canonical_graph_for_pardon(task_a_dependencies: &[&str]) -> CanonicalCampaignGraphV1 {
+    fn canonical_graph_for_amendment(task_a_dependencies: &[&str]) -> CanonicalCampaignGraphV1 {
         let manifest: CampaignManifest = serde_json::from_value(manifest_value_for_test(json!([
             {
                 "id": "prerequisite",
@@ -9979,7 +9802,6 @@ fi
         }));
         let receipt = arm_receipt(
             &json!({"status": "armed"}),
-            &[],
             &graph.ownership_preflight_warnings,
         );
         assert_eq!(
@@ -10686,8 +10508,8 @@ fi
     #[test]
     fn approved_graph_snapshots_are_generation_scoped_and_digest_checked() {
         let temporary = tempfile::tempdir().unwrap();
-        let prior = canonical_graph_for_pardon(&[]);
-        let amended = canonical_graph_for_pardon(&["prerequisite"]);
+        let prior = canonical_graph_for_amendment(&[]);
+        let amended = canonical_graph_for_amendment(&["prerequisite"]);
         let mut registration = CampaignRegistration::new(
             CampaignRegistrationV4 {
                 schema_version: REGISTRY_SCHEMA_VERSION,

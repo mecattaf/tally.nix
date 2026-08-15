@@ -386,6 +386,10 @@ export const meta = {
             ]
           }
         ]
+      },
+      "Sha256Identity": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
       }
     },
     "allOf": [
@@ -486,6 +490,13 @@ export const meta = {
           "tasks",
           "executableDigest"
         ]
+      },
+      "taskInputHashes": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/$defs/Sha256Identity"
+        },
+        "maxProperties": 128
       },
       "armedManifest": {
         "anyOf": [
@@ -1360,6 +1371,15 @@ const reconcileSchema = {
       maxItems: 128,
       items: taskSchema
     },
+    inputEpochs: {
+      type: "object",
+      maxProperties: 128,
+      propertyNames: taskIdSchema,
+      additionalProperties: {
+        type: "string",
+        pattern: "^sha256:[0-9a-f]{64}$"
+      }
+    },
     merged: { type: "array", items: mergedFactSchema },
     checkpoints: { type: "array", items: checkpointFactSchema },
     remaining: { type: "array", items: taskIdSchema },
@@ -2024,6 +2044,7 @@ function campaignInputs() {
       mergeMethod: args.mergeMethod || "squash",
       postFailureEvidence: args.postFailureEvidence === true,
       postFailureStderr: args.postFailureStderr === true,
+      taskInputHashes: null,
       agent: diagnosisSandboxed(args.agent),
       steward: args.steward || null,
       gates: args.gates
@@ -2065,6 +2086,7 @@ function campaignInputs() {
     mergeMethod: manifest.mergeMethod,
     postFailureEvidence: false,
     postFailureStderr: false,
+    taskInputHashes: args.taskInputHashes,
     agent: diagnosisSandboxed(manifest.agent),
     steward: manifest.steward,
     gates: manifest.gates
@@ -2521,6 +2543,19 @@ function authorizedComments(task) {
   return master.concat(args.taskSteering[task.id] || []);
 }
 
+function steeringHighWater() {
+  const highWater = comments => comments.reduce(
+    (maximum, comment) => Math.max(maximum, comment.id),
+    0
+  );
+  const campaign = highWater(args.steering || []);
+  const tasks = {};
+  for (const [taskId, comments] of Object.entries(args.taskSteering || {})) {
+    tasks[taskId] = Math.max(campaign, highWater(comments));
+  }
+  return { campaign, tasks };
+}
+
 function reconciledProjection(reconciliation) {
   return {
     merged: reconciliation.merged,
@@ -2744,6 +2779,11 @@ function sweepDeferral(sweepNode) {
     worklist: inputs.worklist,
     maxTasks: inputs.maxTasks,
     maxParallel: inputs.maxParallel,
+    gateSet: effective.gates,
+    steeringHighWater: steeringHighWater(),
+    ...(inputs.taskInputHashes === null || inputs.taskInputHashes === undefined
+      ? {}
+      : { taskInputHashes: inputs.taskInputHashes }),
     attemptReceipts
   });
   const reconciliationNode = await driverNode(
@@ -2763,6 +2803,13 @@ function sweepDeferral(sweepNode) {
     ...reconciliationNode.result,
     outcomes: reconciliationNode.result.outcomes || []
   };
+  // Every later writer under a current driver carries the reconciler's
+  // immutable epoch snapshot. A stale pass therefore appends its old epoch
+  // even if a re-arm or steer publishes newer authority before the append.
+  // The absence branch keeps pre-epoch seam fixtures conservative.
+  if (reconciliation.inputEpochs !== undefined) {
+    attemptReceipts.inputEpochs = reconciliation.inputEpochs;
+  }
   const repositoryConfig = effective.repositoryConfig;
   const domainsRequired = effective.maxParallel > 1;
 
