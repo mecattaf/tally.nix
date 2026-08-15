@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tally_client::RpcClient;
 use tally_core::adapters::{
     AdapterConfig, AdapterLaunchConfig, AdapterValueOverride, ScrapeCapture, ScrapeMode,
@@ -2560,6 +2561,30 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             let attempt_receipts_path = daemon_paths
                 .state_dir
                 .join("campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl");
+            let write_receipt_authority = |arm_serial: u64| {
+                let worklist = fs::read(checkout.join("specs/001-toy/tasks.json")).unwrap();
+                let worklist_sha256 = format!("sha256:{:x}", Sha256::digest(worklist));
+                let authority_path = attempt_receipts_path
+                    .parent()
+                    .unwrap()
+                    .join("receipt-authority-v1.json");
+                fs::create_dir_all(authority_path.parent().unwrap()).unwrap();
+                fs::write(
+                    &authority_path,
+                    serde_json::to_vec(&json!({
+                        "schemaVersion": 1,
+                        "campaign": "fixture",
+                        "issueNumber": "7",
+                        "armSerial": arm_serial,
+                        "worklistSha256": &worklist_sha256,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                fs::set_permissions(&authority_path, fs::Permissions::from_mode(0o600)).unwrap();
+                worklist_sha256
+            };
+            let initial_worklist_sha256 = write_receipt_authority(1);
             let integration_branch = "tally/fixture-campaign-fixture/integration";
             let arguments = |run_id: &str, priority: &str| {
                 json!({
@@ -3980,8 +4005,14 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 .collect::<Vec<_>>();
             assert_eq!(attempt_receipts.len(), 5);
             assert!(attempt_receipts.iter().enumerate().all(|(index, receipt)| {
-                receipt["schemaVersion"].as_u64() == Some(1)
+                receipt["schemaVersion"].as_u64() == Some(2)
                     && receipt["sequence"].as_u64() == Some(index as u64 + 1)
+                    && receipt["armSerial"].as_u64() == Some(1)
+                    && receipt["worklistSha256"] == initial_worklist_sha256
+                    && receipt["actor"] == "spec-build-driver"
+                    && receipt["writtenAt"]
+                        .as_str()
+                        .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
             }));
             let escalation = &attempt_receipts[4];
             assert_eq!(escalation["kind"], "escalation");
@@ -4280,6 +4311,7 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             fixture_git(&checkout, &["add", "specs/001-toy/tasks.json"]);
             fixture_git(&checkout, &["commit", "-m", "operator: rename the diagnosed task"]);
             fixture_git(&checkout, &["push", "origin", "main"]);
+            let renamed_worklist_sha256 = write_receipt_authority(2);
 
             let renamed = runner(
                 &config_path,
@@ -4402,6 +4434,14 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(retry["sequence"], 6);
             assert_eq!(retry["kind"], "retry");
             assert_eq!(retry["taskId"], "task-2b");
+            assert_eq!(retry["schemaVersion"], 2);
+            assert_eq!(retry["armSerial"], 2);
+            assert_eq!(retry["worklistSha256"], renamed_worklist_sha256);
+            assert_eq!(retry["actor"], "spec-build-driver");
+            assert!(chrono::DateTime::parse_from_rfc3339(
+                retry["writtenAt"].as_str().unwrap()
+            )
+            .is_ok());
             assert!(retry["reason"].as_str().unwrap().contains("`merge`"));
 
             let recovered = runner(
@@ -4520,6 +4560,7 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             fixture_git(&checkout, &["add", "specs/001-toy/tasks.json"]);
             fixture_git(&checkout, &["commit", "-m", "operator: drop the unbuildable task"]);
             fixture_git(&checkout, &["push", "origin", "main"]);
+            write_receipt_authority(3);
 
             // Editing the worklist rotates its digest, so the checkpoint must
             // rebind to the edited worklist before the campaign can be done.

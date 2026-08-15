@@ -13,6 +13,10 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::adapters::{AdapterConfig, AdapterHardening, ScrapeMode, ScrapeStream};
+use tally_core::attempt_receipts::{
+    validate_attempt_receipt_stamp, AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE,
+    ATTEMPT_RECEIPT_SCHEMA_VERSION, LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+};
 use tally_core::campaign_contract::{
     admit_manifest_value, task_completion_revision, validate_agent, validate_argv, validate_gates,
     CampaignAgent, CampaignGate, CampaignManifest, CampaignRepository, CampaignSteward,
@@ -44,9 +48,9 @@ const CAMPAIGN_STEERING_EMBARGO_MILLISECONDS: i64 = 1_000;
 const MAX_CAMPAIGN_STEERING_LOG_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CAMPAIGN_STEERING_BODY_CHARS: usize = 64_000;
 const MAX_CAMPAIGN_STEERING_PER_TARGET: usize = 1_000;
-const ATTEMPT_RECEIPTS_SCHEMA_VERSION: u64 = 1;
 const ATTEMPT_RECEIPTS_FILE: &str = "attempt-receipts-v1.jsonl";
 const MAX_ATTEMPT_RECEIPTS_LOG_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES: u64 = 64 * 1024;
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
 const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
@@ -107,6 +111,7 @@ struct ValidatedWorklist {
 struct CommittedLocalWorklist {
     document: Value,
     source_path: String,
+    source_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +152,7 @@ struct CheckpointBrief<'a> {
 struct CampaignGraph {
     canonical: CanonicalCampaignGraphV1,
     ownership_preflight_warnings: Vec<String>,
+    worklist_sha256: String,
 }
 
 const fn default_worklist_max_tasks() -> usize {
@@ -3670,6 +3676,122 @@ fn local_attempt_receipts_path(state_dir: &Path, campaign: &str) -> Result<PathB
         .join(ATTEMPT_RECEIPTS_FILE))
 }
 
+fn local_attempt_receipt_authority_path(state_dir: &Path, campaign: &str) -> Result<PathBuf> {
+    Ok(local_attempt_receipts_path(state_dir, campaign)?
+        .parent()
+        .expect("attempt-receipts path always has a parent")
+        .join(ATTEMPT_RECEIPT_AUTHORITY_FILE))
+}
+
+fn read_local_attempt_receipt_authority(
+    state_dir: &Path,
+    campaign: &str,
+    issue_number: u64,
+) -> Result<AttemptReceiptAuthorityV1> {
+    let path = local_attempt_receipt_authority_path(state_dir, campaign)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "cannot write a stamped attempt receipt without authority {}",
+                path.display()
+            )
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES
+    {
+        bail!(
+            "attempt receipt authority is not a bounded private regular file: {}",
+            path.display()
+        );
+    }
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES {
+        bail!(
+            "attempt receipt authority exceeds 64 KiB: {}",
+            path.display()
+        );
+    }
+    let authority: AttemptReceiptAuthorityV1 = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "attempt receipt authority {} is invalid JSON",
+            path.display()
+        )
+    })?;
+    authority
+        .validate_for(campaign, &issue_number.to_string())
+        .map_err(|error| invalid(format!("attempt receipt authority is invalid: {error}")))?;
+    Ok(authority)
+}
+
+fn write_local_attempt_receipt_authority(
+    state_dir: &Path,
+    graph: &CampaignGraph,
+    arm_serial: u64,
+) -> Result<()> {
+    let campaign = &graph.canonical.manifest.name;
+    let path = local_attempt_receipt_authority_path(state_dir, campaign)?;
+    let directory = path
+        .parent()
+        .expect("attempt-receipt authority path always has a parent");
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "cannot create attempt-receipts directory {}",
+            directory.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "attempt-receipts parent must be a real directory: {}",
+            directory.display()
+        );
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    let authority = AttemptReceiptAuthorityV1::new(
+        campaign,
+        LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+        arm_serial,
+        graph.worklist_sha256.clone(),
+    )
+    .map_err(|error| invalid(format!("cannot publish attempt receipt authority: {error}")))?;
+    let temporary = directory.join(format!(".receipt-authority.{}.tmp", uuid::Uuid::now_v7()));
+    let write = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "cannot create attempt receipt authority {}",
+                    temporary.display()
+                )
+            })?;
+        serde_json::to_writer(&mut file, &authority)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path).with_context(|| {
+            format!(
+                "cannot publish attempt receipt authority {}",
+                path.display()
+            )
+        })?;
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write
+}
+
 fn local_attempt_receipt_url(campaign: &str, sequence: u64) -> String {
     format!("local://campaign/{campaign}/attempt-receipts/{sequence}")
 }
@@ -3724,56 +3846,60 @@ fn validate_local_attempt_receipt(
         .get("kind")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(format!("{context}.kind must be a string")))?;
-    let common = [
+    let schema_version = object
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid(format!("{context}.schemaVersion is invalid")))?;
+    if !matches!(
+        schema_version,
+        LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION | ATTEMPT_RECEIPT_SCHEMA_VERSION
+    ) {
+        return Err(invalid(format!(
+            "{context}.schemaVersion must equal {LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION} or {ATTEMPT_RECEIPT_SCHEMA_VERSION}"
+        )));
+    }
+    let mut common: Vec<&'static str> = vec![
         "schemaVersion",
         "sequence",
         "kind",
         "campaign",
         "issueNumber",
     ];
+    if schema_version == ATTEMPT_RECEIPT_SCHEMA_VERSION {
+        common.extend(["armSerial", "worklistSha256", "writtenAt", "actor"]);
+    }
+    let fields = |specific: &[&'static str]| -> (Vec<&'static str>, BTreeSet<&'static str>) {
+        let required = common
+            .iter()
+            .copied()
+            .chain(specific.iter().copied())
+            .collect::<Vec<_>>();
+        let allowed = required.iter().copied().collect::<BTreeSet<_>>();
+        (required, allowed)
+    };
     let (required, allowed): (Vec<&str>, BTreeSet<&str>) = match kind {
         "diagnosis" => {
-            let specific = ["taskId", "attempt", "diagnosis", "redaction"];
-            (
-                common.into_iter().chain(specific).collect(),
-                common.into_iter().chain(specific).collect(),
-            )
+            let (required, mut allowed) = fields(&["taskId", "attempt", "diagnosis", "redaction"]);
+            // Judge-era schema-1 history and current schema-2 records may
+            // carry these fields. This fold does not consume their values.
+            allowed.extend(["verdict", "proposal"]);
+            (required, allowed)
         }
-        "retry" => {
-            let specific = ["taskId", "attempt", "reason", "redaction"];
-            (
-                common.into_iter().chain(specific).collect(),
-                common.into_iter().chain(specific).collect(),
-            )
+        "retry" => fields(&["taskId", "attempt", "reason", "redaction"]),
+        "worker-outcome" => fields(&[
+            "taskId",
+            "taskRevision",
+            "taskUuid",
+            "outcome",
+            "paths",
+            "reason",
+        ]),
+        "escalation" => fields(&["body"]),
+        "pardon" => {
+            let (required, mut allowed) = fields(&["tasks"]);
+            allowed.extend(["reason", "actor", "nonce"]);
+            (required, allowed)
         }
-        "worker-outcome" => {
-            let specific = [
-                "taskId",
-                "taskRevision",
-                "taskUuid",
-                "outcome",
-                "paths",
-                "reason",
-            ];
-            (
-                common.into_iter().chain(specific).collect(),
-                common.into_iter().chain(specific).collect(),
-            )
-        }
-        "escalation" => {
-            let specific = ["body"];
-            (
-                common.into_iter().chain(specific).collect(),
-                common.into_iter().chain(specific).collect(),
-            )
-        }
-        "pardon" => (
-            common.into_iter().chain(["tasks"]).collect(),
-            common
-                .into_iter()
-                .chain(["tasks", "reason", "actor", "nonce"])
-                .collect(),
-        ),
         _ => return Err(invalid(format!("{context} has unknown kind {kind:?}"))),
     };
     if let Some(field) = object
@@ -3791,14 +3917,22 @@ fn validate_local_attempt_receipt(
         return Err(invalid(format!("{context} is missing field {field:?}")));
     }
     let expected_issue_number = issue_number.to_string();
-    if object.get("schemaVersion").and_then(Value::as_u64) != Some(ATTEMPT_RECEIPTS_SCHEMA_VERSION)
-        || object.get("sequence").and_then(Value::as_u64) != Some(expected_sequence)
+    if object.get("sequence").and_then(Value::as_u64) != Some(expected_sequence)
         || object.get("campaign").and_then(Value::as_str) != Some(campaign)
         || object.get("issueNumber").and_then(Value::as_str) != Some(expected_issue_number.as_str())
     {
         return Err(invalid(format!(
             "{context} has invalid identity or sequence"
         )));
+    }
+    if schema_version == ATTEMPT_RECEIPT_SCHEMA_VERSION {
+        validate_attempt_receipt_stamp(
+            object.get("armSerial").and_then(Value::as_u64),
+            object.get("worklistSha256").and_then(Value::as_str),
+            object.get("writtenAt").and_then(Value::as_str),
+            object.get("actor").and_then(Value::as_str),
+        )
+        .map_err(|error| invalid(format!("{context} has invalid stamp: {error}")))?;
     }
 
     let task_attempt = |payload: &str, maximum: usize| -> Result<(String, u8)> {
@@ -4391,15 +4525,19 @@ fn append_local_campaign_pardon(
         let sequence = u64::try_from(records.len())?
             .checked_add(1)
             .ok_or_else(|| invalid("attempt-receipts sequence is exhausted"))?;
+        let authority = read_local_attempt_receipt_authority(state_dir, campaign, issue_number)?;
         let candidate = json!({
-            "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+            "schemaVersion": ATTEMPT_RECEIPT_SCHEMA_VERSION,
             "sequence": sequence,
             "kind": "pardon",
             "campaign": campaign,
             "issueNumber": issue_number.to_string(),
+            "armSerial": authority.arm_serial,
+            "worklistSha256": authority.worklist_sha256,
+            "writtenAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "actor": actor,
             "tasks": tasks,
             "reason": normalized_reason,
-            "actor": actor,
             "nonce": nonce,
         });
         validate_local_attempt_receipt(candidate.clone(), &path, sequence, campaign, issue_number)?;
@@ -5044,6 +5182,7 @@ fn committed_local_worklist(
     Ok(CommittedLocalWorklist {
         document,
         source_path: source_path.clone(),
+        source_sha256: format!("sha256:{:x}", Sha256::digest(&raw)),
     })
 }
 
@@ -5062,10 +5201,13 @@ fn local_campaign_graph_from_worklist(
             "the local worklist arm path requires campaign.repository.forge=local",
         ));
     }
-    local_campaign_graph(validated)
+    local_campaign_graph(validated, committed.source_sha256)
 }
 
-fn local_campaign_graph(validated: ValidatedWorklist) -> Result<CampaignGraph> {
+fn local_campaign_graph(
+    validated: ValidatedWorklist,
+    worklist_sha256: String,
+) -> Result<CampaignGraph> {
     if validated.tasks.len() != validated.manifest.tasks.len() {
         return Err(invalid(
             "validated worklist task content does not match its manifest references",
@@ -5086,6 +5228,7 @@ fn local_campaign_graph(validated: ValidatedWorklist) -> Result<CampaignGraph> {
     Ok(CampaignGraph {
         canonical,
         ownership_preflight_warnings,
+        worklist_sha256,
     })
 }
 
@@ -6352,6 +6495,9 @@ async fn run_campaign_arm(
         &registration.flow,
         &registration.driver,
     )?);
+    // Publish the arm's epoch key before any automatic pardon for that arm is
+    // appended. The separately packaged driver reads this same sibling file.
+    write_local_attempt_receipt_authority(&state_dir, &graph, registration.arm_serial)?;
     let mut auto_pardons = Vec::with_capacity(pardon_plan.len());
     for pardon in &pardon_plan {
         let receipt =
@@ -6496,6 +6642,7 @@ async fn run_campaign_resume(
     // Publish the new authority before dispatch. Once this write succeeds, the
     // timer can recover an interrupted dispatch without another manual state
     // edit.
+    write_local_attempt_receipt_authority(&state_dir, &graph, registration.arm_serial)?;
     write_approved_graph_snapshot(&state_dir, &registration, &graph.canonical)?;
     registry.write(&mut registration)?;
     prune_approved_graph_snapshots(&state_dir, &registration)?;
@@ -8859,7 +9006,7 @@ fi
             format!(
                 "{}\n",
                 serde_json::to_string(&json!({
-                    "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                    "schemaVersion": LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
                     "sequence": 1,
                     "kind": "diagnosis",
                     "campaign": campaign,
@@ -9134,7 +9281,7 @@ fi
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let diagnosis = |sequence: u64, task_id: &str, attempt: u8| {
             json!({
-                "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                "schemaVersion": LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
                 "sequence": sequence,
                 "kind": "diagnosis",
                 "campaign": campaign,
@@ -9151,7 +9298,7 @@ fi
             diagnosis(3, "finish", 1),
             diagnosis(4, "finish", 2),
             json!({
-                "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                "schemaVersion": LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
                 "sequence": 5,
                 "kind": "escalation",
                 "campaign": campaign,
@@ -9159,7 +9306,7 @@ fi
                 "body": "The local frontier is quiescent.",
             }),
             json!({
-                "schemaVersion": ATTEMPT_RECEIPTS_SCHEMA_VERSION,
+                "schemaVersion": LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
                 "sequence": 6,
                 "kind": "pardon",
                 "campaign": campaign,
@@ -9191,6 +9338,7 @@ fi
         );
 
         let graph = local_graph_for_test();
+        write_local_attempt_receipt_authority(temporary.path(), &graph, 9).unwrap();
         let receipt = append_local_campaign_pardon(
             temporary.path(),
             &graph,
@@ -9202,6 +9350,15 @@ fi
         assert_eq!(receipt, "local://campaign/night-build/attempt-receipts/7");
         let repaired = fs::read_to_string(&path).unwrap();
         assert!(!repaired.contains("interrupted"));
+        let pardon: Value = serde_json::from_str(repaired.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            pardon["schemaVersion"],
+            json!(ATTEMPT_RECEIPT_SCHEMA_VERSION)
+        );
+        assert_eq!(pardon["armSerial"], json!(9));
+        assert_eq!(pardon["worklistSha256"], json!(graph.worklist_sha256));
+        assert_eq!(pardon["actor"], json!("uid:1000"));
+        assert!(DateTime::parse_from_rfc3339(pardon["writtenAt"].as_str().unwrap()).is_ok());
         let loaded = read_local_attempt_receipts(temporary.path(), campaign, issue_number).unwrap();
         assert_eq!(loaded.len(), 7);
         assert!(
@@ -9488,6 +9645,7 @@ fi
             )
             .unwrap(),
             ownership_preflight_warnings: Vec::new(),
+            worklist_sha256: format!("sha256:{}", "a".repeat(64)),
         }
     }
 
@@ -9584,6 +9742,7 @@ fi
         let committed = CommittedLocalWorklist {
             document,
             source_path: "specs/night/epsilon.json".to_owned(),
+            source_sha256: format!("sha256:{}", "a".repeat(64)),
         };
         let repository = CampaignRepository {
             checkout: PathBuf::from("/srv/acme/widgets"),
@@ -9800,7 +9959,7 @@ fi
                 .collect::<Vec<_>>(),
             [1, 2]
         );
-        let graph = local_campaign_graph(validated).unwrap();
+        let graph = local_campaign_graph(validated, committed.source_sha256.clone()).unwrap();
         assert!(graph.canonical.tasks[0]
             .body
             .contains("Build the local foundation in src/lib.rs."));
@@ -9834,6 +9993,7 @@ fi
             &CommittedLocalWorklist {
                 document: forge_field,
                 source_path: committed.source_path.clone(),
+                source_sha256: committed.source_sha256.clone(),
             },
             &repository,
             "acme/widgets",
@@ -9849,6 +10009,7 @@ fi
             &CommittedLocalWorklist {
                 document: unknown_agent,
                 source_path: committed.source_path,
+                source_sha256: committed.source_sha256,
             },
             &repository,
             "acme/widgets",

@@ -54,7 +54,7 @@ pub enum CanonicalSurfaceId {
     CampaignRegistrations,
     /// Approved graphs and immutable flow/driver snapshots and manifests.
     CampaignAssets,
-    /// Append-only local attempt and steering receipts.
+    /// Append-only local attempt and steering receipts plus receipt authority.
     CampaignReceipts,
     /// Integration branches, immutable receipt refs, and trailer-marked commits.
     RepositoryReceipts,
@@ -357,10 +357,11 @@ pub const CANONICAL_SURFACES: &[CanonicalSurface] = &[
     ),
     CanonicalSurface::new(
         CanonicalSurfaceId::CampaignReceipts,
-        &["campaign_folds"],
+        &["attempt_receipts", "campaign_folds"],
         SurfaceMedium::Filesystem,
         &[
             "state/campaigns/attempt-receipts/*/attempt-receipts-v1.jsonl",
+            "state/campaigns/attempt-receipts/*/receipt-authority-v1.json",
             "state/campaigns/steering/*/steering-v1.jsonl",
         ],
     ),

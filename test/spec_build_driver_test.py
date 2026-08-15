@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 import shutil
 import subprocess
@@ -95,6 +96,8 @@ def driver_under_test() -> Path:
 DRIVER = driver_under_test()
 FINAL_MESSAGE_PREFIX = "TALLY_FINAL_MESSAGE="
 ATTEMPT_RECEIPTS_FILE = "attempt-receipts-v1.jsonl"
+ATTEMPT_RECEIPT_AUTHORITY_FILE = "receipt-authority-v1.json"
+ATTEMPT_RECEIPT_WORKLIST_SHA256 = "sha256:" + "a" * 64
 MAX_CONTINUATION_EVENT_BYTES = 1024 * 1024
 MAX_DIAGNOSIS_CHARS = 12_000
 MAX_WORKER_FINDINGS_BYTES = 8 * 1024
@@ -216,16 +219,29 @@ def issue() -> dict[str, str]:
 
 
 def attempt_receipts(root: Path, campaign: str = "fixture") -> dict[str, object]:
+    directory = root / "campaigns" / "attempt-receipts" / campaign
+    directory.mkdir(parents=True, exist_ok=True)
+    authority = directory / ATTEMPT_RECEIPT_AUTHORITY_FILE
+    authority.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "campaign": campaign,
+                "issueNumber": "7",
+                "armSerial": 1,
+                "worklistSha256": ATTEMPT_RECEIPT_WORKLIST_SHA256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    authority.chmod(0o600)
     return {
         "schemaVersion": 1,
         "kind": "local-jsonl",
-        "path": str(
-            root
-            / "campaigns"
-            / "attempt-receipts"
-            / campaign
-            / ATTEMPT_RECEIPTS_FILE
-        ),
+        "path": str(directory / ATTEMPT_RECEIPTS_FILE),
     }
 
 
@@ -233,7 +249,15 @@ def attempt_records(root: Path, campaign: str = "fixture") -> list[dict[str, Any
     path = Path(str(attempt_receipts(root, campaign)["path"]))
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        if record.get("schemaVersion") != 2:
+            continue
+        assert record["armSerial"] == 1
+        assert record["worklistSha256"] == ATTEMPT_RECEIPT_WORKLIST_SHA256
+        assert record["actor"] == "spec-build-driver"
+        datetime.fromisoformat(str(record["writtenAt"]).replace("Z", "+00:00"))
+    return records
 
 
 def state_scope(campaign: str, issue_number: str) -> str:

@@ -8,8 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Duration as ChronoDuration, FixedOffset};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, SecondsFormat, Utc};
 use regex::Regex;
+use tally_core::attempt_receipts::{
+    validate_attempt_receipt_stamp, AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE,
+    ATTEMPT_RECEIPT_MACHINE_ACTOR, ATTEMPT_RECEIPT_SCHEMA_VERSION,
+    LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+};
 use tally_core::campaign_folds::{
     campaign_digest as fold_campaign_digest, render_campaign_summary, stable_publish_branch,
     stage_scoped_summary_ref, CampaignReconciliation,
@@ -33,6 +38,7 @@ const OUTCOME_FIRST_LEAD_MAX: usize = 240;
 const MAX_CAMPAIGN_TASKS: usize = 128;
 const MAX_DIFF_CHARS: usize = 128 * 1024;
 const MAX_ATTEMPT_RECEIPTS_LOG_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES: u64 = 64 * 1024;
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
 const MAX_MACHINE_RETRIES: usize = 2;
@@ -5001,6 +5007,58 @@ fn attempt_receipt_url(campaign: &str, sequence: u64) -> String {
     format!("local://campaign/{campaign}/attempt-receipts/{sequence}")
 }
 
+fn read_attempt_receipt_authority(
+    receipt_path: &Path,
+    campaign: &str,
+    issue_number: &str,
+) -> Result<AttemptReceiptAuthorityV1> {
+    let path = receipt_path
+        .parent()
+        .ok_or_else(|| DriverError::new("attemptReceipts.path has no parent"))?
+        .join(ATTEMPT_RECEIPT_AUTHORITY_FILE);
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(O_CLOEXEC | O_NOFOLLOW);
+    let mut file = options.open(&path).map_err(|error| {
+        DriverError::new(format!(
+            "cannot write a stamped attempt receipt without authority {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES
+    {
+        return Err(DriverError::new(format!(
+            "attempt receipt authority is not a bounded private regular file: {}",
+            path.display()
+        )));
+    }
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_ATTEMPT_RECEIPT_AUTHORITY_BYTES {
+        return Err(DriverError::new(format!(
+            "attempt receipt authority exceeds 64 KiB: {}",
+            path.display()
+        )));
+    }
+    let authority: AttemptReceiptAuthorityV1 = serde_json::from_slice(&raw).map_err(|error| {
+        DriverError::new(format!(
+            "attempt receipt authority {} is invalid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    authority
+        .validate_for(campaign, issue_number)
+        .map_err(|error| {
+            DriverError::new(format!(
+                "attempt receipt authority {} is invalid: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(authority)
+}
+
 fn validate_attempt_receipt(
     candidate: &Json,
     path: &Path,
@@ -5016,14 +5074,29 @@ fn validate_attempt_receipt(
         .get("kind")
         .and_then(Json::as_str)
         .unwrap_or_default();
-    let common = [
+    let schema_version = object
+        .get("schemaVersion")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| DriverError::new(format!("{context}.schemaVersion is invalid")))?;
+    if !matches!(
+        schema_version,
+        LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION | ATTEMPT_RECEIPT_SCHEMA_VERSION
+    ) {
+        return Err(DriverError::new(format!(
+            "{context}.schemaVersion must equal {LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION} or {ATTEMPT_RECEIPT_SCHEMA_VERSION}"
+        )));
+    }
+    let mut common = vec![
         "schemaVersion",
         "sequence",
         "kind",
         "campaign",
         "issueNumber",
     ];
-    let mut fields = common.to_vec();
+    if schema_version == ATTEMPT_RECEIPT_SCHEMA_VERSION {
+        common.extend(["armSerial", "worklistSha256", "writtenAt", "actor"]);
+    }
+    let mut fields = common;
     match kind {
         "diagnosis" => fields.extend([
             "taskId",
@@ -5051,14 +5124,22 @@ fn validate_attempt_receipt(
         }
     }
     let record = object_exact(candidate, &fields, &context)?;
-    if record.get("schemaVersion").and_then(Json::as_u64) != Some(1)
-        || record.get("sequence").and_then(Json::as_u64) != Some(expected_sequence)
+    if record.get("sequence").and_then(Json::as_u64) != Some(expected_sequence)
         || record.get("campaign").and_then(Json::as_str) != Some(campaign)
         || record.get("issueNumber").and_then(Json::as_str) != Some(issue_number)
     {
         return Err(DriverError::new(format!(
             "{context} has invalid identity or sequence"
         )));
+    }
+    if schema_version == ATTEMPT_RECEIPT_SCHEMA_VERSION {
+        validate_attempt_receipt_stamp(
+            record.get("armSerial").and_then(Json::as_u64),
+            record.get("worklistSha256").and_then(Json::as_str),
+            record.get("writtenAt").and_then(Json::as_str),
+            record.get("actor").and_then(Json::as_str),
+        )
+        .map_err(|error| DriverError::new(format!("{context} has invalid stamp: {error}")))?;
     }
     let comment = attempt_receipt_url(campaign, expected_sequence);
     match kind {
@@ -5815,12 +5896,32 @@ fn append_attempt_receipt(
                     .map(|record| (false, record));
             }
         }
+        let authority = read_attempt_receipt_authority(&path, campaign, issue_number)?;
         let sequence = records.len() as u64 + 1;
         let mut record = BTreeMap::from([
-            ("schemaVersion".to_owned(), Json::Number("1".to_owned())),
+            (
+                "schemaVersion".to_owned(),
+                Json::Number(ATTEMPT_RECEIPT_SCHEMA_VERSION.to_string()),
+            ),
             ("sequence".to_owned(), Json::Number(sequence.to_string())),
             ("campaign".to_owned(), Json::from(campaign)),
             ("issueNumber".to_owned(), Json::from(issue_number)),
+            (
+                "armSerial".to_owned(),
+                Json::Number(authority.arm_serial.to_string()),
+            ),
+            (
+                "worklistSha256".to_owned(),
+                Json::from(authority.worklist_sha256),
+            ),
+            (
+                "writtenAt".to_owned(),
+                Json::from(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+            ),
+            (
+                "actor".to_owned(),
+                Json::from(ATTEMPT_RECEIPT_MACHINE_ACTOR),
+            ),
         ]);
         record.extend(payload_object.clone());
         let record = Json::Object(record);
@@ -10845,11 +10946,16 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        action_steer, action_worker_outcome, append_diagnosis_report, campaign_attempt_state,
-        campaign_attempt_state_all, classify_worker_outcome, closed_inline_code_spans,
-        contains_bare_exclamation_mark, publish_closing_summary, read_local_blob,
-        replace_bare_exclamation_marks, validate_outcome_first, DiagnosisVerdict, Json, RepoConfig,
+        action_steer, action_worker_outcome, append_attempt_receipt, append_diagnosis_report,
+        campaign_attempt_state, campaign_attempt_state_all, classify_worker_outcome,
+        closed_inline_code_spans, contains_bare_exclamation_mark, fold_attempt_receipts,
+        publish_closing_summary, read_local_blob, replace_bare_exclamation_marks,
+        validate_attempt_receipt, validate_outcome_first, DiagnosisVerdict, Json, RepoConfig,
         WorkerOutcome,
+    };
+    use tally_core::attempt_receipts::{
+        AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR,
+        ATTEMPT_RECEIPT_SCHEMA_VERSION,
     };
     use tally_core::campaign_folds::{campaign_digest, CampaignReconciliation, CampaignSource};
     use uuid::Uuid;
@@ -10896,7 +11002,40 @@ mod tests {
         )
     }
 
+    fn test_receipt_path(root: &Path) -> std::path::PathBuf {
+        root.join("campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl")
+    }
+
+    fn write_test_receipt_authority(root: &Path) {
+        let path = test_receipt_path(root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let authority = AttemptReceiptAuthorityV1::new(
+            "fixture",
+            "7",
+            11,
+            format!("sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        fs::write(
+            path.parent().unwrap().join(ATTEMPT_RECEIPT_AUTHORITY_FILE),
+            serde_json::to_vec(&authority).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn test_receipt_source(root: &Path) -> Json {
+        Json::object([
+            ("schemaVersion", Json::Number("1".to_owned())),
+            ("kind", Json::from("local-jsonl")),
+            (
+                "path",
+                Json::from(test_receipt_path(root).display().to_string()),
+            ),
+        ])
+    }
+
     fn worker_outcome_test_brief(root: &Path, task_uuid: &str, message: Json) -> Json {
+        write_test_receipt_authority(root);
         Json::object([
             ("campaign", Json::from("fixture")),
             (
@@ -10915,23 +11054,7 @@ mod tests {
             ),
             ("taskUuid", Json::from(task_uuid)),
             ("message", message),
-            (
-                "attemptReceipts",
-                Json::object([
-                    ("schemaVersion", Json::Number("1".to_owned())),
-                    ("kind", Json::from("local-jsonl")),
-                    (
-                        "path",
-                        Json::from(
-                            root.join(
-                                "campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl",
-                            )
-                            .display()
-                            .to_string(),
-                        ),
-                    ),
-                ]),
-            ),
+            ("attemptReceipts", test_receipt_source(root)),
         ])
     }
 
@@ -10949,6 +11072,7 @@ mod tests {
         verdict: &str,
         proposal: Option<Json>,
     ) -> Json {
+        write_test_receipt_authority(root);
         let mut brief = BTreeMap::from([
             ("campaign".to_owned(), Json::from("fixture")),
             ("repository".to_owned(), Json::from("acme/spec")),
@@ -10977,23 +11101,7 @@ mod tests {
                 Json::from("Identified the bounded failure and its remedy."),
             ),
             ("verdict".to_owned(), Json::from(verdict)),
-            (
-                "attemptReceipts".to_owned(),
-                Json::object([
-                    ("schemaVersion", Json::Number("1".to_owned())),
-                    ("kind", Json::from("local-jsonl")),
-                    (
-                        "path",
-                        Json::from(
-                            root.join(
-                                "campaigns/attempt-receipts/fixture/attempt-receipts-v1.jsonl",
-                            )
-                            .display()
-                            .to_string(),
-                        ),
-                    ),
-                ]),
-            ),
+            ("attemptReceipts".to_owned(), test_receipt_source(root)),
         ]);
         if let Some(proposal) = proposal {
             brief.insert("proposal".to_owned(), proposal);
@@ -11034,6 +11142,135 @@ mod tests {
                 Json::Array(vec![Json::from("driver-foundation")]),
             ),
         ])
+    }
+
+    #[test]
+    fn every_machine_attempt_receipt_kind_is_authority_stamped() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-receipt-stamp-test-{}", Uuid::new_v4()));
+        write_test_receipt_authority(&temporary);
+        let source = test_receipt_source(&temporary);
+        let source = Some(&source);
+        let payloads = [
+            Json::object([
+                ("kind", Json::from("diagnosis")),
+                ("taskId", Json::from("task-1")),
+                ("attempt", Json::Number("1".to_owned())),
+                ("diagnosis", Json::from("Identified the failed check.")),
+                ("redaction", Json::from("conservative-v2")),
+            ]),
+            Json::object([
+                ("kind", Json::from("retry")),
+                ("taskId", Json::from("task-1")),
+                ("attempt", Json::Number("1".to_owned())),
+                ("reason", Json::from("The merge worker exited transiently.")),
+                ("redaction", Json::from("conservative-v2")),
+            ]),
+            Json::object([
+                ("kind", Json::from("worker-outcome")),
+                ("taskId", Json::from("task-2")),
+                (
+                    "taskRevision",
+                    Json::from(format!("sha256:{}", "b".repeat(64))),
+                ),
+                (
+                    "taskUuid",
+                    Json::from("00000000-0000-4000-8000-000000000703"),
+                ),
+                ("outcome", Json::from("impossible")),
+                ("paths", Json::Null),
+                ("reason", Json::from("The required input does not exist.")),
+            ]),
+            Json::object([
+                ("kind", Json::from("escalation")),
+                ("body", Json::from("The campaign frontier is quiescent.")),
+            ]),
+        ];
+        for payload in payloads {
+            assert!(
+                append_attempt_receipt(source, "fixture", "7", payload)
+                    .unwrap()
+                    .0
+            );
+        }
+
+        let log = fs::read_to_string(test_receipt_path(&temporary)).unwrap();
+        let records = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["diagnosis", "retry", "worker-outcome", "escalation"]
+        );
+        for record in records {
+            assert_eq!(
+                record["schemaVersion"].as_u64(),
+                Some(ATTEMPT_RECEIPT_SCHEMA_VERSION)
+            );
+            assert_eq!(record["armSerial"].as_u64(), Some(11));
+            assert_eq!(
+                record["worklistSha256"].as_str(),
+                Some(format!("sha256:{}", "a".repeat(64)).as_str())
+            );
+            assert_eq!(
+                record["actor"].as_str(),
+                Some(ATTEMPT_RECEIPT_MACHINE_ACTOR)
+            );
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(record["writtenAt"].as_str().unwrap()).is_ok()
+            );
+        }
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_new_receipt_refuses_to_write_without_receipt_authority() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-receipt-refusal-test-{}", Uuid::new_v4()));
+        let source = test_receipt_source(&temporary);
+        let error = append_attempt_receipt(
+            Some(&source),
+            "fixture",
+            "7",
+            Json::object([
+                ("kind", Json::from("escalation")),
+                ("body", Json::from("The frontier is quiescent.")),
+            ]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("without authority"), "{error}");
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn legacy_receipt_fixture_decodes_and_reconciles() {
+        let line =
+            include_str!("../../../test/fixtures/spec-build/epsilon-attempt-receipt-v1.jsonl")
+                .trim_end();
+        let receipt = crate::json::parse(line).unwrap();
+        let event = validate_attempt_receipt(
+            &receipt,
+            Path::new("epsilon-attempt-receipt-v1.jsonl"),
+            1,
+            "epsilon",
+            "1",
+        )
+        .unwrap();
+        let state = fold_attempt_receipts(
+            vec![event],
+            &BTreeMap::from([("chapter-gate".to_owned(), None)]),
+        )
+        .unwrap();
+        assert_eq!(state.diagnoses.len(), 1);
+        assert_eq!(state.diagnoses[0].task_id, "chapter-gate");
+        assert_eq!(state.diagnoses[0].attempt, 1);
+        assert!(state.warnings.is_empty());
     }
 
     #[test]
