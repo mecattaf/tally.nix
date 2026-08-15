@@ -227,6 +227,27 @@ pub enum ExecutionTermination {
         exit_code: Option<String>,
         exit_status: Option<String>,
     },
+    /// A kernel OOM kill inside the unit's cgroup. This is a class of its own,
+    /// not a signal: before this variant existed, `service_result == "oom-kill"`
+    /// was folded into `Signaled` and a child-kill — the kernel kills `rustc`,
+    /// the agent survives, the unit exits with the agent's own status — was
+    /// indistinguishable from a clean exit, with no artifact anywhere recording
+    /// the kill (vestige-sweep V-3). The two fields carry what the exit
+    /// recorder measured at `ExecStopPost`; each stays a typed absence when the
+    /// accounting probe never ran or failed, never an invented number.
+    #[serde(rename_all = "camelCase")]
+    OomKilled {
+        /// The cgroup `memory.events` `oom_kill` counter, when measured.
+        /// `None` covers a classification reached by `serviceResult` alone
+        /// (systemd marked the unit `oom-kill` but the accounting probe did
+        /// not deliver a counter).
+        oom_kill_count: Option<u64>,
+        /// The effective `MemoryMax` of the unit's cgroup in bytes, when
+        /// measured. `None` means either the unit ran uncapped or the probe
+        /// did not deliver the property; the failure fact names whichever is
+        /// the case.
+        memory_max_bytes: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,6 +297,24 @@ pub struct UnitAccounting {
     /// `ExecMainExitTimestampMonotonic`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_main_exit_monotonic_usec: Option<u64>,
+    /// `MemoryMax`, the effective memory cap of the unit's cgroup in bytes.
+    /// `None` is systemd's `infinity` — the unit ran with no declared cap —
+    /// which is a load-bearing fact of its own (vestige-sweep V-1): an OOM
+    /// under no unit cap came from somewhere else, and the failure fact says
+    /// so instead of inventing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
+    /// `MemoryPeak`, the highest observed memory usage of the unit's cgroup,
+    /// in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_peak_bytes: Option<u64>,
+    /// The cgroup `memory.events` `oom_kill` counter, read from systemd's
+    /// `MemoryEvents` property: how many times the kernel OOM killer killed a
+    /// process inside this cgroup. `Some(0)` is a measured never-fired; `None`
+    /// is unmeasured (systemd too old to expose the property, or the probe
+    /// failed) and must never be read as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kill_count: Option<u64>,
 }
 
 impl UnitAccounting {
@@ -305,6 +344,14 @@ impl UnitAccounting {
         let usec = exit.checked_sub(start)?;
         Some(usec as f64 / 1_000_000.0)
     }
+
+    /// Whether the kernel OOM-killed at least one process in the unit's
+    /// cgroup, per the measured `memory.events` counter. An unmeasured
+    /// counter (`None`) is not a kill.
+    #[must_use]
+    pub fn oom_killed(self) -> bool {
+        self.oom_kill_count.is_some_and(|count| count > 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,9 +369,13 @@ pub struct UnitExitRecord {
     /// `systemctl show` call. `None` covers both "the probe never ran" (a
     /// pre-#382 record) and "the probe ran and failed" — the failure is
     /// logged to the job's captured stderr at the point it happens, and this
-    /// field never carries a value nobody measured.
+    /// field never carries a value nobody measured. The heap indirection
+    /// keeps the record — and every container that embeds it, up to the
+    /// remote wire enum — small against the six measured facts it carries;
+    /// `Box` serializes transparently, so the durable JSON is exactly what
+    /// it was when the field was inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accounting: Option<UnitAccounting>,
+    pub accounting: Option<Box<UnitAccounting>>,
 }
 
 impl UnitExitRecord {

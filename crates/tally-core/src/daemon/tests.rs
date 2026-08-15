@@ -1548,6 +1548,7 @@ mod tests {
             cpu_usage_nsec: Some(2_500_000_000),
             exec_main_start_monotonic_usec: Some(1_000_000),
             exec_main_exit_monotonic_usec: Some(4_500_000),
+            ..UnitAccounting::default()
         };
         let (charge, gpu_seconds) = accounting_witness_fields(Some(accounting), false);
         assert_eq!(
@@ -1567,6 +1568,7 @@ mod tests {
             cpu_usage_nsec: Some(2_500_000_000),
             exec_main_start_monotonic_usec: Some(1_000_000),
             exec_main_exit_monotonic_usec: Some(4_500_000),
+            ..UnitAccounting::default()
         };
         let (charge, gpu_seconds) = accounting_witness_fields(Some(accounting), true);
         assert_eq!(charge.map(|charge| charge.amount), Some(2.5));
@@ -1574,6 +1576,42 @@ mod tests {
             gpu_seconds,
             Some(3.5),
             "main-process wall-clock runtime, not CPU time"
+        );
+    }
+
+    /// The durable failure fact for an OOM termination names the kill and the
+    /// effective cap instead of whatever noise came last (vestige-sweep V-3).
+    /// This is also the surface where the child-kill shape becomes a failure
+    /// at all: the classification of an `exited` record with a nonzero
+    /// `oom_kill` counter lands here as a named failure, not as the agent's
+    /// own innocent exit status.
+    #[test]
+    fn oom_termination_failure_fact_names_the_kill_and_the_effective_cap() {
+        let fact = execution_fact_for_termination(&ExecutionTermination::OomKilled {
+            oom_kill_count: Some(1),
+            memory_max_bytes: Some(8_589_934_592),
+        });
+        assert_eq!(fact.status, ExecutionStatus::Failure);
+        assert_eq!(fact.exit_code, None);
+        assert_eq!(
+            fact.reason,
+            "process ended by kernel OOM kill (cgroup memory.events oom_kill=1; effective MemoryMax=8589934592 bytes)"
+        );
+    }
+
+    /// An OOM under no declared unit cap names the absence honestly — the
+    /// kill came from somewhere else (host pressure, an outer cgroup), and
+    /// the fact says so instead of inventing a cap.
+    #[test]
+    fn oom_termination_failure_fact_names_an_absent_cap_as_undeclared() {
+        let fact = execution_fact_for_termination(&ExecutionTermination::OomKilled {
+            oom_kill_count: None,
+            memory_max_bytes: None,
+        });
+        assert_eq!(fact.status, ExecutionStatus::Failure);
+        assert_eq!(
+            fact.reason,
+            "process ended by kernel OOM kill (cgroup memory.events oom_kill unmeasured; no unit MemoryMax declared)"
         );
     }
 
@@ -4756,11 +4794,12 @@ mod tests {
                 // CPU-seconds, and 3.5 seconds of measured main-process
                 // wall-clock runtime for the GPU-pool job.
                 if let Some(Ok(outcome)) = finished.outcome.as_mut() {
-                    outcome.record.accounting = Some(UnitAccounting {
+                    outcome.record.accounting = Some(Box::new(UnitAccounting {
                         cpu_usage_nsec: Some(2_500_000_000),
                         exec_main_start_monotonic_usec: Some(1_000_000),
                         exec_main_exit_monotonic_usec: Some(4_500_000),
-                    });
+                        ..UnitAccounting::default()
+                    }));
                 } else {
                     panic!("expected a successful direct-fallback completion");
                 }
@@ -4870,11 +4909,12 @@ mod tests {
                 .await
                 .unwrap();
                 if let Some(Ok(outcome)) = finished.outcome.as_mut() {
-                    outcome.record.accounting = Some(UnitAccounting {
+                    outcome.record.accounting = Some(Box::new(UnitAccounting {
                         cpu_usage_nsec: Some(1_000_000_000),
                         exec_main_start_monotonic_usec: Some(1_000_000),
                         exec_main_exit_monotonic_usec: Some(3_500_000),
-                    });
+                        ..UnitAccounting::default()
+                    }));
                 } else {
                     panic!("expected a successful direct-fallback completion");
                 }
@@ -4952,11 +4992,12 @@ mod tests {
                 .await
                 .unwrap();
                 if let Some(Ok(outcome)) = finished.outcome.as_mut() {
-                    outcome.record.accounting = Some(UnitAccounting {
+                    outcome.record.accounting = Some(Box::new(UnitAccounting {
                         cpu_usage_nsec: Some(1_000_000_000),
                         exec_main_start_monotonic_usec: Some(1_000_000),
                         exec_main_exit_monotonic_usec: Some(2_000_000),
-                    });
+                        ..UnitAccounting::default()
+                    }));
                 } else {
                     panic!("expected a successful direct-fallback completion");
                 }

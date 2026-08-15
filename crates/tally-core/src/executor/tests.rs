@@ -2322,6 +2322,189 @@ fn timeout_records_map_to_runtime_exceeded() {
     );
 }
 
+/// The incident shape from vestige-sweep V-3: the kernel kills a child
+/// (`rustc`), the agent survives, and the unit exits with the agent's own
+/// status — `serviceResult=success`, `exitCode=exited`, `exitStatus=0`. A
+/// nonzero `memory.events` `oom_kill` counter is the only artifact anywhere
+/// that records the kill, and it must reclassify the record as a distinct
+/// OOM termination naming the effective cap, not ride the innocent exit.
+#[test]
+fn exit_record_with_nonzero_oom_kill_classifies_oom() {
+    let record = UnitExitRecord {
+        schema_version: UNIT_EXIT_SCHEMA_VERSION,
+        unit: "unit.service".to_owned(),
+        invocation_id: "id".to_owned(),
+        attempt: 1,
+        lease_epoch: 1,
+        service_result: "success".to_owned(),
+        exit_code: Some("exited".to_owned()),
+        exit_status: Some("0".to_owned()),
+        accounting: Some(Box::new(UnitAccounting {
+            oom_kill_count: Some(1),
+            memory_max_bytes: Some(8_589_934_592),
+            ..UnitAccounting::default()
+        })),
+    };
+    record.validate("unit.service").unwrap();
+    assert_eq!(
+        classify_termination(&record).unwrap(),
+        ExecutionTermination::OomKilled {
+            oom_kill_count: Some(1),
+            memory_max_bytes: Some(8_589_934_592),
+        }
+    );
+}
+
+/// A nonzero counter wins even over an exit that would otherwise classify as
+/// a failure: the OOM is the causal constraint and must name itself, not be
+/// buried under the agent's own nonzero status.
+#[test]
+fn exit_record_with_nonzero_oom_kill_classifies_oom_over_a_nonzero_exit_status() {
+    let record = UnitExitRecord {
+        schema_version: UNIT_EXIT_SCHEMA_VERSION,
+        unit: "unit.service".to_owned(),
+        invocation_id: "id".to_owned(),
+        attempt: 1,
+        lease_epoch: 1,
+        service_result: "exit-code".to_owned(),
+        exit_code: Some("exited".to_owned()),
+        exit_status: Some("101".to_owned()),
+        accounting: Some(Box::new(UnitAccounting {
+            oom_kill_count: Some(2),
+            ..UnitAccounting::default()
+        })),
+    };
+    record.validate("unit.service").unwrap();
+    assert_eq!(
+        classify_termination(&record).unwrap(),
+        ExecutionTermination::OomKilled {
+            oom_kill_count: Some(2),
+            memory_max_bytes: None,
+        }
+    );
+}
+
+/// systemd's own `serviceResult=oom-kill` is the termination naming itself,
+/// independent of the accounting probe: the unit was killed by the cgroup
+/// OOM killer, and the classification carries the effective cap when the
+/// probe measured one. Before this existed, the record folded into the
+/// generic `Signaled` variant, indistinguishable from any signal.
+#[test]
+fn oom_kill_service_result_classifies_oom_naming_the_effective_cap() {
+    let record = UnitExitRecord {
+        schema_version: UNIT_EXIT_SCHEMA_VERSION,
+        unit: "unit.service".to_owned(),
+        invocation_id: "id".to_owned(),
+        attempt: 1,
+        lease_epoch: 1,
+        service_result: "oom-kill".to_owned(),
+        exit_code: Some("killed".to_owned()),
+        exit_status: Some("KILL".to_owned()),
+        accounting: Some(Box::new(UnitAccounting {
+            oom_kill_count: Some(1),
+            memory_max_bytes: Some(8_589_934_592),
+            ..UnitAccounting::default()
+        })),
+    };
+    record.validate("unit.service").unwrap();
+    assert_eq!(
+        classify_termination(&record).unwrap(),
+        ExecutionTermination::OomKilled {
+            oom_kill_count: Some(1),
+            memory_max_bytes: Some(8_589_934_592),
+        }
+    );
+}
+
+/// `serviceResult=oom-kill` classifies OOM even when the accounting probe
+/// delivered nothing (a failed probe, or a systemd too old to expose
+/// `MemoryEvents`): systemd stated the kill, and the unmeasured counter and
+/// cap stay typed absences rather than invented numbers.
+#[test]
+fn oom_kill_service_result_without_accounting_still_classifies_oom() {
+    let record = UnitExitRecord {
+        schema_version: UNIT_EXIT_SCHEMA_VERSION,
+        unit: "unit.service".to_owned(),
+        invocation_id: "id".to_owned(),
+        attempt: 1,
+        lease_epoch: 1,
+        service_result: "oom-kill".to_owned(),
+        exit_code: Some("killed".to_owned()),
+        exit_status: Some("KILL".to_owned()),
+        accounting: None,
+    };
+    record.validate("unit.service").unwrap();
+    assert_eq!(
+        classify_termination(&record).unwrap(),
+        ExecutionTermination::OomKilled {
+            oom_kill_count: None,
+            memory_max_bytes: None,
+        }
+    );
+}
+
+/// A measured counter that never fired must not reclassify a clean exit:
+/// `Some(0)` is "measured and did not happen", which is exactly the shape a
+/// healthy run under a real cap produces.
+#[test]
+fn a_zero_oom_kill_count_keeps_the_exit_classification() {
+    let record = UnitExitRecord {
+        schema_version: UNIT_EXIT_SCHEMA_VERSION,
+        unit: "unit.service".to_owned(),
+        invocation_id: "id".to_owned(),
+        attempt: 1,
+        lease_epoch: 1,
+        service_result: "success".to_owned(),
+        exit_code: Some("exited".to_owned()),
+        exit_status: Some("0".to_owned()),
+        accounting: Some(Box::new(UnitAccounting {
+            oom_kill_count: Some(0),
+            memory_max_bytes: Some(8_589_934_592),
+            ..UnitAccounting::default()
+        })),
+    };
+    record.validate("unit.service").unwrap();
+    assert_eq!(
+        classify_termination(&record).unwrap(),
+        ExecutionTermination::Exited(0)
+    );
+}
+
+/// The durable failure fact text for an OOM termination names the kill, the
+/// measured counter, and the effective cap — or the honest absence of
+/// either. This is the message that replaces whatever noise came last.
+#[test]
+fn oom_failure_message_names_the_kill_the_counter_and_the_cap() {
+    assert_eq!(
+        oom_failure_message(Some(1), Some(8_589_934_592)),
+        "process ended by kernel OOM kill (cgroup memory.events oom_kill=1; effective MemoryMax=8589934592 bytes)"
+    );
+    assert_eq!(
+        oom_failure_message(Some(2), None),
+        "process ended by kernel OOM kill (cgroup memory.events oom_kill=2; no unit MemoryMax declared)"
+    );
+    assert_eq!(
+        oom_failure_message(None, None),
+        "process ended by kernel OOM kill (cgroup memory.events oom_kill unmeasured; no unit MemoryMax declared)"
+    );
+}
+
+/// The remote worker's execution fact speaks the same OOM vocabulary as the
+/// local daemon's, so a kill names itself identically on both halves of the
+/// fleet.
+#[test]
+fn remote_execution_fact_for_an_oom_termination_names_the_kill_and_cap() {
+    let fact = execution_fact(&ExecutionTermination::OomKilled {
+        oom_kill_count: Some(1),
+        memory_max_bytes: Some(8_589_934_592),
+    });
+    assert_eq!(fact.status, crate::completion::ExecutionStatus::Failure);
+    assert_eq!(
+        fact.reason,
+        "process ended by kernel OOM kill (cgroup memory.events oom_kill=1; effective MemoryMax=8589934592 bytes)"
+    );
+}
+
 #[test]
 fn direct_child_fixture() {
     let Ok(pool) = std::env::var("TALLY_POOL") else {
@@ -2764,19 +2947,74 @@ fn hardening_presets_grant_the_capture_lock_directory_only_where_documented() {
 }
 
 #[test]
-fn parse_unit_accounting_reads_all_three_properties() {
+fn parse_unit_accounting_reads_every_property_of_the_one_show() {
     let accounting = parse_unit_accounting(
         "unit.service",
         b"CPUUsageNSec=1500000000\n\
           ExecMainStartTimestampMonotonic=1000000\n\
-          ExecMainExitTimestampMonotonic=3500000\n",
+          ExecMainExitTimestampMonotonic=3500000\n\
+          MemoryMax=8589934592\n\
+          MemoryPeak=7900000000\n\
+          MemoryEvents={\"low\":0,\"high\":12,\"max\":3,\"oom\":1,\"oom_kill\":1}\n",
     )
     .unwrap();
     assert_eq!(accounting.cpu_usage_nsec, Some(1_500_000_000));
     assert_eq!(accounting.exec_main_start_monotonic_usec, Some(1_000_000));
     assert_eq!(accounting.exec_main_exit_monotonic_usec, Some(3_500_000));
+    assert_eq!(accounting.memory_max_bytes, Some(8_589_934_592));
+    assert_eq!(accounting.memory_peak_bytes, Some(7_900_000_000));
+    assert_eq!(accounting.oom_kill_count, Some(1));
+    assert!(accounting.oom_killed());
     assert_eq!(accounting.cpu_seconds(), Some(1.5));
     assert_eq!(accounting.wall_seconds(), Some(2.5));
+}
+
+/// The cgroup `memory.events` `oom_kill` counter is the load-bearing fact of
+/// the child-kill shape (vestige-sweep V-3): the parser lifts it out of
+/// systemd's JSON `MemoryEvents` rendering, and a JSON object that carries
+/// no `oom_kill` key (or no `MemoryEvents` line at all, on a systemd too old
+/// to expose it) leaves the counter a typed absence, never a zero.
+#[test]
+fn parse_unit_accounting_reads_the_memory_events_oom_kill_counter() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"MemoryEvents={\"low\":0,\"high\":0,\"max\":0,\"oom\":0,\"oom_kill\":0}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        accounting.oom_kill_count,
+        Some(0),
+        "a measured never-fired counter is not the same as unmeasured"
+    );
+    assert!(!accounting.oom_killed());
+
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"MemoryEvents={\"low\":0,\"high\":0,\"max\":0,\"oom\":4,\"oom_kill\":3}\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.oom_kill_count, Some(3));
+    assert!(accounting.oom_killed());
+
+    let accounting = parse_unit_accounting("unit.service", b"MemoryEvents={\"low\":0}\n").unwrap();
+    assert_eq!(accounting.oom_kill_count, None);
+
+    let accounting = parse_unit_accounting("unit.service", b"CPUUsageNSec=5\n").unwrap();
+    assert_eq!(accounting.oom_kill_count, None);
+}
+
+/// systemd reports an uncapped unit's `MemoryMax` as the literal `infinity`
+/// — that is "no limit", not a number, and must land as a typed absence the
+/// failure fact can name as an undeclared cap (vestige-sweep V-1, V-3).
+#[test]
+fn parse_unit_accounting_treats_infinity_memory_max_as_an_absent_cap() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"MemoryMax=infinity\nMemoryPeak=[not set]\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.memory_max_bytes, None);
+    assert_eq!(accounting.memory_peak_bytes, None);
 }
 
 #[test]
@@ -2856,6 +3094,11 @@ fn parse_unit_accounting_rejects_malformed_and_unexpected_output() {
     assert!(parse_unit_accounting("unit.service", b"not a line at all\n").is_err());
     assert!(parse_unit_accounting("unit.service", b"SomeOtherProperty=1\n").is_err());
     assert!(parse_unit_accounting("unit.service", b"CPUUsageNSec=1\nCPUUsageNSec=2\n").is_err());
+    assert!(parse_unit_accounting("unit.service", b"MemoryMax=8G\n").is_err());
+    assert!(parse_unit_accounting("unit.service", b"MemoryEvents=not-json\n").is_err());
+    assert!(
+        parse_unit_accounting("unit.service", b"MemoryEvents={\"oom_kill\":\"many\"}\n").is_err()
+    );
 }
 
 #[test]
@@ -2885,6 +3128,9 @@ fn probe_unit_accounting_issues_exactly_one_systemctl_show_with_the_accounting_p
 echo "CPUUsageNSec=2000000000"
 echo "ExecMainStartTimestampMonotonic=100"
 echo "ExecMainExitTimestampMonotonic=100100"
+echo "MemoryMax=8589934592"
+echo "MemoryPeak=8100000000"
+echo "MemoryEvents={{\"low\":0,\"high\":2,\"max\":9,\"oom\":1,\"oom_kill\":1}}"
 "#,
             calls = calls.display()
         ),
@@ -2892,6 +3138,9 @@ echo "ExecMainExitTimestampMonotonic=100100"
     let accounting = probe_unit_accounting(&systemctl, "tally-job-example.service").unwrap();
     assert_eq!(accounting.cpu_seconds(), Some(2.0));
     assert_eq!(accounting.wall_seconds(), Some(0.1));
+    assert_eq!(accounting.memory_max_bytes, Some(8_589_934_592));
+    assert_eq!(accounting.memory_peak_bytes, Some(8_100_000_000));
+    assert_eq!(accounting.oom_kill_count, Some(1));
     let calls = std::fs::read_to_string(&calls).unwrap();
     assert_eq!(
         calls.lines().count(),
@@ -2902,6 +3151,9 @@ echo "ExecMainExitTimestampMonotonic=100100"
     assert!(calls.contains("--property=CPUUsageNSec"));
     assert!(calls.contains("--property=ExecMainStartTimestampMonotonic"));
     assert!(calls.contains("--property=ExecMainExitTimestampMonotonic"));
+    assert!(calls.contains("--property=MemoryMax"));
+    assert!(calls.contains("--property=MemoryPeak"));
+    assert!(calls.contains("--property=MemoryEvents"));
     assert!(calls.contains("tally-job-example.service"));
 }
 
@@ -2946,15 +3198,21 @@ fn a_record_with_a_measured_accounting_sample_round_trips() {
         service_result: "success".to_owned(),
         exit_code: Some("exited".to_owned()),
         exit_status: Some("0".to_owned()),
-        accounting: Some(UnitAccounting {
+        accounting: Some(Box::new(UnitAccounting {
             cpu_usage_nsec: Some(1_500_000_000),
             exec_main_start_monotonic_usec: Some(1_000_000),
             exec_main_exit_monotonic_usec: Some(3_500_000),
-        }),
+            memory_max_bytes: Some(8_589_934_592),
+            memory_peak_bytes: Some(7_900_000_000),
+            oom_kill_count: Some(1),
+        })),
     };
     record.validate("unit.service").unwrap();
     let json = serde_json::to_string(&record).unwrap();
     assert!(json.contains("\"cpuUsageNsec\":1500000000"));
+    assert!(json.contains("\"memoryMaxBytes\":8589934592"));
+    assert!(json.contains("\"memoryPeakBytes\":7900000000"));
+    assert!(json.contains("\"oomKillCount\":1"));
     let round_tripped: UnitExitRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(round_tripped, record);
 }

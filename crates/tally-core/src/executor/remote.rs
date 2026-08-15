@@ -855,6 +855,10 @@ pub(super) fn execution_fact(termination: &ExecutionTermination) -> ExecutionFac
         ExecutionTermination::ServiceFailed { service_result, .. } => {
             ExecutionFact::failed(format!("systemd service failed with {service_result}"))
         }
+        ExecutionTermination::OomKilled {
+            oom_kill_count,
+            memory_max_bytes,
+        } => ExecutionFact::failed(oom_failure_message(*oom_kill_count, *memory_max_bytes)),
     }
 }
 

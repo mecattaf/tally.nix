@@ -405,7 +405,7 @@ impl Daemon {
         // here while a shared reference is still enough. `UnitAccounting` is
         // `Copy` for exactly this: cheap to lift out before the move.
         let accounting = match &finished.outcome {
-            Some(Ok(outcome)) => outcome.record.accounting,
+            Some(Ok(outcome)) => outcome.record.accounting.as_deref().copied(),
             _ => None,
         };
         let terminal_error = match &finished.outcome {
@@ -506,7 +506,8 @@ impl Daemon {
                         )
                     }
                     ExecutionTermination::Signaled { .. }
-                    | ExecutionTermination::ServiceFailed { .. } => {
+                    | ExecutionTermination::ServiceFailed { .. }
+                    | ExecutionTermination::OomKilled { .. } => {
                         (Verdict::Failed, 1, None, None, Vec::new())
                     }
                 },

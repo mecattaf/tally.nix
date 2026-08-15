@@ -701,7 +701,7 @@ fn build_exit_record(
         service_result: required("SERVICE_RESULT")?,
         exit_code: optional("EXIT_CODE")?,
         exit_status: optional("EXIT_STATUS")?,
-        accounting,
+        accounting: accounting.map(Box::new),
     };
     record.validate(expected_unit)?;
     Ok(record)
@@ -710,6 +710,20 @@ fn build_exit_record(
 pub(super) fn classify_termination(
     record: &UnitExitRecord,
 ) -> Result<ExecutionTermination, ExecutorError> {
+    // A kernel OOM kill names itself before every other shape, including a
+    // clean-looking exit: the child-kill case (the kernel kills `rustc`, the
+    // agent survives) leaves `service_result` as `success`/`exit-code` with
+    // the agent's own status, and before this check existed no artifact
+    // anywhere recorded the kill (vestige-sweep V-3). A measured nonzero
+    // `memory.events` `oom_kill` counter wins even over a later `timeout`,
+    // because the cap that fired is exactly the constraint that must stop
+    // masquerading; the record's own `service_result` remains the durable raw
+    // fact beside the classification. A `service_result` of `oom-kill` is
+    // systemd's own statement of the kill and classifies the same way even
+    // when the accounting probe delivered no counter.
+    if let Some(oom) = oom_termination(record) {
+        return Ok(oom);
+    }
     if record.service_result == "timeout" {
         return Ok(ExecutionTermination::RuntimeExceeded);
     }
@@ -734,7 +748,7 @@ pub(super) fn classify_termination(
         &record.exit_code,
         &record.exit_status,
     ) {
-        ("success" | "signal" | "core-dump" | "oom-kill", Some(code), Some(status)) => {
+        ("success" | "signal" | "core-dump", Some(code), Some(status)) => {
             Ok(ExecutionTermination::Signaled {
                 code: code.clone(),
                 status: status.clone(),
@@ -746,6 +760,43 @@ pub(super) fn classify_termination(
             exit_status: record.exit_status.clone(),
         }),
     }
+}
+
+/// The distinct OOM classification of an exit record, when one is warranted:
+/// a measured nonzero `memory.events` `oom_kill` counter, or systemd's own
+/// `serviceResult == "oom-kill"`. The termination names the effective
+/// `MemoryMax` when the accounting probe measured one, so the durable failure
+/// fact can name the cap that fired instead of whatever noise came last.
+fn oom_termination(record: &UnitExitRecord) -> Option<ExecutionTermination> {
+    let accounting = record.accounting.as_deref();
+    let oom_kill_count = accounting.and_then(|sample| sample.oom_kill_count);
+    let counter_fired = oom_kill_count.is_some_and(|count| count > 0);
+    if !counter_fired && record.service_result != "oom-kill" {
+        return None;
+    }
+    Some(ExecutionTermination::OomKilled {
+        oom_kill_count,
+        memory_max_bytes: accounting.and_then(|sample| sample.memory_max_bytes),
+    })
+}
+
+/// The failure-fact text for an OOM termination, shared by the local daemon
+/// (`daemon::completion::execution_fact_for_termination`) and the remote
+/// worker (`executor::remote::execution_fact`) so both halves of the fleet
+/// speak one vocabulary when naming the kill. Names the measured
+/// `memory.events` `oom_kill` count and the effective `MemoryMax`, or the
+/// honest absence of either: an unmeasured counter is never rendered as zero,
+/// and an undeclared cap is named as undeclared rather than invented.
+pub fn oom_failure_message(oom_kill_count: Option<u64>, memory_max_bytes: Option<u64>) -> String {
+    let kills = match oom_kill_count {
+        Some(count) => format!("cgroup memory.events oom_kill={count}"),
+        None => "cgroup memory.events oom_kill unmeasured".to_owned(),
+    };
+    let cap = match memory_max_bytes {
+        Some(bytes) => format!("effective MemoryMax={bytes} bytes"),
+        None => "no unit MemoryMax declared".to_owned(),
+    };
+    format!("process ended by kernel OOM kill ({kills}; {cap})")
 }
 
 pub(super) fn direct_completion(

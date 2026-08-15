@@ -694,6 +694,19 @@ pub(super) fn execution_fact_for_termination(termination: &ExecutionTermination)
         ExecutionTermination::ServiceFailed { service_result, .. } => {
             ExecutionFact::failed(format!("systemd service failed with {service_result}"))
         }
+        // The durable failure fact names the OOM and the effective cap instead
+        // of whatever noise came last (vestige-sweep V-3). This is also the
+        // surface where the child-kill shape becomes a failure at all: an
+        // `exited` record with a nonzero `oom_kill` counter classifies
+        // `OomKilled`, so it lands here as a named failure rather than riding
+        // the agent's own innocent exit status.
+        ExecutionTermination::OomKilled {
+            oom_kill_count,
+            memory_max_bytes,
+        } => ExecutionFact::failed(crate::executor::oom_failure_message(
+            *oom_kill_count,
+            *memory_max_bytes,
+        )),
     }
 }
 

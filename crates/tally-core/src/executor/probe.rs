@@ -371,10 +371,23 @@ pub(super) fn split_systemd_words(input: &str) -> Result<Vec<String>, String> {
 /// pool lease, not the lease span itself — the lease is held from admission
 /// through completion handling, which strictly contains `ExecMain`'s
 /// lifetime.
-const ACCOUNTING_PROPERTIES: [&str; 3] = [
+///
+/// The three memory properties make an OOM kill legible (vestige-sweep V-3):
+/// `MemoryMax` is the effective cap the failure fact must name, `MemoryPeak`
+/// the observed high-water mark, and `MemoryEvents` carries the cgroup
+/// `memory.events` counters — including `oom_kill`, the only artifact
+/// anywhere that records the child-kill shape (the kernel kills a child like
+/// `rustc`, the agent survives, and the unit exits with the agent's own
+/// status). All of them ride the single invocation this probe has always
+/// issued; a systemd too old to expose one of them leaves that field a typed
+/// absence.
+const ACCOUNTING_PROPERTIES: [&str; 6] = [
     "CPUUsageNSec",
     "ExecMainStartTimestampMonotonic",
     "ExecMainExitTimestampMonotonic",
+    "MemoryMax",
+    "MemoryPeak",
+    "MemoryEvents",
 ];
 
 /// Issues the exit recorder's one accounting probe. Called from
@@ -465,9 +478,62 @@ pub(super) fn parse_unit_accounting(
                 }),
         }
     };
+    // A byte-count property that reports "no limit" as systemd's literal
+    // `infinity` rather than a number (`MemoryMax` on an uncapped unit), and
+    // "never measured" as `[not set]`. Both are typed absences: an unauthored
+    // cap must never materialize as an invented number on the record, and an
+    // absent cap is itself the fact the failure fact names (vestige-sweep
+    // V-1, V-3).
+    let parse_bytes = |name: &'static str| -> Result<Option<u64>, ExecutorError> {
+        match properties.get(name).copied() {
+            None | Some("[not set]") | Some("") | Some("infinity") => Ok(None),
+            Some(value) => value
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| ExecutorError::UnitProbe {
+                    unit: unit.to_owned(),
+                    detail: format!(
+                        "systemctl show (accounting) property {name} is not a byte count: {value:?}"
+                    ),
+                }),
+        }
+    };
+    // `MemoryEvents` is systemd's JSON rendering of the cgroup `memory.events`
+    // counters. The one counter this probe exists to lift out is `oom_kill`:
+    // a nonzero count is the only durable evidence of the child-kill shape
+    // (vestige-sweep V-3). A systemd that does not expose the property leaves
+    // the counter unmeasured; a malformed rendering fails the whole probe, the
+    // same way every other malformed line does, and the caller stores a typed
+    // absence.
+    let oom_kill_count = match properties.get("MemoryEvents").copied() {
+        None | Some("[not set]") | Some("") => None,
+        Some(events) => {
+            let parsed: Value =
+                serde_json::from_str(events).map_err(|_| ExecutorError::UnitProbe {
+                    unit: unit.to_owned(),
+                    detail: format!(
+                        "systemctl show (accounting) MemoryEvents is not JSON: {events:?}"
+                    ),
+                })?;
+            match parsed.get("oom_kill") {
+                Some(value) => Some(value.as_u64().ok_or_else(|| {
+                    ExecutorError::UnitProbe {
+                        unit: unit.to_owned(),
+                        detail: format!(
+                            "systemctl show (accounting) MemoryEvents oom_kill is not a u64: {events:?}"
+                        ),
+                    }
+                })?),
+                None => None,
+            }
+        }
+    };
     Ok(UnitAccounting {
         cpu_usage_nsec: parse_property("CPUUsageNSec", false)?,
         exec_main_start_monotonic_usec: parse_property("ExecMainStartTimestampMonotonic", true)?,
         exec_main_exit_monotonic_usec: parse_property("ExecMainExitTimestampMonotonic", true)?,
+        memory_max_bytes: parse_bytes("MemoryMax")?,
+        memory_peak_bytes: parse_bytes("MemoryPeak")?,
+        oom_kill_count,
     })
 }
