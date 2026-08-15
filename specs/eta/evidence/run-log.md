@@ -13,6 +13,20 @@ lands scraped totals; the window is 10,000 credits, reset ~2026-08-22.
 | 0 | 08-15 13:34 | adapter smoke pi (pre-arm) | flagship | 3 | 4,751 | 258 | 0 | ≈5 | ≈9,995 |
 | 1 | 08-15 13:52–13:58 | job-limits-optional attempt 1 | flagship | 24 | 51,501 | 16,276 | 0 | ≈120 | ≈9,875 |
 | 2 | 08-15 14:20–14:47 | job-limits-optional attempt 2 | flagship | 37 | 62,739 | 16,302 | 0 | ≈130 | ≈9,745 |
+| 3 | 08-15 15:03–16:10 | job-limits-optional attempt 3 — MERGED ffcb9a15 | flagship | 76 | 138,727 | 46,001 | 0 | ≈332 | ≈9,413 |
+
+## Calibration verdict (dispatch rule 2, closed)
+
+S1 landed for ≈579 credits across three attempts; the winning
+implementation lane alone was ≈332 credits, 76 turns, 67 minutes. pi's
+usage records report zero cache reads on the plan rail at these
+transcript lengths — the Aug 7 cache-dominance model does not apply at
+small-lane shape, and real burn is roughly a tenth of the ≈3,000-credit
+pre-calibration estimate. Projection: chapters 1–2 complete inside a
+single weekly window with the 15% reserve untouched. Serialization
+(maxParallel 1) stays until C1 regardless — the containment is the point,
+not the credits. Console cross-check deferred to the C1 seam per the
+ledger method note.
 
 ## Attempt 2 — job-limits-optional (ownership refusal; implementation done, wrong assertion home)
 
