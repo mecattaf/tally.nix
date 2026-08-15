@@ -14,6 +14,7 @@ lands scraped totals; the window is 10,000 credits, reset ~2026-08-22.
 | 1 | 08-15 13:52–13:58 | job-limits-optional attempt 1 | flagship | 24 | 51,501 | 16,276 | 0 | ≈120 | ≈9,875 |
 | 2 | 08-15 14:20–14:47 | job-limits-optional attempt 2 | flagship | 37 | 62,739 | 16,302 | 0 | ≈130 | ≈9,745 |
 | 3 | 08-15 15:03–16:10 | job-limits-optional attempt 3 — MERGED ffcb9a15 | flagship | 76 | 138,727 | 46,001 | 0 | ≈332 | ≈9,413 |
+| 4 | 08-15 16:14–16:57 | oom-legibility attempt 1 — MERGED first try | flagship | 66 | 139,379 | 55,220 | 0 | ≈377 | ≈9,036 |
 
 ## Calibration verdict (dispatch rule 2, closed)
 
