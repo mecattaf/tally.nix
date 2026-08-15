@@ -1,0 +1,474 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "eta",
+    "maxTasks": 40,
+    "maxParallel": 1,
+    "steward": "narrator",
+    "agent": {
+      "adapter": "pi",
+      "approvalPolicy": null,
+      "sandboxPolicy": null,
+      "diagnosisSandboxPolicy": null
+    },
+    "gates": [
+      {
+        "kind": "command",
+        "id": "driver-suite",
+        "preflightArgv": ["sh", "-euc", "command -v python3 >/dev/null"],
+        "argv": ["python3", "test/spec_build_driver_test.py"],
+        "runtimeMaxSec": 900
+      },
+      {
+        "kind": "command",
+        "id": "cargo-tests",
+        "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
+        "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"],
+        "runtimeMaxSec": 3600
+      },
+      {
+        "kind": "command",
+        "id": "clippy",
+        "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
+        "argv": ["nix", "develop", "--command", "cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
+        "runtimeMaxSec": 1800
+      },
+      {
+        "kind": "command",
+        "id": "flake-build-subset",
+        "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
+        "argv": ["nix", "build", "--no-link", ".#checks.x86_64-linux.spec-build-driver-tests", ".#checks.x86_64-linux.module-layer", ".#checks.x86_64-linux.campaign-runtime"],
+        "runtimeMaxSec": 1800
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "job-limits-optional",
+      "kind": "implementation",
+      "title": "Delete the unauthored job memory cap; unit limits become optional",
+      "goal": "One unauthored global memory cap SIGKILLs every lane and gate that compiles: the modules hardcode --memory-max-bytes 8589934592 (nix/modules/home-manager.nix:28-29, nix/modules/nixos.nix:29-30), the CLI REQUIRES both limit flags with no in-code default (crates/tally/src/cli/daemon.rs:32-36), one global unit_limits stamps MemoryMax= on every transient job unit (crates/tally-core/src/daemon/completion.rs near :323, crates/tally-core/src/executor/launch.rs:28-32), and validation forbids expressing 'no cap' (executor/lifecycle.rs near :683 and daemon/mod.rs near :355 reject 0 and u64::MAX). Origin is the 2026-07-20 initial release with no ruling anywhere (V-1 in specs/substrate/evidence/vestige-sweep.md); on 2026-08-14 it OOM-killed rustc 14 times in 5 hours and every kill presented as an adapter tool fault. cargo test --workspace runs inside the job cgroup with cores-scaled parallelism, so the cap bites big hosts hardest — it inverts any protective intent, and it binds gates, which are pure flow nodes no steer can ever reach. Delete the hard kill and make limits optional: drop the required-value plumbing from the CLI daemon args (explicitly passed flags stay honored); UnitLimits fields become Option (executor/types.rs near :108); launch.rs emits CPUWeight= and MemoryMax= only when Some; lifecycle.rs and daemon/mod.rs validate only when Some; both modules delete the four job-limit argv items (--memory-max-bytes and --cpu-weight with their values) from their rendered daemonArgv. V-12 rides along: the modules also delete the daemon unit's own CPUWeight=100 line (100 is systemd's default weight — a constraint-shaped no-op) while KEEPING the daemon service's MemoryMax=\"8G\" backstop with a ruling comment (small process; legible recovery via Restart=always and the watchdog). A module option for a job memory cap was explicitly rejected — do not add one; host-level protection is a different mechanism and out of scope. Name the new executor tests so the filter 'memory' selects them: a job argv rendered with limits absent must contain no MemoryMax= and no CPUWeight= (red before this change); extend the module-layer flake check with an assertion that rendered daemonArgv is clean of --memory-max-bytes.",
+      "deliveredBehaviors": [
+        "A job unit rendered without declared limits carries no MemoryMax= or CPUWeight= directive",
+        "Both modules render daemonArgv without job-limit flags and the module-layer check asserts it"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/spec.md#r1", "specs/substrate/evidence/vestige-sweep.md"],
+        "styleReferences": ["crates/tally-core/src/executor"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "cap-deleted-tests",
+          "description": "Executor tests prove a limits-absent job argv renders no MemoryMax=/CPUWeight=; the filter 'memory' selects them.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace memory 2>&1 | tail -20"]
+        },
+        {
+          "id": "modules-clean",
+          "description": "Neither module renders job-limit flags.",
+          "argv": ["bash", "-lc", "! grep -rEn 'memory-max-bytes|cpu-weight' nix/modules/"]
+        },
+        {
+          "id": "module-layer-builds",
+          "description": "The module-layer flake check (with its new daemonArgv assertion) builds.",
+          "argv": ["nix", "build", "--no-link", ".#checks.x86_64-linux.module-layer"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally/src", "crates/tally-core/src/executor", "crates/tally-core/src/daemon", "nix/modules"]
+    },
+    {
+      "id": "oom-legibility",
+      "kind": "implementation",
+      "title": "OOM names itself: memory facts in the probe, a distinct OOM classification, a cap-naming failure fact",
+      "goal": "OOM is structurally illegible (V-3 in specs/substrate/evidence/vestige-sweep.md): executor/captures.rs near :736 folds service_result == \"oom-kill\" into the generic Signaled variant, indistinguishable from any signal; the accounting probe reads only CPUUsageNSec plus GPU fields (executor/probe.rs near :375) — no memory peak, no cgroup memory.events oom_kill counter; repo-wide there is zero OOM-aware code. In the child-kill case — the kernel kills rustc, the agent survives — the unit exits with the agent's own status and NO artifact anywhere records the kill; that shape burned roughly 5 hours of misattribution in one night. Make the next unauthored constraint name itself: the ExecStopPost recorder's existing single systemctl show invocation also reads the unit's memory properties and the cgroup's memory.events oom_kill count; the exit record gains those fields; classify_termination gains a distinct OOM termination that names the effective MemoryMax; and a nonzero oom_kill on an 'exited' (non-signaled) record surfaces on the durable failure fact — the failure message in daemon/completion.rs names OOM and the effective cap instead of whatever noise came last. This task is independent of the cap's fate: job-limits-optional deleted the unauthored default, but a host-declared limit or any future cgroup pressure must still classify legibly. Name the new tests so the filter 'oom' selects them: an exit record with oom_kill greater than zero must classify OOM (red today).",
+      "deliveredBehaviors": [
+        "An exit record with a nonzero oom_kill count classifies as a distinct OOM termination naming the effective cap",
+        "A nonzero oom_kill on an exited record surfaces on the durable failure fact"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/spec.md#r1", "specs/substrate/evidence/vestige-sweep.md"],
+        "styleReferences": ["crates/tally-core/src/executor"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "oom-classified",
+          "description": "An exit record with oom_kill > 0 classifies OOM; the filter 'oom' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace oom 2>&1 | tail -20"]
+        },
+        {
+          "id": "probe-reads-memory",
+          "description": "The probe reads cgroup memory facts.",
+          "argv": ["bash", "-lc", "grep -En 'memory.events|oom_kill' crates/tally-core/src/executor/probe.rs | head -3"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["job-limits-optional"],
+      "conflictDomains": ["crates/tally-core/src/executor", "crates/tally-core/src/daemon"]
+    },
+    {
+      "id": "excerpt-derivations",
+      "kind": "implementation",
+      "title": "Widen the excerpt peepholes as derivations; error-aware excerpting",
+      "goal": "Every failure is read through peepholes sized by nobody (V-4, V-5 in specs/substrate/evidence/vestige-sweep.md): CAPTURE_EXCERPT_MAX_BYTES = 2 KiB (executor/captures.rs:3) renders roughly 20 lines of stderr tail while the causal error of a cargo run sits thousands of lines up, so every failure presents as whatever noise came last — and this is the channel attribution reads. The driver's diagnosis windows compound it: CHECKPOINT_CAPTURE_MAX_BYTES 8 KiB and CHECKPOINT_STDERR_LINES = 10 applied to gate runs of up to 3 hours, MAX_WORKER_FINDINGS_BYTES 8 KiB (crates/spec-build-driver/src/actions.rs:41-43), and bounded(detail, 2000) on gate-failure evidence (examples/flows/spec-build.js near :2010 and :2057) — the diagnosis verdict that gates attempt 2 is made through a 10-line window, so a wrong-but-plausible tail line becomes the recorded cause and burns the budget. Fix as DERIVATIONS, never fresh numerals: the captures.rs excerpt constant becomes an expression over journal::MAX_STDOUT_RECORD_BYTES with the framing margin stated at the definition; the journal bound tests (crates/tally-core/src/journal.rs near :1497 and :1514) re-anchor on the derivation so a hand-retyped number diverges and fails; the driver checkpoint constants derive from MAX_DIAGNOSIS_CHARS (actions.rs near :36); the JS flow's two bounded() literals collapse into one named constant tied to the schema bound. Add error-aware excerpting in both homes: the rendered excerpt carries the first-error block plus the tail, and failure facts carry the full capture path (captures are unbounded on disk — nothing is lost by widening a rendering). Name the fixture tests so the filter 'excerpt' selects them: a capture whose causal error sits 5000 bytes above the tail must appear in the rendered failure fact and in the checkpoint note (red today).",
+      "deliveredBehaviors": [
+        "A buried causal error survives into the failure fact and the checkpoint note",
+        "Every excerpt bound is an expression over its consumer, not a bare numeral"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/spec.md#r1", "specs/substrate/evidence/vestige-sweep.md"],
+        "styleReferences": ["crates/spec-build-driver/src/actions.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "buried-error-bites",
+          "description": "Buried-error fixtures pass; the filter 'excerpt' selects them.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace excerpt 2>&1 | tail -20"]
+        },
+        {
+          "id": "derivations-visible",
+          "description": "The excerpt bounds are derived expressions over their consumers.",
+          "argv": ["bash", "-lc", "grep -n 'MAX_STDOUT_RECORD_BYTES' crates/tally-core/src/executor/captures.rs | head -2 && grep -n 'MAX_DIAGNOSIS_CHARS' crates/spec-build-driver/src/actions.rs | head -3"]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver suite passes with the derived checkpoint constants.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["oom-legibility"],
+      "conflictDomains": ["crates/spec-build-driver", "examples/flows", "crates/tally-core/src/executor", "crates/tally-core/src/journal.rs"]
+    },
+    {
+      "id": "adapter-relative-policies",
+      "kind": "implementation",
+      "title": "Policy defaults resolve adapter-relatively; the portability matrix proves every catalog adapter renders",
+      "goal": "The generic campaign contract bakes one adapter's vocabulary into adapter-neutral bytes (V-15 in specs/substrate/evidence/vestige-sweep.md): DEFAULT_AGENT_APPROVAL_POLICY = \"never\", DEFAULT_AGENT_SANDBOX_POLICY = \"danger-full-access\", and DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY = \"read-only\" (crates/tally-core/src/campaign_contract.rs near :27-29, serde defaults near :866-876) are all keys of the codex preset's policy maps, fired whenever a worklist omits the keys. A policy-less worklist admitted against any other adapter renders those literals and dies at render_policy with 'value not authorized by this adapter' — an adapter switch, exactly the operation a quota outage forces at the worst time, fails with an error quoting a policy the operator never wrote, and the escape hatch (explicitly nulling all three keys) is knowledge obtainable only by reading render_policy source. The diagnosis default's mechanism is also wrong in itself (V-2): read-only maps to the codex landlock jailer that denies ALL filesystem writes including /dev/shm and tempdirs, killing the diagnosing agent's own unified exec machinery before reasoning starts — the ratified POSITION that diagnosis must not mutate is kept; the MECHANISM changes. Settle the class: absent policy keys mean 'the adapter's own default' — the default_agent_*_policy() serde defaults return None, the three consts delete, and a None renders nothing (the adapter binary's native behavior is the default). The codex preset, which WANTS never and danger-full-access for lanes, declares them as ITS launch defaults in nix/lib/adapters.nix, where adapter vocabulary belongs; codex's diagnosis default becomes workspace-write there (codex mounts .git read-only itself under workspace-write per the preset's own documented comment; the diagnosis worktree is disposable; diagnosis has no publish path). Mirror the same absent-means-adapter-default resolution in the JS flow's diagnosisSandboxed() (examples/flows/spec-build.js near :2249) and keep explicit worklist values winning over any default in both deserializers. Adopt the portability matrix as the class guard: a contract/driver test renders admission argv for EVERY adapter in the catalog presets against a policy-less worklist and asserts all render (red today for claude-code, pi, and shell); name it so the filter 'portability' selects it. Any future adapter-flavored default reintroduced into generic bytes fails the matrix.",
+      "deliveredBehaviors": [
+        "A policy-less worklist admits and renders against every catalog adapter",
+        "The codex preset carries its own launch policy defaults; the generic contract carries none"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/spec.md#r1", "specs/substrate/evidence/vestige-sweep.md"],
+        "styleReferences": ["nix/lib/adapters.nix"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "portability-matrix",
+          "description": "Every catalog adapter renders a policy-less worklist; the filter 'portability' selects the test.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace portability 2>&1 | tail -20"]
+        },
+        {
+          "id": "defaults-deleted",
+          "description": "The cross-adapter policy literals are gone from the generic contract.",
+          "argv": ["bash", "-lc", "! grep -n 'DEFAULT_AGENT_APPROVAL_POLICY' crates/tally-core/src/campaign_contract.rs"]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver suite passes with the adapter-relative resolution.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally-core/src/campaign_contract.rs", "examples/flows", "nix/lib", "crates/spec-build-driver"]
+    },
+    {
+      "id": "adapter-terminal-outcomes",
+      "kind": "implementation",
+      "title": "Adapter-terminal outcomes: quota walls name themselves and stop the ladder; token spend enters the envelope",
+      "goal": "A terminal quota wall is structurally illegible (V-16 in specs/substrate/evidence/vestige-sweep.md): the claude-code finalMessage scrape requires a result event, but a quota-terminated stream ends with a type 'error' event and emits NO result — no scrape, no outcome envelope, and stderr is empty because the error is a stdout stream event. The envelope-less exit then takes the already-convicted path: refusal shape, projection-timeout fallback, misread as a transient machinery fault, retries burned against a wall whose own message names its reset date — while the truth sat in the capture archive. Repo-wide, nothing reads a type 'error' trace record and no quota or rate-limit handling exists in the engine, the flow, or any preset. Build the distinct ADAPTER-TERMINAL outcome class, scraped not inferred: presets declare a terminal capture beside finalMessage (claude-code: the error event's message text; pi and codex: their equivalent terminal error event genres as their real streams state them) carrying the message text — which contains the reset time — into the outcome envelope; the driver's classification ranks adapter-terminal above the projection-timeout fallback and STOPS the retry ladder: no in-epoch retry, no machinery retry (kin to the judge's blocked verdict, but deterministic — the adapter stated it, no judgment slot needed). Second half, the spend ledger crystallized: the pi preset additionally scrapes the stream's per-turn usage totals (input, output, cache reads) into the outcome envelope, so every lane's token spend lands in durable facts instead of a hand-reconstructed session ledger. Add fixture captures under test/fixtures/traces: one per adapter bearing the exact terminal quota line, asserting adapter-terminal classification, never projection-timeout (red today). Name the tests so the filters 'adapter_terminal' and 'token_spend' select them.",
+      "deliveredBehaviors": [
+        "A quota-terminated capture classifies adapter-terminal, carries the reset-bearing message, and dispatches no retry",
+        "A pi lane's outcome envelope carries scraped token totals"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/spec.md#r1", "specs/substrate/evidence/vestige-sweep.md"],
+        "styleReferences": ["test/fixtures/traces", "nix/lib/adapters.nix"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "terminal-classified",
+          "description": "Quota fixtures classify adapter-terminal; the filter 'adapter_terminal' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace adapter_terminal 2>&1 | tail -20"]
+        },
+        {
+          "id": "token-spend-scraped",
+          "description": "The envelope carries scraped usage totals; the filter 'token_spend' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace token_spend 2>&1 | tail -10"]
+        },
+        {
+          "id": "quota-fixture-present",
+          "description": "Terminal-quota fixture captures exist in the trace corpus.",
+          "argv": ["bash", "-lc", "grep -rlEi 'quota|usage limit' test/fixtures/traces | head -3"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["adapter-relative-policies"],
+      "conflictDomains": ["nix/lib", "crates/spec-build-driver", "test/fixtures"]
+    },
+    {
+      "id": "substrate-numerals-guard",
+      "kind": "implementation",
+      "title": "The substrate-numerals flake check plus the small deletions",
+      "goal": "The whole-class guard and the residue (V-6, V-7, V-13, V-14 in specs/substrate/evidence/vestige-sweep.md). (1) New flake check checks.x86_64-linux.substrate-numerals: a runCommand derivation scanning nix/modules/*.nix and nix/lib/*.nix for systemd resource and limit directives and argv numerals, failing on any line whose surrounding comment lacks a provenance marker (ruling:/given:/measured:); follow the style of the existing runCommand checks (module-layer, near flake.nix:3467); it is wired free into every gated head because test/fleet-gate.sh:254 already runs nix flake check — do NOT edit test/fleet-gate.sh. This deletes two standing operator rules: 'sweep the modules for unauthored constants after an incident' and 'review new module numerals at sittings'. Annotate every currently-retained directive with its marker as part of this task — the ruled ones cite their ruling, the operator-supplied ones say given (the daemon MemoryMax backstop, pool capacities, retention constants, watchdog and startup budgets). (2) Finish the python-driver deletion: drivers/agency_nightly_driver.py dies (V-13 — the earlier delete task burned both attempts and the corpse survived its own execution; enforcement is absence). (3) STORE_CHECK_TIMEOUT (crates/tally-core/src/nix_store.rs:12) widens from 10s to 60s with the ruling written at the constant: a validity check is latency-tolerant and a store busy with GC or a large parallel build can exceed 10s. (4) DEFAULT_RPC_TIMEOUT_SEC = 60 (crates/tally/src/cli/mod.rs near :68) gets one ruling comment naming the worst honest daemon operation it must cover, sized to cover the flake VM checks' own needs; then delete the VM call-site override --rpc-timeout-sec 120 (flake.nix near :2133) so exactly one authority remains — if 60 cannot honestly cover the VM path, raise the DEFAULT with the ruling stating why, never the call site.",
+      "deliveredBehaviors": [
+        "An unmarked module resource directive fails the substrate-numerals check",
+        "The python driver, the flake rpc call-site override, and the unruled store timeout are gone"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/spec.md#r1", "specs/substrate/evidence/vestige-sweep.md"],
+        "styleReferences": ["flake.nix"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "check-builds",
+          "description": "The substrate-numerals check builds against the annotated tree.",
+          "argv": ["nix", "build", "--no-link", ".#checks.x86_64-linux.substrate-numerals"]
+        },
+        {
+          "id": "python-driver-gone",
+          "description": "The agency-era python driver is absent.",
+          "argv": ["bash", "-lc", "! test -e drivers/agency_nightly_driver.py"]
+        },
+        {
+          "id": "store-timeout-ruled",
+          "description": "The store validity timeout is 60s with its ruling at the constant.",
+          "argv": ["bash", "-lc", "grep -n 'from_secs(60)' crates/tally-core/src/nix_store.rs | head -2"]
+        },
+        {
+          "id": "rpc-single-authority",
+          "description": "The flake no longer overrides the client rpc timeout at a call site.",
+          "argv": ["bash", "-lc", "! grep -n 'rpc-timeout-sec' flake.nix"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["job-limits-optional"],
+      "conflictDomains": ["flake.nix", "nix/modules", "nix/lib", "drivers", "crates/tally-core/src/nix_store.rs", "crates/tally/src/cli/mod.rs"]
+    },
+    {
+      "id": "spec-lint-core",
+      "kind": "implementation",
+      "title": "Build crates/spec-lint: the claim-grammar linter with a must-fail corpus",
+      "goal": "The authority plane's enforcement engine does not exist: specs/README.md v2 defines the lintable claim grammar and rule list, and both authoring models specified — verbatim, in zeta-learnings/raw/instinct-fable.md and raw/instinct-opus.md — the two rules that catch most of what actually breaks downstream (unsourced numerals; identifiers absent from provided context), yet nothing mechanical reads a spec today, so enforcement is exhortative, which is the categorical failure this layer exists to delete. Build crates/spec-lint: a new workspace member binary crate (add it to both members and default-members in Cargo.toml:3-16; use only existing [workspace.dependencies] — serde, serde_json, regex, anyhow, clap, jsonschema — cargo-deny in the fleet ladder gates any new external dependency, so add none). Contract: spec-lint DIR... where each DIR is a specs/<identity>/ directory; exit 0 iff every rule passes; each defect prints exactly one stderr line <file>:<line>: <rule-id>: <message>; exit 1 on warnings only; exit 2 on blocking defects; a directory without spec.md is skipped silently. Implement the structural and model-facing rule classes exactly as specs/README.md v2 enumerates them — the README is the rule list; implement from its bytes, not from this goal — covering at minimum: section and status-block grammar; requirement-heading grammar with number-derived anchors; claim-id uniqueness and ordering; one claim per line (' and ' joining two verbs is a split defect); provenance marks (unmarked-DECIDE default, BELIEVE:path must resolve against the working tree, GUESS blocks, [HUMAN-ATTENDED] legal on oracle gaps); blocking doubt (any unresolved GUESS, BLOCKING unknown, or DECISION-n fails the lint at Status: ratified); the unsourced-numeral rule; the out-of-context identifier rule (backticked tokens set-differenced against BELIEVE'd paths, the vocabulary section, and (NEW) marks); the hedge lexicon; the e.g./etc. ban; vocabulary drift; empty-section-without-reason. Ship fixtures: crates/spec-lint/tests/fixtures/golden/ (one clean minimal spec) and crates/spec-lint/tests/fixtures/must-fail/ with expected-defects.json — the exact {rule-id: count} map — and at least one deliberately broken artifact per rule class; unit tests prove the must-fail corpus produces exactly that map and the golden fixture is clean — a linter never shown to bite is the --list-only flake attribute reborn (VD-5, F33). Consult specs/zeta/contracts/claim-line.fixtures.json as the accept/reject corpus for the claim-line parser. Build no cross-artifact resolution here (worklist, trace, census, coverage belong to spec-lint-resolution, which depends on this task) and no flake wiring (spec-lint-flake-check owns flake.nix).",
+      "deliveredBehaviors": [
+        "spec-lint produces exactly the expected-defects map on the must-fail corpus and exit 0 on the golden fixture",
+        "the crate is a workspace member adding zero new external dependencies"
+      ],
+      "readFirst": {
+        "specSections": ["specs/zeta/spec.md#r1", "specs/README.md", "specs/zeta/contracts/claim-line.fixtures.json", "zeta-learnings/raw/instinct-fable.md", "zeta-learnings/raw/instinct-opus.md"],
+        "styleReferences": ["crates/spec-build-driver"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "rules-bite",
+          "description": "The crate tests prove the must-fail corpus produces the exact defect map and the golden fixture is clean.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test -p spec-lint 2>&1 | tail -20"]
+        },
+        {
+          "id": "fixture-corpus-exists",
+          "description": "The must-fail corpus and its expected-defects map are committed.",
+          "argv": ["bash", "-lc", "test -f crates/spec-lint/tests/fixtures/must-fail/expected-defects.json && ls crates/spec-lint/tests/fixtures/must-fail | head -20"]
+        },
+        {
+          "id": "no-new-deps",
+          "description": "No new external dependency entered the workspace manifest.",
+          "argv": ["bash", "-lc", "! git diff HEAD~1 -- Cargo.toml | grep -E '^\\+.*(git|version) =' | grep -v spec-lint"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/spec-lint", "Cargo.toml", "Cargo.lock"]
+    },
+    {
+      "id": "spec-lint-resolution",
+      "kind": "implementation",
+      "title": "Cross-artifact resolution, census, and coverage modes for spec-lint",
+      "goal": "A spec that cannot be joined to the worklist and the receipts is prose with anchors: the layer's claim is that spec → worklist → receipts → release is one citable lineage (specs/README.md v2, Position). Extend crates/spec-lint with the cross-artifact half, three modes over one parser. (1) Default lint gains cross-resolution: every readFirst.specSections string in the identity's worklist (silent-factory-worklists/<identity>.json, when the file exists) that matches specs/** must resolve to a real file and, where an anchor is present, a real number-derived anchor in the working tree — the 48-phantom-pointer class, A9/D68, caught mechanically; every task id in specs/<identity>/trace.json exists in that worklist; every claim id in trace.json exists in spec.md; every claim is either traced to a task or listed under an unauthored stage's area — anything else is a defect; trace.json validates against specs/zeta/contracts/trace.schema.json (the jsonschema workspace dep). (2) spec-lint --census DIR: every claim binds to exactly one of {a named flake check attribute, a witnessed gate argv, an explicit [HUMAN-ATTENDED] mark}; zero bindings or two is a defect line — byte-oracle-or-nothing; coverage becomes an enumeration, not a judgment. (3) spec-lint --coverage DIR: renders the claim ↔ task ↔ acceptance-id ↔ evidence join from trace.json as a markdown table on stdout, byte-stable across runs, for the operator to hand tally campaign release verbatim as the close-out proof — this deletes the hand-rendered close-out table, which is this task's D58 price. Add must-fail fixtures: phantom pointer, orphan trace row, unbound claim, doubly-bound claim; and one clean worklist+trace pair; extend expected-defects.json accordingly. Do not touch flake.nix (spec-lint-flake-check owns it); do not read receipts or durable completion state (release-from-durable-facts is ext2 scope, out of this campaign).",
+      "deliveredBehaviors": [
+        "a phantom specs/** pointer, an orphan trace row, and a zero-or-two-bound claim each fail with a named rule id",
+        "--coverage renders the trace join as a markdown table byte-stable across runs"
+      ],
+      "readFirst": {
+        "specSections": ["specs/zeta/spec.md#r2", "specs/README.md", "specs/zeta/contracts/trace.schema.json"],
+        "styleReferences": ["silent-factory-worklists/epsilon-extension.json"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "resolution-bites",
+          "description": "Cross-resolution defects each fail with a named rule id.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test -p spec-lint resolution 2>&1 | tail -20"]
+        },
+        {
+          "id": "census-exclusive-binding",
+          "description": "The census enforces exactly-one oracle binding per claim.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test -p spec-lint census 2>&1 | tail -10"]
+        },
+        {
+          "id": "coverage-golden",
+          "description": "The coverage table renders byte-stable.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test -p spec-lint coverage 2>&1 | tail -10"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["spec-lint-core"],
+      "conflictDomains": ["crates/spec-lint"]
+    },
+    {
+      "id": "spec-lint-flake-check",
+      "kind": "implementation",
+      "title": "checks.x86_64-linux.spec-lint: the standing consumer with an in-derivation bite proof",
+      "goal": "A bar without a gate is not a bar: the grind's conformance bar rotted five days as a --list-only flake attribute (VD-5, F33), so the spec layer's standing consumer must execute from day one and must be proven able to fail. Add checks.x86_64-linux.spec-lint to the checks set at flake.nix:3458: one runCommand derivation that (1) runs the built spec-lint binary over every committed specs/<identity>/ directory containing a spec.md (with --worklist silent-factory-worklists/<identity>.json when that file exists; spec-less evidence-only dirs like specs/epsilon-extension/ are skipped), failing the build on any blocking defect, and (2) inside the same derivation runs the binary against crates/spec-lint/tests/fixtures/must-fail/ asserting exit 2 with defect codes exactly matching expected-defects.json — a green check therefore witnesses both 'the corpus is clean' and 'the tool can bite' in one attribute. Because test/fleet-gate.sh:254 already runs nix flake check -L --keep-going, this single attribute gives the layer fleet-tier standing coverage on every gated head with zero fleet-gate edits — do not edit test/fleet-gate.sh. Style: follow the existing runCommand checks (spec-build-driver-tests, module-layer); specs/ and the fixture corpus enter as source inputs so the check re-runs when either changes. If any committed spec under specs/ fails the lint at first contact, do not edit the spec — spec bytes are authority; report the defect lines verbatim in your final message and let the acceptance record carry them (record, don't fix; the operator regenerates and re-ratifies).",
+      "deliveredBehaviors": [
+        "nix build .#checks.x86_64-linux.spec-lint fails on a corpus defect and on a must-fail fixture that unexpectedly passes",
+        "fleet-gate inherits the check through nix flake check with zero fleet-gate edits"
+      ],
+      "readFirst": {
+        "specSections": ["specs/zeta/spec.md#r1", "specs/zeta/spec.md#r3", "specs/README.md"],
+        "styleReferences": ["flake.nix"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "attribute-builds",
+          "description": "The spec-lint check attribute builds.",
+          "argv": ["bash", "-lc", "nix build --no-link .#checks.x86_64-linux.spec-lint 2>&1 | tail -5"]
+        },
+        {
+          "id": "bite-proof-in-derivation",
+          "description": "The derivation replays the must-fail corpus.",
+          "argv": ["bash", "-lc", "grep -n 'must-fail' flake.nix | head -3"]
+        },
+        {
+          "id": "no-fleet-gate-edit",
+          "description": "fleet-gate is untouched.",
+          "argv": ["bash", "-lc", "git diff --name-only HEAD~1 | { ! grep -q 'test/fleet-gate.sh'; }"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["spec-lint-resolution", "substrate-numerals-guard"],
+      "conflictDomains": ["flake.nix"]
+    },
+    {
+      "id": "spec-layer-skills-amend",
+      "kind": "implementation",
+      "title": "Carry the spec-layer doctrine into the three campaign skills",
+      "goal": "The equipment must be committed bytes (F39/42/43): the two campaign skills now carry ext0's doctrine but say nothing about the authority plane, so the sitting's spec steps live only in zeta-learnings prose, which decays. Amend three skills in their existing voice; no new files. skills/assign-tally/SKILL.md gains the spec-layer authoring rules: when a governing spec exists, task goal text cites claim ids and evidence ids instead of restating them; readFirst.specSections point at number-derived anchors of the form specs/<identity>/spec.md#rN that exist at the authority revision; the sitting appends specs/<identity>/trace.json rows in the same commit as the worklist stage; the governing spec appears in no task's conflictDomains and no lane writes it. skills/campaign-operator/SKILL.md gains one interim-close step: render the coverage table with spec-lint --coverage specs/<identity> and hand it to release as part of the operator-authored intent (release renders intent verbatim; the table is the close-out proof — the hand-rendered table is deleted, this task's D58 price, together with the deleted authoring rule 'check that goals restate requirements'). skills/author-spec/SKILL.md: true up every reference to the tool against the merged tree — binary name, the checks.x86_64-linux.spec-lint attribute, fixture paths — the skill was committed before the tool existed and each pointer must now resolve. These are additive sentences and pointer truth-ups; change nothing else in the three files.",
+      "deliveredBehaviors": [
+        "assign-tally states the cite-don't-restate, anchor, trace-row, and governing-spec-ownership rules",
+        "campaign-operator's close checklist names the --coverage command; author-spec's pointers all resolve"
+      ],
+      "readFirst": {
+        "specSections": ["specs/zeta/spec.md#r4", "skills/author-spec/SKILL.md"],
+        "styleReferences": ["skills/assign-tally/SKILL.md", "skills/campaign-operator/SKILL.md"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "authoring-rules-present",
+          "description": "assign-tally carries the anchor and trace-row rules.",
+          "argv": ["bash", "-lc", "grep -n 'spec.md#r' skills/assign-tally/SKILL.md | head -2 && grep -in 'trace.json' skills/assign-tally/SKILL.md | head -2"]
+        },
+        {
+          "id": "close-step-present",
+          "description": "campaign-operator names the coverage render step.",
+          "argv": ["bash", "-lc", "grep -n 'spec-lint --coverage' skills/campaign-operator/SKILL.md | head -2"]
+        },
+        {
+          "id": "author-spec-pointers-resolve",
+          "description": "author-spec names the real check attribute.",
+          "argv": ["bash", "-lc", "grep -n 'checks.x86_64-linux.spec-lint' skills/author-spec/SKILL.md | head -2"]
+        }
+      ],
+      "dependencies": ["spec-lint-flake-check"],
+      "conflictDomains": ["skills/assign-tally", "skills/campaign-operator", "skills/author-spec"]
+    },
+    {
+      "id": "doc-anchor-regrammar",
+      "kind": "implementation",
+      "title": "Re-render doc spec anchors to the ratified number-derived grammar",
+      "goal": "The shipped documentation taught the spec-pointer genre before the layer existed and used a name-derived slug: doc/src/flows/campaigns.md:1341 shows specs/001-crm/spec.md#customer-model, but the ratified grammar derives anchors from the claim number only, precisely so retitling breaks nothing, and numeric directory prefixes are dead — identity is the join key, specs/<identity>/ (specs/README.md v2). Re-render that example, and every sibling occurrence a grep of doc/ for 'specs/' pointers finds, to the committed grammar so the shipped docs and the linter agree. Touch only documentation; the doc flake check must stay green.",
+      "deliveredBehaviors": [
+        "no doc page teaches a name-derived spec anchor or a numeric specs/ prefix",
+        "the doc check builds"
+      ],
+      "readFirst": {
+        "specSections": ["specs/zeta/spec.md#r4", "specs/README.md"],
+        "styleReferences": ["doc/src/flows/campaigns.md"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "old-grammar-gone",
+          "description": "No name-derived anchors or numeric spec prefixes remain in the docs.",
+          "argv": ["bash", "-lc", "! grep -rn 'specs/001-' doc/src && ! grep -rn '#customer-model' doc/src"]
+        },
+        {
+          "id": "doc-builds",
+          "description": "The doc check builds.",
+          "argv": ["bash", "-lc", "nix build --no-link .#checks.x86_64-linux.doc 2>&1 | tail -5"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["doc"]
+    },
+    {
+      "id": "chapter-gate-c1",
+      "kind": "checkpoint",
+      "title": "Checkpoint C1: full gate ladder plus the final conformance bar over chapters 1 and 2",
+      "argv": [
+        "bash",
+        "-lc",
+        "test/fleet-gate.sh \"$(git rev-parse HEAD)\" && exec test/final-bar/run \"$PWD\""
+      ],
+      "runtimeMaxSec": 10800,
+      "dependencies": [
+        "job-limits-optional",
+        "oom-legibility",
+        "excerpt-derivations",
+        "adapter-relative-policies",
+        "adapter-terminal-outcomes",
+        "substrate-numerals-guard",
+        "spec-lint-core",
+        "spec-lint-resolution",
+        "spec-lint-flake-check",
+        "spec-layer-skills-amend",
+        "doc-anchor-regrammar"
+      ]
+    }
+  ]
+}
