@@ -32,7 +32,7 @@ use tally_core::campaign_folds::{
     DeferralFact, DiagnosisFact, MergedFact, ReconciledTask, RetryFact, TALLY_REVISION_PREFIX,
     TALLY_TASK_PREFIX,
 };
-use tally_core::campaign_poll::{CampaignPollEvent, CampaignPollStatus};
+use tally_core::campaign_poll::{CampaignDigestMismatch, CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV4, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
@@ -613,10 +613,6 @@ struct CampaignReleasePayloads {
 enum CampaignPollAttempt {
     Dispatched,
     Unchanged,
-    RearmRequired {
-        approved_graph_digest: String,
-        live_graph_digest: String,
-    },
 }
 
 pub(super) async fn run_campaign(
@@ -5267,25 +5263,31 @@ fn approved_graph_directory(state_dir: &Path, registration_id: &str) -> PathBuf 
 }
 
 fn approved_graph_path(state_dir: &Path, registration: &CampaignRegistration) -> PathBuf {
-    approved_graph_directory(state_dir, &registration.registration_id)
-        .join(format!("{}.graph-v1.json", registration.arm_serial))
+    graph_snapshot_path(
+        state_dir,
+        &registration.registration_id,
+        registration.arm_serial,
+    )
+}
+
+fn graph_snapshot_path(state_dir: &Path, registration_id: &str, arm_serial: u64) -> PathBuf {
+    approved_graph_directory(state_dir, registration_id).join(format!("{arm_serial}.graph-v1.json"))
 }
 
 fn validated_graph_snapshot(
     snapshot: ApprovedGraphSnapshotV1,
     registration: &CampaignRegistration,
+    arm_serial: u64,
     path: &Path,
 ) -> Result<CanonicalCampaignGraphV1> {
     if snapshot.schema_version != APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION
         || snapshot.registration_id != registration.registration_id
-        || snapshot.arm_serial != registration.arm_serial
-        || snapshot.graph.executable_digest != registration.approved_graph_digest
+        || snapshot.arm_serial != arm_serial
     {
         bail!(
-            "campaign approved-graph snapshot {} disagrees with registration {} arm {}",
+            "campaign approved-graph snapshot {} disagrees with registration {} arm {arm_serial}",
             path.display(),
             registration.registration_id,
-            registration.arm_serial
         );
     }
     let rebuilt = CanonicalCampaignGraphV1::new(
@@ -5305,7 +5307,71 @@ fn read_approved_graph_snapshot(
     state_dir: &Path,
     registration: &CampaignRegistration,
 ) -> Result<Option<CanonicalCampaignGraphV1>> {
-    let path = approved_graph_path(state_dir, registration);
+    let graph = read_graph_snapshot(state_dir, registration, registration.arm_serial)?;
+    if let Some(graph) = &graph {
+        if graph.executable_digest != registration.approved_graph_digest {
+            bail!(
+                "campaign approved-graph snapshot for registration {} arm {} disagrees with its admitted digest",
+                registration.registration_id,
+                registration.arm_serial
+            );
+        }
+    }
+    Ok(graph)
+}
+
+/// The graph one epoch back, kept on disk so a straddling attempt's own
+/// admitted digest survives the re-admission that superseded it.
+///
+/// Returns `None` when there is no earlier epoch, or when its snapshot has
+/// already aged out — the refusal then names the digest without the arm.
+fn read_superseded_graph_snapshot(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> Result<Option<(u64, CanonicalCampaignGraphV1)>> {
+    let Some(arm_serial) = registration
+        .arm_serial
+        .checked_sub(1)
+        .filter(|serial| *serial > 0)
+    else {
+        return Ok(None);
+    };
+    Ok(read_graph_snapshot(state_dir, registration, arm_serial)?.map(|graph| (arm_serial, graph)))
+}
+
+/// Tell a straddle as a fact about two epochs.
+///
+/// The prepared arm is recovered from the retained snapshot when the refused
+/// subject turns out to hold exactly the epoch this campaign superseded,
+/// which is the shape a mid-flight attempt has. A snapshot read that fails
+/// must not swallow the refusal it was only decorating, so any error here
+/// simply leaves the arm unnamed.
+fn campaign_digest_mismatch(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+    prepared_graph_digest: &str,
+    subject: String,
+) -> CampaignDigestMismatch {
+    let prepared_arm_serial = read_superseded_graph_snapshot(state_dir, registration)
+        .ok()
+        .flatten()
+        .filter(|(_, graph)| graph.executable_digest == prepared_graph_digest)
+        .map(|(arm_serial, _)| arm_serial);
+    CampaignDigestMismatch {
+        subject,
+        admitted_graph_digest: registration.approved_graph_digest.clone(),
+        admitted_arm_serial: registration.arm_serial,
+        prepared_graph_digest: prepared_graph_digest.to_owned(),
+        prepared_arm_serial,
+    }
+}
+
+fn read_graph_snapshot(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+    arm_serial: u64,
+) -> Result<Option<CanonicalCampaignGraphV1>> {
+    let path = graph_snapshot_path(state_dir, &registration.registration_id, arm_serial);
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5325,7 +5391,7 @@ fn read_approved_graph_snapshot(
         .with_context(|| format!("cannot read campaign approved graph {}", path.display()))?;
     let snapshot: ApprovedGraphSnapshotV1 = serde_json::from_slice(&bytes)
         .with_context(|| format!("campaign approved graph {} is invalid", path.display()))?;
-    validated_graph_snapshot(snapshot, registration, &path).map(Some)
+    validated_graph_snapshot(snapshot, registration, arm_serial, &path).map(Some)
 }
 
 fn write_approved_graph_snapshot(
@@ -5385,12 +5451,26 @@ fn write_approved_graph_snapshot(
     Ok(())
 }
 
+/// Keep the admitted epoch's snapshot and the single epoch it superseded.
+///
+/// A push can re-admit the worklist while an attempt is in flight. Deleting
+/// the graph that attempt was prepared under is precisely what made the
+/// recorded orphan illegible: nothing left on disk could still name the
+/// digest the attempt owned, so the failure was told as a missing commit.
+/// Retention is one generation deep, which is all a straddle spans.
 fn prune_approved_graph_snapshots(
     state_dir: &Path,
     registration: &CampaignRegistration,
 ) -> Result<()> {
     let directory = approved_graph_directory(state_dir, &registration.registration_id);
-    let expected = approved_graph_path(state_dir, registration);
+    let retained = [
+        Some(approved_graph_path(state_dir, registration)),
+        registration
+            .arm_serial
+            .checked_sub(1)
+            .filter(|serial| *serial > 0)
+            .map(|serial| graph_snapshot_path(state_dir, &registration.registration_id, serial)),
+    ];
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -5398,7 +5478,7 @@ fn prune_approved_graph_snapshots(
     };
     for entry in entries {
         let path = entry?.path();
-        if path != expected && path.is_file() {
+        if !retained.iter().flatten().any(|keep| *keep == path) && path.is_file() {
             fs::remove_file(&path).with_context(|| {
                 format!(
                     "cannot prune obsolete campaign approved graph {}",
@@ -6182,13 +6262,19 @@ async fn dispatch_campaign(
     } = host;
     let manifest = &graph.canonical.manifest;
     if graph.canonical.executable_digest != registration.approved_graph_digest {
-        bail!(
-            "campaign executable graph changed from admitted {} to {}; inspect the worklist and run `tally campaign arm {} {}` to approve it",
-            registration.approved_graph_digest,
-            graph.canonical.executable_digest,
-            registration.code_repository,
-            registration.worklist_pattern,
-        );
+        // A pass that reaches here was prepared under an epoch this identity
+        // has since left behind — the straddle. Poll re-admits changed
+        // worklists on its own now, so there is no verb to recommend; the
+        // only useful thing to say is which two digests disagree.
+        return Err(anyhow::Error::new(campaign_digest_mismatch(
+            host.state_dir,
+            registration,
+            &graph.canonical.executable_digest,
+            format!(
+                "campaign pass {} {}",
+                registration.code_repository, registration.worklist_pattern
+            ),
+        )));
     }
     let _ = validate_host(graph, config_path, &registration.flow, &registration.driver)?;
     // A steer racing this boundary has exactly two outcomes. If its append
@@ -6575,6 +6661,49 @@ async fn run_campaign_arm(
     Ok(())
 }
 
+/// Admit a worklist change observed at the identity's authority remote as a
+/// fresh reconcile epoch, with no operator verb between the push and the
+/// dispatch.
+///
+/// `forge:"local"` promises REMOTE-AUTHORITY (sitting-c1, R4): the identity's
+/// authority surface is the local checkout's own configured git remote, which
+/// is exactly what the graph handed here was read from. Pushing the worklist
+/// *is* the arming act, so this is `run_campaign_arm`'s epoch flip minus the
+/// human — same order, same durable artifacts, same arm-serial discipline.
+///
+/// The order is the safety property. Host validation runs against the pushed
+/// graph before any authority moves, so a worklist naming an adapter this
+/// host cannot serve is refused while the campaign is still armed on the
+/// epoch that worked; a bad push cannot cost a good epoch. Only then does the
+/// receipt authority, the approved-graph snapshot, and the registration
+/// advance together, and the superseded snapshot stays on disk so an attempt
+/// that straddles this moment can still be told which digest it owns.
+fn readmit_campaign_epoch(
+    state_dir: &Path,
+    registry: &CampaignRegistry,
+    registration: &mut CampaignRegistration,
+    graph: &CampaignGraph,
+    config_path: Option<&Path>,
+) -> Result<String> {
+    let _ = validate_host(graph, config_path, &registration.flow, &registration.driver)?;
+    let superseded_graph_digest = registration.approved_graph_digest.clone();
+    let arm_serial = registration
+        .arm_serial
+        .checked_add(1)
+        .ok_or_else(|| invalid("campaign arm retry counter is exhausted"))?;
+    registration.arm_serial = arm_serial;
+    registration
+        .approved_graph_digest
+        .clone_from(&graph.canonical.executable_digest);
+    registration.armed_at = Utc::now().to_rfc3339();
+    // Publish the arm authority before a pass can append stamped receipts.
+    write_local_attempt_receipt_authority(state_dir, graph, arm_serial)?;
+    write_approved_graph_snapshot(state_dir, registration, &graph.canonical)?;
+    registry.write(registration)?;
+    prune_approved_graph_snapshots(state_dir, registration)?;
+    Ok(superseded_graph_digest)
+}
+
 async fn run_campaign_poll(
     socket: &Path,
     config_path: Option<&Path>,
@@ -6594,6 +6723,11 @@ async fn run_campaign_poll(
             &registration.code_repository,
             &registration.worklist_pattern,
         );
+        let registration_path = path.display().to_string();
+        // A re-admission is a durable fact of its own, recorded before the
+        // pass it enables reports anything. An operator reading the journal
+        // sees the epoch flip even when the dispatch behind it then fails.
+        let mut events = Vec::new();
         let attempt = async {
             require_local_actor(&registration)?;
             let repository = campaign_repository_from_registration(&registration);
@@ -6604,10 +6738,21 @@ async fn run_campaign_poll(
                 &adapters,
             )?;
             if graph.canonical.executable_digest != registration.approved_graph_digest {
-                return Ok(CampaignPollAttempt::RearmRequired {
-                    approved_graph_digest: registration.approved_graph_digest.clone(),
-                    live_graph_digest: graph.canonical.executable_digest.clone(),
-                });
+                let superseded = readmit_campaign_epoch(
+                    &state_dir,
+                    &registry,
+                    &mut registration,
+                    &graph,
+                    config_path,
+                )?;
+                events.push(CampaignPollEvent::readmitted(
+                    &registration.registration_id,
+                    &event_issue,
+                    &registration_path,
+                    superseded,
+                    &registration.approved_graph_digest,
+                    registration.arm_serial,
+                ));
             }
             let repository_progress = repository_progress_value(&graph)?;
             let steering = read_local_steering_snapshot(&state_dir, &registration)?;
@@ -6658,8 +6803,7 @@ async fn run_campaign_poll(
             Ok::<_, anyhow::Error>(CampaignPollAttempt::Dispatched)
         }
         .await;
-        let registration_path = path.display().to_string();
-        let event = match attempt {
+        events.push(match attempt {
             Ok(CampaignPollAttempt::Dispatched) => CampaignPollEvent::new(
                 &registration.registration_id,
                 &event_issue,
@@ -6672,17 +6816,6 @@ async fn run_campaign_poll(
                 &registration_path,
                 CampaignPollStatus::Unchanged,
             ),
-            Ok(CampaignPollAttempt::RearmRequired {
-                approved_graph_digest,
-                live_graph_digest,
-            }) => CampaignPollEvent::graph_change(
-                &registration.registration_id,
-                &event_issue,
-                &registration_path,
-                CampaignPollStatus::RearmRequired,
-                approved_graph_digest,
-                live_graph_digest,
-            ),
             Err(error) => {
                 had_failures = true;
                 CampaignPollEvent::failed(
@@ -6692,8 +6825,10 @@ async fn run_campaign_poll(
                     format!("{error:#}"),
                 )
             }
-        };
-        outln!("{}", serde_json::to_string(&event)?);
+        });
+        for event in events {
+            outln!("{}", serde_json::to_string(&event)?);
+        }
     }
     if had_failures {
         bail!("one or more armed campaigns could not be polled")
@@ -9482,6 +9617,409 @@ fi
         );
     }
 
+    const READMISSION_REPOSITORY: &str = "acme/widgets";
+    const READMISSION_WORKLIST: &str = "specs/night/tasks.json";
+
+    /// One armed identity whose authority remote is a real bare repository,
+    /// because re-admission is defined against what `git fetch` reports and
+    /// nothing weaker can prove a push was observed.
+    struct ReadmissionLane {
+        temporary: tempfile::TempDir,
+        checkout: PathBuf,
+        state_dir: PathBuf,
+        config: PathBuf,
+        flow: PathBuf,
+        driver: PathBuf,
+    }
+
+    fn readmission_git(checkout: &Path, arguments: &[&str]) {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn readmission_worklist(goal: &str) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "campaign": {
+                "name": "night-readmission",
+                "maxTasks": 4,
+                "maxParallel": 1,
+                "agent": {},
+                "gates": [{
+                    "kind": "command",
+                    "id": "tests",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"]
+                }]
+            },
+            "tasks": [{
+                "id": "foundation",
+                "kind": "implementation",
+                "title": "Build the foundation",
+                "goal": goal,
+                "deliveredBehaviors": ["The foundation exists"],
+                "readFirst": {"specSections": ["specs/night/spec.md"], "styleReferences": []},
+                "acceptanceCriteria": [{
+                    "id": "green",
+                    "description": "The suite passes.",
+                    "argv": ["true"]
+                }],
+                "dependencies": [],
+                "conflictDomains": ["src"]
+            }]
+        })
+    }
+
+    impl ReadmissionLane {
+        fn open(goal: &str) -> Self {
+            let temporary = tempfile::tempdir().unwrap();
+            let checkout = temporary.path().join("checkout");
+            let remote = temporary.path().join("remote.git");
+            let state_dir = temporary.path().join("state");
+            fs::create_dir(&checkout).unwrap();
+            assert!(ProcessCommand::new("git")
+                .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success());
+            readmission_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+            readmission_git(&checkout, &["config", "user.name", "Campaign Test"]);
+            readmission_git(
+                &checkout,
+                &["config", "user.email", "campaign@example.invalid"],
+            );
+            readmission_git(
+                &checkout,
+                &["remote", "add", "origin", remote.to_str().unwrap()],
+            );
+
+            let assets = temporary.path().join("assets");
+            fs::create_dir(&assets).unwrap();
+            let flow = assets.join("spec-build.js");
+            let driver = assets.join("spec-build-driver");
+            fs::write(&flow, "fixture flow\n").unwrap();
+            fs::write(&driver, "fixture driver\n").unwrap();
+            let config = assets.join("config.json");
+            fs::write(
+                &config,
+                serde_json::to_vec(&json!({
+                    "pools": {
+                        "flow": {},
+                        "campaign-agent": {},
+                        "campaign-control": {}
+                    },
+                    "adapters": {
+                        "shell": {},
+                        "spec-build-driver": {},
+                        "codex": {}
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let lane = Self {
+                temporary,
+                checkout,
+                state_dir,
+                config,
+                flow,
+                driver,
+            };
+            lane.push_worklist(goal);
+            lane
+        }
+
+        /// The arming act itself: an amended worklist committed and pushed to
+        /// the identity's authority remote, with no tally verb involved.
+        fn push_worklist(&self, goal: &str) {
+            let path = self.checkout.join(READMISSION_WORKLIST);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&readmission_worklist(goal)).unwrap(),
+            )
+            .unwrap();
+            readmission_git(&self.checkout, &["add", READMISSION_WORKLIST]);
+            readmission_git(&self.checkout, &["commit", "--quiet", "-m", "worklist"]);
+            readmission_git(&self.checkout, &["push", "--quiet", "origin", "main"]);
+        }
+
+        /// What a poll pass reads: the graph committed at the authority
+        /// remote's base branch, never the working tree beside it.
+        fn live_graph(&self) -> CampaignGraph {
+            local_campaign_graph_from_worklist(
+                CampaignRepository {
+                    checkout: self.checkout.clone(),
+                    base_branch: "main".to_owned(),
+                    remote: "origin".to_owned(),
+                    forge: "local".to_owned(),
+                },
+                READMISSION_REPOSITORY,
+                READMISSION_WORKLIST,
+                &load_client_config(Some(&self.config)).unwrap().adapters,
+            )
+            .unwrap()
+        }
+
+        fn registry(&self) -> CampaignRegistry {
+            CampaignRegistry::open(&self.state_dir).unwrap()
+        }
+
+        /// Epoch one, written exactly as `campaign arm` writes it.
+        fn arm(&self, graph: &CampaignGraph) -> CampaignRegistration {
+            let mut registration = CampaignRegistration::new(
+                CampaignRegistrationV4 {
+                    schema_version: REGISTRY_SCHEMA_VERSION,
+                    registration_id: "0198a62b-41ee-7000-8000-0000000005c1".to_owned(),
+                    worklist_pattern: READMISSION_WORKLIST.to_owned(),
+                    code_repository: READMISSION_REPOSITORY.to_owned(),
+                    checkout: self.checkout.clone(),
+                    base_branch: "main".to_owned(),
+                    remote: "origin".to_owned(),
+                    armed_at: Utc::now().to_rfc3339(),
+                    arm_serial: 1,
+                    approved_graph_digest: graph.canonical.executable_digest.clone(),
+                    local_actor: local_actor(),
+                    allowed_actors: vec![LOCAL_ALLOWED_ACTOR.to_owned()],
+                    last_observation: None,
+                    flow: self.flow.clone(),
+                    driver: self.driver.clone(),
+                    workspace_root: self.temporary.path().join("workspaces"),
+                },
+                None,
+            );
+            write_local_attempt_receipt_authority(&self.state_dir, graph, 1).unwrap();
+            write_approved_graph_snapshot(&self.state_dir, &registration, &graph.canonical)
+                .unwrap();
+            self.registry().write(&mut registration).unwrap();
+            registration
+        }
+
+        fn receipt_authority(&self, graph: &CampaignGraph) -> AttemptReceiptAuthorityV1 {
+            let path = local_attempt_receipt_authority_path(
+                &self.state_dir,
+                &graph.canonical.manifest.name,
+            )
+            .unwrap();
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+        }
+    }
+
+    #[test]
+    fn poll_readmission_admits_a_pushed_worklist_with_no_operator_verb() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let first = lane.live_graph();
+        let mut registration = lane.arm(&first);
+        let registry = lane.registry();
+
+        lane.push_worklist("Build the foundation and the amended edge case.");
+        let second = lane.live_graph();
+        assert_ne!(
+            second.canonical.executable_digest, first.canonical.executable_digest,
+            "the pushed amendment must change the executable graph"
+        );
+
+        let superseded = readmit_campaign_epoch(
+            &lane.state_dir,
+            &registry,
+            &mut registration,
+            &second,
+            Some(&lane.config),
+        )
+        .unwrap();
+
+        assert_eq!(superseded, first.canonical.executable_digest);
+        assert_eq!(registration.arm_serial, 2);
+        assert_eq!(
+            registration.approved_graph_digest,
+            second.canonical.executable_digest
+        );
+
+        // Durable, not merely in hand: the next pass reads this from disk.
+        let reread = registry
+            .read_campaign(READMISSION_REPOSITORY, READMISSION_WORKLIST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.arm_serial, 2);
+        assert_eq!(
+            reread.approved_graph_digest,
+            second.canonical.executable_digest
+        );
+        assert_eq!(
+            read_approved_graph_snapshot(&lane.state_dir, &reread)
+                .unwrap()
+                .unwrap()
+                .executable_digest,
+            second.canonical.executable_digest
+        );
+
+        // Attempts opened from here stamp the new epoch.
+        let authority = lane.receipt_authority(&second);
+        assert_eq!(authority.arm_serial, 2);
+        assert_eq!(authority.worklist_sha256, second.worklist_sha256);
+
+        // And the pass is work, not a no-op: both the graph and the arm term
+        // of the observation moved, so the poll dispatches rather than
+        // reporting the registration unchanged.
+        let steering = read_local_steering_snapshot(&lane.state_dir, &reread).unwrap();
+        let progress = json!({});
+        assert_ne!(
+            campaign_observation(&first, &steering.steering, &progress, 1).unwrap(),
+            campaign_observation(&second, &steering.steering, &progress, 2).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_readmission_refuses_a_straddling_attempt_as_a_digest_mismatch() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let first = lane.live_graph();
+        let mut registration = lane.arm(&first);
+        let registry = lane.registry();
+
+        lane.push_worklist("Build the foundation and the amended edge case.");
+        let second = lane.live_graph();
+        readmit_campaign_epoch(
+            &lane.state_dir,
+            &registry,
+            &mut registration,
+            &second,
+            Some(&lane.config),
+        )
+        .unwrap();
+
+        // The epoch the in-flight attempt was prepared under survives the
+        // flip. Without this the refusal below could name only one digest.
+        let (superseded_arm, superseded_graph) =
+            read_superseded_graph_snapshot(&lane.state_dir, &registration)
+                .unwrap()
+                .unwrap();
+        assert_eq!(superseded_arm, 1);
+        assert_eq!(
+            superseded_graph.executable_digest,
+            first.canonical.executable_digest
+        );
+
+        // A pass still carrying the superseded graph is the straddle. It is
+        // refused before it can enqueue anything, and the refusal is about
+        // two epochs -- never about an agent that produced no commit.
+        let refusal = dispatch_campaign(
+            CampaignHost {
+                socket: &lane.temporary.path().join("absent.sock"),
+                config_path: Some(&lane.config),
+                state_dir: &lane.state_dir,
+                rpc_timeout: Duration::from_secs(1),
+            },
+            &first,
+            &json!({}),
+            &mut registration,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let mismatch = refusal
+            .downcast_ref::<CampaignDigestMismatch>()
+            .unwrap_or_else(|| panic!("straddle must be typed, got {refusal:#}"));
+        assert_eq!(
+            mismatch.prepared_graph_digest,
+            first.canonical.executable_digest
+        );
+        assert_eq!(mismatch.prepared_arm_serial, Some(1));
+        assert_eq!(
+            mismatch.admitted_graph_digest,
+            second.canonical.executable_digest
+        );
+        assert_eq!(mismatch.admitted_arm_serial, 2);
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("digest-mismatch"), "{rendered}");
+        assert!(
+            rendered.contains(&first.canonical.executable_digest)
+                && rendered.contains(&second.canonical.executable_digest),
+            "{rendered}"
+        );
+        for forbidden in ["produced no commit", "campaign arm", "re-arm"] {
+            assert!(!rendered.contains(forbidden), "{forbidden:?} in {rendered}");
+        }
+
+        // Retention is one generation deep. A second re-admission ages the
+        // first epoch out, and the refusal degrades by dropping the arm
+        // attribution only -- both digests still stand.
+        lane.push_worklist("Build the foundation, the amended edge case, and one more.");
+        let third = lane.live_graph();
+        readmit_campaign_epoch(
+            &lane.state_dir,
+            &registry,
+            &mut registration,
+            &third,
+            Some(&lane.config),
+        )
+        .unwrap();
+        assert!(read_graph_snapshot(&lane.state_dir, &registration, 1)
+            .unwrap()
+            .is_none());
+        let stale = campaign_digest_mismatch(
+            &lane.state_dir,
+            &registration,
+            &first.canonical.executable_digest,
+            "campaign attempt foundation".to_owned(),
+        );
+        assert_eq!(stale.prepared_arm_serial, None);
+        let rendered = stale.to_string();
+        assert!(
+            rendered.contains(&first.canonical.executable_digest)
+                && rendered.contains(&third.canonical.executable_digest),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn poll_readmission_refuses_a_push_this_host_cannot_serve_without_losing_the_epoch() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let first = lane.live_graph();
+        let mut registration = lane.arm(&first);
+        let registry = lane.registry();
+
+        lane.push_worklist("Build the foundation and the amended edge case.");
+        let second = lane.live_graph();
+        // A host that configures no campaign pools cannot run this graph.
+        let hostile = lane.temporary.path().join("assets/unhosted.json");
+        fs::write(&hostile, b"{}\n").unwrap();
+        let refusal = readmit_campaign_epoch(
+            &lane.state_dir,
+            &registry,
+            &mut registration,
+            &second,
+            Some(&hostile),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refusal.contains("require configured pool"), "{refusal}");
+
+        // The good epoch is untouched: a bad push costs nothing.
+        assert_eq!(registration.arm_serial, 1);
+        let reread = registry
+            .read_campaign(READMISSION_REPOSITORY, READMISSION_WORKLIST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.arm_serial, 1);
+        assert_eq!(
+            reread.approved_graph_digest,
+            first.canonical.executable_digest
+        );
+        assert_eq!(lane.receipt_authority(&first).arm_serial, 1);
+    }
+
     fn local_graph_for_test() -> CampaignGraph {
         let manifest = serde_json::from_value(manifest_value_for_test(json!([{
             "id": "foundation",
@@ -10666,8 +11204,33 @@ fi
         );
         prune_approved_graph_snapshots(temporary.path(), &registration).unwrap();
         assert!(
+            old_path.exists(),
+            "the immediately superseded generation is retained so an attempt \
+             straddling the flip can still be told which digest it owns"
+        );
+        assert_eq!(
+            read_superseded_graph_snapshot(temporary.path(), &registration)
+                .unwrap()
+                .unwrap(),
+            (1, prior)
+        );
+
+        // Retention is exactly one generation deep: a third epoch collects
+        // the first, so the directory cannot grow with the arm serial.
+        let third = canonical_graph_for_amendment(&["prerequisite", "task-b"]);
+        registration.arm_serial = 3;
+        registration.approved_graph_digest = third.executable_digest.clone();
+        write_approved_graph_snapshot(temporary.path(), &registration, &third).unwrap();
+        prune_approved_graph_snapshots(temporary.path(), &registration).unwrap();
+        assert!(
             !old_path.exists(),
-            "the superseded graph generation must be pruned"
+            "a generation two epochs back must be pruned"
+        );
+        assert_eq!(
+            read_superseded_graph_snapshot(temporary.path(), &registration)
+                .unwrap()
+                .unwrap(),
+            (2, amended)
         );
     }
 
