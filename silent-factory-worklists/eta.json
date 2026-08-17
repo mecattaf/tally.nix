@@ -470,6 +470,222 @@
         "spec-layer-skills-amend",
         "doc-anchor-regrammar"
       ]
+    },
+    {
+      "id": "publish-machine-stage",
+      "kind": "implementation",
+      "title": "The single-line integration model: main advances only by machine fast-forward of a gate-proven head",
+      "goal": "Today the campaign merges to its integration branch while operator amendments land on main, so the proven and published shas diverge every stage, the release can name a commit unreachable from main, and the bridge is an operator cherry-pick ritual — the wedge class that ended ext0 and that this campaign has performed by hand at every chapter close (specs/epsilon-extension/evidence/final-shape.md, F31/PA-21/PA-08/CA-8; the eta run log's chapter closes). Build the final shape, final-shape.md section 4 item 6 verbatim: worklist amendments become COMMITS ON THE INTEGRATION BRANCH (written by the coordinator machinery on approval, or by the operator; never by lanes — the protected set holds); lanes branch from and merge to it; the chapter or stage gate proves its head; and main advances ONLY by machine fast-forward of a gate-proven head, with the publish receipt recording that one sha — one sha, never a pair. Auto-fast-forward is RULED (sitting-c1: the record shows publish carried zero judgment) — no per-stage human click. Where the integration branch and main have diverged through operator record commits, the machinery rebases the integration line onto main when the delta is content-disjoint and re-gates the rebased head before any fast-forward — a published sha is always a gated sha. Delete the operator ritual's cause, not codify it: no cherry-pick verb. Name the tests so the filter 'publish' selects them: a gate-proven integration head fast-forwards main with a receipt (red today); a head that is not gate-proven never moves main. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification, finish with one commit and a clean worktree (git log -1 && git status --porcelain).",
+      "deliveredBehaviors": [
+        "main advances only by machine fast-forward of a gate-proven integration head, recorded in a publish receipt",
+        "worklist amendments are integration-branch commits; the operator cherry-pick ritual has no remaining cause"
+      ],
+      "readFirst": {
+        "specSections": ["specs/epsilon-extension/evidence/final-shape.md", "specs/eta/evidence/sitting-c1.md"],
+        "styleReferences": ["crates/tally/src/cli/campaign.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "publish-ff-proven",
+          "description": "A gate-proven head fast-forwards main with a receipt; an unproven head never moves main; the filter 'publish' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace publish 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src", "crates/spec-build-driver", "examples/flows"]
+    },
+    {
+      "id": "poll-readmission",
+      "kind": "implementation",
+      "title": "Poll re-admission: a push to the armed identity's worklist is the arming act",
+      "goal": "Today an amended worklist stops the campaign at 'rearm-required' and waits for an operator arm — this campaign hit that wall at every amendment, and one mid-attempt re-arm ORPHANED a completed green commit because the attempt's worktree digest no longer matched the newly admitted graph (specs/eta/evidence/run-log.md, the S4 attempt-3 postmortem). Build re-admission: a poll pass that observes a changed worklist digest at the identity's authority remote re-admits it as a fresh reconcile epoch with no operator verb — the push IS the arming act. The authority remote is ruled (sitting-c1, R4): forge 'local' promises REMOTE-AUTHORITY — the local checkout's own configured git remote, integration branch included; no forge API, no second push target. Re-admission must be safe against the recorded incident: an in-flight attempt either completes against its own admitted digest or fails legibly as digest-mismatch, naming both digests — never as 'agent produced no commit'. The rearm-required refusal deletes with its cause. Name the tests so the filter 'readmission' selects them: a worklist push to the authority remote makes the next poll pass dispatch under the new digest (red today); an attempt straddling a re-admission is not misattributed. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification, finish with one commit and a clean worktree.",
+      "deliveredBehaviors": [
+        "a worklist push re-admits on the next poll pass with no operator verb",
+        "an attempt straddling re-admission completes or fails as digest-mismatch, never as agent-produced-no-commit"
+      ],
+      "readFirst": {
+        "specSections": ["specs/epsilon-extension/evidence/final-shape.md", "specs/eta/evidence/sitting-c1.md", "specs/eta/evidence/run-log.md"],
+        "styleReferences": ["crates/tally/src/cli/campaign.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "readmission-proven",
+          "description": "A pushed worklist re-admits without an arm verb; the straddle case is legible; the filter 'readmission' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace readmission 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["publish-machine-stage"],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src"]
+    },
+    {
+      "id": "acceptance-domain-lint",
+      "kind": "implementation",
+      "title": "The acceptance-argv/conflictDomains join becomes a spec-lint rule",
+      "goal": "Arming eta printed seventy-four advisory warnings about path-shaped tokens outside declared conflictDomains, and the two most expensive incidents of chapter 1 were exactly this class arriving too late: a lane refused mid-flight because its acceptance argv and goal named files its boundary did not grant (specs/eta/evidence/run-log.md, S1 attempt 1 and the S4 postmortems). Move the check to authoring time: crates/spec-lint gains a worklist rule — every path-shaped token in a task's acceptanceCriteria argvs that names a WRITE target (a file the acceptance requires the lane to have created or modified) must fall inside the task's declared conflictDomains; read-only references stay advisory. The rule runs in the default lint's cross-resolution pass over silent-factory-worklists/<identity>.json and lands in the rule-index table of specs/README.md with its own id, following the grammar the table already carries — the README parity test must stay green, so extend the table and the implementation together. Add must-fail fixtures (a worklist whose acceptance writes outside its domains) and extend expected-defects.json. Admission's existing advisory warnings stay untouched — one authority per fact lives in the lint. Name the tests so the filter 'acceptance_domains' selects them. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification, finish with one commit and a clean worktree.",
+      "deliveredBehaviors": [
+        "a worklist whose acceptance writes outside its declared domains fails the lint with a named rule id",
+        "the README rule-index and the implemented set stay in parity"
+      ],
+      "readFirst": {
+        "specSections": ["specs/README.md", "specs/eta/evidence/sitting-c1.md", "specs/eta/evidence/run-log.md"],
+        "styleReferences": ["crates/spec-lint"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "acceptance-domains-bite",
+          "description": "The out-of-domain write fixture fails with the new rule id; the filter 'acceptance_domains' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test -p spec-lint acceptance_domains 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/spec-lint", "specs/README.md"]
+    },
+    {
+      "id": "specs-deny-list",
+      "kind": "implementation",
+      "title": "The governing spec is mechanically unwritable by lanes",
+      "goal": "Today no lane writes under specs/<armed-identity>/ because goals say so — authoring discipline, not mechanism (the zeta floor deferred this to ext1 with an owner; specs/eta/spec.md Forbidden F.3). Make it structural: ownership certification refuses any lane commit that touches the armed identity's governing spec directory, regardless of declared conflictDomains — specs/<identity>/** joins the protected set beside the worklist and the gate definitions (sitting-c1 ruling). The refusal names the path and the protection, in the same legible genre as the existing outside-domain refusal. Evidence additions are NOT exempt: a lane that wants to write evidence hands it to its final message; the operator or the machinery lands it — spec-dir bytes move only by operator or coordinator hands (constitution A22's altitude). Name the tests so the filter 'deny_list' selects them: a lane commit touching specs/<identity>/ is refused at ownership even when conflictDomains claim it (red today). Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification, finish with one commit and a clean worktree.",
+      "deliveredBehaviors": [
+        "a lane commit touching the armed identity's spec directory is refused at ownership with a named protection",
+        "the protected set is {worklist, gate definitions, specs/<identity>/**}"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c1.md", "specs/eta/spec.md#forbidden"],
+        "styleReferences": ["crates/spec-build-driver"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "deny-list-bites",
+          "description": "A spec-dir-touching lane commit is refused; the filter 'deny_list' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace deny_list 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["acceptance-domain-lint"],
+      "conflictDomains": ["crates/tally-core/src", "crates/spec-build-driver"]
+    },
+    {
+      "id": "gate-budgets-from-receipts",
+      "kind": "implementation",
+      "title": "Gate budgets derive from receipts; the GUESS numbers retire",
+      "goal": "The four template gate runtimeMaxSec numbers (900/3600/1800/1800) are convicted guesses riding unmarked since the first worklist — 'unvalidated guesses, zero recorded firings, all week' — and their destination was already adjudicated: derive from observed duration times slack, because the receipts hold every historical gate duration (V-6 in specs/substrate/evidence/vestige-sweep.md; the caps-replay adjudication it cites). Build the derivation: runtimeMaxSec on a gate becomes OPTIONAL; when absent, the effective budget derives from the campaign's own attempt receipts for that gate id — observed high-water duration times a stated slack factor, with a stated floor for gates that have never fired — and the derivation is visible in the admission rehearsal output so an operator can read which budget will bind. An explicit runtimeMaxSec stays honored verbatim (min semantics with nothing — the declared number IS the budget; the zero-required-numbers doctrine, same shape as the maxParallel permanence ruling in ETA.md). The eta worklist's own gate numbers stay as they are this chapter — retiring them is one amendment AFTER this task deploys, recorded then. Name the tests so the filter 'gate_budget' selects them: an absent runtimeMaxSec derives from seeded receipts (red today); an explicit one is honored verbatim. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification, finish with one commit and a clean worktree.",
+      "deliveredBehaviors": [
+        "an absent gate budget derives from that gate's receipt history with a visible derivation",
+        "an explicit gate budget is honored verbatim"
+      ],
+      "readFirst": {
+        "specSections": ["specs/substrate/evidence/vestige-sweep.md", "specs/eta/evidence/sitting-c1.md"],
+        "styleReferences": ["crates/tally-core/src"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "gate-budget-derives",
+          "description": "Absent budgets derive from receipts, explicit budgets bind verbatim; the filter 'gate_budget' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace gate_budget 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src", "examples/flows"]
+    },
+    {
+      "id": "the-lease",
+      "kind": "implementation",
+      "title": "The lease: activation held while work flows, lapsing into durable completion",
+      "goal": "The final-shape lifecycle (specs/epsilon-extension/evidence/final-shape.md, the lifecycle sketch): commit worklist, then run acquires a lease; poll passes admit, dispatch, merge, and publish under it; completion lapses the lease and the facts remain for release whenever, by anyone. Today activation is the arm verb's side effect and quiescence is an operator observation ('the campaign status view is authoritative only for the reconciled past; list-units is liveness' — the standing checklist line this task deletes). Build the lease as a durable campaign fact: acquired at activation, renewed by passes while any node is live, lapsed exactly when the last task reaches a terminal state with the chapter gate proven — and the lapse is a written fact a release can rely on, not an observed silence. Overlapping passes respect the lease: two concurrent reconcile passes over one identity never double-dispatch a frontier (the lease-epoch plumbing the attest layer already carries is the substrate; make the campaign-level story whole). The post-flash checklist's 'stop the poll timer' line survives only until this task plus poll re-admission deploy — with a lease, a poll against a quiescent, complete campaign is a no-op by construction. Name the tests so the filter 'lease' selects them: concurrent passes never double-dispatch (red today if racing); completion writes the lapse fact. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification, finish with one commit and a clean worktree.",
+      "deliveredBehaviors": [
+        "campaign completion writes a durable lease-lapse fact release can rely on",
+        "concurrent reconcile passes over one identity never double-dispatch"
+      ],
+      "readFirst": {
+        "specSections": ["specs/epsilon-extension/evidence/final-shape.md", "specs/eta/evidence/sitting-c1.md"],
+        "styleReferences": ["crates/tally-core/src"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "lease-proven",
+          "description": "Lease lifecycle and no-double-dispatch proven; the filter 'lease' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace lease 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["poll-readmission"],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src"]
+    },
+    {
+      "id": "the-inbox",
+      "kind": "implementation",
+      "title": "The inbox: the typed-doubt queue becomes a delivery surface",
+      "goal": "Escalations, typed questions, and blocked-verdict reports today land in pass stderr and unit journals — the supervising session greps for them, which is exactly the read-everything role the record says must disappear. Build the inbox: a campaign-scoped, append-only delivery surface where every typed escalation lands as one structured entry (task, attempt, epoch, the typed question or the prepared amendment diff, the evidence paths), readable with one verb (tally campaign inbox <identity>), and where an operator answer ingests as ordered steering addressed to the task — closing the loop the epoch-budget derivation already understands (a steer is new input). Entries are facts: unanswered entries survive daemon restarts and re-admissions; answering marks, never deletes. No notification transport in this task — delivery to a human device is a later concern; the surface is the deliverable (the epsilon program's E8 destination, specs/epsilon-extension/evidence/final-shape.md). Name the tests so the filter 'inbox' selects them: a blocked escalation lands as a structured entry; an answer becomes steering that refreshes the task's budget by derivation. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification, finish with one commit and a clean worktree.",
+      "deliveredBehaviors": [
+        "escalations land as durable structured inbox entries readable by one verb",
+        "an operator answer ingests as steering that refreshes the task's budget"
+      ],
+      "readFirst": {
+        "specSections": ["specs/epsilon-extension/evidence/final-shape.md", "specs/eta/evidence/sitting-c1.md"],
+        "styleReferences": ["crates/tally/src/cli/campaign.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "inbox-proven",
+          "description": "Escalation-to-entry and answer-to-steering proven; the filter 'inbox' selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace inbox 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["poll-readmission"],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src", "examples/flows"]
+    },
+    {
+      "id": "chapter-gate-c2",
+      "kind": "checkpoint",
+      "title": "Checkpoint C2: full gate ladder plus the final conformance bar over chapter 3",
+      "argv": [
+        "bash",
+        "-lc",
+        "test/fleet-gate.sh \"$(git rev-parse HEAD)\" && exec test/final-bar/run \"$PWD\""
+      ],
+      "runtimeMaxSec": 10800,
+      "dependencies": [
+        "publish-machine-stage",
+        "poll-readmission",
+        "acceptance-domain-lint",
+        "specs-deny-list",
+        "gate-budgets-from-receipts",
+        "the-lease",
+        "the-inbox"
+      ]
     }
   ]
 }
