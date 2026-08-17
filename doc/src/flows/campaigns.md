@@ -762,7 +762,7 @@ services.tally = {
     # default-off. Diagnose locally unless this campaign explicitly needs them.
     postFailureEvidence = false;
     postFailureStderr = false;
-    worklist = "specs/001-crm/tasks.json";
+    worklist = "specs/crm/tasks.json";
     maxTasks = 32;
     maxParallel = 4;
 
@@ -1268,7 +1268,7 @@ services.tally.campaigns.crm = {
   # lanes, branches and pull requests land on the product repository.
   specRepository = "mecattaf/crm-spec";
   codeRepository = "mecattaf/crm";
-  worklist = "specs/001-crm/tasks.json";
+  worklist = "specs/crm/tasks.json";
   # ...
 };
 ```
@@ -1340,7 +1340,7 @@ authority for uncommitted worklist bytes. It accepts schema version 1:
       ],
       "readFirst": {
         "specSections": [
-          "specs/001-crm/spec.md#customer-model"
+          "specs/crm/spec.md#r2"
         ],
         "styleReferences": [
           "src/domain/order.rs"
