@@ -161,3 +161,14 @@ Calibration note: a recon-shaped six-minute lane on the flagship cost
 cache-read term of the Aug 7 model did not appear at this transcript
 length. The ≈3,000-credit ext0-shape estimate stands until a full
 implementation lane closes.
+
+## Chapter 1 CLOSED — 2026-08-17 12:33 UTC
+
+All six substrate-repair tasks merged and published to main as
+cherry-picked squashes (652eb612..3813e769), proven by the full ladder:
+language-entry-policy, fleet-gate PASS for 3813e769, final bar 24/24
+(the #440 launch-cwd-ordinary-completion case passed without retry).
+The eta campaign is disarmed pending the operator's chapter-2 ruling;
+the chapter-2 auto-dispatch that exceeded the ruling was stopped at two
+minutes. Awaiting: pin-bump confirmation (deploys the substrate repairs;
+deletes the 24 GiB drop-in outright per §5).
