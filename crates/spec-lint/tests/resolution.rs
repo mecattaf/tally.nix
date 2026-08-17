@@ -254,6 +254,43 @@ fn an_unresolvable_evidence_citation_fails_resolution_as_l13() {
 }
 
 #[test]
+fn acceptance_domains_outside_the_declared_boundary_fail_resolution_as_l18() {
+    let defects = defects_of(&fixtures().join("must-fail/l18-acceptance-domains"));
+    assert_eq!(defects.len(), 2, "{}", shown(&defects));
+    assert!(defects.iter().all(|defect| defect.rule == RuleId::L18));
+    assert!(defects.iter().all(|defect| defect
+        .message
+        .contains("task `writes-outside-its-boundary`")));
+    // The asserted file and the redirection target are both write positions:
+    // neither can be true of a tree the lane never touched.
+    assert!(defects.iter().any(|defect| defect
+        .message
+        .contains("acceptance `asserts-a-file-it-may-not-create` writes `flake.nix`")));
+    assert!(defects.iter().any(|defect| defect
+        .message
+        .contains("acceptance `writes-a-report-it-may-not-own` writes `doc/report.md`")));
+    // The defect names the worklist, because that is the file that has to change.
+    assert!(defects
+        .iter()
+        .all(|defect| defect.file.ends_with("l18-acceptance-domains.json")));
+}
+
+#[test]
+fn acceptance_domains_stay_silent_over_reads_and_over_an_undeclared_boundary() {
+    // The same fixture carries the two silent cases: a task that reads a path
+    // outside its boundary and writes only inside it, and a task that declares
+    // no boundary at all. Both appear in the defect list above by absence.
+    let reported = defects_of(&fixtures().join("must-fail/l18-acceptance-domains"));
+    for task in ["stays-inside-its-boundary", "declares-no-boundary"] {
+        assert!(
+            !reported.iter().any(|defect| defect.message.contains(task)),
+            "{task} reported: {}",
+            shown(&reported)
+        );
+    }
+}
+
+#[test]
 fn the_census_binds_every_claim_to_exactly_one_witnessed_oracle() {
     let opened = open(&joined());
     let (rows, defects) = census::census(
@@ -394,7 +431,7 @@ fn every_resolution_rule_class_the_pass_evaluates_appears_in_the_corpus() {
         .expect("the expected-defects map is committed");
     let expected: BTreeMap<String, usize> =
         serde_json::from_str(&bytes).expect("the map is a rule-id to count object");
-    for rule in [RuleId::L13, RuleId::L14] {
+    for rule in [RuleId::L13, RuleId::L14, RuleId::L18] {
         assert!(
             expected.contains_key(&rule.to_string()),
             "{rule} is evaluated by the resolution pass and has no must-fail fixture"

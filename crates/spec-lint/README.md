@@ -36,9 +36,9 @@ specs/zeta/spec.md:93: L10: a `(GUESS)` is outstanding; doubt is resolved by a t
 `src/rules.rs` carries the §7 index — every rule id and its severity cell — and
 a crate test asserts parity with the README table, which is why the README names
 this crate its standing consumer. Rules marked `Stage::Resolution` are evaluated
-by the cross-artifact pass rather than by the single-spec one: L13 and L14 run
-today, and L17 (trace append-only against the parent revision) waits on sitting
-mode, which is the only place a parent revision exists.
+by the cross-artifact pass rather than by the single-spec one: L13, L14, and L18
+run today, and L17 (trace append-only against the parent revision) waits on
+sitting mode, which is the only place a parent revision exists.
 
 Three judgments the README leaves to the implementation, fixed here as bytes:
 
@@ -82,9 +82,26 @@ chain mechanically as part of the default check:
   the worklist declares, and acceptance ids that task declares. A release row
   with no earlier sitting row for the same claim and task is a defect, and so
   is a claim traced to no task and listed under no unauthored stage.
+- **L18.** Every path a task's `acceptanceCriteria` argvs require the lane to
+  write falls inside the `conflictDomains` that task declares. The join is the
+  one a lane otherwise discovers by being refused mid-flight; read here it is
+  two committed fields of one file. `src/boundary.rs` decides what a write is:
+  a redirection target, an operand of a command whose whole effect is the write
+  (`rm`, `mv`, `touch`, `mkdir`, `tee`, `cp`, `ln`, `install`, `truncate`,
+  `dd of=`, `sed -i`), a path `git add`/`rm`/`mv`/`apply`/`checkout`/`restore`
+  moves, or the operand of a `test` file predicate — an acceptance asserting a
+  path exists, or is gone, asserts the lane put it there or took it away. A
+  `bash -lc` argv is split into its commands first, and wrappers are read
+  through, so `nix develop --command touch <path>` is the `touch`.
 
-Four judgments this pass fixes as bytes:
+Five judgments this pass fixes as bytes:
 
+- **What stays advisory.** A path an acceptance only reads — a grep pattern, a
+  file it inspects, a suite it runs, a build target — settles nothing about who
+  owns the byte, because the file may predate the task entirely. Admission
+  already reports those at arm time, and one authority per fact means L18 does
+  not repeat it. The same goes for a task whose `conflictDomains` key is absent
+  rather than empty: an inferred boundary is no allowlist to compare against.
 - **What counts as absent.** Either artifact may be missing. A spec proposed
   before its boundary sitting governs no worklist and has no trace rows yet;
   absence is a lifecycle state, and the pass is silent over it. The pointer
@@ -151,6 +168,9 @@ A linter never shown to bite is the `--list-only` flake attribute reborn
   spec's `Governs` target must exist. `l13-phantom-pointer/` and
   `l14-orphan-trace-row/` carry the worklist and trace that break, with clean
   spec bytes: the cross-artifact rules break beside the spec, not inside it.
+  `l18-acceptance-domains/` carries all three L18 cases in one worklist: the
+  task whose acceptance writes outside its boundary, the task that reads
+  outside it and writes inside it, and the task that declares no boundary.
 - `tests/fixtures/evidence-only/` — an identity directory with no `spec.md`,
   which the lint skips silently.
 

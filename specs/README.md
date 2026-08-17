@@ -155,6 +155,15 @@ here (one authority per fact).
 | L15 | missing section without an `Omitted:` reason; empty Rulings | template-completeness review; fabricated filler | blocking / warning |
 | L16 | model names in spec or governing worklist bytes | the host-catalog leakage review | blocking |
 | L17 | trace not append-only vs parent revision (sitting mode only — the flake sandbox has no history) | the trace-integrity re-read | blocking in sitting mode |
+| L18 | acceptance-argv write targets outside the task's declared `conflictDomains` | the boundary refusal read back from a mid-flight lane transcript | blocking |
+
+A task's `conflictDomains` are the one write boundary its lane is granted, and
+its acceptance criteria are the oracle it is graded by. A criterion requiring a
+path to exist, to be gone, or to have been rewritten outside that boundary
+names a write the lane may not make, so the task cannot pass its own acceptance
+`[L18]`. A path a criterion only reads — a pattern, a suite it runs, a build
+target — settles nothing about who owns the byte and stays advisory where
+admission already reports it.
 
 Self-test is not a numbered rule but harness law: the crate ships a must-fail
 fixture corpus with an exact expected-defects map, and the flake check re-runs

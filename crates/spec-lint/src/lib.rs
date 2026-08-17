@@ -13,6 +13,7 @@
 //!   as the markdown table an operator hands to release.
 
 pub mod artifacts;
+pub mod boundary;
 pub mod census;
 pub mod claim;
 pub mod coverage;

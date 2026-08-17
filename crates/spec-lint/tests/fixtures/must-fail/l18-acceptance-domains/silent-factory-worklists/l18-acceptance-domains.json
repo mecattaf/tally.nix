@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "l18-acceptance-domains",
+    "maxTasks": 3,
+    "maxParallel": 1,
+    "steward": "narrator",
+    "gates": [
+      {
+        "kind": "command",
+        "id": "cargo-tests",
+        "argv": ["cargo", "test", "-p", "spec-lint"],
+        "runtimeMaxSec": 3600
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "writes-outside-its-boundary",
+      "kind": "implementation",
+      "title": "Be graded by a file the boundary does not grant",
+      "goal": "One criterion asserts a file outside the declared domains exists; one writes a report outside them.",
+      "deliveredBehaviors": ["the resolution pass reports both out-of-domain write targets"],
+      "readFirst": {
+        "specSections": [],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "asserts-a-file-it-may-not-create",
+          "description": "The flake carries the new attribute.",
+          "argv": ["bash", "-lc", "test -f flake.nix"]
+        },
+        {
+          "id": "writes-a-report-it-may-not-own",
+          "description": "The run leaves its report behind.",
+          "argv": ["bash", "-lc", "cargo run --quiet > doc/report.md"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/spec-lint"]
+    },
+    {
+      "id": "stays-inside-its-boundary",
+      "kind": "implementation",
+      "title": "Read outside the boundary and write inside it",
+      "goal": "A path an acceptance only reads settles nothing about who owns the byte and reports nothing here.",
+      "deliveredBehaviors": ["a read-only reference outside the declared domains stays silent"],
+      "readFirst": {
+        "specSections": [],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "reads-outside-and-writes-inside",
+          "description": "The flake already names the attribute, and the corpus map is written.",
+          "argv": [
+            "bash",
+            "-lc",
+            "grep -n 'spec-lint' flake.nix && test -f crates/spec-lint/tests/fixtures/must-fail/expected-defects.json"
+          ]
+        },
+        {
+          "id": "runs-a-suite-it-does-not-own",
+          "description": "The driver suite stays green.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/spec-lint"]
+    },
+    {
+      "id": "declares-no-boundary",
+      "kind": "checkpoint",
+      "title": "Declare no boundary at all",
+      "goal": "An absent conflictDomains key is inferred after execution and gives this pass no allowlist to compare against.",
+      "deliveredBehaviors": ["a task declaring no boundary reports nothing"],
+      "readFirst": {
+        "specSections": [],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "writes-anywhere",
+          "description": "The checkpoint leaves its receipt behind.",
+          "argv": ["bash", "-lc", "touch doc/receipt.md"]
+        }
+      ],
+      "dependencies": []
+    }
+  ]
+}
