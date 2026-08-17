@@ -1663,6 +1663,7 @@ const driverActionNodeRole = Object.freeze({
   constraint: specBuildNodeRole.CONSTRAINT,
   checkpoint: specBuildNodeRole.CHECKPOINT_RECORD,
   publish: specBuildNodeRole.PUBLISH,
+  stagePublish: specBuildNodeRole.PUBLISH,
   rebase: specBuildNodeRole.REBASE,
   merge: specBuildNodeRole.MERGE
 });
@@ -1764,6 +1765,69 @@ const mergeSchema = {
     // or null when the campaign could not name the assisting session. The
     // trailer is a pointer into the witness ledger.
     trailer: { type: ["string", "null"], maxLength: 400 }
+  },
+  additionalProperties: false
+};
+
+// The single-line integration model's terminal act. `sha` is the one revision
+// the publication names -- the receipt carries no second sha to diverge from
+// it -- and it is present only when `main` names that gate-proven revision.
+const stagePublishSchema = {
+  type: "object",
+  required: [
+    "action",
+    "baseBranch",
+    "sha",
+    "integrationHead",
+    "provenHead",
+    "regateRequired",
+    "receipt",
+    "receiptRef",
+    "reason"
+  ],
+  properties: {
+    action: {
+      enum: ["fast-forward", "already-published", "rebase-and-regate", "withhold"]
+    },
+    baseBranch: { type: "string", minLength: 1 },
+    sha: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
+    integrationHead: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    provenHead: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
+    // A rebased integration head is a commit no gate has seen. `main` stays
+    // where it is until the next pass re-runs the gate against it.
+    regateRequired: { type: "boolean" },
+    receipt: {
+      type: ["object", "null"],
+      required: [
+        "schemaVersion",
+        "campaign",
+        "baseBranch",
+        "sha",
+        "provenBy",
+        "actor",
+        "writtenAt"
+      ],
+      properties: {
+        schemaVersion: { type: "integer", minimum: 1, maximum: 1 },
+        campaign: { type: "string", minLength: 1 },
+        baseBranch: { type: "string", minLength: 1 },
+        sha: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+        provenBy: {
+          type: "object",
+          required: ["taskId", "reference"],
+          properties: {
+            taskId: taskIdSchema,
+            reference: { type: "string", minLength: 1 }
+          },
+          additionalProperties: false
+        },
+        actor: { type: "string", minLength: 1, maxLength: 128 },
+        writtenAt: { type: "string", minLength: 1, maxLength: 64 }
+      },
+      additionalProperties: false
+    },
+    receiptRef: { type: ["string", "null"], minLength: 1 },
+    reason: { type: "string", minLength: 1, maxLength: 2000 }
   },
   additionalProperties: false
 };
@@ -2732,6 +2796,67 @@ async function sweepCampaign(repositoryConfig) {
   return sweepNode;
 }
 
+// The single line of development, closed at its far end: `main` advances only
+// by machine fast-forward of a head a stage or chapter gate proved, and the
+// publish receipt names that one sha. Auto-fast-forward is ruled -- the record
+// shows publish carried zero judgment -- so no approval sits here, and where
+// `main` has taken operator record commits the driver rebases the integration
+// line onto it and waits for the re-gate. Nothing here cherry-picks anything.
+//
+// The node runs on every pass that has a durable gate proof to offer, so a
+// publication interrupted by a dead process is finished by the next pass
+// rather than by a keyboard. Its own failure is a machinery fact: it is
+// reported, and the next pass retries the same idempotent decision.
+async function publishProvenHead(reconciliation, settledCheckpoints) {
+  const proofs = [];
+  const seen = [];
+  for (const checkpoint of reconciliation.checkpoints.concat(settledCheckpoints)) {
+    if (typeof checkpoint.ref !== "string" || typeof checkpoint.revision !== "string") {
+      continue;
+    }
+    const key = `${checkpoint.taskId} ${checkpoint.revision}`;
+    if (seen.indexOf(key) !== -1) {
+      continue;
+    }
+    seen.push(key);
+    proofs.push({
+      taskId: checkpoint.taskId,
+      ref: checkpoint.ref,
+      revision: checkpoint.revision
+    });
+  }
+  if (proofs.length === 0) {
+    return { published: null, failure: null };
+  }
+  // The most recently settled proof is the subject: the gate whose pass is the
+  // reason this publication is being attempted at all.
+  const subject = proofs[proofs.length - 1].taskId;
+  const node = await driverNode(
+    "stagePublish",
+    withSeam({
+      campaign: effective.campaign,
+      campaignIdentity: campaignTaskIdentity,
+      repository: codeRepository,
+      repositoryConfig: effective.repositoryConfig,
+      issue: args.issue,
+      runId: args.runId,
+      workspaceRoot: args.workspaceRoot,
+      source: reconciliation.source,
+      proofs
+    }),
+    `publish-main-${subject}`,
+    `publish-main-${subject}`,
+    stagePublishSchema,
+    null,
+    true,
+    taskRefFor(subject)
+  );
+  if (!nodePassed(node)) {
+    return { published: null, failure: failureReport({ id: subject }, "publish", node) };
+  }
+  return { published: node.result, failure: null };
+}
+
 function sweepDeferral(sweepNode) {
   if (sweepNode.result.blockingJobs.length === 0 && sweepNode.result.liveRuns.length === 0) {
     return null;
@@ -2829,6 +2954,10 @@ function sweepDeferral(sweepNode) {
   const domainsRequired = effective.maxParallel > 1;
 
   if (reconciliation.complete) {
+    // A complete campaign still offers its proven head: this is where a
+    // publication whose process died mid-act is finished, and where a record
+    // commit that landed on `main` after the close starts its rebase.
+    const publication = await publishProvenHead(reconciliation, []);
     return {
       campaign: effective.campaign,
       repository: codeRepository,
@@ -2839,7 +2968,8 @@ function sweepDeferral(sweepNode) {
       maintenance: sweepNode.result,
       checkpoints: [],
       merged: [],
-      failures: [],
+      published: publication.published,
+      failures: publication.failure === null ? [] : [publication.failure],
       diagnoses: [],
       retries: [],
       outcomes: [],
@@ -2864,6 +2994,10 @@ function sweepDeferral(sweepNode) {
       );
       escalation = escalated.result;
     }
+    // Work the gates already proved is published even while a later task is
+    // blocked: the block is the operator's to answer, and the proven head is
+    // not waiting on that answer.
+    const publication = await publishProvenHead(reconciliation, []);
     return {
       campaign: effective.campaign,
       repository: codeRepository,
@@ -2874,7 +3008,8 @@ function sweepDeferral(sweepNode) {
       maintenance: sweepNode.result,
       checkpoints: [],
       merged: [],
-      failures: [],
+      published: publication.published,
+      failures: publication.failure === null ? [] : [publication.failure],
       diagnoses: [],
       retries: [],
       outcomes: reconciliation.outcomes,
@@ -3703,6 +3838,14 @@ function sweepDeferral(sweepNode) {
     .filter(lane => lane.checkpoint)
     .map(lane => lane.checkpoint);
 
+  // Every merge and checkpoint this pass will make has been made, so the head
+  // a gate proved is the head that exists. Publication runs before the model
+  // work below -- diagnosing a blocked task is no reason to hold proven work
+  // off `main`. Its report joins `failures` after the classification below,
+  // beside cleanup and continuation: it is a campaign act, not a task's, and
+  // the next pass retries the same idempotent decision.
+  const publication = await publishProvenHead(reconciliation, checkpoints);
+
   const steerable = [];
   const machineryFaults = [];
   const deferrals = [];
@@ -3745,6 +3888,9 @@ function sweepDeferral(sweepNode) {
     } else {
       deferrals.push(failure);
     }
+  }
+  if (publication.failure !== null) {
+    failures.push(publication.failure);
   }
 
   // A machinery fault buys a retry only while the task's receipt-counted retry
@@ -4149,6 +4295,8 @@ function sweepDeferral(sweepNode) {
     maintenance: sweepNode.result,
     checkpoints,
     merged,
+    // The one sha `main` names, when this pass moved it. Never a pair.
+    published: publication.published,
     failures: failures.map(failure => failure.report || failure),
     diagnoses,
     retries,

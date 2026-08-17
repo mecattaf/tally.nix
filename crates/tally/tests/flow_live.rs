@@ -102,6 +102,7 @@ const SPEC_BUILD_RUN_MACHINERY: &str = "00000000-0000-4000-8000-000000000532";
 const SPEC_BUILD_RUN_RECOVERED: &str = "00000000-0000-4000-8000-000000000533";
 const SPEC_BUILD_RUN_HALTED: &str = "00000000-0000-4000-8000-000000000534";
 const SPEC_BUILD_RUN_LAST_TASK: &str = "00000000-0000-4000-8000-000000000535";
+const SPEC_BUILD_RUN_REGATE: &str = "00000000-0000-4000-8000-000000000538";
 const SPEC_BUILD_RUN_COMPLETE: &str = "00000000-0000-4000-8000-000000000536";
 const SPEC_BUILD_RED_PREFLIGHT_RUN: &str = "00000000-0000-4000-8000-000000000537";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
@@ -3734,14 +3735,49 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 checkpoint_revision
             );
             assert_eq!(fixture_git(&checkout, &["ls-remote", "--tags", "origin"]), "");
-            let checkpoint_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_5, 7).await;
-            assert_eq!(checkpoint_items.len(), 7);
+
+            // The gate proved this head, so the machine publishes it: `main`
+            // fast-forwards to that exact revision and the receipt names it.
+            // No operator act stands between the proof and the publication.
+            let published = &checkpoint_value["published"];
+            assert_eq!(published["action"], "fast-forward");
+            assert_eq!(published["sha"], checkpoint_revision);
+            assert_eq!(published["baseBranch"], "main");
+            assert_eq!(published["receipt"]["sha"], checkpoint_revision);
+            assert_eq!(
+                published["receipt"]["provenBy"]["taskId"],
+                "phase-one-checkpoint"
+            );
+            assert_eq!(published["receipt"]["provenBy"]["reference"], checkpoint_ref);
+            assert_eq!(
+                fixture_git(&checkout, &["ls-remote", "origin", "refs/heads/main"])
+                    .split_whitespace()
+                    .next()
+                    .unwrap(),
+                checkpoint_revision,
+                "main advances by fast-forward of the gate-proven head"
+            );
+            let receipt_ref = published["receiptRef"].as_str().unwrap();
+            assert!(receipt_ref.starts_with("refs/tally/spec-build/v1/"));
+            assert!(receipt_ref.ends_with(checkpoint_revision));
+            assert_eq!(
+                fixture_git(&checkout, &["ls-remote", "origin", receipt_ref])
+                    .split_whitespace()
+                    .next()
+                    .unwrap(),
+                checkpoint_revision
+            );
+            assert_eq!(fixture_git(&checkout, &["ls-remote", "--tags", "origin"]), "");
+
+            let checkpoint_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_5, 8).await;
+            assert_eq!(checkpoint_items.len(), 8);
             assert_eq!(
                 checkpoint_items
                 .iter()
                     .filter(|item| item["taskRef"] == "fixture/phase-one-checkpoint")
                     .count(),
-                4
+                5,
+                "the publication is the gate's own terminal act and carries its task ref"
             );
             assert_eq!(
                 checkpoint_items
@@ -3794,8 +3830,15 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(sixth_value["continuation"]["created"], true);
             let sixth_submitted = runner_events(&sixth, "node-submitted");
             // #386: `tree-delta-task-2` -- task-2 passes ownership this pass,
-            // so it reaches the gate.
-            assert_eq!(sixth_submitted.len(), 13);
+            // so it reaches the gate. The fourteenth node is the standing
+            // publication: a proven head is re-offered to `main` every pass,
+            // which is what makes an interrupted fast-forward and a record
+            // commit landing on `main` mid-campaign both self-repairing.
+            assert_eq!(sixth_submitted.len(), 14);
+            assert_eq!(
+                sixth_value["published"]["action"], "already-published",
+                "a pass that merged nothing re-offers the same proven head and moves nothing"
+            );
             assert!(sixth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
@@ -3865,10 +3908,24 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             );
             let commits = first_parent.lines().collect::<Vec<_>>();
             assert_eq!(commits.len(), 5, "initial commit plus four task merges");
+            // One line of development. The shared remote base is not a second
+            // line the campaign has to be bridged to: it is the gate-proven
+            // prefix of this one, so it names the revision the gate proved and
+            // holds nothing the integration line does not contain.
+            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
-                "1",
-                "the shared remote base must still contain only its authority commit"
+                fixture_git(&checkout, &["rev-parse", "origin/main"]),
+                checkpoint_revision,
+                "main names the gate-proven head it fast-forwarded to"
+            );
+            fixture_git(
+                &checkout,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    "origin/main",
+                    integration_branch,
+                ],
             );
 
             let replay = runner(
@@ -3933,8 +3990,10 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(seventh_value["continuation"]["created"], true);
             let seventh_submitted = runner_events(&seventh, "node-submitted");
             // #386: `tree-delta-task-2` -- task-2 passes ownership this pass
-            // too, so it reaches the gate again before blocking.
-            assert_eq!(seventh_submitted.len(), 13);
+            // too, so it reaches the gate again before blocking. The publish
+            // node runs beside it and finds the same head already published.
+            assert_eq!(seventh_submitted.len(), 14);
+            assert_eq!(seventh_value["published"]["action"], "already-published");
             assert_eq!(
                 seventh_submitted
                     .iter()
@@ -3998,10 +4057,22 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(eighth_value["escalation"]["posted"], true);
             assert_eq!(eighth_value["escalation"]["diagnosisCount"], 4);
             let eighth_submitted = runner_events(&eighth, "node-submitted");
-            assert_eq!(eighth_submitted.len(), 3);
-            assert!(eighth_submitted
-                .iter()
-                .all(|event| event.get("taskRef").is_none()));
+            // Sweep, reconcile, escalate -- and the publication, which a block
+            // does not hold up: the head the gate proved is already on `main`,
+            // and the blocked task is the operator's to answer, not its bar.
+            assert_eq!(eighth_submitted.len(), 4);
+            assert_eq!(
+                eighth_submitted
+                    .iter()
+                    .filter(|event| event.get("taskRef").is_none())
+                    .count(),
+                3
+            );
+            assert_eq!(eighth_value["published"]["action"], "already-published");
+            assert_eq!(
+                eighth_value["published"]["sha"], checkpoint_revision,
+                "a blocked campaign still names one published sha, and it is the proven one"
+            );
 
             let attempt_receipts = fs::read_to_string(&attempt_receipts_path)
                 .unwrap()
@@ -4132,12 +4203,20 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             let ninth_submitted = runner_events(&ninth, "node-submitted");
             assert_eq!(
                 ninth_submitted.len(),
-                2,
-                "escalation must be projected once"
+                3,
+                "escalation must be projected once, beside the sweep and the publication"
             );
-            assert!(ninth_submitted
+            assert!(!ninth_submitted
                 .iter()
-                .all(|event| event.get("taskRef").is_none()));
+                .any(|event| event["label"] == "spec-build-escalate"));
+            assert_eq!(
+                ninth_submitted
+                    .iter()
+                    .filter(|event| event.get("taskRef").is_none())
+                    .count(),
+                2
+            );
+            assert_eq!(ninth_value["published"]["action"], "already-published");
             assert!(
                 !fixture_git(&checkout, &["worktree", "list", "--porcelain"])
                     .contains(workspace_root.to_str().unwrap())
@@ -4203,11 +4282,11 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 );
             }
             assert_eq!(
-                wait_for_flow_items(&client, SPEC_BUILD_ATTACHED_RUN, 2)
+                wait_for_flow_items(&client, SPEC_BUILD_ATTACHED_RUN, 3)
                     .await
                     .len(),
-                2,
-                "an attached live replay must share sweep and reconcile nodes"
+                3,
+                "an attached live replay must share sweep, reconcile, and publish nodes"
             );
 
             let agent_order = fs::read_to_string(control.join("agent-order.log")).unwrap();
@@ -4597,6 +4676,71 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 last_task_value["reconciled"]["closingSummary"],
                 Value::Null,
                 "a pass that still has work is not a terminal pass"
+            );
+            // The operator's two worklist edits landed on `main`, so the two
+            // lines diverged over a path no lane touched. This is the whole
+            // wedge the single-line model deletes: no commit is copied across
+            // by hand and nothing is published on the strength of an old
+            // proof. The machinery rebases the integration line onto `main`
+            // and leaves `main` exactly where it was until a gate has seen the
+            // rebased head.
+            assert_eq!(last_task_value["published"]["action"], "rebase-and-regate");
+            assert_eq!(last_task_value["published"]["regateRequired"], true);
+            assert_eq!(last_task_value["published"]["sha"], Value::Null);
+            assert_eq!(last_task_value["published"]["receipt"], Value::Null);
+            let rebased_head = last_task_value["published"]["integrationHead"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            fixture_git(&checkout, &["fetch", "origin"]);
+            assert_eq!(
+                fixture_git(&checkout, &["rev-parse", integration_branch]),
+                rebased_head
+            );
+            fixture_git(
+                &checkout,
+                &["merge-base", "--is-ancestor", "origin/main", &rebased_head],
+            );
+            assert_ne!(
+                fixture_git(&checkout, &["rev-parse", "origin/main"]),
+                rebased_head,
+                "an unproven head never moves main"
+            );
+
+            // The re-gate is an ordinary pass: the checkpoint's own ref names
+            // the revision it proved, so a rebased head is simply not proven
+            // yet and the gate runs again. Only then does main advance.
+            let regated = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_REGATE,
+                &arguments("fixture-comment-19-regate", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let regated = runner_output(regated).await;
+            assert!(
+                regated.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&regated.stdout),
+                String::from_utf8_lossy(&regated.stderr)
+            );
+            let regated_value = &flow_report(&regated)["report"]["finalValue"];
+            assert_eq!(regated_value["state"], "advanced");
+            assert_eq!(
+                regated_value["checkpoints"][0]["taskId"],
+                "phase-one-checkpoint"
+            );
+            assert_eq!(regated_value["checkpoints"][0]["revision"], rebased_head);
+            assert_eq!(regated_value["published"]["action"], "fast-forward");
+            assert_eq!(regated_value["published"]["sha"], rebased_head);
+            fixture_git(&checkout, &["fetch", "origin"]);
+            assert_eq!(
+                fixture_git(&checkout, &["rev-parse", "origin/main"]),
+                rebased_head,
+                "a published sha is always a gated sha"
             );
 
             let completed = runner(
