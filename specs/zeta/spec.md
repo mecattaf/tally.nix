@@ -1,6 +1,6 @@
 # zeta — the authority plane
 
-Status: ratified 2026-08-17
+Status: proposed
 Governs: silent-factory-worklists/zeta.json
 Consumers: checks.x86_64-linux.spec-lint; the zeta worklist readFirst anchors; the close sitting coverage render
 Supersedes: none
