@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "l14-orphan-trace-row",
+    "maxTasks": 1,
+    "maxParallel": 1,
+    "steward": "narrator",
+    "gates": [
+      {
+        "kind": "command",
+        "id": "cargo-tests",
+        "argv": ["cargo", "test", "-p", "spec-lint"],
+        "runtimeMaxSec": 3600
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "the-task",
+      "kind": "implementation",
+      "title": "Carry the one claim this corpus spec declares",
+      "goal": "The task exists so the orphan row is the only thing the join cannot resolve.",
+      "deliveredBehaviors": ["the resolution pass reports the orphan row"],
+      "readFirst": { "specSections": [], "styleReferences": [] },
+      "acceptanceCriteria": [
+        { "id": "the-corpus-counts-it", "description": "The corpus test counts the defect.", "argv": ["true"] }
+      ],
+      "dependencies": [],
+      "conflictDomains": []
+    }
+  ]
+}

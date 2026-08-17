@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "l13-phantom-pointer",
+    "maxTasks": 2,
+    "maxParallel": 1,
+    "steward": "narrator",
+    "gates": [
+      {
+        "kind": "command",
+        "id": "cargo-tests",
+        "argv": ["cargo", "test", "-p", "spec-lint"],
+        "runtimeMaxSec": 3600
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "reads-an-absent-file",
+      "kind": "implementation",
+      "title": "Read first from a file the tree does not carry",
+      "goal": "The pointer names a specs/** path that does not exist at this revision.",
+      "deliveredBehaviors": ["the resolution pass reports the dangling pointer"],
+      "readFirst": {
+        "specSections": [
+          "specs/pointed/evidence/absent.md"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [],
+      "dependencies": [],
+      "conflictDomains": []
+    },
+    {
+      "id": "reads-an-absent-anchor",
+      "kind": "implementation",
+      "title": "Read first from an anchor the target does not offer",
+      "goal": "The pointer names a file that exists and an anchor no heading derives.",
+      "deliveredBehaviors": ["the resolution pass reports the dangling anchor"],
+      "readFirst": {
+        "specSections": [
+          "specs/pointed/evidence/ledger.md#r9"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [],
+      "dependencies": [],
+      "conflictDomains": []
+    }
+  ]
+}

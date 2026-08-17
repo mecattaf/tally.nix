@@ -1,5 +1,6 @@
 //! The check pass: every rule `specs/README.md` §7 marks as a single-spec rule,
-//! run over one `specs/<identity>/spec.md`.
+//! run over one `specs/<identity>/spec.md`, followed by the cross-artifact half
+//! that joins it to the governing worklist and to `trace.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -8,10 +9,12 @@ use std::sync::OnceLock;
 use anyhow::Context as _;
 use regex::Regex;
 
+use crate::artifacts::Artifacts;
 use crate::claim::{self, Believe};
 use crate::defect::Defect;
-use crate::document::{Document, Line, Section, NEVER_OMITTABLE, SECTION_ORDER};
+use crate::document::{Document, Line, Logical, Section, NEVER_OMITTABLE, SECTION_ORDER};
 use crate::lexicon;
+use crate::resolution;
 use crate::rules::RuleId;
 use crate::tree::{self, Tree};
 
@@ -28,12 +31,42 @@ pub struct Context {
     pub root: PathBuf,
 }
 
-/// Lint one identity directory. `Ok(None)` means the directory carries no
+/// What a run is pointed at beyond the identity directory itself.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// The working-tree root paths resolve against. Inferred when absent.
+    pub root: Option<PathBuf>,
+    /// The governing worklist. Without it the run reads
+    /// `<root>/silent-factory-worklists/<identity>.json`, when that file exists.
+    pub worklist: Option<PathBuf>,
+}
+
+/// One identity directory, opened: its `spec.md` parsed and the two
+/// cross-artifact files beside it read.
+pub struct Opened {
+    pub context: Context,
+    pub document: Document,
+    pub artifacts: Artifacts,
+}
+
+impl Opened {
+    /// The check mode: the single-spec pass, then the cross-artifact one.
+    pub fn lint(&self) -> Vec<Defect> {
+        let mut defects = check(&self.document, &self.context);
+        defects.extend(resolution::resolve(
+            &self.document,
+            &self.context,
+            &self.artifacts,
+        ));
+        defects.sort();
+        defects.dedup();
+        defects
+    }
+}
+
+/// Open one identity directory. `Ok(None)` means the directory carries no
 /// `spec.md` and is skipped silently, as §2 requires of evidence-only dirs.
-pub fn lint_directory(
-    directory: &Path,
-    root: Option<&Path>,
-) -> anyhow::Result<Option<Vec<Defect>>> {
+pub fn open(directory: &Path, options: &Options) -> anyhow::Result<Option<Opened>> {
     let spec = directory.join("spec.md");
     if !spec.is_file() {
         return Ok(None);
@@ -51,53 +84,52 @@ pub fn lint_directory(
         file: spec.display().to_string(),
         identity,
         directory: directory.to_path_buf(),
-        root: root.map_or_else(|| tree::infer_root(directory), Path::to_path_buf),
+        root: options
+            .root
+            .clone()
+            .unwrap_or_else(|| tree::infer_root(directory)),
     };
-    Ok(Some(lint_text(&text, &context)))
+    let artifacts = Artifacts::open(&context, options.worklist.as_deref())?;
+    Ok(Some(Opened {
+        document: Document::parse(&text),
+        context,
+        artifacts,
+    }))
 }
 
-/// Lint the bytes of one `spec.md`.
+/// Lint one identity directory: the single-spec check pass, then the
+/// cross-artifact resolution pass over the worklist and `trace.json`.
+pub fn lint_directory(directory: &Path, options: &Options) -> anyhow::Result<Option<Vec<Defect>>> {
+    Ok(open(directory, options)?.map(|opened| opened.lint()))
+}
+
+/// Lint the bytes of one `spec.md` — the single-spec half on its own.
 pub fn lint_text(text: &str, context: &Context) -> Vec<Defect> {
     let document = Document::parse(text);
+    let mut defects = check(&document, context);
+    defects.sort();
+    defects.dedup();
+    defects
+}
+
+/// Every rule `specs/README.md` §7 marks as a single-spec rule.
+pub fn check(document: &Document, context: &Context) -> Vec<Defect> {
     let mut tree = Tree::new(context.root.clone()).with_local(context.directory.clone());
     let mut defects = Vec::new();
 
-    let status = status_block(&document, context, &mut defects);
-    let bodies = section_set(&document, context, &mut defects);
-    let vocabulary = vocabulary(&document, context, &bodies, &mut defects);
-    rulings(&document, context, &bodies, &mut defects);
-    prime_believed_files(&document, &mut tree);
-    claims(
-        &document,
-        context,
-        &bodies,
-        &vocabulary,
-        &tree,
-        &mut defects,
-    );
-    unchanged(
-        &document,
-        context,
-        &bodies,
-        &vocabulary,
-        &tree,
-        &mut defects,
-    );
-    unknowns(&document, context, &bodies, &mut defects);
-    stages(&document, context, &bodies, &mut defects);
-    forbidden(
-        &document,
-        context,
-        &bodies,
-        &vocabulary,
-        &tree,
-        &mut defects,
-    );
-    doubt(&document, context, status.ratified, &mut defects);
-    lexical(&document, context, &mut defects);
+    let status = status_block(document, context, &mut defects);
+    let bodies = section_set(document, context, &mut defects);
+    let vocabulary = vocabulary(document, context, &bodies, &mut defects);
+    rulings(document, context, &bodies, &mut defects);
+    prime_believed_files(document, &mut tree);
+    claims(document, context, &bodies, &vocabulary, &tree, &mut defects);
+    unchanged(document, context, &bodies, &vocabulary, &tree, &mut defects);
+    unknowns(document, context, &bodies, &mut defects);
+    stages(document, context, &bodies, &mut defects);
+    forbidden(document, context, &bodies, &vocabulary, &tree, &mut defects);
+    doubt(document, context, status.ratified, &mut defects);
+    lexical(document, context, &mut defects);
 
-    defects.sort();
-    defects.dedup();
     defects
 }
 
@@ -414,40 +446,8 @@ fn body_state(
     Body::Omitted
 }
 
-/// One logical line of a section body: a line plus the indented continuation
-/// lines that wrap it. The grammar is line-oriented; wrapping a long line at
-/// the margin is typography, not a second line.
-#[derive(Clone, Debug)]
-struct Logical {
-    number: usize,
-    text: String,
-}
-
-impl Logical {
-    fn trimmed(&self) -> &str {
-        &self.text
-    }
-}
-
 fn content_lines(document: &Document, section: &Section) -> Vec<Logical> {
-    let mut logical: Vec<Logical> = Vec::new();
-    for line in document.body(section) {
-        if line.is_blank() || line.fenced {
-            continue;
-        }
-        let continuation = line.text.starts_with([' ', '\t']);
-        match (continuation, logical.last_mut()) {
-            (true, Some(previous)) => {
-                previous.text.push(' ');
-                previous.text.push_str(line.text.trim());
-            }
-            _ => logical.push(Logical {
-                number: line.number,
-                text: line.text.trim().to_owned(),
-            }),
-        }
-    }
-    logical
+    document.logical(section)
 }
 
 /// The Vocabulary section, indexed for the identifier and drift rules.

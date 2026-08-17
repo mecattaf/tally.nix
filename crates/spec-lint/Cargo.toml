@@ -12,6 +12,7 @@ readme = "README.md"
 anyhow.workspace = true
 clap.workspace = true
 regex.workspace = true
-
-[dev-dependencies]
+# The cross-artifact half reads the governing worklist and trace.json at lint
+# runtime, so serde_json moves out of dev-dependencies. Cargo.lock already
+# carries it for this crate: promoting a dev-dependency changes no lock byte.
 serde_json.workspace = true

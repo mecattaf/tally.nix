@@ -73,7 +73,10 @@ impl fmt::Display for RuleId {
 pub enum Stage {
     /// Evaluated by this crate's `check` pass over one `spec.md`.
     Core,
-    /// Catalogued here, evaluated by the cross-artifact resolution pass.
+    /// Evaluated by the cross-artifact resolution pass, which runs inside the
+    /// check mode over the governing worklist and `trace.json`. L13 and L14
+    /// run there today; L17 compares the trace against its parent revision and
+    /// waits on sitting mode, the only place a parent revision exists.
     Resolution,
 }
 

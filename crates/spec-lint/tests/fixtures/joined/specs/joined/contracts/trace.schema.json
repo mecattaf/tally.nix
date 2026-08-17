@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tally spec-layer trace file",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "spec", "rows"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "spec": {
+      "type": "string",
+      "pattern": "^specs/[a-z0-9-]+/spec\\.md$"
+    },
+    "rows": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/row" }
+    }
+  },
+  "$defs": {
+    "row": {
+      "type": "object",
+      "required": ["seq", "at", "kind", "claim", "task"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 1 },
+        "at": { "type": "string", "format": "date-time" },
+        "kind": { "enum": ["sitting", "release"] },
+        "claim": {
+          "type": "string",
+          "pattern": "^([0-9]+\\.[0-9]+|U\\.[0-9]+)$"
+        },
+        "task": { "type": "string", "minLength": 1 }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": { "const": "sitting" },
+            "sitting": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]+/s[0-9]+$"
+            },
+            "acceptance": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1
+            },
+            "evidence": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          },
+          "required": ["sitting", "acceptance"]
+        },
+        {
+          "properties": {
+            "kind": { "const": "release" },
+            "merged": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "witness": { "type": "string", "minLength": 1 },
+            "release": { "type": "string", "minLength": 1 }
+          },
+          "required": ["merged", "witness", "release"]
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

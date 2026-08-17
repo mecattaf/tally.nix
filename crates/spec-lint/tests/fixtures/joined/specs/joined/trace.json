@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "spec": "specs/joined/spec.md",
+  "rows": [
+    { "seq": 1, "at": "2026-08-17T09:00:00Z", "kind": "sitting", "claim": "1.1", "task": "the-first-task", "sitting": "joined/s1", "acceptance": ["the-pointers-resolve"], "evidence": ["specs/joined/evidence/ledger.md"] },
+    { "seq": 2, "at": "2026-08-17T09:00:00Z", "kind": "sitting", "claim": "1.2", "task": "the-second-task", "sitting": "joined/s1", "acceptance": ["the-rows-resolve"] },
+    { "seq": 3, "at": "2026-08-17T10:00:00Z", "kind": "release", "claim": "1.1", "task": "the-first-task", "merged": "0123456789abcdef0123456789abcdef01234567", "witness": "joined/summary/complete", "release": "joined-v0" }
+  ]
+}

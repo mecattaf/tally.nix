@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use spec_lint::defect::{Defect, Outcome, Severity};
-use spec_lint::lint;
+use spec_lint::lint::{self, Options};
 use spec_lint::rules::RuleId;
 
 fn fixtures() -> PathBuf {
@@ -29,7 +29,7 @@ fn corpus_directories() -> Vec<PathBuf> {
 }
 
 fn defects_of(directory: &Path) -> Vec<Defect> {
-    lint::lint_directory(directory, None)
+    lint::lint_directory(directory, &Options::default())
         .expect("the fixture is readable")
         .unwrap_or_else(|| panic!("{} carries no spec.md", directory.display()))
 }
@@ -123,7 +123,7 @@ fn a_warning_only_fixture_stops_short_of_blocking() {
 
 #[test]
 fn a_directory_without_a_spec_is_skipped_silently() {
-    let skipped = lint::lint_directory(&fixtures().join("evidence-only"), None)
+    let skipped = lint::lint_directory(&fixtures().join("evidence-only"), &Options::default())
         .expect("the fixture directory is readable");
     assert!(skipped.is_none());
 }

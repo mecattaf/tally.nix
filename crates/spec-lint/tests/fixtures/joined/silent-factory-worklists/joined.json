@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "joined",
+    "maxTasks": 2,
+    "maxParallel": 1,
+    "steward": "narrator",
+    "gates": [
+      {
+        "kind": "command",
+        "id": "corpus-tests",
+        "preflightArgv": ["sh", "-euc", "command -v cargo >/dev/null"],
+        "argv": ["cargo", "test", "-p", "spec-lint"],
+        "runtimeMaxSec": 3600
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "the-first-task",
+      "kind": "implementation",
+      "title": "Resolve the worklist pointers against the tree",
+      "goal": "Every specs/** pointer this task reads first resolves, anchor included.",
+      "deliveredBehaviors": ["the resolution pass reports nothing over this tree"],
+      "readFirst": {
+        "specSections": [
+          "specs/joined/spec.md#r1",
+          "specs/joined/evidence/ledger.md"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        { "id": "the-pointers-resolve", "description": "Every pointer resolves.", "argv": ["true"] }
+      ],
+      "dependencies": [],
+      "conflictDomains": []
+    },
+    {
+      "id": "the-second-task",
+      "kind": "implementation",
+      "title": "Resolve the trace rows against the spec and the worklist",
+      "goal": "Every row names a claim, a task, and acceptance ids that exist.",
+      "deliveredBehaviors": ["the coverage table renders the join byte-stable"],
+      "readFirst": {
+        "specSections": [
+          "specs/joined/spec.md#r2"
+        ],
+        "styleReferences": []
+      },
+      "acceptanceCriteria": [
+        { "id": "the-rows-resolve", "description": "Every row resolves.", "argv": ["true"] }
+      ],
+      "dependencies": ["the-first-task"],
+      "conflictDomains": []
+    }
+  ]
+}

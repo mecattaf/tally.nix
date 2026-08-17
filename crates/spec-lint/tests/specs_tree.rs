@@ -1,6 +1,9 @@
-//! The two tests that read the committed `specs/` tree: the §7 rule-index
-//! parity `specs/README.md` names as its standing consumer, and the
-//! accept/reject corpus at `specs/zeta/contracts/claim-line.fixtures.json`.
+//! The tests that read the committed `specs/` tree: the §7 rule-index parity
+//! `specs/README.md` names as its standing consumer, the accept/reject corpus
+//! at `specs/zeta/contracts/claim-line.fixtures.json`, and the second half of
+//! §2's double pin — every `trace.schema.json` a fixture carries is the
+//! committed contract byte for byte, so a fixture can never validate against a
+//! schema the layer has moved past.
 //!
 //! The workspace derivation builds from a filtered source that does not carry
 //! `./specs`, so both tests SKIP with a printed note when no ancestor of the
@@ -64,6 +67,50 @@ fn the_readme_rule_index_and_the_implemented_rule_set_stay_in_parity() {
         index, catalogued,
         "specs/README.md §7 and crates/spec-lint's rule catalog have drifted"
     );
+}
+
+/// Every `trace.schema.json` under the crate's fixture tree.
+fn fixture_schemas(directory: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(directory).expect("the fixture tree is readable") {
+        let path = entry.expect("the fixture tree is readable").path();
+        if path.is_dir() {
+            fixture_schemas(&path, found);
+        } else if path
+            .file_name()
+            .is_some_and(|name| name == "trace.schema.json")
+        {
+            found.push(path);
+        }
+    }
+    found.sort();
+}
+
+#[test]
+fn every_fixture_trace_schema_is_the_committed_contract_byte_for_byte() {
+    let Some(root) = specs_tree() else {
+        skip("every_fixture_trace_schema_is_the_committed_contract_byte_for_byte");
+        return;
+    };
+    let contract = std::fs::read_to_string(root.join("specs/zeta/contracts/trace.schema.json"))
+        .expect("the trace contract is readable");
+
+    let mut schemas = Vec::new();
+    fixture_schemas(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
+        &mut schemas,
+    );
+    assert!(
+        !schemas.is_empty(),
+        "a fixture carrying a trace.json carries the contract it validates against"
+    );
+    for schema in schemas {
+        assert_eq!(
+            std::fs::read_to_string(&schema).expect("the fixture schema is readable"),
+            contract,
+            "{} has drifted from specs/zeta/contracts/trace.schema.json",
+            schema.display()
+        );
+    }
 }
 
 /// The synthetic spec one fixture line is read inside, and the line number the

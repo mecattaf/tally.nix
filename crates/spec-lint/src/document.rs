@@ -121,6 +121,43 @@ impl Document {
             .iter()
             .rfind(|section| section.heading <= line)
     }
+
+    /// One section body as logical lines.
+    pub fn logical(&self, section: &Section) -> Vec<Logical> {
+        let mut logical: Vec<Logical> = Vec::new();
+        for line in self.body(section) {
+            if line.is_blank() || line.fenced {
+                continue;
+            }
+            let continuation = line.text.starts_with([' ', '\t']);
+            match (continuation, logical.last_mut()) {
+                (true, Some(previous)) => {
+                    previous.text.push(' ');
+                    previous.text.push_str(line.text.trim());
+                }
+                _ => logical.push(Logical {
+                    number: line.number,
+                    text: line.text.trim().to_owned(),
+                }),
+            }
+        }
+        logical
+    }
+}
+
+/// One logical line of a section body: a line plus the indented continuation
+/// lines that wrap it. The grammar is line-oriented; wrapping a long line at
+/// the margin is typography, not a second line.
+#[derive(Clone, Debug)]
+pub struct Logical {
+    pub number: usize,
+    pub text: String,
+}
+
+impl Logical {
+    pub fn trimmed(&self) -> &str {
+        &self.text
+    }
 }
 
 #[cfg(test)]

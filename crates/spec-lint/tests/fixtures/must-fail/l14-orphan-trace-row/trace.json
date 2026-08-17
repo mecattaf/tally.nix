@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "spec": "specs/l14-orphan-trace-row/spec.md",
+  "rows": [
+    { "seq": 1, "at": "2026-08-17T09:00:00Z", "kind": "sitting", "claim": "1.1", "task": "the-task", "sitting": "l14/s1", "acceptance": ["the-corpus-counts-it"] },
+    { "seq": 2, "at": "2026-08-17T09:00:00Z", "kind": "sitting", "claim": "9.9", "task": "the-task", "sitting": "l14/s1", "acceptance": ["the-corpus-counts-it"] }
+  ]
+}
