@@ -10,6 +10,18 @@ with `tally-core`, steering and attempt receipts, checkpoint capture,
 publication gates, conflict-domain enforcement, and linked-worktree merge and
 cleanup mechanics.
 
+## The protected set at ownership
+
+Ownership certification judges the protected set before it judges declared
+conflict domains. A lane commit touching `specs/<identity>/**` is refused with
+the path and the protection named, and a conflict domain that claims the path
+does not buy it: the governing spec directory is not a lane's to write, and
+evidence additions are not exempt. A lane with evidence to land hands it to its
+final message and the operator or the coordinator writes it. The rule and its
+identity-blindness live in `tally_core::campaign_protection`; the other two
+members of the set — the worklist and the gate definitions inside its bytes —
+are the operator's arming surface and are protected there.
+
 ## The `laneCapture` seam
 
 The `retry` and `steer` briefs accept an optional `laneCapture` block —
