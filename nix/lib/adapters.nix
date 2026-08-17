@@ -123,6 +123,36 @@ let
       skillBundle == null || skillRevision == null
     ) "tally adapter skillBundle and skillRevision are mutually exclusive";
     assert lib.assertMsg (builtins.isAttrs extraConfig) "tally adapter extraConfig must be an attrset";
+    # An adapter may declare the policy it launches under when a job names none.
+    # The declaration is only meaningful in this adapter's own vocabulary, so it
+    # must name a policy this adapter declares -- caught here rather than at
+    # render, where the equivalent mistake used to surface mid-campaign.
+    assert lib.assertMsg (builtins.all
+      (
+        {
+          key,
+          policies,
+        }:
+        let
+          declared = extraConfig.${key} or null;
+        in
+        declared == null || (builtins.isString declared && builtins.hasAttr declared policies)
+      )
+      [
+        {
+          key = "defaultApprovalPolicy";
+          policies = launch.approvalPolicies or { };
+        }
+        {
+          key = "defaultSandboxPolicy";
+          policies = launch.sandboxPolicies or { };
+        }
+        {
+          key = "defaultDiagnosisSandboxPolicy";
+          policies = launch.sandboxPolicies or { };
+        }
+      ]
+    ) "tally adapter extraConfig default policy must name a policy this adapter declares";
     {
       inherit
         argv
@@ -577,7 +607,27 @@ let
           "dangerously-bypass"
         ];
       };
-      extraConfig.modelFlag = "--model";
+      extraConfig = {
+        modelFlag = "--model";
+        # This preset's own answer for a job that names no policy. These three
+        # names are codex vocabulary -- every one of them is a key of the maps
+        # just above -- and they lived as campaign-contract constants until a
+        # policy-less worklist admitted against any other adapter rendered them
+        # and died at render with "value not authorized by this adapter",
+        # quoting a policy its operator never wrote. Declared here they reach
+        # exactly the adapter whose binary understands them, and an adapter that
+        # declares nothing keeps its own native behaviour.
+        defaultApprovalPolicy = "never";
+        defaultSandboxPolicy = "danger-full-access";
+        # Not read-only, which is this binary's landlock jailer: it denies ALL
+        # filesystem writes, /dev/shm and tempdirs included, so a diagnosing
+        # agent died inside its own exec machinery before it could reason.
+        # Under workspace-write codex mounts .git read-only itself (see the
+        # commit-capability note above), the diagnosis worktree is disposable,
+        # and diagnosis has no publish path -- the position that diagnosis must
+        # not mutate is kept; only the mechanism changes.
+        defaultDiagnosisSandboxPolicy = "workspace-write";
+      };
     };
   };
 in

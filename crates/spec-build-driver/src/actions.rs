@@ -880,10 +880,13 @@ fn validate_campaign_agent(value: Option<&Json>, context: &str) -> Result<()> {
     if !matches!(priority.as_str(), "interrupt" | "high" | "medium" | "low") {
         return Err(DriverError::new(format!("{context}.priority is invalid")));
     }
+    // No policy default: the three policy names are adapter vocabulary, and the
+    // adapter answers for a worklist that names none. Absent is admissible and
+    // renders nothing.
     for (name, default) in [
-        ("approvalPolicy", Some("never")),
-        ("sandboxPolicy", Some("danger-full-access")),
-        ("diagnosisSandboxPolicy", Some("read-only")),
+        ("approvalPolicy", None::<&str>),
+        ("sandboxPolicy", None),
+        ("diagnosisSandboxPolicy", None),
         ("model", None),
     ] {
         let temporary = default.map(Json::from);

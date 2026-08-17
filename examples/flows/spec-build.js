@@ -2045,7 +2045,15 @@ function campaignInputs() {
       postFailureEvidence: args.postFailureEvidence === true,
       postFailureStderr: args.postFailureStderr === true,
       taskInputHashes: null,
-      agent: diagnosisSandboxed(args.agent),
+      // The agent block travels verbatim, policy keys included. An absent
+      // diagnosis policy means the adapter's own answer, exactly as an absent
+      // lane policy does; stamping one here made every adapter inherit one
+      // preset's vocabulary, and the value stamped -- "read-only" -- is that
+      // preset's landlock jailer, which denies every filesystem write
+      // including /dev/shm and tempdirs and killed the diagnosing agent's own
+      // exec machinery before it could reason. The diagnosis brief still
+      // prohibits mutation; that position is carried by the brief's shape.
+      agent: args.agent,
       steward: args.steward || null,
       gates: args.gates
     };
@@ -2087,7 +2095,8 @@ function campaignInputs() {
     postFailureEvidence: false,
     postFailureStderr: false,
     taskInputHashes: args.taskInputHashes,
-    agent: diagnosisSandboxed(manifest.agent),
+    // Verbatim, for the reason spelled out on the pre-manifest branch above.
+    agent: manifest.agent,
     steward: manifest.steward,
     gates: manifest.gates
   };
@@ -2465,15 +2474,6 @@ function checkpointBrief(task, prepared, reconciliation) {
   };
 }
 
-// The diagnosis brief prohibits mutation. An operator whose adapter declares no
-// read-only policy sets diagnosisSandboxPolicy to null explicitly.
-function diagnosisSandboxed(agent) {
-  if (agent.diagnosisSandboxPolicy !== undefined) {
-    return agent;
-  }
-  return { ...agent, diagnosisSandboxPolicy: "read-only" };
-}
-
 function applyAgentPolicies(spec, sandboxPolicy = effective.agent.sandboxPolicy) {
   if (effective.agent.runtimeMaxSec !== null) {
     spec.runtimeMaxSec = effective.agent.runtimeMaxSec;
@@ -2481,7 +2481,12 @@ function applyAgentPolicies(spec, sandboxPolicy = effective.agent.sandboxPolicy)
   if (effective.agent.model !== null && effective.agent.model !== undefined) {
     spec.model = effective.agent.model;
   }
-  if (effective.agent.approvalPolicy !== null) {
+  // Absent and null are the same statement now -- "the adapter answers" -- so
+  // neither may reach the node as a policy name.
+  if (
+    effective.agent.approvalPolicy !== null &&
+    effective.agent.approvalPolicy !== undefined
+  ) {
     spec.approvalPolicy = effective.agent.approvalPolicy;
   }
   if (sandboxPolicy !== null && sandboxPolicy !== undefined) {
@@ -2526,8 +2531,13 @@ function applyDiagnosisRole(spec) {
     // the node contributes only the workload prompt, never those host bytes.
     argv: [diagnosisBriefSentinel],
     adapter: role.adapter,
-    priority: "low",
-    sandboxPolicy: "read-only"
+    priority: "low"
+    // No sandbox policy. The steward seam refuses an adapter that declares
+    // launch policies at all, so a stamped policy name could never render
+    // against a legal steward -- it died at admission with "sandboxPolicy
+    // value read-only is not authorized by this adapter". The direct narration
+    // subprocess has no jailer to configure either; the read-only position is
+    // carried by this node's read-only brief shape, not by policy vocabulary.
   };
   if (role.runtimeMaxSec !== null && role.runtimeMaxSec !== undefined) {
     bound.runtimeMaxSec = role.runtimeMaxSec;

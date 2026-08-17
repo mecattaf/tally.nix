@@ -22,10 +22,9 @@ use tally_core::campaign_contract::{
     admit_manifest_value, task_completion_revision, task_input_epoch, task_input_hash,
     validate_agent, validate_argv, validate_gates, CampaignAgent, CampaignGate, CampaignManifest,
     CampaignRepository, CampaignSteward, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1,
-    BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION, DEFAULT_AGENT_APPROVAL_POLICY,
-    DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY, DEFAULT_AGENT_PRIORITY, DEFAULT_AGENT_RUNTIME_MAX_SEC,
-    DEFAULT_AGENT_SANDBOX_POLICY, DEFAULT_DRIVER_RUNTIME_MAX_SEC, DEFAULT_MAX_TASKS,
-    DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN, DEFAULT_STEWARD_RUNTIME_MAX_SEC, MAX_CAMPAIGN_TASKS,
+    BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION, DEFAULT_AGENT_PRIORITY, DEFAULT_AGENT_RUNTIME_MAX_SEC,
+    DEFAULT_DRIVER_RUNTIME_MAX_SEC, DEFAULT_MAX_TASKS, DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN,
+    DEFAULT_STEWARD_RUNTIME_MAX_SEC, MAX_CAMPAIGN_TASKS,
 };
 use tally_core::campaign_folds::{
     campaign_digest, render_campaign_summary, stable_publish_branch, stage_scoped_summary_ref,
@@ -178,9 +177,11 @@ fn default_worklist_agent() -> CampaignAgent {
         argv: vec![BRIEF_SENTINEL.to_owned()],
         priority: DEFAULT_AGENT_PRIORITY.to_owned(),
         runtime_max_sec: Some(DEFAULT_AGENT_RUNTIME_MAX_SEC),
-        approval_policy: Some(DEFAULT_AGENT_APPROVAL_POLICY.to_owned()),
-        sandbox_policy: Some(DEFAULT_AGENT_SANDBOX_POLICY.to_owned()),
-        diagnosis_sandbox_policy: Some(DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY.to_owned()),
+        // A worklist that names no policy gets none here either: the selected
+        // adapter answers for its own launch vocabulary.
+        approval_policy: None,
+        sandbox_policy: None,
+        diagnosis_sandbox_policy: None,
         model: None,
     }
 }
@@ -5015,12 +5016,12 @@ fn manifest_config_from_worklist(
     adapters: &BTreeMap<String, AdapterConfig>,
 ) -> Result<Value> {
     let policy = parse_worklist_campaign_policy(&committed.document, &committed.source_path)?;
-    if !adapters.contains_key(&policy.agent.adapter) {
+    let Some(adapter) = adapters.get(&policy.agent.adapter) else {
         return Err(invalid(format!(
             "worklist campaign references unknown agent adapter {:?}",
             policy.agent.adapter
         )));
-    }
+    };
     let pool = format!("campaign/{code_repository}");
     debug_assert!(is_campaign_pool_name(&pool));
     let steward = resolve_worklist_steward(&policy, adapters)?;
@@ -5034,11 +5035,43 @@ fn manifest_config_from_worklist(
         "runtimeMaxSec": policy.runtime_max_sec,
         "pool": pool,
         "mergeMethod": policy.merge_method,
-        "agent": policy.agent,
+        "agent": resolve_worklist_agent_policies(policy.agent, adapter),
         "steward": steward,
         "gates": policy.gates,
         "tasks": [],
     }))
+}
+
+/// Bind the worklist's policy silence to the selected adapter's own answer.
+///
+/// A worklist is adapter-neutral bytes: the three agent policy names are keys
+/// of some adapter's policy map and of no other's, so a worklist that names one
+/// has chosen an adapter, and a worklist that names none has said nothing at
+/// all. Silence used to be filled by campaign-contract constants holding one
+/// preset's vocabulary, which every other adapter then refused at render. It is
+/// filled here instead, from the adapter the campaign actually selected and
+/// only from what that adapter declares about itself -- the same seam that
+/// already resolves the steward catalog role against this host's catalog.
+///
+/// An explicitly written value wins outright. Null and absent are the same
+/// statement, because a worklist has no way to distinguish them and neither
+/// should: both mean "the adapter answers".
+fn resolve_worklist_agent_policies(agent: CampaignAgent, adapter: &AdapterConfig) -> CampaignAgent {
+    let approval_policy = adapter
+        .resolved_approval_policy(agent.approval_policy.as_deref())
+        .map(str::to_owned);
+    let sandbox_policy = adapter
+        .resolved_sandbox_policy(agent.sandbox_policy.as_deref())
+        .map(str::to_owned);
+    let diagnosis_sandbox_policy = adapter
+        .resolved_diagnosis_sandbox_policy(agent.diagnosis_sandbox_policy.as_deref())
+        .map(str::to_owned);
+    CampaignAgent {
+        approval_policy,
+        sandbox_policy,
+        diagnosis_sandbox_policy,
+        ..agent
+    }
 }
 
 fn committed_local_worklist(
@@ -5422,6 +5455,12 @@ fn validate_agent_policies(agent: &CampaignAgent, adapter: &AdapterConfig) -> Re
     // The implementation node's whole obligation is a commit. When the adapter
     // has said which of its sandbox policies reach git metadata, that pairing is
     // knowable before any agent time is spent.
+    //
+    // The manifest's policy is read as written. A worklist campaign has already
+    // had its silence bound to this adapter's own declaration by
+    // `resolve_worklist_agent_policies`, so what arrives here is the policy the
+    // node will actually launch under -- and a manifest that arrives with none
+    // will launch with none, which is exactly the pairing to refuse.
     if !adapter
         .launch
         .permits_commit(agent.sandbox_policy.as_deref())
@@ -7625,9 +7664,7 @@ fn validate_local_worklist_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tally_core::campaign_contract::{
-        validate_manifest, BRIEF_SENTINEL, DEFAULT_AGENT_SANDBOX_POLICY,
-    };
+    use tally_core::campaign_contract::{validate_manifest, BRIEF_SENTINEL};
 
     fn manifest_value_for_test(tasks: Value) -> Value {
         json!({
@@ -9622,6 +9659,77 @@ fi
         assert!(failure.contains("non-empty stdout regex"), "{failure}");
     }
 
+    /// The worklist stays adapter-neutral bytes; the arm binds its silence.
+    ///
+    /// A worklist that writes no policy key used to be filled by
+    /// campaign-contract constants holding one preset's vocabulary, so the same
+    /// neutral bytes armed against any other adapter died at render quoting a
+    /// policy nobody wrote. The silence is bound here instead, from the adapter
+    /// the campaign selected and only from what that adapter declares.
+    #[test]
+    fn a_policy_less_worklist_binds_its_silence_to_the_selected_adapter() {
+        let document = json!({
+            "schemaVersion": 1,
+            "campaign": {
+                "agent": {"adapter": "codex"},
+                "gates": [{
+                    "kind": "command",
+                    "id": "tests",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"]
+                }]
+            },
+            "tasks": []
+        });
+        let committed = CommittedLocalWorklist {
+            document,
+            source_path: "specs/night/epsilon.json".to_owned(),
+            source_sha256: format!("sha256:{}", "a".repeat(64)),
+        };
+        let repository = CampaignRepository {
+            checkout: PathBuf::from("/srv/acme/widgets"),
+            base_branch: "main".to_owned(),
+            remote: "origin".to_owned(),
+            forge: "local".to_owned(),
+        };
+
+        // An adapter that declares nothing answers silence with silence: the
+        // manifest carries no policy name it could not render.
+        let silent_catalog = BTreeMap::from([("codex".to_owned(), codex_shaped_adapter(&[]))]);
+        let config =
+            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &silent_catalog)
+                .unwrap();
+        assert_eq!(config["agent"]["approvalPolicy"], Value::Null);
+        assert_eq!(config["agent"]["sandboxPolicy"], Value::Null);
+        assert_eq!(config["agent"]["diagnosisSandboxPolicy"], Value::Null);
+
+        // The codex preset's shape: it wants `never` and `danger-full-access`
+        // for its lanes and says so itself, and its diagnosis answer is
+        // workspace-write rather than the read-only jailer that kills a
+        // diagnosing agent's own exec machinery.
+        let mut declaring = codex_shaped_adapter(&["danger-full-access"]);
+        for (key, policy) in [
+            (tally_core::adapters::DEFAULT_APPROVAL_POLICY_KEY, "never"),
+            (
+                tally_core::adapters::DEFAULT_SANDBOX_POLICY_KEY,
+                "danger-full-access",
+            ),
+            (
+                tally_core::adapters::DEFAULT_DIAGNOSIS_SANDBOX_POLICY_KEY,
+                "workspace-write",
+            ),
+        ] {
+            declaring.extra_config.insert(key.to_owned(), json!(policy));
+        }
+        let catalog = BTreeMap::from([("codex".to_owned(), declaring)]);
+        let config =
+            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &catalog)
+                .unwrap();
+        assert_eq!(config["agent"]["approvalPolicy"], "never");
+        assert_eq!(config["agent"]["sandboxPolicy"], "danger-full-access");
+        assert_eq!(config["agent"]["diagnosisSandboxPolicy"], "workspace-write");
+    }
+
     #[test]
     fn packaged_campaign_assets_are_resolved_beside_the_tally_binary() {
         let temporary = tempfile::tempdir().unwrap();
@@ -10750,12 +10858,67 @@ fi
     }
 
     #[test]
-    fn campaign_defaults_are_a_pairing_a_codex_agent_can_commit_under() {
-        let adapter = codex_shaped_adapter(&["danger-full-access"]);
-        // The shipped module defaults, unmodified.
-        let defaults = agent_with(Some(DEFAULT_AGENT_SANDBOX_POLICY));
-        assert_eq!(defaults.approval_policy.as_deref(), Some("never"));
-        validate_agent_policies(&defaults, &adapter).unwrap();
+    fn a_policy_less_campaign_commits_under_the_adapters_own_declared_default() {
+        // A worklist that names no policy now carries none: the contract has no
+        // adapter's vocabulary to fall back on.
+        let silent = agent_with(None);
+        assert_eq!(silent.approval_policy, None);
+        assert_eq!(silent.sandbox_policy, None);
+        assert_eq!(silent.diagnosis_sandbox_policy, None);
+
+        // A codex-shaped adapter that declares its own answers binds that
+        // silence at the arm seam, and the resolved pairing is one it can
+        // commit under.
+        let mut declaring = codex_shaped_adapter(&["danger-full-access"]);
+        for (key, policy) in [
+            (tally_core::adapters::DEFAULT_APPROVAL_POLICY_KEY, "never"),
+            (
+                tally_core::adapters::DEFAULT_SANDBOX_POLICY_KEY,
+                "danger-full-access",
+            ),
+            (
+                tally_core::adapters::DEFAULT_DIAGNOSIS_SANDBOX_POLICY_KEY,
+                "workspace-write",
+            ),
+        ] {
+            declaring.extra_config.insert(key.to_owned(), json!(policy));
+        }
+        let resolved = resolve_worklist_agent_policies(silent.clone(), &declaring);
+        assert_eq!(resolved.approval_policy.as_deref(), Some("never"));
+        assert_eq!(
+            resolved.sandbox_policy.as_deref(),
+            Some("danger-full-access")
+        );
+        // Not the lane default, and not read-only: a diagnosing agent under
+        // codex's read-only jailer cannot write /dev/shm or a tempdir and dies
+        // inside its own exec machinery.
+        assert_eq!(
+            resolved.diagnosis_sandbox_policy.as_deref(),
+            Some("workspace-write")
+        );
+        validate_agent_policies(&resolved, &declaring).unwrap();
+
+        // An adapter that declares nothing answers silence with silence, and
+        // the commit obligation it cannot show it can honour is still refused.
+        let undeclared = codex_shaped_adapter(&["danger-full-access"]);
+        let unresolved = resolve_worklist_agent_policies(silent, &undeclared);
+        assert_eq!(unresolved.sandbox_policy, None);
+        let error = validate_agent_policies(&unresolved, &undeclared).unwrap_err();
+        assert!(error.to_string().contains("<adapter default>"), "{error}");
+
+        // An explicit worklist value wins outright over any declaration.
+        let explicit = resolve_worklist_agent_policies(
+            CampaignAgent {
+                diagnosis_sandbox_policy: Some("read-only".to_owned()),
+                ..agent_with(Some("workspace-write"))
+            },
+            &declaring,
+        );
+        assert_eq!(explicit.sandbox_policy.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            explicit.diagnosis_sandbox_policy.as_deref(),
+            Some("read-only")
+        );
 
         // The estate workaround already deployed by the consumer: both values
         // explicit, approval disabled outright.
@@ -10763,12 +10926,12 @@ fi
             approval_policy: None,
             ..agent_with(Some("danger-full-access"))
         };
-        validate_agent_policies(&workaround, &adapter).unwrap();
+        validate_agent_policies(&workaround, &undeclared).unwrap();
     }
 
     #[test]
     fn missing_agent_final_message_capture_warns_before_worker_findings_are_lost() {
-        let agent = agent_with(Some(DEFAULT_AGENT_SANDBOX_POLICY));
+        let agent = agent_with(Some("danger-full-access"));
         let mut adapter = codex_shaped_adapter(&["danger-full-access"]);
         let warning = worker_findings_warning(&agent, &adapter).unwrap();
         assert!(warning.contains("scrape.finalMessage"), "{warning}");

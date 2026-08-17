@@ -976,6 +976,79 @@ class CampaignDriverTests(unittest.TestCase):
             with self.assertRaisesRegex(DriverFailure, "unknown fields: label"):
                 run_driver("worklist", base)
 
+    def test_a_policy_less_worklist_admits_against_a_steward_bound_campaign(self) -> None:
+        """No policy key is required, and none is invented on the agent's behalf.
+
+        The three agent policy names are adapter vocabulary. A campaign that
+        writes none of them binds its diagnosis role to a steward adapter that
+        declares no launch policies at all, so any default the driver supplied
+        here would be a policy that steward could never render.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/policy-less.json"
+            worklist.parent.mkdir(parents=True)
+            campaign: dict[str, Any] = {
+                "maxTasks": 1,
+                "maxParallel": 1,
+                "steward": "narrator",
+                "stewardArgv": ["narrate", "--json"],
+                "agent": {"adapter": "pi"},
+                "gates": [
+                    {
+                        "kind": "command",
+                        "id": "tests",
+                        "preflightArgv": ["true"],
+                        "argv": ["true"],
+                    }
+                ],
+            }
+            document = {
+                "schemaVersion": 1,
+                "campaign": campaign,
+                "tasks": [task("task-1")],
+            }
+            base = {
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout),
+                "worklist": "specs/*/policy-less.json",
+                "maxTasks": 1,
+                "maxParallel": 1,
+            }
+
+            def commit_and_admit(message: str) -> dict[str, Any]:
+                worklist.write_text(json.dumps(document), encoding="utf-8")
+                git(checkout, "add", "specs/campaign/policy-less.json")
+                git(checkout, "commit", "--quiet", "-m", message)
+                git(checkout, "push", "--quiet", "origin", "main")
+                return run_driver("worklist", base)
+
+            admitted = commit_and_admit("add a policy-less steward-bound campaign")
+            self.assertEqual([item["id"] for item in admitted["tasks"]], ["task-1"])
+
+            # An explicit value still wins outright; absence is the only thing
+            # that defers to the adapter.
+            campaign["agent"] = {
+                "adapter": "codex",
+                "approvalPolicy": "never",
+                "sandboxPolicy": "danger-full-access",
+                "diagnosisSandboxPolicy": "workspace-write",
+            }
+            admitted = commit_and_admit("spell every policy explicitly")
+            self.assertEqual([item["id"] for item in admitted["tasks"]], ["task-1"])
+
+            # A policy name is still a bounded string when it is present.
+            campaign["agent"]["diagnosisSandboxPolicy"] = 17
+            worklist.write_text(json.dumps(document), encoding="utf-8")
+            git(checkout, "add", "specs/campaign/policy-less.json")
+            git(checkout, "commit", "--quiet", "-m", "write a policy that is not a name")
+            git(checkout, "push", "--quiet", "origin", "main")
+            with self.assertRaisesRegex(
+                DriverFailure, "worklist.campaign.agent.diagnosisSandboxPolicy"
+            ):
+                run_driver("worklist", base)
+
     def test_pre_post_refresh_refuses_quiescence_after_the_frontier_reopens(self) -> None:
         """A PATH shim pardons the blocked task between the two durable reads."""
         with tempfile.TemporaryDirectory() as temporary:

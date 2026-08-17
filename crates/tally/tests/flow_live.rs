@@ -2636,6 +2636,11 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                         "model": "fixture/policy-agent-1",
                         "priority": priority,
                         "runtimeMaxSec": 30,
+                        // Every policy is spelled out, and the fixture agent
+                        // below asserts each one reaches the launch argv: this
+                        // is the live witness that an explicit worklist value
+                        // wins outright over whatever the adapter declares for
+                        // a campaign that names none.
                         "approvalPolicy": "never",
                         "sandboxPolicy": "danger-full-access",
                         "diagnosisSandboxPolicy": "read-only"

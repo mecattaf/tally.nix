@@ -24,9 +24,6 @@ pub const DEFAULT_DRIVER_RUNTIME_MAX_SEC: u64 = 900;
 pub const DEFAULT_AGENT_RUNTIME_MAX_SEC: u64 = 14_400;
 pub const DEFAULT_RUNNER_POOL: &str = "campaign";
 pub const DEFAULT_AGENT_PRIORITY: &str = "low";
-pub const DEFAULT_AGENT_APPROVAL_POLICY: &str = "never";
-pub const DEFAULT_AGENT_SANDBOX_POLICY: &str = "danger-full-access";
-pub const DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY: &str = "read-only";
 pub const DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN: &str = "^TALLY_FINAL_MESSAGE=(.*)$";
 pub const DEFAULT_STEWARD_RUNTIME_MAX_SEC: u64 = 120;
 pub const MAX_AGENT_MODEL_CHARS: usize = 128;
@@ -66,12 +63,20 @@ pub struct CampaignAgent {
     pub priority: String,
     #[serde(default = "default_agent_runtime_max_sec")]
     pub runtime_max_sec: Option<u64>,
-    #[serde(default = "default_agent_approval_policy")]
+    /// Absent leaves the launch policy to the adapter.
+    ///
+    /// These three names are adapter vocabulary: every policy string a worklist
+    /// can write here is a key of some adapter's own policy map, and no value
+    /// exists that every adapter authorizes. A default here would therefore be
+    /// one adapter's answer quoted at all the others, so the contract states
+    /// none: absent means "whatever this adapter launches under", and the
+    /// adapter seam is where that is resolved.
+    #[serde(default)]
     pub approval_policy: Option<String>,
-    #[serde(default = "default_agent_sandbox_policy")]
+    #[serde(default)]
     pub sandbox_policy: Option<String>,
     /// Named adapter sandbox policy for diagnosis nodes.
-    #[serde(default = "default_agent_diagnosis_sandbox_policy")]
+    #[serde(default)]
     pub diagnosis_sandbox_policy: Option<String>,
     /// Absent leaves model selection to the adapter.
     #[serde(default)]
@@ -926,18 +931,6 @@ fn default_agent_priority() -> String {
 
 const fn default_agent_runtime_max_sec() -> Option<u64> {
     Some(DEFAULT_AGENT_RUNTIME_MAX_SEC)
-}
-
-fn default_agent_approval_policy() -> Option<String> {
-    Some(DEFAULT_AGENT_APPROVAL_POLICY.to_owned())
-}
-
-fn default_agent_sandbox_policy() -> Option<String> {
-    Some(DEFAULT_AGENT_SANDBOX_POLICY.to_owned())
-}
-
-fn default_agent_diagnosis_sandbox_policy() -> Option<String> {
-    Some(DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY.to_owned())
 }
 
 fn default_steward_final_message_pattern() -> String {

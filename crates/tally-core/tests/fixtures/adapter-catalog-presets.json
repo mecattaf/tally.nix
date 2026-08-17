@@ -1,0 +1,323 @@
+{
+  "claude-code": {
+    "argv": [
+      "claude",
+      "--print",
+      "--verbose",
+      "--output-format",
+      "stream-json",
+      "--"
+    ],
+    "env": {},
+    "extraConfig": {
+      "modelFlag": "--model"
+    },
+    "extraWritablePaths": [],
+    "launch": {},
+    "resume": [
+      "claude",
+      "--resume",
+      "%<sessionRef>%",
+      "--model",
+      "%<model>%",
+      "--print",
+      "--verbose",
+      "--output-format",
+      "stream-json",
+      "--"
+    ],
+    "resumeRequiresLaunchCwd": false,
+    "scrape": {
+      "contextWindow": {
+        "fields": {
+          "contextWindow": [
+            "$"
+          ]
+        },
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'result'].modelUsage.*.contextWindow",
+        "stream": "stdout"
+      },
+      "finalMessage": {
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'result'].result",
+        "stream": "stdout"
+      },
+      "model": {
+        "mode": "jsonPath",
+        "pattern": "$..model",
+        "stream": "stdout"
+      },
+      "occupancy": {
+        "fields": {
+          "residentCacheReadTokens": [
+            "cache_read_input_tokens"
+          ],
+          "residentCacheWriteTokens": [
+            "cache_creation_input_tokens"
+          ],
+          "residentInputTokens": [
+            "input_tokens"
+          ]
+        },
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'assistant'].message.usage",
+        "stream": "stdout"
+      },
+      "sessionRef": {
+        "mode": "jsonPath",
+        "pattern": "$..session_id",
+        "stream": "stdout"
+      },
+      "usage": {
+        "fields": {
+          "cacheReadTokens": [
+            "cache_read_input_tokens"
+          ],
+          "cacheWriteTokens": [
+            "cache_creation_input_tokens"
+          ],
+          "inputTokens": [
+            "input_tokens"
+          ],
+          "outputTokens": [
+            "output_tokens"
+          ]
+        },
+        "mode": "jsonPath",
+        "pattern": "$..usage",
+        "stream": "stdout"
+      },
+      "usageCost": {
+        "fields": {
+          "costUsd": [
+            "$"
+          ]
+        },
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'result'].total_cost_usd",
+        "stream": "stdout"
+      }
+    },
+    "trace": {
+      "framing": "json-lines",
+      "stream": "stdout"
+    },
+    "usageCounterScope": "attempt",
+    "yieldHook": [
+      "tally",
+      "lease",
+      "status"
+    ]
+  },
+  "codex": {
+    "argv": [
+      "codex",
+      "exec",
+      "--json",
+      "--"
+    ],
+    "env": {},
+    "extraConfig": {
+      "defaultApprovalPolicy": "never",
+      "defaultDiagnosisSandboxPolicy": "workspace-write",
+      "defaultSandboxPolicy": "danger-full-access",
+      "modelFlag": "--model"
+    },
+    "extraWritablePaths": [],
+    "launch": {
+      "allowPrePromptArgv": true,
+      "approvalPolicies": {
+        "never": [
+          "-c",
+          "approval_policy=\"never\""
+        ],
+        "on-failure": [
+          "-c",
+          "approval_policy=\"on-failure\""
+        ],
+        "on-request": [
+          "-c",
+          "approval_policy=\"on-request\""
+        ],
+        "untrusted": [
+          "-c",
+          "approval_policy=\"untrusted\""
+        ]
+      },
+      "commitCapableSandboxPolicies": [
+        "danger-full-access",
+        "dangerously-bypass"
+      ],
+      "cwdArgv": [
+        "-C",
+        "%<cwd>%"
+      ],
+      "resumeOptionsBeforeCapture": "sessionRef",
+      "sandboxPolicies": {
+        "danger-full-access": [
+          "--sandbox",
+          "danger-full-access"
+        ],
+        "dangerously-bypass": [
+          "--dangerously-bypass-approvals-and-sandbox"
+        ],
+        "read-only": [
+          "--sandbox",
+          "read-only"
+        ],
+        "workspace-write": [
+          "--sandbox",
+          "workspace-write"
+        ]
+      }
+    },
+    "resume": [
+      "codex",
+      "-C",
+      "%<cwd>%",
+      "exec",
+      "resume",
+      "--json",
+      "%<sessionRef>%",
+      "--"
+    ],
+    "resumeRequiresLaunchCwd": false,
+    "scrape": {
+      "finalMessage": {
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text",
+        "stream": "stdout"
+      },
+      "model": {
+        "mode": "jsonPath",
+        "pattern": "$..model",
+        "stream": "stdout"
+      },
+      "sessionRef": {
+        "mode": "jsonPath",
+        "pattern": "$..thread_id",
+        "stream": "stdout"
+      },
+      "usage": {
+        "counterScope": "session-cumulative",
+        "fields": {
+          "cacheReadTokens": [
+            "cached_input_tokens"
+          ],
+          "cacheWriteTokens": [
+            "cache_write_input_tokens"
+          ],
+          "inputTokensWithCacheRead": [
+            "input_tokens"
+          ],
+          "outputTokens": [
+            "output_tokens"
+          ],
+          "reasoningTokens": [
+            "reasoning_output_tokens"
+          ]
+        },
+        "mode": "jsonPath",
+        "pattern": "$..usage",
+        "stream": "stdout"
+      }
+    },
+    "trace": {
+      "framing": "json-lines",
+      "stream": "stdout"
+    },
+    "usageCounterScope": "session-cumulative",
+    "yieldHook": [
+      "tally",
+      "lease",
+      "status"
+    ]
+  },
+  "pi": {
+    "argv": [
+      "pi",
+      "--mode",
+      "json"
+    ],
+    "env": {},
+    "extraConfig": {
+      "modelFlag": "--model"
+    },
+    "extraWritablePaths": [],
+    "launch": {
+      "rejectOptionLikeWorkloadHead": true
+    },
+    "resume": [
+      "pi",
+      "--mode",
+      "json",
+      "--session",
+      "%<sessionRef>%",
+      "--model",
+      "%<model>%"
+    ],
+    "resumeRequiresLaunchCwd": true,
+    "scrape": {
+      "finalMessage": {
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.content[?@.type == 'text'].text",
+        "stream": "stdout"
+      },
+      "model": {
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.model",
+        "stream": "stdout"
+      },
+      "occupancy": {
+        "fields": {
+          "residentCacheReadTokens": [
+            "cacheRead"
+          ],
+          "residentCacheWriteTokens": [
+            "cacheWrite"
+          ],
+          "residentInputTokens": [
+            "input"
+          ]
+        },
+        "mode": "jsonPathLast",
+        "pattern": "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage",
+        "stream": "stdout"
+      },
+      "sessionRef": {
+        "mode": "jsonPath",
+        "pattern": "$.id",
+        "stream": "stdout"
+      },
+      "usage": {
+        "mode": "jsonPath",
+        "pattern": "$..usage",
+        "stream": "stdout"
+      }
+    },
+    "trace": {
+      "framing": "json-lines",
+      "stream": "stdout"
+    },
+    "usageCounterScope": "attempt",
+    "yieldHook": [
+      "tally",
+      "lease",
+      "status"
+    ]
+  },
+  "shell": {
+    "argv": [],
+    "env": {},
+    "extraConfig": {},
+    "extraWritablePaths": [],
+    "launch": {},
+    "resume": null,
+    "resumeRequiresLaunchCwd": false,
+    "scrape": {},
+    "trace": null,
+    "usageCounterScope": "attempt",
+    "yieldHook": null
+  }
+}

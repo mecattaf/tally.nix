@@ -53,9 +53,9 @@
           ],
           "priority": "low",
           "runtimeMaxSec": 14400,
-          "approvalPolicy": "never",
-          "sandboxPolicy": "danger-full-access",
-          "diagnosisSandboxPolicy": "read-only",
+          "approvalPolicy": null,
+          "sandboxPolicy": null,
+          "diagnosisSandboxPolicy": null,
           "model": null
         },
         "steward": null,
@@ -80,7 +80,7 @@
           }
         ]
       },
-      "manifestCanonicalJson": "{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]}",
+      "manifestCanonicalJson": "{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":null,\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":null,\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":null},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]}",
       "graph": {
         "manifest": {
           "schemaVersion": 1,
@@ -104,9 +104,9 @@
             ],
             "priority": "low",
             "runtimeMaxSec": 14400,
-            "approvalPolicy": "never",
-            "sandboxPolicy": "danger-full-access",
-            "diagnosisSandboxPolicy": "read-only",
+            "approvalPolicy": null,
+            "sandboxPolicy": null,
+            "diagnosisSandboxPolicy": null,
             "model": null
           },
           "steward": null,
@@ -138,10 +138,10 @@
             "body": "Implement the minimal admitted fixture."
           }
         ],
-        "executableDigest": "sha256:580204b83450dc43e9977c6f25b4c03aa8d30cb29ee18ec60540a793c18b7177"
+        "executableDigest": "sha256:2d36d28ddd12ee15f6094c3cb875280a9a4d0ea9974e08b06d34ace900301a4d"
       },
-      "graphCanonicalJson": "{\"executableDigest\":\"sha256:580204b83450dc43e9977c6f25b4c03aa8d30cb29ee18ec60540a793c18b7177\",\"manifest\":{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":\"never\",\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":\"read-only\",\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":\"danger-full-access\"},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]},\"tasks\":[{\"body\":\"Implement the minimal admitted fixture.\",\"number\":101,\"title\":\"Build the fixture\"}]}",
-      "digest": "sha256:580204b83450dc43e9977c6f25b4c03aa8d30cb29ee18ec60540a793c18b7177"
+      "graphCanonicalJson": "{\"executableDigest\":\"sha256:2d36d28ddd12ee15f6094c3cb875280a9a4d0ea9974e08b06d34ace900301a4d\",\"manifest\":{\"agent\":{\"adapter\":\"codex\",\"approvalPolicy\":null,\"argv\":[\"Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.\"],\"diagnosisSandboxPolicy\":null,\"model\":null,\"priority\":\"low\",\"runtimeMaxSec\":14400,\"sandboxPolicy\":null},\"driverRuntimeMaxSec\":900,\"gates\":[{\"forbidPaths\":[\"*.db\"],\"id\":\"scope\",\"kind\":\"forbidPaths\",\"runtimeMaxSec\":900}],\"maxParallel\":1,\"maxTasks\":64,\"mergeMethod\":\"squash\",\"name\":\"corpus-minimal\",\"pool\":\"campaign\",\"repository\":{\"baseBranch\":\"main\",\"checkout\":\"/srv/contract-corpus/minimal\",\"forge\":\"local\",\"remote\":\"origin\"},\"runtimeMaxSec\":86400,\"schemaVersion\":1,\"steward\":null,\"tasks\":[{\"argv\":null,\"dependencies\":[],\"id\":\"build\",\"issue\":101,\"kind\":\"implementation\",\"runtimeMaxSec\":null}]},\"tasks\":[{\"body\":\"Implement the minimal admitted fixture.\",\"number\":101,\"title\":\"Build the fixture\"}]}",
+      "digest": "sha256:2d36d28ddd12ee15f6094c3cb875280a9a4d0ea9974e08b06d34ace900301a4d"
     },
     {
       "name": "complete-parallel-mixed",

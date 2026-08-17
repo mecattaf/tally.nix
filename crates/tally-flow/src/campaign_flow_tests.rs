@@ -502,6 +502,58 @@ fn a_codex_tool_router_session_death_is_priced_as_machinery() {
     );
 }
 
+/// A steward-bound diagnosis node carries no policy vocabulary.
+///
+/// Witnessed live on eta's first failed-lane diagnosis dispatch: the node was
+/// stamped with `sandboxPolicy: "read-only"`, and the steward seam refuses any
+/// adapter that declares launch policies at all, so the stamp could never
+/// render against a legal steward. The pass died at admission with "invalid
+/// adapter narrator: sandboxPolicy value read-only is not authorized by this
+/// adapter". The read-only position survives in the node's read-only brief
+/// shape; the direct narration subprocess has no jailer to configure.
+#[test]
+fn a_steward_bound_diagnosis_node_renders_no_policy_vocabulary() {
+    let mut realm = CampaignFlowRealm::new(&json!({
+        "campaign": "fixture",
+        "repository": "acme/spec",
+        "repositories": {
+            "acme/spec": {
+                "checkout": "/tmp/fixture",
+                "baseBranch": "main",
+                "remote": "origin",
+                "forge": "local"
+            }
+        },
+        "worklist": "specs/*.json",
+        "maxParallel": 1,
+        // Even a campaign that names a diagnosis policy for its worker adapter
+        // must not push that name onto the steward.
+        "agent": {"adapter": "codex", "diagnosisSandboxPolicy": "read-only"},
+        "steward": {
+            "adapter": "narrator",
+            "argv": ["narrate", "--json"],
+            "env": {},
+            "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
+            "runtimeMaxSec": 120
+        },
+        "gates": []
+    }));
+    let bound = realm.call(
+        "applyDiagnosisRole",
+        &[json!({"id": "diagnose-build", "kind": "diagnosis"})],
+    );
+    assert_eq!(bound["adapter"], json!("narrator"), "{bound}");
+    assert_eq!(bound["priority"], json!("low"), "{bound}");
+    assert!(
+        bound.get("sandboxPolicy").is_none(),
+        "the steward diagnosis node must render no sandbox policy: {bound}"
+    );
+    assert!(
+        bound.get("approvalPolicy").is_none(),
+        "the steward diagnosis node must render no approval policy: {bound}"
+    );
+}
+
 /// Local task-addressed steering composes with campaign-wide steering without
 /// leaking between stable task IDs.
 #[test]

@@ -95,9 +95,10 @@ def base_manifest(_checkout: Path | None = None) -> dict[str, Any]:
                 "argv": ["/bin/sh", "-c", "true"],
                 "priority": "low",
                 "runtimeMaxSec": 60,
-                "approvalPolicy": None,
-                "sandboxPolicy": None,
-                "diagnosisSandboxPolicy": None,
+                # No policy keys at all.  They used to be spelled null here to
+                # keep one adapter's vocabulary from being rendered at the
+                # shell adapter, which declares no policies; absence now means
+                # the adapter's own answer, so the omission is the declaration.
                 "model": None,
             },
             "steward": None,

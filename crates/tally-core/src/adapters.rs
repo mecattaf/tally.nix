@@ -272,7 +272,81 @@ pub enum UsageCounterScope {
     SessionCumulative,
 }
 
+/// `extraConfig` key naming the approval policy this adapter answers with when
+/// the campaign that selected it names none.
+pub const DEFAULT_APPROVAL_POLICY_KEY: &str = "defaultApprovalPolicy";
+/// `extraConfig` key naming the sandbox policy this adapter answers with when
+/// the campaign that selected it names none.
+pub const DEFAULT_SANDBOX_POLICY_KEY: &str = "defaultSandboxPolicy";
+/// `extraConfig` key naming the sandbox policy this adapter answers with for a
+/// diagnosis node when the campaign that selected it names none.
+pub const DEFAULT_DIAGNOSIS_SANDBOX_POLICY_KEY: &str = "defaultDiagnosisSandboxPolicy";
+
 impl AdapterConfig {
+    /// The policy names this adapter declares for a campaign that names none.
+    ///
+    /// Policy vocabulary belongs to the adapter: `never` and
+    /// `danger-full-access` are keys of one preset's maps, not facts about
+    /// agents, so a caller-side default can only be one adapter's answer quoted
+    /// at all the others. An adapter that wants a launch policy for a
+    /// policy-silent campaign says so itself here; an adapter that declares
+    /// nothing keeps its binary's own native behaviour, which is the only
+    /// default that is true everywhere.
+    ///
+    /// A declaration is read where a campaign is armed against a named adapter,
+    /// not inside `render_launch_prefix`: rendering must answer for the argv it
+    /// was asked for, so a direct invocation that requests no policy still gets
+    /// no policy fragment.
+    ///
+    /// The declaration rides `extraConfig` because that is this schema's
+    /// declared extension point, and it is validated against the adapter's own
+    /// policy maps at load, so a misspelled or unauthorized name is a
+    /// configuration refusal rather than a silently ignored key.
+    fn declared_policy_default(&self, key: &str) -> Option<&str> {
+        self.extra_config.get(key).and_then(Value::as_str)
+    }
+
+    #[must_use]
+    pub fn default_approval_policy(&self) -> Option<&str> {
+        self.declared_policy_default(DEFAULT_APPROVAL_POLICY_KEY)
+    }
+
+    #[must_use]
+    pub fn default_sandbox_policy(&self) -> Option<&str> {
+        self.declared_policy_default(DEFAULT_SANDBOX_POLICY_KEY)
+    }
+
+    #[must_use]
+    pub fn default_diagnosis_sandbox_policy(&self) -> Option<&str> {
+        self.declared_policy_default(DEFAULT_DIAGNOSIS_SANDBOX_POLICY_KEY)
+    }
+
+    /// An explicitly requested policy always wins over the adapter's own
+    /// default; only silence reaches the declaration, and an adapter that
+    /// declares nothing answers silence with silence.
+    #[must_use]
+    pub fn resolved_approval_policy<'a>(&'a self, requested: Option<&'a str>) -> Option<&'a str> {
+        requested.or_else(|| self.default_approval_policy())
+    }
+
+    #[must_use]
+    pub fn resolved_sandbox_policy<'a>(&'a self, requested: Option<&'a str>) -> Option<&'a str> {
+        requested.or_else(|| self.default_sandbox_policy())
+    }
+
+    /// A diagnosis node reads rather than writes, so an adapter answers for it
+    /// separately. It deliberately does not fall through to the lane default:
+    /// the lane default is chosen so an implementation node can commit, and
+    /// inheriting it would hand a diagnosing agent write access nobody asked
+    /// for. An adapter with nothing to say about diagnosis says nothing.
+    #[must_use]
+    pub fn resolved_diagnosis_sandbox_policy<'a>(
+        &'a self,
+        requested: Option<&'a str>,
+    ) -> Option<&'a str> {
+        requested.or_else(|| self.default_diagnosis_sandbox_policy())
+    }
+
     /// Resolve the replay-stable skill or agent-definition revision carried by
     /// this adapter configuration.
     #[must_use]
@@ -778,6 +852,11 @@ fn render_launch_prefix(
         );
     }
     let mut inserted = options.pre_prompt_argv.clone();
+    // The job's own request, verbatim. An adapter's declared policy default is
+    // resolved where a job is composed, not here: this renderer is also the
+    // direct `__adapter-render` surface, where "no policy requested" must stay
+    // "no policy fragment", and a default silently injected at render would
+    // make a bare invocation disagree with the argv its caller asked for.
     inserted.extend(render_policy(
         name,
         "approvalPolicy",
@@ -1000,6 +1079,7 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
         }
     }
     validate_launch_config(name, &adapter.launch)?;
+    validate_policy_defaults(name, adapter)?;
     resume_options_insertion_index(name, adapter)?;
     let mut names = BTreeSet::new();
     for (capture_name, capture) in &adapter.scrape {
@@ -1132,6 +1212,51 @@ fn resume_options_insertion_index(
         );
     }
     Ok(Some(index))
+}
+
+/// An adapter's declared policy defaults must be its own vocabulary.
+///
+/// Without this the declaration would fail the way the deleted contract
+/// constants did -- at render, mid-campaign, quoting a policy name against the
+/// adapter that never declared it. Here it fails at configuration load, where
+/// the operator is still holding the file.
+fn validate_policy_defaults(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterError> {
+    for (key, field, policies) in [
+        (
+            DEFAULT_APPROVAL_POLICY_KEY,
+            "approvalPolicies",
+            &adapter.launch.approval_policies,
+        ),
+        (
+            DEFAULT_SANDBOX_POLICY_KEY,
+            "sandboxPolicies",
+            &adapter.launch.sandbox_policies,
+        ),
+        (
+            DEFAULT_DIAGNOSIS_SANDBOX_POLICY_KEY,
+            "sandboxPolicies",
+            &adapter.launch.sandbox_policies,
+        ),
+    ] {
+        let Some(declared) = adapter.extra_config.get(key) else {
+            continue;
+        };
+        let Some(policy) = declared.as_str() else {
+            return invalid_config(
+                name,
+                format!("extraConfig.{key} must name a policy as a string"),
+            );
+        };
+        if !policies.contains_key(policy) {
+            return invalid_config(
+                name,
+                format!(
+                    "extraConfig.{key} names {policy:?}, which launch.{field} does not declare"
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_launch_config(adapter: &str, launch: &AdapterLaunchConfig) -> Result<(), AdapterError> {

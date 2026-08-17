@@ -199,9 +199,9 @@ def pipeline_manifest(checkout: Path, agent: Path) -> dict[str, Any]:
         "argv": ["python3", str(agent)],
         "priority": "low",
         "runtimeMaxSec": 90,
-        "approvalPolicy": None,
-        "sandboxPolicy": None,
-        "diagnosisSandboxPolicy": None,
+        # The three policy keys are omitted, not nulled: the shell adapter
+        # declares no policy vocabulary, and absence now resolves to whatever
+        # the selected adapter itself launches under.
         "model": None,
     }
     value["campaign"]["gates"] = [
