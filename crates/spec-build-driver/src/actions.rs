@@ -20,6 +20,7 @@ use tally_core::campaign_folds::{
     campaign_digest as fold_campaign_digest, render_campaign_summary, stable_publish_branch,
     stage_scoped_summary_ref, CampaignReconciliation,
 };
+use tally_core::campaign_protection::{protected_lane_paths, PROTECTED_SET_OWNER};
 use tally_core::campaign_publish::{
     publish_plan, publish_receipt_ref, PublishAction, PublishFacts, PublishPlan, PublishProof,
     PublishReceiptV1,
@@ -9298,6 +9299,28 @@ fn enforce_conflict_domains(
     }
     let union_base = lane_union_base(worktree, base_rev, head, current_base)?;
     let changed_paths = changed_paths_in_history(worktree, &union_base, head, true)?;
+    // The protected set is judged before the declared domains, because a
+    // domain that claims a protected path must not be able to buy it: the
+    // refusal a lane reads should name the protection, not a boundary the
+    // lane already satisfied.
+    let protected = protected_lane_paths(&changed_paths);
+    if !protected.is_empty() {
+        let mut preview = protected
+            .iter()
+            .take(20)
+            .map(|(path, protection)| {
+                format!("{} ({protection})", Json::from(path.clone()).stringify())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if protected.len() > 20 {
+            preview.push_str(&format!(", and {} more", protected.len() - 20));
+        }
+        return Err(DriverError::new(format!(
+            "task {task_id:?} changed {} path(s) in the protected set: {preview}; a declared conflictDomain does not grant a protected path -- these bytes move only by {PROTECTED_SET_OWNER} hands. Hand the change to your final message and let the operator land it.",
+            protected.len()
+        )));
+    }
     let outside: Vec<_> = domains.as_ref().map_or_else(Vec::new, |domains| {
         changed_paths
             .iter()
@@ -11767,15 +11790,16 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        action_retry, action_steer, action_worker_outcome, append_attempt_receipt,
-        append_diagnosis_report, campaign_attempt_state, campaign_attempt_state_all,
-        checkpoint_capture_note, checkpoint_ref, classify_worker_outcome, closed_inline_code_spans,
-        contains_bare_exclamation_mark, current_task_input_epochs, excerpt_text_window,
-        fold_attempt_receipts, git_with_input, integration_branch, json, merge_local,
-        publish_closing_summary, read_capture_tail, read_local_blob, remote_ref_oid,
-        replace_bare_exclamation_marks, stage_publish_local, validate_attempt_receipt,
-        validate_outcome_first, witnessed_gate_proofs, DiagnosisVerdict, GateProof, Json,
-        RepoConfig, WorkerOutcome, CHECKPOINT_CAPTURE_MAX_BYTES, CHECKPOINT_STDERR_WINDOW_CHARS,
+        action_ownership, action_retry, action_steer, action_worker_outcome,
+        append_attempt_receipt, append_diagnosis_report, campaign_attempt_state,
+        campaign_attempt_state_all, checkpoint_capture_note, checkpoint_ref,
+        classify_worker_outcome, closed_inline_code_spans, contains_bare_exclamation_mark,
+        current_task_input_epochs, excerpt_text_window, fold_attempt_receipts, git_with_input,
+        integration_branch, json, merge_local, publish_closing_summary, read_capture_tail,
+        read_local_blob, remote_ref_oid, replace_bare_exclamation_marks, stage_publish_local,
+        validate_attempt_receipt, validate_outcome_first, witnessed_gate_proofs, DiagnosisVerdict,
+        GateProof, Json, RepoConfig, WorkerOutcome, CHECKPOINT_CAPTURE_MAX_BYTES,
+        CHECKPOINT_STDERR_WINDOW_CHARS,
     };
     use tally_core::attempt_receipts::{
         AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR,
@@ -13654,5 +13678,168 @@ mod tests {
             mismatched.to_string().contains("is not the checkpoint ref"),
             "{mismatched}"
         );
+    }
+
+    /// One lane, certified: a repository with a pushed base branch, a lane
+    /// branch carrying `files`, and a task declaring `domains`. The lane is
+    /// always given non-empty conflictDomains, because the deny list is what
+    /// must refuse a governing-spec write -- an empty domains array would
+    /// refuse it for an unrelated reason and prove nothing.
+    fn deny_list_ownership(
+        label: &str,
+        files: &[(&str, &str)],
+        domains: &[&str],
+    ) -> (PathBuf, std::result::Result<Json, String>) {
+        let root = std::env::temp_dir().join(format!("tally-deny-list-{label}-{}", Uuid::new_v4()));
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        summary_ref_test_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        summary_ref_test_git(&checkout, &["config", "user.name", "Deny List Test"]);
+        summary_ref_test_git(
+            &checkout,
+            &["config", "user.email", "deny-list@example.invalid"],
+        );
+        fs::write(checkout.join("README.md"), "fixture\n").unwrap();
+        summary_ref_test_git(&checkout, &["add", "README.md"]);
+        summary_ref_test_git(&checkout, &["commit", "--quiet", "-m", "fixture: base"]);
+        let remote = root.join("remote.git");
+        summary_ref_test_git(
+            &checkout,
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                &remote.display().to_string(),
+            ],
+        );
+        summary_ref_test_git(
+            &checkout,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        summary_ref_test_git(&checkout, &["push", "--quiet", "origin", "main"]);
+        let base = summary_ref_test_git(&checkout, &["rev-parse", "HEAD"]);
+        let branch = "tally-work/eta-deadbeefcafe/specs-deny-list";
+        summary_ref_test_git(&checkout, &["switch", "--quiet", "-c", branch]);
+        for (path, contents) in files {
+            let file = checkout.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, contents).unwrap();
+        }
+        summary_ref_test_git(&checkout, &["add", "--all"]);
+        summary_ref_test_git(&checkout, &["commit", "--quiet", "-m", "lane: the work"]);
+        let declared = Json::Array(domains.iter().map(|domain| Json::from(*domain)).collect());
+        let brief = Json::object([
+            (
+                "task",
+                Json::object([
+                    ("id", Json::from("specs-deny-list")),
+                    ("title", Json::from("The governing spec is unwritable")),
+                    ("conflictDomains", declared.clone()),
+                ]),
+            ),
+            ("domainsRequired", Json::from(true)),
+            (
+                "repositoryConfig",
+                Json::object([
+                    ("checkout", Json::from(checkout.display().to_string())),
+                    ("baseBranch", Json::from("main")),
+                    ("remote", Json::from("origin")),
+                    ("forge", Json::from("local")),
+                ]),
+            ),
+            (
+                "workspace",
+                Json::object([
+                    ("taskId", Json::from("specs-deny-list")),
+                    ("baseRev", Json::from(base)),
+                    ("branch", Json::from(branch)),
+                    (
+                        "publishBranch",
+                        Json::from("tally/eta-campaign-7/specs-deny-list"),
+                    ),
+                    ("worktreePath", Json::from(checkout.display().to_string())),
+                    ("conflictDomains", declared),
+                ]),
+            ),
+        ]);
+        let certified = action_ownership(&brief).map_err(|error| error.to_string());
+        (root, certified)
+    }
+
+    #[test]
+    fn ownership_deny_list_refuses_a_governing_spec_write_its_domains_claim() {
+        let (root, certified) = deny_list_ownership(
+            "claimed",
+            &[
+                ("specs/eta/spec.md", "# eta\n"),
+                ("crates/tally-core/src/lane.rs", "// lane\n"),
+            ],
+            &["specs/eta", "crates/tally-core/src"],
+        );
+        let refused = certified.expect_err("a governing-spec write is refused at ownership");
+        assert!(
+            refused.contains("\"specs/eta/spec.md\""),
+            "the refusal names the path: {refused}"
+        );
+        assert!(
+            refused.contains("governing-spec-directory: the governing spec of identity \"eta\""),
+            "the refusal names the protection: {refused}"
+        );
+        assert!(
+            refused.contains("a declared conflictDomain does not grant a protected path"),
+            "the refusal says the declared domain bought nothing: {refused}"
+        );
+        assert!(
+            refused.contains("operator or coordinator"),
+            "the refusal names the hands these bytes move by: {refused}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ownership_deny_list_refuses_an_evidence_addition_under_the_governing_spec() {
+        // Evidence is the sympathetic case and it is not exempt: a lane with
+        // evidence to land hands it to its final message.
+        let (root, certified) = deny_list_ownership(
+            "evidence",
+            &[("specs/eta/evidence/specs-deny-list.md", "# lane notes\n")],
+            &["specs/eta/evidence"],
+        );
+        let refused = certified.expect_err("an evidence addition is a governing-spec write");
+        assert!(
+            refused.contains("\"specs/eta/evidence/specs-deny-list.md\""),
+            "the refusal names the path: {refused}"
+        );
+        assert!(
+            refused.contains("governing-spec-directory"),
+            "the refusal names the protection: {refused}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ownership_deny_list_certifies_a_lane_that_stays_out_of_the_spec_directories() {
+        // The protection must bite exactly its members: a lane amending the
+        // specs index or its own crate still certifies.
+        let (root, certified) = deny_list_ownership(
+            "clean",
+            &[
+                ("crates/tally-core/src/lane.rs", "// lane\n"),
+                ("specs/README.md", "# specs\n"),
+            ],
+            &["crates/tally-core/src", "specs/README.md"],
+        );
+        let ownership = certified.expect("a lane outside the protected set certifies");
+        let owned = ownership
+            .as_object()
+            .and_then(|object| object.get("ownedPaths"))
+            .and_then(Json::as_array)
+            .expect("ownedPaths is an array")
+            .iter()
+            .filter_map(Json::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(owned, ["crates/tally-core/src/lane.rs", "specs/README.md"]);
+        fs::remove_dir_all(root).unwrap();
     }
 }

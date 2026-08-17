@@ -13,6 +13,7 @@ pub mod brief;
 pub mod campaign_contract;
 pub mod campaign_folds;
 pub mod campaign_poll;
+pub mod campaign_protection;
 pub mod campaign_publish;
 pub mod campaign_registry;
 pub mod completion;
