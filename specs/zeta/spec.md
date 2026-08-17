@@ -1,6 +1,6 @@
 # zeta — the authority plane
 
-Status: proposed
+Status: ratified 2026-08-17
 Governs: silent-factory-worklists/zeta.json
 Consumers: checks.x86_64-linux.spec-lint; the zeta worklist readFirst anchors; the close sitting coverage render
 Supersedes: none
@@ -49,6 +49,7 @@ anchors becomes possible at the sitting that follows this campaign's close.
 | Z5 | fixture home | `crates/spec-lint/tests/fixtures/golden/` and the must-fail corpus with an exact defect map — never a bare nonzero-exit assertion |
 | Z6 | ratification timing | proposed tonight; ratified at the boundary sitting after the falsity pass against the observed post-ext0 tree |
 | Z7 | release-row witness | the summary/complete ref, resolved by the release closing summary |
+| Z8 | steward field value | narrator — the diagnosis and judge slots bind the steward catalog role, so evaluation never runs on the metered lane adapter; settled at the eta sitting 0 drain |
 
 ## Claims
 
@@ -87,8 +88,7 @@ U.2 the pre-existing checks module-layer and campaign-runtime build beside the n
 
 ## Unknowns
 
-UNKNOWN-1 whether an existing cargo test covers the read-first brief rendering (the would-be oracle for 3.2) — the spec-lint-core lane greps the campaign CLI tests; if present, 3.2 rebinds from HUMAN-ATTENDED at the next sitting.
-DECISION-1 the worklist `steward` field value after the ext0 merge? proposed: narrator (given)
+UNKNOWN-1 whether an existing cargo test covers the read-first brief rendering (the would-be oracle for 3.2) — drained 2026-08-15: none exists; 3.2 keeps its HUMAN-ATTENDED binding.
 
 ## Stages
 

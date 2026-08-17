@@ -1,6 +1,6 @@
 # eta — the daily-driver buildout, chapters one and two
 
-Status: proposed
+Status: ratified 2026-08-17
 Governs: silent-factory-worklists/eta.json
 Consumers: the eta worklist readFirst anchors; the C1 seam sitting; checks.x86_64-linux.spec-lint once the attribute exists
 Supersedes: none
