@@ -59,6 +59,19 @@ machinery finding for a later sitting: an attempt whose worktree digest
 no longer matches the admitted graph should fail legibly as
 digest-mismatch, not as agent-produced-no-commit.
 
+## Chapter 1 finish on claude-code (operator ruling 2026-08-17)
+
+| # | when (UTC) | what | adapter | outcome |
+|---|---|---|---|---|
+| 11 | 08-17 | adapter-relative-policies attempt 5 | claude-code/host-default | committed; ownership+driver-suite+cargo-tests+clippy green; flake-build-subset caught the fixture outside the nix source filter |
+| 12 | 08-17 | adapter-relative-policies attempt 6 — MERGED | claude-code/host-default | crate-local fixture per amendment 6; sandbox proof run pre-commit; witness adapter-relative-policies-fb1861e7fa6a17a5 |
+
+S4 closed after six attempts: two boundary refusals (supervisor
+authoring), one orphaned green commit (supervisor re-arm mid-attempt),
+one quota wall, one sandbox-filter fixture defect, one merge. Every
+failure named itself before touching the base; the class-killer landed
+with its portability matrix standing guard.
+
 ## Dispatch state
 
 Paused per ETA.md §6 — a planned state, not an incident. Campaign armed,
