@@ -108,12 +108,17 @@ Until the close is a single verb, run it as an ordered checklist and take no
 step out of order:
 
 1. `tally campaign quiescent` — read what is armed and what is grading it.
-2. `tally campaign release --plan` — render the complete close without
+2. `spec-lint --coverage specs/<identity>` — when the campaign has a governing
+   spec, render the claim ↔ task ↔ acceptance ↔ evidence table, review it, and
+   hand it to release as part of the operator-authored intent. Release renders
+   that intent verbatim, so the rendered table is the close-out proof; never
+   retype it by hand.
+3. `tally campaign release --plan` — render the complete close without
    contacting a forge, and read what it renders.
-3. `tally campaign release --probe` — exercise it against the disposable
+4. `tally campaign release --probe` — exercise it against the disposable
    target.
-4. `tally campaign release` — the one release act.
-5. `tally campaign disarm` — last, and nothing after it.
+5. `tally campaign release` — the one release act.
+6. `tally campaign disarm` — last, and nothing after it.
 
 ## Abandon
 

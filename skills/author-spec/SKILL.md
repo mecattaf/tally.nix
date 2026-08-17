@@ -31,11 +31,19 @@ line.
 Then loop: run
 
     nix develop --command cargo run -p spec-lint -- specs/<identity> \
-      --worklist silent-factory-worklists/<identity>.json --repo-root . \
-      --mode sitting
+      --worklist silent-factory-worklists/<identity>.json --root .
 
-fix, rerun until blocking defects are zero. Do not argue with the linter in
-prose; change the bytes. For contracts of consequence, run the grind (A16):
+fix, rerun until blocking defects are zero. `--mode check` is the default and
+carries the cross-artifact resolution pass; `--census` and `--coverage` are
+the other two modes, and there is no sitting mode yet — L17's append-only
+comparison against the parent revision waits on one. Exit 0 is clean, 1 is
+warnings only, 2 is blocking. The same binary grades every fleet-gated head
+as `checks.x86_64-linux.spec-lint`, which relints every committed
+`specs/<identity>/` and, in the same derivation, replays the must-fail corpus
+at `crates/spec-lint/tests/fixtures/must-fail/` against its committed
+`expected-defects.json` — a green attribute is the tool shown to bite. Do not
+argue with the linter in prose; change the bytes. For contracts of
+consequence, run the grind (A16):
 implementation plan and conformance bar derived blind from the spec as the
 single intent source; the bar frozen and read-only; converge by collision;
 disagreements escalate as spec defects, never absorbed; the bar shown to bite
@@ -78,7 +86,7 @@ is the filter that keeps the spec out of the epoch key. Append
 `kind: "sitting"` rows to `specs/<identity>/trace.json` joining claim → task
 → acceptance ids. Write the census report to
 `specs/<identity>/evidence/census-<stage>.md` — record deviations, never
-patch frozen inputs. Rerun the sitting-mode lint and the admission rehearsal
+patch frozen inputs. Rerun the check-mode lint and the admission rehearsal
 (every gate preflight argv verbatim, in a pristine worktree). Commit once —
 worklist stage, trace rows, census report — and push. Pre-ext1, ring the
 doorbell with `tally campaign arm`; post-ext1 the push is the arming act and

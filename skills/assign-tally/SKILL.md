@@ -104,6 +104,23 @@ Populate `tasks` in topological order. Give every implementation task:
 - normalized repository-relative `conflictDomains` that cover every path the
   task may change. Require them whenever `maxParallel` is greater than one.
 
+When a governing spec exists — `specs/<identity>/spec.md`, sharing the
+worklist's filename stem — four rules bind the bytes you write:
+
+- Task `goal` text cites claim ids and evidence ids; it does not restate them.
+  The spec is the one authority for what a claim says, and a restatement is a
+  second copy that drifts.
+- `readFirst.specSections` point at number-derived anchors of the form
+  `specs/<identity>/spec.md#rN` — `### R2 — the trace` anchors at `#r2` and
+  nowhere else, so a retitle cannot dangle the pointer. Every anchor must
+  exist at the authority revision.
+- The sitting appends `specs/<identity>/trace.json` rows joining claim → task
+  → acceptance ids, in the same commit as the worklist stage. A trace row
+  written later is a row written from memory.
+- The governing spec appears in no task's `conflictDomains`, and no lane
+  writes it. Spec churn reaches the graph only through the sitting that
+  amends the worklist.
+
 Give a checkpoint only `id`, `kind: "checkpoint"`, `title`, executable `argv`,
 `runtimeMaxSec`, and earlier `dependencies`. Let tally render its brief.
 
