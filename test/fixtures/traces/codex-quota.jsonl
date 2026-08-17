@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"codex-thread-quota"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/true","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Try again after 2026-08-20T13:00:00Z."}}

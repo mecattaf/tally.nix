@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 
 mod actions;
+mod adapter_outcome;
 mod error;
 mod git;
 mod json;

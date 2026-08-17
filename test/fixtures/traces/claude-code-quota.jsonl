@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"claude-session-quota"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Reading the workspace before the first edit."}],"usage":{"input_tokens":1204,"cache_creation_input_tokens":2048,"cache_read_input_tokens":18432,"output_tokens":96}}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"README.md"}}],"usage":{"input_tokens":1310,"cache_creation_input_tokens":0,"cache_read_input_tokens":20480,"output_tokens":41}}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"fixture result"}]}}
+{"type":"error","message":"You've hit your usage limit. Your limit will reset at 9am (America/New_York) on Aug 20th."}

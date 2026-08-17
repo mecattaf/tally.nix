@@ -377,6 +377,74 @@ let
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.content[?@.type == 'text'].text";
         };
+        # The wall, named by the adapter itself (vestige-sweep V-16). The four
+        # captures above all read the LAST VALID turn, which is the right
+        # reading for every question an operator asks about work that
+        # happened -- and it is precisely why an attempt that ended because
+        # the provider refused had nothing to say for itself: the records
+        # stating the refusal are the ones those guards exclude, so the lane
+        # exited with no envelope at all and the machinery guessed.
+        #
+        # This capture is the same guard read from the other side, and it is
+        # scoped to the shape the `occupancy` note above already names: pi's
+        # in-stream error signal arrives on the same `message_end` every
+        # message uses, under `stopReason: "error"` -- the branch that note
+        # records as the one a non-interactive `pi --mode json` can actually
+        # reach -- with the text at `errorMessage`, the field
+        # `pi-aborted-turn.jsonl` shows carrying `Operation aborted` on that
+        # fixture's `aborted` sibling. So the clause the reader captures
+        # exclude as "not a valid turn" is exactly the clause this one keeps
+        # as "the adapter said why it stopped", and one record serves both
+        # readings without either lying. No stream-level error genre is
+        # declared for pi because none has been observed here; silence is
+        # "unmeasured", not "absent".
+        #
+        # What reaches the driver is the message text, and the text is the
+        # whole point: a quota refusal names its own reset time, so the
+        # outcome envelope carries a dated, non-retryable fact instead of an
+        # empty exit that read as transient machinery congestion.
+        terminal = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'message_end' && @.message.stopReason == 'error'].message";
+          fields.terminalMessage = [ "errorMessage" ];
+        };
+        # The spend ledger, scraped rather than hand-reconstructed (eta R1
+        # 1.8). This is deliberately NOT a `fields` mapping on `usage` above:
+        # that capture's own comment refuses one because `$..usage` takes the
+        # last usage object anywhere in the stream, and reporting that as an
+        # attempt roll-up would understate every multi-turn pi node. The
+        # refusal stands; what it withheld was a number under a name that
+        # would have been read as the attempt's total.
+        #
+        # This capture claims something narrower and true: the figures of the
+        # last VALID assistant turn, under the same guard `occupancy` and
+        # `finalMessage` carry, which is the only per-turn reading pi's stream
+        # supports. The spend spelling is `input` exclusive of both cache
+        # halves -- the capture settles it arithmetically, 190 + 46 + 842 + 0
+        # == 1078 == `totalTokens` -- so `inputTokens` is the honest logical
+        # name and `inputTokensWithCacheRead` would be wrong here. `reasoning`
+        # is declared because pi states it and a stated zero is a
+        # measurement; it is nested inside `output` and the normalizer's
+        # component sum leaves it out, so declaring it cannot double-count.
+        #
+        # It is a separate capture from `occupancy` rather than a widening of
+        # it because the two answer different questions off the same bytes --
+        # how full is the window now, versus what did this turn cost -- and
+        # `crate::occupancy`'s module doc requires that neither concern's
+        # lookup can ever resolve against the other's declaration. Distinct
+        # names are how that is enforced.
+        tokenSpend = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage";
+          fields = {
+            inputTokens = [ "input" ];
+            outputTokens = [ "output" ];
+            cacheReadTokens = [ "cacheRead" ];
+            cacheWriteTokens = [ "cacheWrite" ];
+            reasoningTokens = [ "reasoning" ];
+            totalTokens = [ "totalTokens" ];
+          };
+        };
       };
       yieldHook = checkpointHook;
       extraConfig.modelFlag = "--model";
@@ -466,6 +534,26 @@ let
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'result'].result";
         };
+        # The quota wall, scraped rather than inferred (vestige-sweep V-16).
+        # `finalMessage` directly above requires a `result` event. A stream
+        # the API terminates on its own usage limit emits none: it ends on
+        # `{"type":"error","message":"You've hit your usage limit ..."}` and
+        # stops. That is a stdout STREAM event, which is why stderr was empty
+        # -- so the lane produced no envelope, the empty exit took the
+        # refusal-shape path to a projection timeout, and a dated,
+        # non-retryable wall was retried as transient congestion while its
+        # own message sat in the capture archive naming the reset hour.
+        #
+        # The capture keeps the event object and declares where the text
+        # lives, rather than selecting `.message` directly, so that one
+        # adapter-neutral reader serves every preset whose terminal genre
+        # nests the text differently -- see codex below, which needs two
+        # candidate paths for two genres.
+        terminal = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'error']";
+          fields.terminalMessage = [ "message" ];
+        };
       };
       yieldHook = checkpointHook;
       extraConfig.modelFlag = "--model";
@@ -536,6 +624,27 @@ let
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text";
+        };
+        # codex's own terminal genres (vestige-sweep V-16). `finalMessage`
+        # above requires a completed `agent_message` item, and a turn the
+        # provider refuses produces none -- the same envelope-less exit the
+        # claude-code preset documents at its own `terminal` capture.
+        #
+        # codex states the refusal in two shapes and this declares both, in
+        # the order the stream can carry them: the stream-level `error` event
+        # puts its text at `message`, while a turn that fails puts the same
+        # kind of text one level down at `error.message`. Ordered candidate
+        # paths are how a harness's shape reaches tally without a Rust match
+        # arm; declaring only one of the two would leave the other genre
+        # exiting into the projection-timeout fallback, which is the exact
+        # defect this capture exists to end.
+        terminal = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'error' || @.type == 'turn.failed']";
+          fields.terminalMessage = [
+            "message"
+            "error.message"
+          ];
         };
         # No `contextWindow` capture: no `turn.completed` in this project's
         # corpus has ever stated one, and declaring a key nobody has observed

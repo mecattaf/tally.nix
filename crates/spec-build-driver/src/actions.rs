@@ -9,6 +9,7 @@ use std::process::Command;
 
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, SecondsFormat, Utc};
 use regex::Regex;
+use tally_core::adapters::AdapterConfig;
 use tally_core::attempt_receipts::{
     is_sha256_identity, validate_attempt_receipt_stamp, AttemptReceiptAuthorityV1,
     ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR, ATTEMPT_RECEIPT_SCHEMA_VERSION,
@@ -21,6 +22,7 @@ use tally_core::campaign_folds::{
 };
 use uuid::Uuid;
 
+use crate::adapter_outcome::{self, LaneOutcome};
 use crate::error::{DriverError, Result};
 use crate::git::{git, git_with_input};
 use crate::json::{self, Json};
@@ -2736,6 +2738,7 @@ fn action_steer(brief: &Json) -> Result<Json> {
             "proposal",
             "attemptReceipts",
             "checkpointCapture",
+            "laneCapture",
             "gateEvidence",
             "breach",
             "breachDetail",
@@ -2810,12 +2813,26 @@ fn action_steer(brief: &Json) -> Result<Json> {
     // machinery retry budget.
     let transient_budget_exhausted = requested_verdict == DiagnosisVerdict::Transient
         && spent_machinery_retries >= MAX_MACHINE_RETRIES;
-    let mut verdict =
-        if breach || task_kind == "checkpoint" || attempt == 2 || transient_budget_exhausted {
-            DiagnosisVerdict::Blocked
-        } else {
-            requested_verdict
-        };
+    // An adapter that stated its own terminal condition has settled the
+    // verdict before the judge was asked (vestige-sweep V-16). This is kin to
+    // the judge's `blocked`, but it needs no judgment slot: the rail is
+    // deterministic because the adapter said so in its own stream, and
+    // whatever the judge proposed -- retry, transient -- cannot outrank a
+    // dated wall that named itself.
+    let lane_outcome = lane_capture_outcome(data.get("laneCapture"))?;
+    let adapter_terminal = lane_outcome
+        .as_ref()
+        .is_some_and(LaneOutcome::is_adapter_terminal);
+    let mut verdict = if breach
+        || task_kind == "checkpoint"
+        || attempt == 2
+        || transient_budget_exhausted
+        || adapter_terminal
+    {
+        DiagnosisVerdict::Blocked
+    } else {
+        requested_verdict
+    };
     let proposal = (verdict == DiagnosisVerdict::Blocked)
         .then_some(proposal)
         .flatten();
@@ -2918,6 +2935,21 @@ fn action_steer(brief: &Json) -> Result<Json> {
     let diagnosis = bound_public_diagnosis(&diagnosis);
     let diagnosis = validated_diagnosis(&diagnosis, data.get("gateEvidence"));
     let diagnosis = append_checkpoint_capture_note(&diagnosis, &capture_note, MAX_DIAGNOSIS_CHARS);
+    // The adapter's own account of how the lane ended, and what the lane
+    // spent saying it, land in the durable receipt (eta R1 1.6 and 1.8)
+    // rather than in a session ledger somebody reconstructs by hand. This is
+    // the half of the fix an operator actually reads: a wall that names its
+    // reset hour is only useful if the hour survives into the record.
+    let (lane_note, lane_note_redacted) = match lane_outcome.as_ref().map(LaneOutcome::note) {
+        Some(note) if !note.is_empty() => redact_public_text(&note),
+        _ => (String::new(), false),
+    };
+    let diagnosis = append_machine_note(
+        &diagnosis,
+        &lane_note,
+        MAX_DIAGNOSIS_CHARS,
+        "\n[... earlier machine detail shortened for the lane outcome envelope ...]",
+    );
     // A transient diagnosis is a reason for the existing free machinery
     // retry, not a task-attempt receipt. Keeping it out of the diagnosis
     // ledger means the redispatch remains attempt 1 while the independent
@@ -2969,9 +3001,128 @@ fn action_steer(brief: &Json) -> Result<Json> {
         verdict,
         proposal.as_ref(),
         true,
-        redacted || capture_redacted || proposal_redacted,
+        redacted || capture_redacted || proposal_redacted || lane_note_redacted,
         None,
     ))
+}
+
+/// The lane's own capture, as a brief names it, classified into an outcome.
+///
+/// The adapter's declarations travel in the brief rather than being resolved
+/// from ambient configuration. The driver runs as an ordinary job and holds
+/// no adapter catalog, and a classification that stops a retry ladder has to
+/// be reproducible from the brief alone -- the same rule every other
+/// deterministic decision here follows.
+///
+/// Absent is admissible and means only that this pass named no capture: a
+/// lane whose stream was never handed over is classified exactly as it was
+/// before, by the machinery's own code.
+fn lane_capture_outcome(value: Option<&Json>) -> Result<Option<LaneOutcome>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let capture = object_exact(
+        value,
+        &[
+            "adapter",
+            "adapterConfig",
+            "stdoutPath",
+            "stderrPath",
+            "failureCode",
+        ],
+        "laneCapture",
+    )?;
+    let adapter = required_string(capture.get("adapter"), "laneCapture.adapter", Some(128))?;
+    if !is_component(&adapter) {
+        return Err(DriverError::new("laneCapture.adapter is not a safe name"));
+    }
+    let declarations = capture
+        .get("adapterConfig")
+        .filter(|value| value.as_object().is_some())
+        .ok_or_else(|| DriverError::new("laneCapture.adapterConfig must be an object"))?;
+    let declarations: AdapterConfig =
+        serde_json::from_str(&declarations.stringify()).map_err(|error| {
+            DriverError::new(format!(
+                "laneCapture.adapterConfig is not an adapter declaration: {error}"
+            ))
+        })?;
+    let stdout = lane_capture_path(capture.get("stdoutPath"), "laneCapture.stdoutPath")?
+        .ok_or_else(|| DriverError::new("laneCapture.stdoutPath is required"))?;
+    let stderr = lane_capture_path(capture.get("stderrPath"), "laneCapture.stderrPath")?;
+    // A capture the retention horizon has already reaped states nothing, and
+    // a re-run of a settled pass must stay idempotent rather than becoming a
+    // hard driver failure the second time it is asked. So an absent file
+    // degrades to the classification this pass would have reached without it;
+    // an unreadable one still refuses, because that is a capture claiming to
+    // exist and failing to be read.
+    if !stdout.is_file() {
+        return Ok(None);
+    }
+    let stderr = stderr.filter(|path| path.is_file());
+    let failure_code = match capture.get("failureCode") {
+        None | Some(Json::Null) => None,
+        Some(value) => Some(required_string(
+            Some(value),
+            "laneCapture.failureCode",
+            Some(128),
+        )?),
+    };
+    adapter_outcome::classify_paths(
+        &adapter,
+        &declarations,
+        &stdout,
+        stderr.as_deref(),
+        failure_code.as_deref(),
+    )
+    .map(Some)
+}
+
+fn lane_capture_path(value: Option<&Json>, context: &str) -> Result<Option<PathBuf>> {
+    match value {
+        None | Some(Json::Null) => Ok(None),
+        Some(value) => {
+            let text = required_string(Some(value), context, Some(700))?;
+            let path = PathBuf::from(text);
+            if !path.is_absolute() {
+                return Err(DriverError::new(format!("{context} must be absolute")));
+            }
+            Ok(Some(path))
+        }
+    }
+}
+
+/// The retry result a stopped ladder produces.
+///
+/// It is deliberately the same shape a spent budget returns -- nothing
+/// appended, `posted: false` -- because the flow's reading of that shape is
+/// already exactly right: no dispatch happened, so the failure is steered
+/// rather than re-run. What differs is the reason, and the reason is a fact
+/// the adapter stated; it reaches the durable ledger through the steering
+/// diagnosis that follows, which carries the message and the token spend
+/// (see [`adapter_outcome::LaneOutcome::note`]).
+fn no_machinery_retry(
+    source: Option<&Json>,
+    campaign: &str,
+    issue_number: &str,
+    task_id: &str,
+) -> Result<Json> {
+    let state = campaign_attempt_state_all(source, campaign, issue_number)?;
+    let spent = state
+        .retries
+        .iter()
+        .filter(|receipt| receipt.task_id == task_id)
+        .count();
+    Ok(Json::object([
+        ("taskId", Json::from(task_id)),
+        ("attempt", Json::from(spent)),
+        ("comment", Json::Null),
+        ("exhausted", Json::from(true)),
+        ("posted", Json::from(false)),
+        ("redacted", Json::from(false)),
+    ]))
 }
 
 fn record_machine_retry(
@@ -3051,6 +3202,7 @@ fn action_retry(brief: &Json) -> Result<Json> {
             "detail",
             "attemptReceipts",
             "checkpointCapture",
+            "laneCapture",
             "specRepository",
             "issueRepository",
         ],
@@ -3076,6 +3228,22 @@ fn action_retry(brief: &Json) -> Result<Json> {
         return Err(DriverError::new("stage is not a safe campaign stage name"));
     }
     let detail = required_text(data.get("detail"), "detail", MAX_RETRY_CHARS)?;
+    // The lane's own stream is read before the budget is charged, because an
+    // adapter that stated its own terminal condition has already answered the
+    // question a retry would ask (vestige-sweep V-16). A quota wall is dated
+    // and non-retryable; re-dispatching against it is how five hours went
+    // last time, and the message naming the reset hour was in this capture
+    // the whole time.
+    if lane_capture_outcome(data.get("laneCapture"))?
+        .is_some_and(|outcome| !outcome.dispatches_retry())
+    {
+        return no_machinery_retry(
+            data.get("attemptReceipts"),
+            &campaign,
+            &issue_number,
+            &task_id,
+        );
+    }
     let capture_note = if data.contains_key("checkpointCapture") {
         checkpoint_capture_note(data.get("checkpointCapture"), &campaign, &task_id)?
     } else {
@@ -4116,6 +4284,18 @@ fn checkpoint_capture_note(value: Option<&Json>, campaign: &str, task_id: &str) 
 }
 
 fn append_checkpoint_capture_note(value: &str, note: &str, maximum: usize) -> String {
+    append_machine_note(
+        value,
+        note,
+        maximum,
+        "\n[... earlier machine detail shortened for checkpoint capture ...]",
+    )
+}
+
+/// Append a machine-composed note to public prose, keeping the note whole and
+/// shortening the prose it follows. The note is the newer, more specific fact,
+/// so it is the half that must survive the bound.
+fn append_machine_note(value: &str, note: &str, maximum: usize, marker: &str) -> String {
     if note.is_empty() {
         return value.to_owned();
     }
@@ -4123,7 +4303,6 @@ fn append_checkpoint_capture_note(value: &str, note: &str, maximum: usize) -> St
     if value.chars().count() + suffix.chars().count() <= maximum {
         return format!("{value}{suffix}");
     }
-    let marker = "\n[... earlier machine detail shortened for checkpoint capture ...]";
     let available = maximum
         .saturating_sub(marker.chars().count())
         .saturating_sub(suffix.chars().count());
@@ -11117,14 +11296,15 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        action_steer, action_worker_outcome, append_attempt_receipt, append_diagnosis_report,
-        campaign_attempt_state, campaign_attempt_state_all, checkpoint_capture_note,
-        classify_worker_outcome, closed_inline_code_spans, contains_bare_exclamation_mark,
-        current_task_input_epochs, excerpt_text_window, fold_attempt_receipts, git_with_input,
-        integration_branch, merge_local, publish_closing_summary, read_capture_tail,
-        read_local_blob, replace_bare_exclamation_marks, validate_attempt_receipt,
-        validate_outcome_first, DiagnosisVerdict, Json, RepoConfig, WorkerOutcome,
-        CHECKPOINT_CAPTURE_MAX_BYTES, CHECKPOINT_STDERR_WINDOW_CHARS,
+        action_retry, action_steer, action_worker_outcome, append_attempt_receipt,
+        append_diagnosis_report, campaign_attempt_state, campaign_attempt_state_all,
+        checkpoint_capture_note, classify_worker_outcome, closed_inline_code_spans,
+        contains_bare_exclamation_mark, current_task_input_epochs, excerpt_text_window,
+        fold_attempt_receipts, git_with_input, integration_branch, json, merge_local,
+        publish_closing_summary, read_capture_tail, read_local_blob,
+        replace_bare_exclamation_marks, validate_attempt_receipt, validate_outcome_first,
+        DiagnosisVerdict, Json, RepoConfig, WorkerOutcome, CHECKPOINT_CAPTURE_MAX_BYTES,
+        CHECKPOINT_STDERR_WINDOW_CHARS,
     };
     use tally_core::attempt_receipts::{
         AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR,
@@ -12079,6 +12259,221 @@ mod tests {
         assert_eq!(state.diagnoses.len(), 1);
         assert!(state.diagnoses[0].blocks_task());
         assert!(state.retries.is_empty());
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A quota-terminated claude-code capture, verbatim from the corpus the
+    /// adapter presets are declared against.
+    const QUOTA_WALLED_CAPTURE: &str =
+        include_str!("../../../test/fixtures/traces/claude-code-quota.jsonl");
+
+    /// One lane capture written where a retained archive would have it,
+    /// beside the adapter declarations the catalog states for it. The
+    /// declarations travel in the brief because the driver holds no adapter
+    /// catalog of its own.
+    fn lane_capture_fixture(root: &Path, adapter: &str, stream: &str) -> Json {
+        let catalog = json::parse(include_str!(
+            "../../../test/fixtures/spec-build/adapter-terminal-catalog.json"
+        ))
+        .expect("the committed catalog snapshot parses");
+        let declarations = catalog
+            .as_object()
+            .and_then(|catalog| catalog.get(adapter))
+            .unwrap_or_else(|| panic!("the catalog snapshot declares {adapter:?}"))
+            .clone();
+        let captures = root.join("captures");
+        fs::create_dir_all(&captures).unwrap();
+        let path = captures.join(format!("{adapter}.out"));
+        fs::write(&path, stream).unwrap();
+        Json::object([
+            ("adapter", Json::from(adapter)),
+            ("adapterConfig", declarations),
+            ("stdoutPath", Json::from(path.display().to_string())),
+            ("failureCode", Json::from("result-projection-timeout")),
+        ])
+    }
+
+    fn lane_retry_brief(root: &Path, checkout: &Path, lane_capture: Option<Json>) -> Json {
+        write_test_receipt_authority(root);
+        let mut brief = BTreeMap::from([
+            ("campaign".to_owned(), Json::from("fixture")),
+            ("repository".to_owned(), Json::from("acme/spec")),
+            (
+                "repositoryConfig".to_owned(),
+                Json::object([
+                    ("checkout", Json::from(checkout.display().to_string())),
+                    ("baseBranch", Json::from("main")),
+                    ("remote", Json::from("origin")),
+                    ("forge", Json::from("local")),
+                ]),
+            ),
+            (
+                "issue".to_owned(),
+                Json::object([
+                    ("number", Json::from("7")),
+                    ("url", Json::from("local://acme/spec/issues/7")),
+                ]),
+            ),
+            ("taskId".to_owned(), Json::from("task-1")),
+            ("stage".to_owned(), Json::from("agent")),
+            (
+                "detail".to_owned(),
+                Json::from("The agent stage faulted and its stderr was empty."),
+            ),
+            ("attemptReceipts".to_owned(), test_receipt_source(root)),
+        ]);
+        if let Some(lane_capture) = lane_capture {
+            brief.insert("laneCapture".to_owned(), lane_capture);
+        }
+        Json::Object(brief)
+    }
+
+    /// The ladder stop, at the layer that spends the budget. Before this, an
+    /// empty-stderr agent fault was a machinery fault by default and bought a
+    /// retry against a wall that had already named the hour it lifts.
+    #[test]
+    fn an_adapter_terminal_lane_capture_buys_no_machinery_retry() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-adapter-terminal-retry-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let brief = lane_retry_brief(
+            &temporary,
+            &checkout,
+            Some(lane_capture_fixture(
+                &temporary,
+                "claude-code",
+                QUOTA_WALLED_CAPTURE,
+            )),
+        );
+
+        let result = action_retry(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(result.get("posted").and_then(Json::as_bool), Some(false));
+        assert_eq!(result.get("exhausted").and_then(Json::as_bool), Some(true));
+        assert!(matches!(result.get("comment"), Some(Json::Null)));
+
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert!(
+            state.retries.is_empty(),
+            "a stated wall charged the machinery budget"
+        );
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The complement, and the reason the stop is scraped rather than
+    /// assumed: a lane whose stream states nothing terminal is priced exactly
+    /// as it was before.
+    #[test]
+    fn a_lane_capture_with_no_adapter_terminal_event_still_buys_the_machinery_retry() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-adapter-terminal-none-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let healthy = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"claude-session-healthy"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"Done."}"#,
+            "\n",
+        );
+        let brief = lane_retry_brief(
+            &temporary,
+            &checkout,
+            Some(lane_capture_fixture(&temporary, "claude-code", healthy)),
+        );
+
+        let result = action_retry(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(result.get("posted").and_then(Json::as_bool), Some(true));
+        assert_eq!(result.get("exhausted").and_then(Json::as_bool), Some(false));
+
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert_eq!(state.retries.len(), 1);
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A capture the retention horizon reaped states nothing, and asking
+    /// again must not turn a settled pass into a driver failure. The
+    /// classification degrades to the reading this pass would have reached
+    /// without the capture at all.
+    #[test]
+    fn a_reaped_lane_capture_claims_no_adapter_terminal_outcome() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-adapter-terminal-reaped-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let lane_capture = lane_capture_fixture(&temporary, "claude-code", QUOTA_WALLED_CAPTURE);
+        let path = lane_capture
+            .as_object()
+            .and_then(|capture| capture.get("stdoutPath"))
+            .and_then(Json::as_str)
+            .expect("the fixture names its capture")
+            .to_owned();
+        fs::remove_file(&path).unwrap();
+        let brief = lane_retry_brief(&temporary, &checkout, Some(lane_capture));
+
+        let result = action_retry(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(result.get("posted").and_then(Json::as_bool), Some(true));
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The other half of the ladder: the in-epoch retry the judge proposed.
+    /// The adapter stated the outcome, so the verdict is settled before the
+    /// judgment is consulted -- and the receipt carries the sentence the wall
+    /// wrote plus what the lane spent reaching it.
+    #[test]
+    fn an_adapter_terminal_lane_capture_blocks_the_verdict_the_judge_proposed() {
+        let temporary =
+            std::env::temp_dir().join(format!("tally-adapter-terminal-steer-{}", Uuid::new_v4()));
+        let checkout = diagnosis_test_checkout(&temporary);
+        let mut brief =
+            diagnosis_test_brief(&temporary, &checkout, "implementation", "retry", None);
+        brief.as_object_mut().unwrap().insert(
+            "laneCapture".to_owned(),
+            lane_capture_fixture(&temporary, "claude-code", QUOTA_WALLED_CAPTURE),
+        );
+
+        let result = action_steer(&brief).unwrap();
+        let result = result.as_object().unwrap();
+        assert_eq!(
+            result.get("verdict").and_then(Json::as_str),
+            Some("blocked")
+        );
+        assert_eq!(result.get("blocked").and_then(Json::as_bool), Some(true));
+        assert!(matches!(result.get("retry"), Some(Json::Null)));
+
+        let state = campaign_attempt_state_all(
+            brief
+                .as_object()
+                .and_then(|brief| brief.get("attemptReceipts")),
+            "fixture",
+            "7",
+        )
+        .unwrap();
+        assert_eq!(state.diagnoses.len(), 1);
+        assert!(state.diagnoses[0].blocks_task());
+        assert!(state.retries.is_empty());
+        let recorded = state.diagnoses[0].diagnosis_json();
+        let recorded = recorded
+            .as_object()
+            .and_then(|diagnosis| diagnosis.get("diagnosis"))
+            .and_then(Json::as_str)
+            .expect("the durable receipt carries its diagnosis");
+        assert!(recorded.contains("Adapter-terminal outcome"), "{recorded}");
+        assert!(recorded.contains("usage limit"), "{recorded}");
+        assert!(recorded.contains("Token spend scraped"), "{recorded}");
         fs::remove_dir_all(temporary).unwrap();
     }
 

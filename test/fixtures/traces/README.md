@@ -1,9 +1,10 @@
 # Trace fixtures — provenance
 
-`pi.jsonl` and `pi-aborted-turn.jsonl` are the only fixtures in this
-directory this file makes a claim about. `claude-code.jsonl` and
-`codex.jsonl` predate it and are described by the tests that read them, not
-here; nothing below should be read as a statement about their origin.
+`pi.jsonl`, `pi-aborted-turn.jsonl` and the three `*-quota.jsonl` files
+are the fixtures in this directory this file makes a claim about.
+`claude-code.jsonl` and `codex.jsonl` predate it and are described by the
+tests that read them, not here; nothing below should be read as a statement
+about their origin.
 
 ## `pi.jsonl`
 
@@ -160,3 +161,91 @@ rediscovering it per finding.
   response id, working directory or free-text body, so nothing in this
   directory can be used to check tally's redaction paths; those have their
   own fixtures.
+
+## The three `*-quota.jsonl` fixtures
+
+`claude-code-quota.jsonl`, `codex-quota.jsonl` and `pi-quota.jsonl` exist for
+the `terminal` scrape capture each of those presets declares — the
+adapter-terminal outcome class of vestige-sweep V-16. Each ends on the event
+genre its harness uses to state a terminal condition, and each of those
+events carries a provider usage-limit message naming the time the wall lifts,
+because the reset time surviving into the outcome envelope is the whole point
+of the class.
+
+**None of the three is a recorded capture of a quota-terminated run, and
+saying so exactly is the point of this section.** No such stream was captured
+on the machine these were built on. What is real about them is the *shape*, and the shapes come from
+different places, which is why they are described separately below rather
+than as one family. Nothing here should be read as evidence about what any
+provider's refusal text actually says: the message bodies are fixture prose
+written to carry a reset time, not transcribed refusals. The claim these
+fixtures support is narrow and structural — that the declared capture selects
+the terminal event and reads its text out of the path the preset names — and
+that claim does not depend on the wording.
+
+* `claude-code-quota.jsonl`. The terminating line is
+  `{"type":"error","message":"..."}`, the genre and key the vestige ledger
+  records from the incident that commissioned this work
+  (`specs/substrate/evidence/vestige-sweep.md`, V-16 — *"a quota-terminated
+  stream ends `{"type":"error","message":"You've hit your usage limit... try
+  again at Aug 20th"}` and emits NO result"*). The ledger is the only source
+  for it; the preceding `system`/`assistant`/`user` lines are modelled on the
+  committed `claude-code.jsonl`, with `usage` objects added so the same
+  fixture can observe token spend surviving a walled lane. The absence
+  matters as much as the presence: there is **no `result` event**, which is
+  exactly why `finalMessage` cannot scrape such a stream and why the lane
+  used to exit with no envelope at all.
+* `codex-quota.jsonl`. The terminating line is
+  `{"type":"turn.failed","error":{"message":"..."}}`. codex states a terminal
+  condition in two genres and the preset declares both; a single stream can
+  only carry one, so this file carries `turn.failed` and the stream-level
+  `{"type":"error","message":"..."}` genre is exercised from an inline
+  synthetic line in the driver's own test. Neither genre is attested by a
+  recorded capture here — both are declared on the same footing as the rest
+  of the codex preset's flags, and the fixture proves only that the declared
+  candidate paths resolve the text where each genre puts it. There is no
+  `turn.completed` in this file, so it also fixes the honest reading of a
+  refused turn's spend: `not-reported`, never a zero.
+* `pi-quota.jsonl`. **Part real.** Lines 1–19 are `pi.jsonl` verbatim — the
+  real two-turn capture described above, truncated before its `agent_end` and
+  `agent_settled`, which a refused turn never reaches. Appended are a
+  `turn_start` and one derived `message_start`/`message_end` pair for the
+  refused turn. Every field in that pair is copied from the real capture's own
+  records or is the literal pi writes at that point in the lifecycle: the
+  `usage` object is pi's zero-fill for an invalid turn, exactly as
+  `pi-aborted-turn.jsonl` documents it, and `errorMessage` is the field that
+  fixture shows carrying `Operation aborted` on the `aborted` sibling of this
+  same `stopReason` guard. What is synthesised is the splice, the
+  `stopReason: "error"` value, and the `errorMessage` body.
+
+  The real prefix is load-bearing rather than decorative. The refused turn's
+  usage is zero-filled, so a fixture without a preceding valid turn could not
+  see that `tokenSpend` and `occupancy` still report the work that happened
+  (input 190, output 46, cacheRead 842) while `terminal` reports the wall —
+  which is the property those two captures' `stopReason` guards exist for,
+  read from both sides at once. The `message_start` is present for the reason
+  the aborted fixture states: a bare spliced `message_end` is not a shape
+  `pi --mode json` can produce.
+
+### What these three still cannot see
+
+* Nothing here observes a provider's real refusal text, so no fixture in this
+  directory can be used to check any parsing of a reset time out of a
+  message. Tally deliberately does none: the message travels whole.
+* Nothing here observes what a harness does *after* it states a terminal
+  event — whether the process exits non-zero, whether more lines follow — so
+  these fixtures say nothing about exit-code handling, only about the scrape.
+* `claude-code-quota.jsonl` and `codex-quota.jsonl` carry no real session
+  identifiers, working directories or free-text bodies, for the same reason
+  `pi.jsonl` is redacted: this repository is public.
+
+### What reads them
+
+`crates/spec-build-driver/src/adapter_outcome.rs`, against the preset
+declarations in `test/fixtures/spec-build/adapter-terminal-catalog.json`.
+That file is a snapshot of `nix/lib/adapters.nix`'s preset catalog, generated
+by evaluating it (`nix eval` over `presets`, filtered to the adapters these
+cases exercise) rather than hand-typed, and embedded in the driver rather
+than read from the repository root so the packaged build carries it. The nix
+expression stays the authority: regenerate the snapshot when a preset's
+declarations change.
