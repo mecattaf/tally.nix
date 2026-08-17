@@ -14,14 +14,35 @@ use serde_json::Value;
 
 use crate::lint::Context;
 
+/// One acceptance criterion of a task: the id a trace row cites and the argv
+/// the criterion is graded by.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Criterion {
+    pub id: String,
+    pub argv: Vec<String>,
+}
+
 /// One task of the governing worklist, reduced to the fields the join reads.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Task {
     pub id: String,
     /// `readFirst.specSections`, verbatim.
     pub spec_sections: Vec<String>,
-    /// The `acceptanceCriteria` ids, in worklist order.
-    pub acceptance: Vec<String>,
+    /// The `acceptanceCriteria`, in worklist order.
+    pub criteria: Vec<Criterion>,
+    /// `conflictDomains` — the write boundary the task declares. `None` when
+    /// the key is absent: a boundary inferred after execution declares no
+    /// allowlist here, and the checkpoint kind carries none by contract.
+    pub conflict_domains: Option<Vec<String>>,
+}
+
+impl Task {
+    /// Whether the task declares an acceptance id.
+    pub fn declares(&self, acceptance: &str) -> bool {
+        self.criteria
+            .iter()
+            .any(|criterion| criterion.id == acceptance)
+    }
 }
 
 /// One campaign gate, so a `[gate: <id>]` binding can be witnessed by its argv.
@@ -53,12 +74,21 @@ impl Worklist {
                     .map(|task| Task {
                         id: string(&task["id"]),
                         spec_sections: strings(&task["readFirst"]["specSections"]),
-                        acceptance: task["acceptanceCriteria"]
+                        criteria: task["acceptanceCriteria"]
                             .as_array()
                             .map(|criteria| {
-                                criteria.iter().map(|entry| string(&entry["id"])).collect()
+                                criteria
+                                    .iter()
+                                    .map(|entry| Criterion {
+                                        id: string(&entry["id"]),
+                                        argv: strings(&entry["argv"]),
+                                    })
+                                    .collect()
                             })
                             .unwrap_or_default(),
+                        conflict_domains: task["conflictDomains"]
+                            .as_array()
+                            .map(|domains| domains.iter().map(string).collect()),
                     })
                     .collect()
             })
@@ -266,7 +296,8 @@ mod tests {
       "tasks": [
         { "id": "a-task",
           "readFirst": { "specSections": ["specs/sample/spec.md#r1"], "styleReferences": [] },
-          "acceptanceCriteria": [ { "id": "green", "argv": ["true"] } ] }
+          "acceptanceCriteria": [ { "id": "green", "argv": ["true"] } ],
+          "conflictDomains": ["crates/sample"] }
       ]
     }"#;
 
@@ -284,7 +315,15 @@ mod tests {
         let worklist = Worklist::parse("w.json".to_owned(), WORKLIST.to_owned());
         let task = worklist.task("a-task").expect("the task is read");
         assert_eq!(task.spec_sections, ["specs/sample/spec.md#r1"]);
-        assert_eq!(task.acceptance, ["green"]);
+        assert_eq!(task.criteria.len(), 1);
+        assert_eq!(task.criteria[0].id, "green");
+        assert_eq!(task.criteria[0].argv, ["true"]);
+        assert!(task.declares("green"));
+        assert!(!task.declares("absent"));
+        assert_eq!(
+            task.conflict_domains.as_deref(),
+            Some(["crates/sample".to_owned()].as_slice())
+        );
         assert_eq!(
             worklist.gate("cargo-tests").expect("the gate is read").argv,
             ["cargo", "test"]
@@ -307,6 +346,19 @@ mod tests {
     fn a_malformed_file_reads_as_empty_rather_than_panicking() {
         let worklist = Worklist::parse("w.json".to_owned(), "not json".to_owned());
         assert!(worklist.tasks.is_empty());
+        // An omitted boundary is absence, not an empty allowlist: the two mean
+        // different things to the join, so the reader keeps them apart.
+        let boundless = Worklist::parse(
+            "w.json".to_owned(),
+            "{\"tasks\": [{\"id\": \"a-checkpoint\"}]}".to_owned(),
+        );
+        assert_eq!(
+            boundless
+                .task("a-checkpoint")
+                .expect("the task is read")
+                .conflict_domains,
+            None
+        );
         let trace = Trace::parse("t.json".to_owned(), "{\"rows\": 7}".to_owned(), None);
         assert!(trace.rows.is_empty());
         assert_eq!(line_of("a\nb\nc", "zzz"), 1);

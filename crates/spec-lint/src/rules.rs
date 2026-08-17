@@ -24,6 +24,7 @@ pub enum RuleId {
     L15,
     L16,
     L17,
+    L18,
 }
 
 impl RuleId {
@@ -47,6 +48,7 @@ impl RuleId {
             Self::L15 => "L15",
             Self::L16 => "L16",
             Self::L17 => "L17",
+            Self::L18 => "L18",
         }
     }
 
@@ -74,9 +76,9 @@ pub enum Stage {
     /// Evaluated by this crate's `check` pass over one `spec.md`.
     Core,
     /// Evaluated by the cross-artifact resolution pass, which runs inside the
-    /// check mode over the governing worklist and `trace.json`. L13 and L14
-    /// run there today; L17 compares the trace against its parent revision and
-    /// waits on sitting mode, the only place a parent revision exists.
+    /// check mode over the governing worklist and `trace.json`. L13, L14, and
+    /// L18 run there today; L17 compares the trace against its parent revision
+    /// and waits on sitting mode, the only place a parent revision exists.
     Resolution,
 }
 
@@ -90,7 +92,7 @@ pub struct Rule {
 }
 
 /// Every rule the README enumerates, in README order.
-pub const CATALOG: [Rule; 17] = [
+pub const CATALOG: [Rule; 18] = [
     Rule {
         id: RuleId::L1,
         severity: "blocking",
@@ -176,6 +178,11 @@ pub const CATALOG: [Rule; 17] = [
         severity: "blocking in sitting mode",
         stage: Stage::Resolution,
     },
+    Rule {
+        id: RuleId::L18,
+        severity: "blocking",
+        stage: Stage::Resolution,
+    },
 ];
 
 #[cfg(test)]
@@ -187,7 +194,7 @@ mod tests {
         for rule in CATALOG {
             assert_eq!(RuleId::parse(rule.id.as_str()), Some(rule.id));
         }
-        assert_eq!(RuleId::parse("L18"), None);
+        assert_eq!(RuleId::parse("L19"), None);
         assert_eq!(RuleId::parse("l1"), None);
     }
 

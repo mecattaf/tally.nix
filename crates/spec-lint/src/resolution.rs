@@ -14,6 +14,10 @@
 //!   claims the spec declares, tasks the worklist declares, and acceptance ids
 //!   those tasks declare; no release row precedes its sitting row; and every
 //!   claim is traced to a task or left to an unauthored stage.
+//! - `[L18]` every path a task's acceptance criteria require it to write falls
+//!   inside the `conflictDomains` that task declares. The join is the one the
+//!   lane discovers by being refused mid-flight; read at authoring time it is
+//!   two committed fields of one file.
 //!
 //! Both halves are conditional on their artifact existing. A spec proposed
 //! before its boundary sitting governs no worklist and has no trace rows yet;
@@ -22,6 +26,7 @@
 use std::collections::BTreeSet;
 
 use crate::artifacts::{self, Artifacts, Trace, Worklist};
+use crate::boundary;
 use crate::defect::Defect;
 use crate::document::Document;
 use crate::index;
@@ -37,6 +42,7 @@ pub fn resolve(document: &Document, context: &Context, artifacts: &Artifacts) ->
 
     if let Some(worklist) = &artifacts.worklist {
         pointers(worklist, &tree, &mut defects);
+        acceptance_domains(worklist, &mut defects);
     }
     if let Some(trace) = &artifacts.trace {
         validate(trace, &mut defects);
@@ -92,6 +98,37 @@ fn pointers(worklist: &Worklist, tree: &Tree, defects: &mut Vec<Defect>) {
                     format!(
                         "task `{}` reads first from `{pointer}`; `{path}` offers no `#{anchor}` anchor",
                         task.id
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// `[L18]` — every path a task's acceptance criteria require the lane to write
+/// is inside the write boundary that task declares.
+///
+/// A task whose `conflictDomains` key is absent declares no boundary here: the
+/// serial-task boundary is inferred after execution and the checkpoint kind
+/// carries none, so there is no allowlist to hold a path against. A declared
+/// but empty boundary grants nothing, and is read as the author wrote it.
+fn acceptance_domains(worklist: &Worklist, defects: &mut Vec<Defect>) {
+    for task in &worklist.tasks {
+        let Some(domains) = &task.conflict_domains else {
+            continue;
+        };
+        for criterion in &task.criteria {
+            for path in boundary::write_targets(&criterion.argv) {
+                if domains.iter().any(|domain| boundary::inside(&path, domain)) {
+                    continue;
+                }
+                defects.push(Defect::blocking(
+                    &worklist.file,
+                    artifacts::line_of(&worklist.text, &path),
+                    RuleId::L18,
+                    format!(
+                        "task `{}` acceptance `{}` writes `{path}`, which the conflictDomains that task declares do not grant",
+                        task.id, criterion.id
                     ),
                 ));
             }
@@ -197,7 +234,7 @@ fn rows(
                 )),
                 Some(task) => {
                     for id in &row.acceptance {
-                        if !task.acceptance.contains(id) {
+                        if !task.declares(id) {
                             defects.push(Defect::blocking(
                                 &trace.file,
                                 row.line,
