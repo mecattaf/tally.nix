@@ -790,6 +790,24 @@
           '';
           meta.mainProgram = "spec-build-driver";
         };
+        # The spec layer's enforcement engine (specs/zeta/spec.md#r1). Built from
+        # the same filtered source as the workspace, which carries no ./specs —
+        # the crate's specs-tree tests skip there by construction and bite in the
+        # full worktree; the committed spec corpus is linted by the check below,
+        # against the whole revision.
+        specLint = pkgs.rustPlatform.buildRustPackage {
+          pname = "spec-lint";
+          version = "0.1.0";
+          src = tallySource;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # All Boa workspace crates share this one fixed-output git source.
+            outputHashes."boa_ast-1.0.0-dev" = "sha256-xdB+SCFjaV+/hJu9n+3Il3vN0TZQXq0V95XmsJ/ihwo=";
+          };
+          cargoBuildFlags = [ "--package=spec-lint" ];
+          cargoTestFlags = [ "--package=spec-lint" ];
+          meta.mainProgram = "spec-lint";
+        };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
         catalogFixtureUnchecked = catalogLibrary.renderCatalog (
           catalogFixtureInput
@@ -3535,6 +3553,98 @@
                 touch "$out"
               '';
           spec-build-driver = specBuildDriver;
+          # The spec layer's standing consumer (specs/zeta/spec.md#r1 1.3,
+          # specs/zeta/spec.md#r3 3.3). One derivation carries both halves: the
+          # committed spec corpus is linted, and the must-fail corpus is replayed
+          # beside it against its exact defect map. A green attribute therefore
+          # witnesses both "the corpus is clean" and "the tool can bite" — a bar
+          # without a gate is not a bar, and a linter never shown to bite is the
+          # `--list-only` attribute reborn (VD-5, F33). test/fleet-gate.sh
+          # already runs `nix flake check -L --keep-going`, so this attribute
+          # grades every fleet-gated head with zero fleet-gate edits.
+          spec-lint =
+            pkgs.runCommand "tally-spec-lint"
+              {
+                nativeBuildInputs = [
+                  pkgs.diffutils
+                  pkgs.gawk
+                  pkgs.jq
+                ];
+                # The whole revision, because that is what the rules resolve
+                # against: `BELIEVE:<path>` lines and backticked identifiers are
+                # read against the tree at the lint revision (specs/README.md §4,
+                # §5), so a source narrowed to specs/ alone would report files
+                # that exist as absent. specs/ and the fixture corpus both travel
+                # inside it, so the check re-runs when either changes. Read-only:
+                # the lint never writes, so the tree enters uncopied and defect
+                # lines stay repo-relative.
+                tree = self;
+              }
+              ''
+                cd "$tree"
+                status=0
+
+                # (1) every committed specs/<identity>/ that carries a spec.md,
+                # each against the worklist it governs. A spec-less evidence-only
+                # identity directory is legal and skipped (specs/README.md §2,
+                # ruling Z2).
+                linted=0
+                for directory in specs/*/; do
+                  identity="$(basename "$directory")"
+                  test -f "$directory/spec.md" || continue
+                  linted=$((linted + 1))
+                  worklist="silent-factory-worklists/$identity.json"
+                  code=0
+                  if test -f "$worklist"; then
+                    ${specLint}/bin/spec-lint --worklist "$worklist" "$directory" || code=$?
+                  else
+                    ${specLint}/bin/spec-lint "$directory" || code=$?
+                  fi
+                  # 0 clean, 1 warnings only, 2 blocking. Only a blocking defect
+                  # fails the build; a warning is reported and survives.
+                  if test "$code" -ge 2; then
+                    echo "spec-lint: specs/$identity carries a blocking defect" >&2
+                    status=1
+                  fi
+                done
+                if test "$linted" -eq 0; then
+                  echo "spec-lint: no committed specs/<identity>/spec.md was linted" >&2
+                  exit 1
+                fi
+
+                # (2) the bite proof, inside this same derivation: the must-fail
+                # corpus exits 2 with defect codes exactly matching its committed
+                # expected-defects.json. A fixture that unexpectedly passes moves
+                # a count and fails here.
+                corpus=crates/spec-lint/tests/fixtures/must-fail
+                code=0
+                ${specLint}/bin/spec-lint "$corpus"/*/ 2> "$TMPDIR/defects" || code=$?
+                cat "$TMPDIR/defects" >&2
+                if test "$code" -ne 2; then
+                  echo "spec-lint: the must-fail corpus exited $code, not 2" >&2
+                  status=1
+                fi
+                # One defect is one stderr line `<file>:<line>: <rule-id>: <message>`.
+                awk -F': ' '{ print $2 }' "$TMPDIR/defects" \
+                  | sort \
+                  | uniq -c \
+                  | awk '{ print $2, $1 }' \
+                  | jq -R -s 'split("\n")
+                      | map(select(length > 0) | split(" ") | { (.[0]): (.[1] | tonumber) })
+                      | add // {}' > "$TMPDIR/observed.json"
+                if ! diff -u \
+                  <(jq -S . "$corpus/expected-defects.json") \
+                  <(jq -S . "$TMPDIR/observed.json"); then
+                  echo "spec-lint: the must-fail corpus and expected-defects.json disagree" >&2
+                  status=1
+                fi
+
+                if test "$status" -ne 0; then
+                  echo "spec-lint: the standing consumer is red; the defect lines above carry it" >&2
+                  exit 1
+                fi
+                touch "$out"
+              '';
           campaign-runtime =
             pkgs.runCommand "tally-campaign-runtime"
               {
