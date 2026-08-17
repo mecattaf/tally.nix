@@ -27,8 +27,6 @@ anchors becomes possible at the sitting that follows this campaign's close.
   oracle binding.
 - binding — a claim's single oracle: a flake check attribute, a worklist gate
   id, or HUMAN-ATTENDED.
-- provenance mark — the per-claim valve: unmarked DECIDE, BELIEVE:path,
-  GUESS, HUMAN-ATTENDED.
 - sitting — the human-attended boundary act that authors a worklist stage
   from a ratified spec and appends trace rows.
 - trace row — one append-only record in `trace.json` joining a claim to a
@@ -73,7 +71,7 @@ Why: the freeze contradiction resolves only if the join lives beside the frozen 
 
 ### R3 — the seams
 Why: the layer attaches with zero machinery change; these lines are falsified by the tree, not defended by it.
-3.1 BELIEVE:examples/flows/spec-build.js — `specSections` items are free strings of maxLength 1000 → anchors of the form `specs/zeta/spec.md#r2` are admissible worklist bytes unchanged. [HUMAN-ATTENDED]
+3.1 BELIEVE:examples/flows/spec-build.js — `specSections` items are free strings of maxLength 1000 → anchors of the form specs/zeta/spec.md#r2 are admissible worklist bytes unchanged. [HUMAN-ATTENDED]
 3.2 BELIEVE:crates/tally/src/cli/campaign.rs — the worker brief renders `specSections` verbatim under its read-first heading → the worker receives the anchor untouched. [HUMAN-ATTENDED]
 3.3 BELIEVE:test/fleet-gate.sh — the ladder runs `nix flake check -L --keep-going` → the new attribute grades every fleet-gated head with zero fleet-gate edits. [check: spec-lint]
 
@@ -84,13 +82,13 @@ Why: doctrine in prose decays; the procedures land where agents execute them.
 
 ## Unchanged
 
-U.1 worklist admission refuses unknown keys → the zeta worklist adds none and admits under schemaVersion 1 (given). [gate: cargo-tests]
-U.2 the pre-existing checks `module-layer` and `campaign-runtime` build beside the new attribute → the flake stays green. [gate: flake-build-subset]
+U.1 worklist admission refuses unknown keys → the zeta worklist admits under schemaVersion 1 (given) with zero added keys. [gate: cargo-tests]
+U.2 the pre-existing checks module-layer and campaign-runtime build beside the new attribute → the flake stays green. [gate: flake-build-subset]
 
 ## Unknowns
 
 UNKNOWN-1 whether an existing cargo test covers the read-first brief rendering (the would-be oracle for 3.2) — the spec-lint-core lane greps the campaign CLI tests; if present, 3.2 rebinds from HUMAN-ATTENDED at the next sitting.
-DECISION-1 the worklist `steward` field value after the ext0 merge? proposed: narrator (GUESS)
+DECISION-1 the worklist `steward` field value after the ext0 merge? proposed: narrator (given)
 
 ## Stages
 

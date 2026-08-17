@@ -22,8 +22,6 @@ amendment.
 
 ## Vocabulary
 
-- vestige — an unauthored substrate constant that presents as agent failure;
-  the census lives in specs/substrate/evidence/vestige-sweep.md.
 - adapter-terminal (NEW) — an outcome class scraped from the agent stream's
   own terminal error event; it stops the retry ladder.
 - substrate-numerals (NEW) — the flake check attribute that scans module and
@@ -62,7 +60,7 @@ Why: the five lint tasks answer to specs/zeta/spec.md; this group claims only th
 
 ## Unchanged
 
-U.1 worklist admission refuses unknown keys → the eta worklist adds none and admits under schemaVersion 1 (given). [gate: cargo-tests]
+U.1 worklist admission refuses unknown keys → the eta worklist admits under schemaVersion 1 (given) with zero added keys. [gate: cargo-tests]
 U.2 the pre-existing checks module-layer and campaign-runtime build beside the new attributes → the flake stays green. [gate: flake-build-subset]
 
 ## Unknowns
