@@ -31,6 +31,7 @@ fn packaged_binary_exposes_the_native_action_surface() {
         "constraint",
         "checkpoint",
         "publish",
+        "stagePublish",
         "rebase",
         "merge",
     ] {

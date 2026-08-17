@@ -20,6 +20,10 @@ use tally_core::campaign_folds::{
     campaign_digest as fold_campaign_digest, render_campaign_summary, stable_publish_branch,
     stage_scoped_summary_ref, CampaignReconciliation,
 };
+use tally_core::campaign_publish::{
+    publish_plan, publish_receipt_ref, PublishAction, PublishFacts, PublishPlan, PublishProof,
+    PublishReceiptV1,
+};
 use uuid::Uuid;
 
 use crate::adapter_outcome::{self, LaneOutcome};
@@ -183,6 +187,7 @@ pub(crate) fn dispatch(action: &str, brief: &Json) -> Result<Json> {
         "constraint" => action_constraint(brief),
         "checkpoint" => action_checkpoint(brief),
         "publish" => action_publish(brief),
+        "stagePublish" => action_stage_publish(brief),
         "rebase" => action_rebase(brief),
         "merge" => action_merge(brief),
         "cleanup" => action_cleanup(brief),
@@ -11143,6 +11148,472 @@ fn action_rebase(brief: &Json) -> Result<Json> {
     ))
 }
 
+/// One witnessed gate proof: the checkpoint task, its durable ref, and the
+/// revision that ref proves.
+#[derive(Clone, Debug)]
+struct GateProof {
+    task_id: String,
+    reference: String,
+    revision: String,
+}
+
+/// Read the pass's claimed gate proofs and keep the ones the remote confirms.
+///
+/// A claimed proof is checked against the canonical checkpoint ref name and
+/// the object that ref actually names, so the publish decision rests on the
+/// durable fact rather than on the brief that carried it.
+fn witnessed_gate_proofs(
+    config: &RepoConfig,
+    campaign: &str,
+    issue_number: &str,
+    source_sha256: &str,
+    value: Option<&Json>,
+) -> Result<Vec<GateProof>> {
+    let claimed = value
+        .and_then(Json::as_array)
+        .ok_or_else(|| DriverError::new("proofs must be an array"))?;
+    let mut proofs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for claim in claimed {
+        let proof = object_exact(claim, &["taskId", "ref", "revision"], "proof")?;
+        let task_id = required_string(proof.get("taskId"), "proof.taskId", Some(80))?;
+        if !is_task_id(&task_id) {
+            return Err(DriverError::new("proof.taskId is not a safe task ID"));
+        }
+        let revision = full_oid(proof.get("revision"), "proof.revision")?;
+        let reference = required_string(proof.get("ref"), "proof.ref", None)?;
+        let expected = checkpoint_ref(campaign, issue_number, &task_id, source_sha256, &revision)?;
+        if reference != expected {
+            return Err(DriverError::new(format!(
+                "gate proof {reference:?} is not the checkpoint ref {expected:?} its task and revision name"
+            )));
+        }
+        if remote_ref_oid(&config.checkout, &config.remote, &reference)?.as_deref()
+            != Some(revision.as_str())
+        {
+            return Err(DriverError::new(format!(
+                "gate proof {reference:?} does not name revision {revision} on the campaign remote"
+            )));
+        }
+        if seen.insert((task_id.clone(), revision.clone())) {
+            proofs.push(GateProof {
+                task_id,
+                reference,
+                revision,
+            });
+        }
+    }
+    Ok(proofs)
+}
+
+/// The paths one line changed since it forked from the other.
+///
+/// Renames stay un-detected on purpose: the question this answers is which
+/// paths a rebase would have to replay over, and a rename is two of them.
+fn changed_paths(checkout: &Path, from: &str, to: &str) -> Result<BTreeSet<String>> {
+    let listed = git(
+        checkout,
+        [
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &format!("{from}..{to}"),
+        ],
+        true,
+    )?;
+    Ok(listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect())
+}
+
+/// Rebase the integration line onto the base branch it diverged from.
+///
+/// The rebased head is a new commit that no gate has seen, so this moves the
+/// integration branch and nothing else. The chapter gate's own ref is keyed by
+/// the revision it proved, so the next pass re-runs it against the rebased
+/// head and the fast-forward follows from that proof.
+fn rebase_integration_onto_base(
+    config: &RepoConfig,
+    branch: &str,
+    head: &str,
+    base_head: &str,
+    fork_point: &str,
+    workspace_root: &Path,
+) -> Result<String> {
+    fs::create_dir_all(workspace_root)?;
+    let temporary = workspace_root.join(format!("publish-{}", Uuid::new_v4()));
+    let checkout = temporary.join("worktree");
+    fs::create_dir_all(&temporary)?;
+    let checkout_text = checkout.to_string_lossy().into_owned();
+    git(
+        &config.checkout,
+        [
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            &checkout_text,
+            head,
+        ],
+        true,
+    )?;
+    let rebased = (|| {
+        let replayed = git(
+            &checkout,
+            [
+                "-c",
+                "user.name=tally spec-build",
+                "-c",
+                "user.email=tally-spec-build@invalid",
+                "rebase",
+                "--onto",
+                base_head,
+                fork_point,
+            ],
+            false,
+        )?;
+        if !replayed.success() {
+            let detail = replayed.detail();
+            let aborted = git(&checkout, ["rebase", "--abort"], false)?;
+            return Err(DriverError::new(format!(
+                "cannot rebase the integration line onto {base_head}: {detail}; rebase abort exited {}",
+                aborted.status
+            )));
+        }
+        let rebased_head = git(&checkout, ["rev-parse", "HEAD"], true)?.stdout_trimmed();
+        if !is_full_oid(&rebased_head) {
+            return Err(DriverError::new(
+                "the rebased integration head is not a Git object ID",
+            ));
+        }
+        git(
+            &config.checkout,
+            [
+                "update-ref",
+                &format!("refs/heads/{branch}"),
+                &rebased_head,
+                head,
+            ],
+            true,
+        )?;
+        Ok(rebased_head)
+    })();
+    let _ = git(
+        &config.checkout,
+        ["worktree", "remove", "--force", &checkout_text],
+        false,
+    );
+    let _ = fs::remove_dir_all(&temporary);
+    rebased
+}
+
+/// Record the one published revision as a durable, idempotent remote ref.
+///
+/// The ref is the durable fact and it is immutable: one ref per published
+/// revision, named by that revision and pointing at it. The rendered receipt
+/// beside it stamps *this* act — a later pass that finds the same head still
+/// published re-affirms the same one sha rather than minting a second one.
+fn record_publish_receipt(
+    config: &RepoConfig,
+    campaign: &str,
+    issue_number: &str,
+    base_branch: &str,
+    sha: &str,
+    proof: &GateProof,
+) -> Result<(String, Json)> {
+    let receipt = PublishReceiptV1::new(
+        campaign,
+        base_branch,
+        sha,
+        PublishProof {
+            task_id: proof.task_id.clone(),
+            reference: proof.reference.clone(),
+        },
+        ATTEMPT_RECEIPT_MACHINE_ACTOR,
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    )
+    .map_err(|error| DriverError::new(format!("cannot record the publish receipt: {error}")))?;
+    let reference = publish_receipt_ref(&local_state_prefix(campaign, issue_number), sha)
+        .map_err(|error| DriverError::new(format!("cannot name the publish receipt: {error}")))?;
+    let existing = remote_ref_oid(&config.checkout, &config.remote, &reference)?;
+    if existing.as_deref().is_some_and(|existing| existing != sha) {
+        return Err(DriverError::new(format!(
+            "immutable publish receipt {reference:?} already points to another object"
+        )));
+    }
+    if existing.is_none() {
+        let pushed = git(
+            &config.checkout,
+            ["push", &config.remote, &format!("{sha}:{reference}")],
+            false,
+        )?;
+        if !pushed.success()
+            && remote_ref_oid(&config.checkout, &config.remote, &reference)?.as_deref() != Some(sha)
+        {
+            return Err(DriverError::new(format!(
+                "cannot record publish receipt {reference:?}: {}",
+                pushed.detail()
+            )));
+        }
+    }
+    let recorded = serde_json::to_value(&receipt)
+        .ok()
+        .and_then(|value| json::parse(&value.to_string()).ok())
+        .ok_or_else(|| DriverError::new("the publish receipt did not render as JSON"))?;
+    Ok((reference, recorded))
+}
+
+/// Advance the base branch by machine fast-forward of a gate-proven head.
+///
+/// The whole act is here: witness the two branch heads and the durable gate
+/// proof, decide with the shared fold, and execute exactly what it decided.
+/// The base branch moves in one place, under one precondition — the head it
+/// moves to is the head a gate proved — and the receipt names that one sha.
+fn stage_publish_local(
+    config: &RepoConfig,
+    campaign: &str,
+    identity: &str,
+    issue_number: &str,
+    workspace_root: &Path,
+    proofs: &[GateProof],
+) -> Result<Json> {
+    let branch = integration_branch(campaign, identity);
+    let integration_head = required_integration_revision(config, campaign, identity)?;
+    let base_head = git(
+        &config.checkout,
+        [
+            "rev-parse",
+            "--verify",
+            &format!("{}/{}^{{commit}}", config.remote, config.base_branch),
+        ],
+        true,
+    )?
+    .stdout_trimmed();
+    if !is_full_oid(&base_head) {
+        return Err(DriverError::new(
+            "the campaign base branch did not resolve to a Git object ID",
+        ));
+    }
+    let proof = proofs
+        .iter()
+        .find(|proof| proof.revision == integration_head);
+    let base_is_ancestor = git(
+        &config.checkout,
+        ["merge-base", "--is-ancestor", &base_head, &integration_head],
+        false,
+    )?
+    .success();
+    let integration_is_ancestor = git(
+        &config.checkout,
+        ["merge-base", "--is-ancestor", &integration_head, &base_head],
+        false,
+    )?
+    .success();
+    let fork_point = if base_is_ancestor || integration_is_ancestor {
+        None
+    } else {
+        let common = git(
+            &config.checkout,
+            ["merge-base", &base_head, &integration_head],
+            false,
+        )?;
+        common
+            .success()
+            .then(|| common.stdout_trimmed())
+            .filter(|oid| is_full_oid(oid))
+    };
+    let (base_paths, integration_paths) = match fork_point.as_deref() {
+        None => (BTreeSet::new(), BTreeSet::new()),
+        Some(fork) => (
+            changed_paths(&config.checkout, fork, &base_head)?,
+            changed_paths(&config.checkout, fork, &integration_head)?,
+        ),
+    };
+    let facts = PublishFacts {
+        base_branch: config.base_branch.clone(),
+        base_head: base_head.clone(),
+        integration_head: integration_head.clone(),
+        proven_head: proof.map(|proof| proof.revision.clone()),
+        base_is_ancestor,
+        integration_is_ancestor,
+        base_paths,
+        integration_paths,
+    };
+    let mut plan = publish_plan(&facts);
+    if plan.action == PublishAction::RebaseAndRegate && fork_point.is_none() {
+        plan = PublishPlan {
+            action: PublishAction::Withhold,
+            sha: None,
+            reason: format!(
+                "the integration line and {} share no history",
+                config.base_branch
+            ),
+        };
+    }
+    let mut published_head = integration_head.clone();
+    let mut regate_required = false;
+    let mut receipt = Json::Null;
+    let mut receipt_ref = Json::Null;
+    match plan.action {
+        PublishAction::FastForward => {
+            let sha = plan.sha.as_deref().expect("a fast-forward names its sha");
+            let pushed = git(
+                &config.checkout,
+                [
+                    "push",
+                    &config.remote,
+                    &format!("{sha}:refs/heads/{}", config.base_branch),
+                ],
+                false,
+            )?;
+            if !pushed.success() {
+                return Err(DriverError::new(format!(
+                    "cannot fast-forward {} to the gate-proven head {sha}: {}",
+                    config.base_branch,
+                    pushed.detail()
+                )));
+            }
+            if remote_ref_oid(
+                &config.checkout,
+                &config.remote,
+                &format!("refs/heads/{}", config.base_branch),
+            )?
+            .as_deref()
+                != Some(sha)
+            {
+                return Err(DriverError::new(format!(
+                    "{} did not expose the gate-proven head {sha} after the fast-forward",
+                    config.base_branch
+                )));
+            }
+            let (reference, recorded) = record_publish_receipt(
+                config,
+                campaign,
+                issue_number,
+                &config.base_branch,
+                sha,
+                proof.expect("a published head carries its gate proof"),
+            )?;
+            receipt = recorded;
+            receipt_ref = Json::from(reference);
+        }
+        PublishAction::AlreadyPublished => {
+            // The receipt is the fact, and it is written here as well as after
+            // the push: a fast-forward that lands and then loses its process
+            // is repaired by the next pass rather than left unrecorded.
+            let sha = plan.sha.as_deref().expect("a publication names its sha");
+            let (reference, recorded) = record_publish_receipt(
+                config,
+                campaign,
+                issue_number,
+                &config.base_branch,
+                sha,
+                proof.expect("a published head carries its gate proof"),
+            )?;
+            receipt = recorded;
+            receipt_ref = Json::from(reference);
+        }
+        PublishAction::RebaseAndRegate => {
+            published_head = rebase_integration_onto_base(
+                config,
+                &branch,
+                &integration_head,
+                &base_head,
+                fork_point
+                    .as_deref()
+                    .expect("a divergence has a fork point"),
+                workspace_root,
+            )?;
+            regate_required = true;
+        }
+        PublishAction::Withhold => {}
+    }
+    Ok(Json::object([
+        ("action", Json::from(plan.action.as_str())),
+        ("baseBranch", Json::from(config.base_branch.clone())),
+        ("sha", plan.sha.map_or(Json::Null, Json::from)),
+        ("integrationHead", Json::from(published_head)),
+        (
+            "provenHead",
+            facts.proven_head.map_or(Json::Null, Json::from),
+        ),
+        ("regateRequired", Json::from(regate_required)),
+        ("receipt", receipt),
+        ("receiptRef", receipt_ref),
+        ("reason", Json::from(plan.reason)),
+    ]))
+}
+
+fn action_stage_publish(brief: &Json) -> Result<Json> {
+    let data = object_exact(
+        brief,
+        &[
+            "campaign",
+            "campaignIdentity",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "runId",
+            "workspaceRoot",
+            "source",
+            "proofs",
+            "specRepository",
+            "issueRepository",
+        ],
+        "stagePublish brief",
+    )?;
+    let campaign = required_string(data.get("campaign"), "campaign", None)?;
+    if !is_component(&campaign) {
+        return Err(DriverError::new("campaign is not a safe component"));
+    }
+    let repository = repository_name(data.get("repository"), "repository")?;
+    let config = repo_config(data.get("repositoryConfig"))?;
+    campaign_coordinates(data, repository, config.clone())?;
+    let identity = campaign_identity(data, &campaign)?;
+    let issue_number = campaign_issue(data.get("issue"))?.0;
+    let source_value = data
+        .get("source")
+        .ok_or_else(|| DriverError::new("source must be an object"))?;
+    let source = object_exact(
+        source_value,
+        &["path", "sha256", "revision", "repository"],
+        "source",
+    )?;
+    let source_sha256 = required_string(source.get("sha256"), "source.sha256", None)?;
+    let workspace_root = PathBuf::from(required_string(
+        data.get("workspaceRoot"),
+        "workspaceRoot",
+        None,
+    )?);
+    if !workspace_root.is_absolute() {
+        return Err(DriverError::new("workspaceRoot must be absolute"));
+    }
+    git(
+        &config.checkout,
+        ["fetch", "--prune", "--no-tags", &config.remote],
+        true,
+    )?;
+    let proofs = witnessed_gate_proofs(
+        &config,
+        &campaign,
+        &issue_number,
+        &source_sha256,
+        data.get("proofs"),
+    )?;
+    stage_publish_local(
+        &config,
+        &campaign,
+        &identity,
+        &issue_number,
+        &workspace_root,
+        &proofs,
+    )
+}
+
 fn prune_empty_ancestors(path: &Path, stop: &Path) {
     let mut current = path.to_owned();
     while current != stop {
@@ -11298,13 +11769,13 @@ mod tests {
     use super::{
         action_retry, action_steer, action_worker_outcome, append_attempt_receipt,
         append_diagnosis_report, campaign_attempt_state, campaign_attempt_state_all,
-        checkpoint_capture_note, classify_worker_outcome, closed_inline_code_spans,
+        checkpoint_capture_note, checkpoint_ref, classify_worker_outcome, closed_inline_code_spans,
         contains_bare_exclamation_mark, current_task_input_epochs, excerpt_text_window,
         fold_attempt_receipts, git_with_input, integration_branch, json, merge_local,
-        publish_closing_summary, read_capture_tail, read_local_blob,
-        replace_bare_exclamation_marks, validate_attempt_receipt, validate_outcome_first,
-        DiagnosisVerdict, Json, RepoConfig, WorkerOutcome, CHECKPOINT_CAPTURE_MAX_BYTES,
-        CHECKPOINT_STDERR_WINDOW_CHARS,
+        publish_closing_summary, read_capture_tail, read_local_blob, remote_ref_oid,
+        replace_bare_exclamation_marks, stage_publish_local, validate_attempt_receipt,
+        validate_outcome_first, witnessed_gate_proofs, DiagnosisVerdict, GateProof, Json,
+        RepoConfig, WorkerOutcome, CHECKPOINT_CAPTURE_MAX_BYTES, CHECKPOINT_STDERR_WINDOW_CHARS,
     };
     use tally_core::attempt_receipts::{
         AttemptReceiptAuthorityV1, ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR,
@@ -12838,5 +13309,350 @@ mod tests {
         let small = excerpt_text_window("short capture\n", CHECKPOINT_STDERR_WINDOW_CHARS);
         assert!(!small.truncated);
         assert_eq!(small.text, "short capture\n");
+    }
+
+    fn write_fixture_file(checkout: &Path, path: &str, body: &str) {
+        let file = checkout.join(path);
+        fs::create_dir_all(file.parent().expect("a fixture path has a parent")).unwrap();
+        fs::write(file, body).unwrap();
+    }
+
+    /// A campaign checkout wired to its own remote: the whole authority
+    /// surface a `forge: "local"` campaign has. `main` lives on the remote,
+    /// the integration branch is local, and gate proofs are pushed refs.
+    struct StagePublishFixture {
+        root: PathBuf,
+        checkout: PathBuf,
+        config: RepoConfig,
+        campaign: String,
+        identity: String,
+        issue: String,
+        source_sha256: String,
+        integration: String,
+    }
+
+    impl StagePublishFixture {
+        fn new(identity: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("tally-stage-publish-{}", Uuid::new_v4()));
+            let origin = root.join("origin");
+            let checkout = root.join("checkout");
+            fs::create_dir_all(&origin).unwrap();
+            fs::create_dir_all(&checkout).unwrap();
+            summary_ref_test_git(
+                &origin,
+                &["init", "--bare", "--quiet", "--initial-branch=main"],
+            );
+            summary_ref_test_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+            summary_ref_test_git(&checkout, &["config", "user.name", "Stage Publish Test"]);
+            summary_ref_test_git(
+                &checkout,
+                &["config", "user.email", "stage-publish@example.invalid"],
+            );
+            summary_ref_test_git(
+                &checkout,
+                &["remote", "add", "origin", &origin.to_string_lossy()],
+            );
+            fs::write(checkout.join("README.md"), "fixture\n").unwrap();
+            summary_ref_test_git(&checkout, &["add", "README.md"]);
+            summary_ref_test_git(&checkout, &["commit", "--quiet", "-m", "fixture"]);
+            summary_ref_test_git(&checkout, &["push", "--quiet", "origin", "main"]);
+            let campaign = "fixture".to_owned();
+            let integration = integration_branch(&campaign, identity);
+            summary_ref_test_git(&checkout, &["branch", &integration, "main"]);
+            Self {
+                config: RepoConfig {
+                    checkout: checkout.clone(),
+                    base_branch: "main".to_owned(),
+                    remote: "origin".to_owned(),
+                },
+                root,
+                checkout,
+                campaign,
+                identity: identity.to_owned(),
+                issue: "7".to_owned(),
+                source_sha256: format!("sha256:{}", "a".repeat(64)),
+                integration,
+            }
+        }
+
+        /// One lane merge, as the merge node would leave it.
+        fn commit_on_integration(&self, path: &str, body: &str) -> String {
+            summary_ref_test_git(&self.checkout, &["switch", "--quiet", &self.integration]);
+            write_fixture_file(&self.checkout, path, body);
+            summary_ref_test_git(&self.checkout, &["add", path]);
+            summary_ref_test_git(
+                &self.checkout,
+                &["commit", "--quiet", "-m", &format!("feat: {path}")],
+            );
+            let head = summary_ref_test_git(&self.checkout, &["rev-parse", "HEAD"]);
+            summary_ref_test_git(&self.checkout, &["switch", "--quiet", "main"]);
+            head
+        }
+
+        /// One operator record commit, landing on the published line the way
+        /// every eta chapter close landed one.
+        fn commit_on_main(&self, path: &str, body: &str) -> String {
+            write_fixture_file(&self.checkout, path, body);
+            summary_ref_test_git(&self.checkout, &["add", path]);
+            summary_ref_test_git(
+                &self.checkout,
+                &["commit", "--quiet", "-m", &format!("docs: {path}")],
+            );
+            summary_ref_test_git(&self.checkout, &["push", "--quiet", "origin", "main"]);
+            summary_ref_test_git(&self.checkout, &["rev-parse", "HEAD"])
+        }
+
+        /// The chapter gate's own durable receipt for one revision.
+        fn prove(&self, task_id: &str, revision: &str) -> GateProof {
+            let reference = checkpoint_ref(
+                &self.campaign,
+                &self.issue,
+                task_id,
+                &self.source_sha256,
+                revision,
+            )
+            .unwrap();
+            summary_ref_test_git(
+                &self.checkout,
+                &[
+                    "push",
+                    "--quiet",
+                    "origin",
+                    &format!("{revision}:{reference}"),
+                ],
+            );
+            GateProof {
+                task_id: task_id.to_owned(),
+                reference,
+                revision: revision.to_owned(),
+            }
+        }
+
+        fn remote_oid(&self, reference: &str) -> Option<String> {
+            remote_ref_oid(&self.checkout, "origin", reference).unwrap()
+        }
+
+        fn published_main(&self) -> String {
+            self.remote_oid("refs/heads/main")
+                .expect("the fixture remote always has main")
+        }
+
+        fn publish(&self, proofs: &[GateProof]) -> BTreeMap<String, Json> {
+            summary_ref_test_git(&self.checkout, &["fetch", "--prune", "--no-tags", "origin"]);
+            stage_publish_local(
+                &self.config,
+                &self.campaign,
+                &self.identity,
+                &self.issue,
+                &self.root.join("workspaces"),
+                proofs,
+            )
+            .unwrap()
+            .as_object()
+            .expect("the publish node returns an object")
+            .clone()
+        }
+    }
+
+    impl Drop for StagePublishFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn field(result: &BTreeMap<String, Json>, key: &str) -> String {
+        result
+            .get(key)
+            .and_then(Json::as_str)
+            .unwrap_or_else(|| panic!("{key} is absent or not a string: {result:?}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn publish_fast_forwards_main_to_the_gate_proven_head_and_receipts_that_one_sha() {
+        let fixture = StagePublishFixture::new("ff");
+        let head = fixture.commit_on_integration("crates/tally/src/lane.rs", "lane\n");
+        let proof = fixture.prove("chapter-gate-c1", &head);
+
+        let result = fixture.publish(std::slice::from_ref(&proof));
+
+        assert_eq!(field(&result, "action"), "fast-forward");
+        assert_eq!(field(&result, "sha"), head);
+        assert_eq!(fixture.published_main(), head);
+        let receipt_ref = field(&result, "receiptRef");
+        assert_eq!(fixture.remote_oid(&receipt_ref), Some(head.clone()));
+        let receipt = result
+            .get("receipt")
+            .and_then(Json::as_object)
+            .expect("a published head carries its receipt")
+            .clone();
+        assert_eq!(field(&receipt, "sha"), head);
+        assert_eq!(field(&receipt, "baseBranch"), "main");
+        assert_eq!(
+            receipt
+                .get("provenBy")
+                .and_then(Json::as_object)
+                .map(|proven| field(proven, "reference")),
+            Some(proof.reference.clone())
+        );
+        // The receipt names one revision: the proof's ref ends in the sha it
+        // published, so a proven head and a published head cannot differ.
+        assert!(proof.reference.ends_with(&head));
+
+        // Publishing again is the same fact, not a second one.
+        let repeated = fixture.publish(&[proof]);
+        assert_eq!(field(&repeated, "action"), "already-published");
+        assert_eq!(field(&repeated, "sha"), head);
+        assert_eq!(fixture.published_main(), head);
+    }
+
+    #[test]
+    fn publish_leaves_main_alone_when_no_gate_has_proven_the_integration_head() {
+        let fixture = StagePublishFixture::new("unproven");
+        let before = fixture.published_main();
+        let proven = fixture.commit_on_integration("crates/tally/src/first.rs", "first\n");
+        let proof = fixture.prove("chapter-gate-c1", &proven);
+        // One more lane merges after the gate ran: the head the gate proved is
+        // no longer the head that would be published.
+        let head = fixture.commit_on_integration("crates/tally/src/second.rs", "second\n");
+
+        let result = fixture.publish(&[proof]);
+
+        assert_eq!(field(&result, "action"), "withhold");
+        assert_eq!(result.get("sha"), Some(&Json::Null));
+        assert_eq!(result.get("receipt"), Some(&Json::Null));
+        assert_eq!(fixture.published_main(), before);
+        assert!(
+            field(&result, "reason").contains(&head),
+            "the refusal names the unproven head: {}",
+            field(&result, "reason")
+        );
+
+        // No proof at all is the same refusal.
+        let unproven = fixture.publish(&[]);
+        assert_eq!(field(&unproven, "action"), "withhold");
+        assert_eq!(fixture.published_main(), before);
+    }
+
+    #[test]
+    fn publish_rebases_a_diverged_line_and_waits_for_the_re_gate_before_moving_main() {
+        let fixture = StagePublishFixture::new("diverged");
+        let head = fixture.commit_on_integration("crates/tally/src/lane.rs", "lane\n");
+        let proof = fixture.prove("chapter-gate-c1", &head);
+        let record = fixture.commit_on_main("AUG17-RUN.md", "the chapter close\n");
+
+        let rebase = fixture.publish(&[proof]);
+
+        // Main did not move: the rebased head is a commit no gate has seen.
+        assert_eq!(field(&rebase, "action"), "rebase-and-regate");
+        assert_eq!(rebase.get("sha"), Some(&Json::Null));
+        assert_eq!(rebase.get("receipt"), Some(&Json::Null));
+        assert_eq!(rebase.get("regateRequired"), Some(&Json::from(true)));
+        assert_eq!(fixture.published_main(), record);
+        let rebased = field(&rebase, "integrationHead");
+        assert_ne!(rebased, head);
+        assert_eq!(
+            summary_ref_test_git(
+                &fixture.checkout,
+                &["rev-parse", &format!("refs/heads/{}", fixture.integration)]
+            ),
+            rebased
+        );
+        // The operator's record commit is now on the integration line, so the
+        // ritual that used to move it by hand has nothing left to do.
+        summary_ref_test_git(
+            &fixture.checkout,
+            &["merge-base", "--is-ancestor", &record, &rebased],
+        );
+        assert_eq!(
+            summary_ref_test_git(
+                &fixture.checkout,
+                &["show", &format!("{rebased}:AUG17-RUN.md")]
+            ),
+            "the chapter close"
+        );
+
+        // The re-gate proves the rebased head, and only then does main move.
+        let regate = fixture.prove("chapter-gate-c1", &rebased);
+        let published = fixture.publish(&[regate]);
+        assert_eq!(field(&published, "action"), "fast-forward");
+        assert_eq!(field(&published, "sha"), rebased);
+        assert_eq!(fixture.published_main(), rebased);
+    }
+
+    #[test]
+    fn publish_withholds_a_divergence_both_lines_wrote() {
+        let fixture = StagePublishFixture::new("contended");
+        let head = fixture.commit_on_integration("crates/tally/src/lane.rs", "lane\n");
+        let proof = fixture.prove("chapter-gate-c1", &head);
+        let record = fixture.commit_on_main("crates/tally/src/lane.rs", "operator lane\n");
+
+        let result = fixture.publish(&[proof]);
+
+        assert_eq!(field(&result, "action"), "withhold");
+        assert_eq!(fixture.published_main(), record);
+        assert_eq!(
+            summary_ref_test_git(
+                &fixture.checkout,
+                &["rev-parse", &format!("refs/heads/{}", fixture.integration)]
+            ),
+            head,
+            "a contended divergence leaves both lines exactly where they are"
+        );
+        assert!(
+            field(&result, "reason").contains("crates/tally/src/lane.rs"),
+            "{}",
+            field(&result, "reason")
+        );
+    }
+
+    #[test]
+    fn publish_refuses_a_gate_proof_the_campaign_remote_does_not_carry() {
+        let fixture = StagePublishFixture::new("forged");
+        let head = fixture.commit_on_integration("crates/tally/src/lane.rs", "lane\n");
+        let reference = checkpoint_ref(
+            &fixture.campaign,
+            &fixture.issue,
+            "chapter-gate-c1",
+            &fixture.source_sha256,
+            &head,
+        )
+        .unwrap();
+        let refused = witnessed_gate_proofs(
+            &fixture.config,
+            &fixture.campaign,
+            &fixture.issue,
+            &fixture.source_sha256,
+            Some(&Json::Array(vec![Json::object([
+                ("taskId", Json::from("chapter-gate-c1")),
+                ("ref", Json::from(reference)),
+                ("revision", Json::from(head.clone())),
+            ])])),
+        )
+        .expect_err("an unpushed gate proof is not a proof");
+        assert!(
+            refused.to_string().contains("does not name revision"),
+            "{refused}"
+        );
+
+        // A ref that exists but is not the checkpoint ref its own task and
+        // revision name is refused before it can prove anything.
+        let proof = fixture.prove("chapter-gate-c1", &head);
+        let mismatched = witnessed_gate_proofs(
+            &fixture.config,
+            &fixture.campaign,
+            &fixture.issue,
+            &fixture.source_sha256,
+            Some(&Json::Array(vec![Json::object([
+                ("taskId", Json::from("chapter-gate-c2")),
+                ("ref", Json::from(proof.reference)),
+                ("revision", Json::from(head)),
+            ])])),
+        )
+        .expect_err("a proof must be the checkpoint ref its task names");
+        assert!(
+            mismatched.to_string().contains("is not the checkpoint ref"),
+            "{mismatched}"
+        );
     }
 }

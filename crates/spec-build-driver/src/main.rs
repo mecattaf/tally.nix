@@ -50,6 +50,8 @@ enum Action {
     Checkpoint,
     #[value(name = "publish")]
     Publish,
+    #[value(name = "stagePublish")]
+    StagePublish,
     #[value(name = "rebase")]
     Rebase,
     #[value(name = "merge")]
@@ -77,6 +79,7 @@ impl Action {
             Self::Constraint => "constraint",
             Self::Checkpoint => "checkpoint",
             Self::Publish => "publish",
+            Self::StagePublish => "stagePublish",
             Self::Rebase => "rebase",
             Self::Merge => "merge",
         }
@@ -125,7 +128,7 @@ mod tests {
 
     use super::{Action, Cli};
 
-    const ACTION_NAMES: [&str; 20] = [
+    const ACTION_NAMES: [&str; 21] = [
         "worklist",
         "sweep",
         "reconcile",
@@ -144,6 +147,7 @@ mod tests {
         "constraint",
         "checkpoint",
         "publish",
+        "stagePublish",
         "rebase",
         "merge",
     ];
