@@ -172,3 +172,21 @@ The eta campaign is disarmed pending the operator's chapter-2 ruling;
 the chapter-2 auto-dispatch that exceeded the ruling was stopped at two
 minutes. Awaiting: pin-bump confirmation (deploys the substrate repairs;
 deletes the 24 GiB drop-in outright per §5).
+
+## Chapters 1+2 CLOSED — C1 green, 2026-08-17 18:05 UTC
+
+Chapter 2 ran end to end on claude-code (operator ruling): spec-lint-core
+merged on attempt 4 (three legible refusals first: a sandbox-filter
+panic, a dirty-tree ownership refusal, and a background-build wait-loop
+deadlock — each now goal-byte doctrine), then resolution, flake-check,
+skills-amend, and doc-anchor-regrammar merged first-try. The chapter
+gate's first run went RED on the linter's first contact with its own
+authors' specs — seven defect lines across specs/eta and specs/zeta —
+and the operator-side regeneration turned it green without a single
+lane edit to spec bytes: the two-way loop's first full cycle. Final
+state: fleet gate PASS 5fe28fe90cea1a3f18e2a1080d95d6f585a59cc9 with
+checks.x86_64-linux.spec-lint executing inside the ladder; final bar
+24/24; published to main; eta disarmed pending the chapter-3 sitting.
+The coverage table above this entry's commit was rendered by
+spec-lint --coverage specs/eta — the first tool-rendered close-out;
+the hand-rendered table is dead as designed.
