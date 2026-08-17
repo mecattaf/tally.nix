@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/spec-build-driver",
+  "crates/spec-lint",
   "crates/tally-client",
   "crates/tally-core",
   "crates/tally-flow",
@@ -9,6 +10,7 @@ members = [
 ]
 default-members = [
   "crates/spec-build-driver",
+  "crates/spec-lint",
   "crates/tally-client",
   "crates/tally-core",
   "crates/tally-flow",

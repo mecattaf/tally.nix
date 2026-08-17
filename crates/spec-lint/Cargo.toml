@@ -1,0 +1,17 @@
+[package]
+name = "spec-lint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
