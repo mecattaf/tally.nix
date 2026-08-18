@@ -8,6 +8,41 @@ fn clap_tree_is_consistent() {
 }
 
 #[test]
+fn version_provenance_names_the_source_revision_beside_the_crate_version() {
+    let rendered = Opts::command().render_version().to_string();
+    assert!(
+        rendered.contains(env!("CARGO_PKG_VERSION")),
+        "--version must still name the workspace version: {rendered}"
+    );
+    assert!(
+        rendered.contains(env!("TALLY_BUILD_REV")),
+        "--version must name the build's source revision: {rendered}"
+    );
+}
+
+#[test]
+fn version_provenance_is_a_revision_or_the_unstamped_dev_fallback() {
+    // The two shapes the build environment can produce, and nothing else: a
+    // git revision (`self.rev`, or `self.dirtyRev`'s `<rev>-dirty`) when nix
+    // stamped one, and the literal `dev` when no revision was passed. An empty
+    // or free-form stamp would render a --version line that reads like
+    // provenance without being any.
+    let stamped = env!("TALLY_BUILD_REV");
+    if stamped == "dev" {
+        return;
+    }
+    let revision = stamped.strip_suffix("-dirty").unwrap_or(stamped);
+    assert!(
+        revision.len() >= 7
+            && revision.len() <= 64
+            && revision
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()),
+        "a stamped revision must be a hexadecimal object name: {stamped}"
+    );
+}
+
+#[test]
 fn rpc_timeout_flag_is_global() {
     let options =
         Opts::try_parse_from(["tally", "query", "pools", "--rpc-timeout-sec", "7"]).unwrap();

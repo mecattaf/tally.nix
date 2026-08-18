@@ -8,7 +8,7 @@ pub(super) enum Mode {
 #[derive(Debug, Parser)]
 #[command(
     name = "tally",
-    version,
+    version = VERSION,
     about = "Contention and proof for impure labor"
 )]
 pub(super) struct Opts {

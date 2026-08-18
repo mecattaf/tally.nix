@@ -30,6 +30,15 @@
         inherit self;
       };
       priorityRanks = import ./nix/lib/priority-ranks.nix;
+      # The source revision the package is built from. `self.rev` on a clean
+      # checkout, `self.dirtyRev` (`<rev>-dirty`) when the flake ref carries
+      # uncommitted bytes, and the literal `dev` when the ref carries no git
+      # metadata at all — a tarball, or a plain `cargo build` that never sees
+      # this expression. Passed into the build environment rather than written
+      # into a committed file so a build outside nix stays reproducible, and
+      # read back by `tally --version`: a deployed binary that cannot name its
+      # own provenance forces every seam check to read store paths instead.
+      buildRevision = self.rev or self.dirtyRev or "dev";
     in
     {
       lib.adapters = adapterLibrary;
@@ -41,6 +50,8 @@
       };
       nixosModules.tally = import ./nix/modules/nixos.nix self;
       homeManagerModules.tally = import ./nix/modules/home-manager.nix self;
+      # The fleet-free product profile, imported beside `homeManagerModules.tally`.
+      homeManagerModules.product = import ./nix/modules/product-profile.nix self;
     }
     // flake-utils.lib.eachSystem supportedSystems (
       system:
@@ -150,6 +161,8 @@
             # All Boa workspace crates share this one fixed-output git source.
             outputHashes."boa_ast-1.0.0-dev" = "sha256-xdB+SCFjaV+/hJu9n+3Il3vN0TZQXq0V95XmsJ/ihwo=";
           };
+          # Read by `crates/tally/build.rs` and rendered into `--version`.
+          TALLY_BUILD_REV = buildRevision;
           doCheck = true;
           preCheck = ''
             export TALLY_NIX_CATALOG_FIXTURE=${catalogFixtureUnchecked}
@@ -1282,6 +1295,25 @@
                     catalog = catalogFixture;
                   };
                 };
+              };
+            }
+          ];
+        };
+        # The product profile under evaluation: the tally module plus
+        # `nix/modules/product-profile.nix` and the three bytes home-manager
+        # demands of any configuration, and nothing else. Whatever this needs
+        # beyond those bytes is something a machine outside the fleet would
+        # also need, which is the whole point of checking it.
+        productHome = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            self.homeManagerModules.product
+            {
+              home = {
+                username = "tally-product";
+                homeDirectory = "/tmp/tally-product-home";
+                stateVersion = "26.11";
               };
             }
           ];
@@ -3056,6 +3088,7 @@
         campaignSystemPollScript =
           campaignNixos.config.systemd.services.tally-campaign-poll.serviceConfig.ExecStart;
         checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
+        checkedProductConfig = productHome.config.xdg.configFile."tally/config.json".source;
         systemServices = stockNixos.config.systemd.services;
         systemTimers = stockNixos.config.systemd.timers;
         campaignSystemConfig = campaignNixos.config.services.tally;
@@ -3469,6 +3502,83 @@
           doc = documentation;
           hardening-doc-drift = hardeningDocDrift;
           stock-home-activation = stockHome.activationPackage;
+          # D1's witness, in one derivation because either half alone is a
+          # half-truth: a profile that evaluates but whose package cannot find
+          # its own flow assets runs no campaign, and assets sitting beside a
+          # binary nobody can configure are not an install. Green here means a
+          # machine that has never heard of the fleet can install this head and
+          # arm a campaign on an ordinary repository.
+          product-profile =
+            pkgs.runCommand "tally-product-profile"
+              {
+                activationPackage = productHome.activationPackage;
+                checkedConfig = checkedProductConfig;
+                nativeBuildInputs = [ pkgs.jq ];
+              }
+              ''
+                trap 'echo "product-profile: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+                # (a) The profile activates, exactly the way
+                # `stock-home-activation` activates `stockHome`: its activation
+                # package is built, and the config that package installs is the
+                # one the daemon accepts.
+                test -e "$activationPackage"
+                ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
+
+                # ...and what it renders is the campaign runtime with nothing
+                # fleet-shaped in it: no remote executor, no flow or producer
+                # unit synthesized from a coordinator's declaration. The two
+                # campaign pools carry the resource kinds the module layer
+                # supplies and the width the profile chose.
+                jq -e '
+                  .pools["campaign-control"].resource == "cpu-slot" and
+                  .pools["campaign-agent"].resource == "slot" and
+                  .pools["campaign-agent"].capacity == 1 and
+                  .adapters["claude-code"].argv[0] == "claude" and
+                  .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
+                  .executors == { } and
+                  .flows == { } and
+                  .producers == { }
+                ' "$checkedConfig" >/dev/null
+
+                # (b) The INSTALLED prefix carries the flow assets, reached the
+                # way `resolve_campaign_asset` reaches them
+                # (crates/tally/src/cli/campaign.rs): relative to the directory
+                # the running executable lives in, not relative to a checkout
+                # and not through a store path an operator had to know.
+                exeDirectory="$(dirname "$(readlink -f ${tally}/bin/tally)")"
+                flow="$exeDirectory/../share/tally/flows/spec-build.js"
+                driver="$exeDirectory/../libexec/tally/spec-build-driver"
+                test -f "$flow"
+                # The driver is installed as a symlink, so existence is not
+                # resolution: follow it and require an executable at the end.
+                test -L "$driver"
+                test -x "$(readlink -f "$driver")"
+
+                # The profile's campaign pools are the flow's own pool names.
+                # Read out of the rendered config and looked for in the
+                # installed flow, so a profile that declared a pool the flow
+                # never names — or a flow that renamed one — is a red line here
+                # rather than an admission failure on someone's machine.
+                while read -r pool; do
+                  if ! grep -Fq "\"$pool\"" "$flow"; then
+                    echo "product-profile: pool $pool is named by no flow node" >&2
+                    exit 1
+                  fi
+                done < <(jq -r '.pools | keys[] | select(startswith("campaign-"))' "$checkedConfig")
+
+                # The install names itself. This is the only place the nix-side
+                # stamp and the Rust-side render meet; the cargo tests witness
+                # the render alone.
+                observed="$(${tally}/bin/tally --version)"
+                expected="tally ${tally.version} (rev ${buildRevision})"
+                if test "$observed" != "$expected"; then
+                  echo "product-profile: --version rendered '$observed', not '$expected'" >&2
+                  exit 1
+                fi
+
+                touch "$out"
+              '';
           module-layer = moduleContract;
           substrate-numerals =
             pkgs.runCommand "tally-substrate-numerals" { nativeBuildInputs = [ pkgs.gawk ]; }
