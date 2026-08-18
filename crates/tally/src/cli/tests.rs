@@ -149,6 +149,37 @@ fn campaign_steer_supports_task_scope_and_the_ssh_stdin_contract() {
 }
 
 #[test]
+fn campaign_inbox_reads_one_identity_and_nothing_else() {
+    let options = Opts::try_parse_from([
+        "tally",
+        "campaign",
+        "inbox",
+        "acme/widgets",
+        "specs/night/tasks.json",
+        "--json",
+        "--state-dir",
+        "/var/lib/tally/state",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Campaign {
+            command: CampaignCommand::Inbox(CampaignInboxArgs {
+                code_repository,
+                worklist_pattern,
+                json: true,
+                state_dir: Some(state_dir),
+            })
+        }) if code_repository == "acme/widgets"
+            && worklist_pattern == "specs/night/tasks.json"
+            && state_dir == Path::new("/var/lib/tally/state")
+    ));
+    // The identity is the whole argument surface: the inbox is campaign
+    // scoped, so half an identity addresses nothing.
+    assert!(Opts::try_parse_from(["tally", "campaign", "inbox", "acme/widgets"]).is_err());
+}
+
+#[test]
 fn campaign_resume_is_not_a_command() {
     let error = Opts::try_parse_from([
         "tally",

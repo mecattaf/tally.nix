@@ -49,6 +49,7 @@ const COMPLETION_TRAILER_PREFIXES: [&str; 2] = ["Tally-Task:", "Tally-Revision:"
 const APPROVED_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_APPROVED_GRAPH_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 const CAMPAIGN_STEERING_SCHEMA_VERSION: u32 = 1;
+const CAMPAIGN_INBOX_SCHEMA_VERSION: u32 = 1;
 const CAMPAIGN_STEERING_CURSOR_SCHEMA_VERSION: u32 = 1;
 const CAMPAIGN_STEERING_EMBARGO_MILLISECONDS: i64 = 1_000;
 const MAX_CAMPAIGN_STEERING_LOG_BYTES: u64 = 128 * 1024 * 1024;
@@ -371,13 +372,22 @@ struct ApprovedGraphSnapshotV1 {
     graph: CanonicalCampaignGraphV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum LocalAttemptReceiptV1 {
     Diagnosis {
+        sequence: u64,
         task_id: String,
         attempt: u8,
         input_epoch: Option<String>,
         blocks_task: bool,
+        /// The typed question itself, kept verbatim. The escalation folds
+        /// ignore it; the inbox is the reader that hands it to a human.
+        diagnosis: String,
+        /// The prepared amendment the driver minted beside its diagnosis,
+        /// when it had one. Carried as authored so the entry an operator
+        /// approves is the diff the machine wrote, not a re-rendering.
+        proposal: Option<Box<Value>>,
+        written_at: Option<String>,
     },
     Retry {
         task_id: String,
@@ -407,6 +417,7 @@ struct LocalWorkerOutcome {
     task_uuid: String,
     input_epoch: Option<String>,
     outcome: WorkerOutcomePayload,
+    written_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,6 +745,7 @@ pub(super) async fn run_campaign(
             run_campaign_arm(socket, config_path, rpc_timeout, args).await
         }
         CampaignCommand::Steer(args) => run_campaign_steer(args),
+        CampaignCommand::Inbox(args) => run_campaign_inbox(args),
         CampaignCommand::Release(args) => run_campaign_release(args),
         CampaignCommand::Poll(args) => {
             run_campaign_poll(socket, config_path, rpc_timeout, args).await
@@ -3583,10 +3595,15 @@ fn read_local_steering_snapshot(
 /// Read steering for projections without creating the steering directory or
 /// lock file. A real source always has its lock; a partially present source is
 /// rejected rather than read without synchronization.
-fn read_existing_local_steering(
+///
+/// The projection runs under the shared lock, so every reader — the epoch
+/// derivation and the inbox alike — sees one consistent prefix of the
+/// append-only log.
+fn read_existing_local_steering_with<T: Default>(
     state_dir: &Path,
     registration: &CampaignRegistration,
-) -> Result<CampaignSteering> {
+    project: impl FnOnce(&LocalSteeringPaths, &[LocalSteeringRecordV1]) -> Result<T>,
+) -> Result<T> {
     fn path_is_present(path: &Path) -> Result<bool> {
         match fs::symlink_metadata(path) {
             Ok(_) => Ok(true),
@@ -3610,7 +3627,7 @@ fn read_existing_local_steering(
                     paths.lock.display()
                 );
             }
-            return Ok(CampaignSteering::default());
+            return Ok(T::default());
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -3635,7 +3652,7 @@ fn read_existing_local_steering(
     })?;
     let read = (|| {
         let records = read_local_steering_records_locked(&paths, registration)?;
-        Ok(local_steering_snapshot_from_records(&paths, registration, &records)?.steering)
+        project(&paths, &records)
     })();
     let unlock = FileExt::unlock(&lock).with_context(|| {
         format!(
@@ -3646,8 +3663,26 @@ fn read_existing_local_steering(
     match (read, unlock) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(steering), Ok(())) => Ok(steering),
+        (Ok(projected), Ok(())) => Ok(projected),
     }
+}
+
+fn read_existing_local_steering(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> Result<CampaignSteering> {
+    read_existing_local_steering_with(state_dir, registration, |paths, records| {
+        Ok(local_steering_snapshot_from_records(paths, registration, records)?.steering)
+    })
+}
+
+/// The ordered steering records themselves, which is what an answer looks
+/// like before it is folded into an epoch.
+fn read_existing_local_steering_records(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> Result<Vec<LocalSteeringRecordV1>> {
+    read_existing_local_steering_with(state_dir, registration, |_, records| Ok(records.to_vec()))
 }
 
 fn ensure_local_steering_log_locked(paths: &LocalSteeringPaths) -> Result<()> {
@@ -4019,6 +4054,31 @@ fn validate_attempt_receipt_string(value: &Value, context: &str, maximum: usize)
     Ok(())
 }
 
+/// The prepared amendment a blocked diagnosis may carry, as the inbox hands
+/// it on.
+///
+/// The driver that writes it already normalizes the object and refuses one
+/// beside a non-blocking verdict; this side only has to refuse a shape it
+/// could not render — the field stays optional and a null stays absent, so
+/// judge-era history reads exactly as it always did.
+fn validated_attempt_receipt_proposal(
+    value: Option<&Value>,
+    context: &str,
+) -> Result<Option<Box<Value>>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(invalid(format!("{context}.proposal must be an object")));
+    }
+    if serde_json::to_string(value)?.chars().count() > MAX_DIAGNOSIS_CHARS {
+        return Err(invalid(format!(
+            "{context}.proposal exceeds {MAX_DIAGNOSIS_CHARS} characters"
+        )));
+    }
+    Ok(Some(Box::new(value.clone())))
+}
+
 fn validate_local_attempt_receipt(
     candidate: Value,
     path: &Path,
@@ -4144,7 +4204,12 @@ fn validate_local_attempt_receipt(
         })
         .transpose()?;
 
-    let task_attempt = |payload: &str, maximum: usize| -> Result<(String, u8)> {
+    let written_at = object
+        .get("writtenAt")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let task_attempt = |payload: &str, maximum: usize| -> Result<(String, u8, String)> {
         let task_id = object
             .get("taskId")
             .and_then(Value::as_str)
@@ -4162,19 +4227,20 @@ fn validate_local_attempt_receipt(
         ) {
             return Err(invalid(format!("{context}.redaction is unsupported")));
         }
-        validate_attempt_receipt_text(
-            object
-                .get(payload)
-                .expect("receipt payload is required above"),
-            &format!("{context}.{payload}"),
-            maximum,
-        )?;
-        Ok((task_id.to_owned(), attempt))
+        let text = object
+            .get(payload)
+            .expect("receipt payload is required above");
+        validate_attempt_receipt_text(text, &format!("{context}.{payload}"), maximum)?;
+        Ok((
+            task_id.to_owned(),
+            attempt,
+            text.as_str().expect("validated payload is text").to_owned(),
+        ))
     };
 
     match kind {
         "diagnosis" => {
-            let (task_id, attempt) = task_attempt("diagnosis", MAX_DIAGNOSIS_CHARS)?;
+            let (task_id, attempt, diagnosis) = task_attempt("diagnosis", MAX_DIAGNOSIS_CHARS)?;
             let verdict = match object.get("verdict") {
                 None => None,
                 Some(Value::String(verdict))
@@ -4188,15 +4254,20 @@ fn validate_local_attempt_receipt(
                     )))
                 }
             };
+            let proposal = validated_attempt_receipt_proposal(object.get("proposal"), &context)?;
             Ok(LocalAttemptReceiptV1::Diagnosis {
+                sequence: expected_sequence,
                 task_id,
                 attempt,
                 input_epoch,
                 blocks_task: attempt == 2 || verdict == Some("blocked"),
+                diagnosis,
+                proposal,
+                written_at,
             })
         }
         "retry" => {
-            let (task_id, _) = task_attempt("reason", MAX_RETRY_CHARS)?;
+            let (task_id, ..) = task_attempt("reason", MAX_RETRY_CHARS)?;
             Ok(LocalAttemptReceiptV1::Retry {
                 task_id,
                 input_epoch,
@@ -4306,6 +4377,7 @@ fn validate_local_attempt_receipt(
                 task_uuid,
                 input_epoch,
                 outcome,
+                written_at,
             }))
         }
         "escalation" => {
@@ -4539,6 +4611,325 @@ fn resolve_worklist_gate_budgets(
         .map(|(gate, budget)| gate.resolved(budget.runtime_max_sec))
         .collect();
     (resolved, budgets)
+}
+
+/// One typed doubt addressed to one task, as the operator surface reads it.
+///
+/// The entry is a projection, never a second artifact: every field is read
+/// out of the campaign's own append-only attempt-receipts log, and the answer
+/// out of the campaign's own steering log. That is what makes an unanswered
+/// entry survive a daemon restart and a re-admission alike — nothing holds it
+/// but the two logs that already had to be durable, and neither of them can
+/// be rewritten to make an entry go away.
+#[derive(Debug, Clone, PartialEq)]
+struct CampaignInboxEntry {
+    /// The receipt sequence the entry was folded from — its stable identity,
+    /// because an append-only log never renumbers.
+    sequence: u64,
+    kind: &'static str,
+    task_id: String,
+    /// Present for a diagnosis; a worker outcome is not attempt-numbered.
+    attempt: Option<u8>,
+    input_epoch: Option<String>,
+    written_at: Option<String>,
+    /// The typed question, kept verbatim.
+    question: String,
+    /// The prepared amendment that rode with the question, when there was one.
+    proposal: Option<Box<Value>>,
+    /// The paths the doubt is about — the authority surface a needs-authority
+    /// outcome named. Empty when the question carries its own evidence.
+    evidence: Vec<String>,
+    answer: Option<CampaignInboxAnswer>,
+}
+
+/// The steering record that answered an entry.
+///
+/// Answering marks; it never deletes. The entry stays in the projection with
+/// the answer beside it, because the log it was folded from is append-only
+/// and a fact does not stop having happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CampaignInboxAnswer {
+    sequence: u64,
+    /// `None` for an answer addressed to the whole campaign, which addresses
+    /// every task in it.
+    task_id: Option<String>,
+    created_at: String,
+}
+
+impl CampaignInboxEntry {
+    const fn state(&self) -> &'static str {
+        if self.answer.is_some() {
+            "answered"
+        } else {
+            "open"
+        }
+    }
+
+    fn value(&self, campaign: &str) -> Value {
+        json!({
+            "sequence": self.sequence,
+            "receipt": local_attempt_receipt_url(campaign, self.sequence),
+            "kind": self.kind,
+            "taskId": self.task_id,
+            "attempt": self.attempt,
+            "inputEpoch": self.input_epoch,
+            "writtenAt": self.written_at,
+            "question": self.question,
+            "proposal": self.proposal.as_deref().cloned().unwrap_or(Value::Null),
+            "evidence": self.evidence,
+            "state": self.state(),
+            "answeredBy": self.answer.as_ref().map_or(Value::Null, |answer| {
+                json!({
+                    "sequence": answer.sequence,
+                    "taskId": answer.task_id,
+                    "createdAt": answer.created_at,
+                })
+            }),
+        })
+    }
+}
+
+/// Fold this campaign's receipts and steering into the delivery surface.
+///
+/// The two logs are joined on time rather than on the epoch, deliberately. An
+/// epoch moves for a worklist amendment as readily as for a steer, and an
+/// entry that a re-admission quietly retired would be an entry the operator
+/// never saw — the record's whole complaint about escalations that live in
+/// pass stderr. Ordered steering addressed to the task (or to the campaign,
+/// which addresses every task in it) after the entry was written is the one
+/// act that marks it, and both timestamps are written once into append-only
+/// logs, so the mark never comes undone.
+fn campaign_inbox_entries(
+    records: &[LocalAttemptReceiptV1],
+    steering: &[LocalSteeringRecordV1],
+) -> Result<Vec<CampaignInboxEntry>> {
+    let answers = steering
+        .iter()
+        .map(|record| {
+            let created = parse_steering_time(
+                &record.comment.created_at,
+                &format!("campaign steering record {} createdAt", record.sequence),
+            )?;
+            Ok((
+                created,
+                CampaignInboxAnswer {
+                    sequence: record.sequence,
+                    task_id: record.task_id.clone(),
+                    created_at: record.comment.created_at.clone(),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut entries = Vec::new();
+    for record in records {
+        let entry = match record {
+            LocalAttemptReceiptV1::Diagnosis {
+                sequence,
+                task_id,
+                attempt,
+                input_epoch,
+                blocks_task: true,
+                diagnosis,
+                proposal,
+                written_at,
+            } => CampaignInboxEntry {
+                sequence: *sequence,
+                kind: "blocked",
+                task_id: task_id.clone(),
+                attempt: Some(*attempt),
+                input_epoch: input_epoch.clone(),
+                written_at: written_at.clone(),
+                question: diagnosis.clone(),
+                proposal: proposal.clone(),
+                evidence: Vec::new(),
+                answer: None,
+            },
+            LocalAttemptReceiptV1::WorkerOutcome(outcome) => {
+                let (question, evidence) = match &outcome.outcome {
+                    WorkerOutcomePayload::NeedsAuthority { paths } => (
+                        format!(
+                            "the lane cannot finish inside its own conflict domains and asks for {}",
+                            if paths.len() == 1 {
+                                "one path".to_owned()
+                            } else {
+                                format!("{} paths", paths.len())
+                            }
+                        ),
+                        paths.clone(),
+                    ),
+                    WorkerOutcomePayload::Impossible { reason } => {
+                        (reason.clone(), Vec::new())
+                    }
+                };
+                CampaignInboxEntry {
+                    sequence: outcome.sequence,
+                    kind: outcome.outcome.class(),
+                    task_id: outcome.task_id.clone(),
+                    attempt: None,
+                    input_epoch: outcome.input_epoch.clone(),
+                    written_at: outcome.written_at.clone(),
+                    question,
+                    proposal: None,
+                    evidence,
+                    answer: None,
+                }
+            }
+            LocalAttemptReceiptV1::Diagnosis { .. }
+            | LocalAttemptReceiptV1::Retry { .. }
+            | LocalAttemptReceiptV1::Escalation
+            | LocalAttemptReceiptV1::Pardon { .. }
+            | LocalAttemptReceiptV1::GateObservation { .. } => continue,
+        };
+        entries.push(entry);
+    }
+
+    for entry in &mut entries {
+        // An entry the log cannot place in time is answered by the first
+        // steering that addressed it at all: judge-era history carries no
+        // stamp, and reading it as never-answered would strand it forever.
+        let written = entry
+            .written_at
+            .as_deref()
+            .map(|written| {
+                parse_steering_time(
+                    written,
+                    &format!("attempt receipt {} writtenAt", entry.sequence),
+                )
+            })
+            .transpose()?;
+        entry.answer = answers
+            .iter()
+            .find(|(created, answer)| {
+                answer
+                    .task_id
+                    .as_ref()
+                    .is_none_or(|task_id| *task_id == entry.task_id)
+                    && written.is_none_or(|written| *created >= written)
+            })
+            .map(|(_, answer)| answer.clone());
+    }
+    Ok(entries)
+}
+
+/// Everything `tally campaign inbox` prints, for one campaign identity.
+fn campaign_inbox_value(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+    campaign: &str,
+) -> Result<Value> {
+    let records = read_local_attempt_receipts(state_dir, campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)?;
+    let steering = read_existing_local_steering_records(state_dir, registration)?;
+    let entries = campaign_inbox_entries(&records, &steering)?;
+    let open = entries
+        .iter()
+        .filter(|entry| entry.answer.is_none())
+        .count();
+    Ok(json!({
+        "schemaVersion": CAMPAIGN_INBOX_SCHEMA_VERSION,
+        "campaign": campaign,
+        "codeRepository": registration.code_repository,
+        "worklistPattern": registration.worklist_pattern,
+        "issue": campaign_issue_url(
+            &registration.code_repository,
+            &registration.worklist_pattern,
+        ),
+        "open": open,
+        "entries": entries
+            .iter()
+            .map(|entry| entry.value(campaign))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// The one verb the standing operator surface has: read the typed doubt this
+/// campaign is holding, and see which of it has already been answered.
+fn run_campaign_inbox(args: CampaignInboxArgs) -> Result<()> {
+    let (code_repository, worklist_pattern) =
+        campaign_identity(&args.code_repository, &args.worklist_pattern)?;
+    let state_dir = resolve_state_dir(args.state_dir)?;
+    let registry = CampaignRegistry::open(&state_dir)?;
+    let registration = registry
+        .read_campaign(&code_repository, &worklist_pattern)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "campaign {code_repository}/{worklist_pattern} is not armed; arm it before reading its inbox"
+            ))
+        })?;
+    require_local_actor(&registration)?;
+    let campaign = campaign_name_for_status(
+        read_approved_graph_snapshot(&state_dir, &registration)?.as_ref(),
+        &Value::Null,
+        &worklist_pattern,
+    );
+    let inbox = campaign_inbox_value(&state_dir, &registration, &campaign)?;
+    if args.json {
+        outln!("{}", serde_json::to_string(&inbox)?);
+        return Ok(());
+    }
+    print_campaign_inbox_human(&inbox)
+}
+
+fn print_campaign_inbox_human(inbox: &Value) -> Result<()> {
+    let entries = inbox["entries"]
+        .as_array()
+        .ok_or_else(|| invalid("campaign inbox projection has no entries"))?;
+    let open = inbox["open"].as_u64().unwrap_or_default();
+    outln!(
+        "Inbox {}  {} entr{}, {} open",
+        compact_text(inbox["campaign"].as_str().unwrap_or("-")),
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        open,
+    );
+    for entry in entries {
+        outln!(
+            "[{}] {} {} ({})",
+            entry["sequence"].as_u64().unwrap_or_default(),
+            compact_text(entry["kind"].as_str().unwrap_or("-")),
+            compact_text(entry["taskId"].as_str().unwrap_or("-")),
+            compact_text(entry["state"].as_str().unwrap_or("-")),
+        );
+        if let Some(attempt) = entry["attempt"].as_u64() {
+            outln!("  attempt: {attempt}");
+        }
+        if let Some(epoch) = entry["inputEpoch"].as_str() {
+            outln!("  epoch: {}", compact_text(epoch));
+        }
+        outln!(
+            "  {}",
+            compact_text(entry["question"].as_str().unwrap_or("-"))
+        );
+        if let Some(paths) = entry["evidence"]
+            .as_array()
+            .filter(|paths| !paths.is_empty())
+        {
+            outln!(
+                "  evidence: {}",
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(compact_text)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !entry["proposal"].is_null() {
+            outln!("  proposal: {}", serde_json::to_string(&entry["proposal"])?);
+        }
+        outln!(
+            "  receipt: {}",
+            compact_text(entry["receipt"].as_str().unwrap_or("-"))
+        );
+        if let Some(answer) = entry["answeredBy"].as_object() {
+            outln!(
+                "  answered by steer {} at {}",
+                answer["sequence"].as_u64().unwrap_or_default(),
+                compact_text(answer["createdAt"].as_str().unwrap_or("-")),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn active_escalated_tasks_from_receipts(
@@ -9899,16 +10290,24 @@ fi
         let current_epoch = format!("sha256:{}", "d".repeat(64));
         let old_epoch_history = [
             LocalAttemptReceiptV1::Diagnosis {
+                sequence: 1,
                 task_id: "finish".to_owned(),
                 attempt: 1,
                 input_epoch: Some(old_epoch.clone()),
                 blocks_task: false,
+                diagnosis: "the first attempt read the wrong section".to_owned(),
+                proposal: None,
+                written_at: None,
             },
             LocalAttemptReceiptV1::Diagnosis {
+                sequence: 2,
                 task_id: "finish".to_owned(),
                 attempt: 2,
                 input_epoch: Some(old_epoch),
                 blocks_task: true,
+                diagnosis: "the second attempt cannot proceed".to_owned(),
+                proposal: None,
+                written_at: None,
             },
             LocalAttemptReceiptV1::Escalation,
         ];
@@ -9922,10 +10321,14 @@ fi
 
         let mut lifetime_history = (1..=MAX_TASK_LIFETIME_ATTEMPTS)
             .map(|ordinal| LocalAttemptReceiptV1::Diagnosis {
+                sequence: u64::try_from(ordinal).unwrap(),
                 task_id: "finish".to_owned(),
                 attempt: 1,
                 input_epoch: Some(format!("sha256:{ordinal:064x}")),
                 blocks_task: false,
+                diagnosis: "another epoch, another retryable failure".to_owned(),
+                proposal: None,
+                written_at: None,
             })
             .collect::<Vec<_>>();
         lifetime_history.push(LocalAttemptReceiptV1::Escalation);
@@ -9962,6 +10365,7 @@ fi
                         "test/fleet-gate.sh".to_owned(),
                     ],
                 },
+                written_at: None,
             }),
             LocalAttemptReceiptV1::WorkerOutcome(LocalWorkerOutcome {
                 sequence: 2,
@@ -9972,6 +10376,7 @@ fi
                 outcome: WorkerOutcomePayload::Impossible {
                     reason: "The required upstream proof does not exist.".to_owned(),
                 },
+                written_at: None,
             }),
         ];
         let mut status = json!({
@@ -10186,7 +10591,23 @@ fi
     }
 
     const READMISSION_REPOSITORY: &str = "acme/widgets";
-    const READMISSION_WORKLIST: &str = "specs/night/tasks.json";
+
+    /// A scope number no other lane in this process holds.
+    ///
+    /// A campaign identity is what names durable state: the lease directory
+    /// is `sha256(repository, worklist)`, the receipts log and the state ref
+    /// prefix are the campaign name. Lanes that share one identity are one
+    /// campaign to every one of those artifacts, and the only thing keeping
+    /// two of them apart is that each happens to have rooted its state
+    /// somewhere else — an isolation the tests never state and a single
+    /// shared root would silently remove, with `cargo test` running the lanes
+    /// concurrently. Giving each lane its own identity says it instead:
+    /// nothing a lane writes can alias what another lane wrote, wherever
+    /// either of them roots its state.
+    fn readmission_scope() -> u64 {
+        static SCOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 
     /// One armed identity whose authority remote is a real bare repository,
     /// because re-admission is defined against what `git fetch` reports and
@@ -10198,6 +10619,9 @@ fi
         config: PathBuf,
         flow: PathBuf,
         driver: PathBuf,
+        /// This lane's own campaign name and worklist path.
+        campaign: String,
+        worklist: String,
         /// Whether the worklist this lane pushes ends in a chapter gate — the
         /// checkpoint task whose proof a lapse rests on.
         chapter_gate: bool,
@@ -10217,11 +10641,10 @@ fi
         );
     }
 
-    const READMISSION_CAMPAIGN: &str = "night-readmission";
-
     const READMISSION_CHAPTER_GATE: &str = "chapter-gate-c1";
 
     fn readmission_worklist(
+        campaign: &str,
         goal: &str,
         gate_runtime_max_sec: Option<u64>,
         chapter_gate: bool,
@@ -10265,7 +10688,7 @@ fi
         json!({
             "schemaVersion": 1,
             "campaign": {
-                "name": READMISSION_CAMPAIGN,
+                "name": campaign,
                 "maxTasks": 4,
                 "maxParallel": 1,
                 "agent": {},
@@ -10291,6 +10714,7 @@ fi
         }
 
         fn open_with(goal: &str, gate_runtime_max_sec: Option<u64>, chapter_gate: bool) -> Self {
+            let scope = readmission_scope();
             let temporary = tempfile::tempdir().unwrap();
             let checkout = temporary.path().join("checkout");
             let remote = temporary.path().join("remote.git");
@@ -10345,40 +10769,61 @@ fi
                 config,
                 flow,
                 driver,
+                campaign: format!("night-readmission-{scope}"),
+                worklist: format!("specs/night/tasks-{scope}.json"),
                 chapter_gate,
             };
             lane.push_worklist_declaring(goal, gate_runtime_max_sec);
             lane
         }
 
-        /// Append one recorded firing of a gate id to this identity's own
-        /// attempt-receipts log — the evidence a silent budget derives from.
-        fn seed_gate_observation(&self, gate_id: &str, duration_sec: u64) {
-            let path = local_attempt_receipts_path(&self.state_dir, READMISSION_CAMPAIGN).unwrap();
+        /// Append one stamped receipt to this identity's own append-only
+        /// attempt-receipts log, exactly as a pass's driver appends it.
+        ///
+        /// `payload` carries the kind-specific fields; the identity, the
+        /// sequence, and the stamp are the log's own and are filled in here.
+        fn seed_receipt(&self, kind: &str, written_at: &str, payload: Value) -> u64 {
+            let path = local_attempt_receipts_path(&self.state_dir, &self.campaign).unwrap();
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let sequence = fs::read_to_string(&path)
-                .map(|text| text.lines().count())
-                .unwrap_or_default()
+            let sequence = u64::try_from(
+                fs::read_to_string(&path)
+                    .map(|text| text.lines().count())
+                    .unwrap_or_default(),
+            )
+            .unwrap()
                 + 1;
-            let record = json!({
+            let mut record = json!({
                 "schemaVersion": ATTEMPT_RECEIPT_SCHEMA_VERSION,
                 "sequence": sequence,
-                "kind": "gate-observation",
-                "campaign": READMISSION_CAMPAIGN,
+                "kind": kind,
+                "campaign": self.campaign,
                 "issueNumber": LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
                 "armSerial": 1,
                 "worklistSha256": format!("sha256:{}", "b".repeat(64)),
-                "writtenAt": "2026-08-17T12:00:00Z",
+                "writtenAt": written_at,
                 "actor": "spec-build-driver",
-                "gateId": gate_id,
-                "durationSec": duration_sec,
             });
+            let object = record.as_object_mut().unwrap();
+            for (field, value) in payload.as_object().unwrap() {
+                object.insert(field.clone(), value.clone());
+            }
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
                 .unwrap();
             writeln!(file, "{record}").unwrap();
+            sequence
+        }
+
+        /// Append one recorded firing of a gate id to this identity's own
+        /// attempt-receipts log — the evidence a silent budget derives from.
+        fn seed_gate_observation(&self, gate_id: &str, duration_sec: u64) {
+            self.seed_receipt(
+                "gate-observation",
+                "2026-08-17T12:00:00Z",
+                json!({"gateId": gate_id, "durationSec": duration_sec}),
+            );
         }
 
         /// The arming act itself: an amended worklist committed and pushed to
@@ -10388,11 +10833,12 @@ fi
         }
 
         fn push_worklist_declaring(&self, goal: &str, gate_runtime_max_sec: Option<u64>) {
-            let path = self.checkout.join(READMISSION_WORKLIST);
+            let path = self.checkout.join(&self.worklist);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(
                 &path,
                 serde_json::to_vec_pretty(&readmission_worklist(
+                    &self.campaign,
                     goal,
                     gate_runtime_max_sec,
                     self.chapter_gate,
@@ -10400,7 +10846,7 @@ fi
                 .unwrap(),
             )
             .unwrap();
-            readmission_git(&self.checkout, &["add", READMISSION_WORKLIST]);
+            readmission_git(&self.checkout, &["add", &self.worklist]);
             readmission_git(&self.checkout, &["commit", "--quiet", "-m", "worklist"]);
             readmission_git(&self.checkout, &["push", "--quiet", "origin", "main"]);
         }
@@ -10433,7 +10879,7 @@ fi
         }
 
         fn state_prefix(&self) -> String {
-            campaign_state_ref_prefix(READMISSION_CAMPAIGN, LOCAL_CAMPAIGN_ISSUE_NUMBER)
+            campaign_state_ref_prefix(&self.campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)
         }
 
         /// The merge receipt that makes one implementation task terminal.
@@ -10472,7 +10918,7 @@ fi
                     forge: "local".to_owned(),
                 },
                 READMISSION_REPOSITORY,
-                READMISSION_WORKLIST,
+                &self.worklist,
                 &load_client_config(Some(&self.config)).unwrap().adapters,
             )
         }
@@ -10487,7 +10933,7 @@ fi
                 CampaignRegistrationV4 {
                     schema_version: REGISTRY_SCHEMA_VERSION,
                     registration_id: "0198a62b-41ee-7000-8000-0000000005c1".to_owned(),
-                    worklist_pattern: READMISSION_WORKLIST.to_owned(),
+                    worklist_pattern: self.worklist.clone(),
                     code_repository: READMISSION_REPOSITORY.to_owned(),
                     checkout: self.checkout.clone(),
                     base_branch: "main".to_owned(),
@@ -10646,7 +11092,7 @@ fi
                 forge: "local".to_owned(),
             },
             READMISSION_REPOSITORY,
-            READMISSION_WORKLIST,
+            &lane.worklist,
             &load_client_config(Some(&lane.config)).unwrap().adapters,
         )
         .unwrap_err()
@@ -10660,6 +11106,201 @@ fi
         lane.seed_gate_observation("tests", MAX_GATE_OBSERVATION_SEC + 1);
         let failure = lane.live_graph_result().unwrap_err().to_string();
         assert!(failure.contains("durationSec"), "{failure}");
+    }
+
+    /// The escalation stops living in pass stderr. A blocked attempt writes
+    /// its typed question and the amendment it prepared into the campaign's
+    /// own append-only receipts, and one verb reads them back as structured
+    /// entries — task, attempt, epoch, question, prepared diff, evidence —
+    /// with no supervising session grepping anything.
+    #[test]
+    fn inbox_blocked_escalation_lands_as_one_structured_entry() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let graph = lane.live_graph();
+        let mut registration = lane.arm(&graph);
+        let epoch =
+            current_task_input_epochs(&graph.task_input_hashes, &CampaignSteering::default())
+                .unwrap()["foundation"]
+                .clone();
+        let proposal = json!({
+            "kind": "amendment-task",
+            "paths": ["specs/night/spec.md"],
+            "goal": "Author the section the foundation's readFirst cites.",
+            "acceptanceCriteria": [{
+                "id": "green",
+                "description": "The suite passes.",
+                "argv": ["true"]
+            }],
+            "dependencies": []
+        });
+        let question = "specs/night/spec.md carries no section the goal cites.";
+        let blocked = lane.seed_receipt(
+            "diagnosis",
+            "2026-08-17T12:00:00Z",
+            json!({
+                "taskId": "foundation",
+                "attempt": 1,
+                "diagnosis": question,
+                "redaction": "conservative-v1",
+                "verdict": "blocked",
+                "proposal": proposal,
+                "inputEpoch": epoch,
+            }),
+        );
+        lane.seed_receipt(
+            "escalation",
+            "2026-08-17T12:00:01Z",
+            json!({"body": "foundation is blocked on its first attempt."}),
+        );
+
+        let inbox = campaign_inbox_value(&lane.state_dir, &registration, &lane.campaign).unwrap();
+        assert_eq!(inbox["campaign"], json!(lane.campaign));
+        assert_eq!(inbox["open"], json!(1));
+        let entries = inbox["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "one escalation, one entry: {inbox}");
+        let entry = &entries[0];
+        assert_eq!(entry["kind"], json!("blocked"));
+        assert_eq!(entry["taskId"], json!("foundation"));
+        assert_eq!(entry["attempt"], json!(1));
+        assert_eq!(entry["inputEpoch"], json!(epoch));
+        assert_eq!(entry["writtenAt"], json!("2026-08-17T12:00:00Z"));
+        assert_eq!(entry["question"], json!(question));
+        assert_eq!(entry["proposal"], proposal);
+        assert_eq!(entry["state"], json!("open"));
+        assert!(entry["answeredBy"].is_null(), "{entry}");
+        assert_eq!(
+            entry["receipt"],
+            json!(local_attempt_receipt_url(&lane.campaign, blocked))
+        );
+
+        // The other typed doubt a lane can raise reads the same way, and its
+        // evidence is the authority surface it named.
+        lane.seed_receipt(
+            "worker-outcome",
+            "2026-08-17T12:05:00Z",
+            json!({
+                "taskId": "foundation",
+                "taskRevision": format!("sha256:{}", "a".repeat(64)),
+                "taskUuid": "00000000-0000-4000-8000-0000000008a1",
+                "outcome": "needs-authority",
+                "paths": [".github/workflows/release.yml"],
+                "reason": Value::Null,
+                "inputEpoch": epoch,
+            }),
+        );
+        let inbox = campaign_inbox_value(&lane.state_dir, &registration, &lane.campaign).unwrap();
+        assert_eq!(inbox["open"], json!(2));
+        let authority = &inbox["entries"].as_array().unwrap()[1];
+        assert_eq!(authority["kind"], json!("needs-authority"));
+        assert_eq!(
+            authority["evidence"],
+            json!([".github/workflows/release.yml"])
+        );
+
+        // Entries are facts. A re-admission moves the epoch and rewrites the
+        // approved graph, and an unanswered entry is still there afterwards —
+        // the surface holds what nobody answered, not what is still current.
+        lane.push_worklist("Build the foundation and the amended edge case.");
+        let pushed = lane.live_graph();
+        readmit_campaign_epoch(
+            &lane.state_dir,
+            &lane.registry(),
+            &mut registration,
+            &pushed,
+            Some(&lane.config),
+        )
+        .unwrap();
+        assert_eq!(registration.arm_serial, 2);
+        let readmitted =
+            campaign_inbox_value(&lane.state_dir, &registration, &lane.campaign).unwrap();
+        assert_eq!(readmitted["open"], json!(2));
+        assert_eq!(readmitted["entries"], inbox["entries"]);
+        print_campaign_inbox_human(&readmitted).unwrap();
+    }
+
+    /// The loop the epoch-budget derivation already understood, now closed by
+    /// a surface a human can reach: an answer is ordinary steering addressed
+    /// to the task, it marks the entry rather than deleting it, and it is new
+    /// input — so the epoch the exhausted budget was stamped with stops being
+    /// current and the task is free to run again.
+    #[test]
+    fn inbox_answer_becomes_steering_that_refreshes_the_task_budget() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let graph = lane.live_graph();
+        let registration = lane.arm(&graph);
+        let revisions = release_task_revisions(&graph.canonical).unwrap();
+        let unanswered =
+            current_task_input_epochs(&graph.task_input_hashes, &CampaignSteering::default())
+                .unwrap();
+        let question = "the acceptance argv names a gate this worklist never declared.";
+        lane.seed_receipt(
+            "diagnosis",
+            "2026-08-17T12:00:00Z",
+            json!({
+                "taskId": "foundation",
+                "attempt": 2,
+                "diagnosis": question,
+                "redaction": "conservative-v2",
+                "inputEpoch": unanswered["foundation"],
+            }),
+        );
+        lane.seed_receipt(
+            "escalation",
+            "2026-08-17T12:00:01Z",
+            json!({"body": "foundation exhausted its budget."}),
+        );
+
+        // The budget is spent: the task is held, and the entry is what the
+        // operator is being asked about.
+        let records = read_local_attempt_receipts(
+            &lane.state_dir,
+            &lane.campaign,
+            LOCAL_CAMPAIGN_ISSUE_NUMBER,
+        )
+        .unwrap();
+        assert_eq!(
+            active_escalated_tasks_from_receipts(&records, &revisions, &unanswered).unwrap(),
+            BTreeSet::from(["foundation".to_owned()])
+        );
+        let before = campaign_inbox_value(&lane.state_dir, &registration, &lane.campaign).unwrap();
+        assert_eq!(before["open"], json!(1));
+
+        // The answer: one steer addressed to the task, appended to the
+        // campaign's own ordered log. No second apparatus.
+        let answer = append_local_steering_at(
+            &lane.state_dir,
+            &registration,
+            Some("foundation".to_owned()),
+            "The gate is `tests`; read specs/night/spec.md §4 for its argv.".to_owned(),
+            "2026-08-17T13:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        )
+        .unwrap();
+
+        // Answering marks. The entry, its question, and its evidence are
+        // exactly what they were; only the answer beside it is new.
+        let after = campaign_inbox_value(&lane.state_dir, &registration, &lane.campaign).unwrap();
+        let entries = after["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "answering never deletes: {after}");
+        assert_eq!(after["open"], json!(0));
+        assert_eq!(entries[0]["question"], json!(question));
+        assert_eq!(entries[0]["state"], json!("answered"));
+        assert_eq!(entries[0]["answeredBy"]["sequence"], json!(answer.sequence));
+        assert_eq!(entries[0]["answeredBy"]["taskId"], json!("foundation"));
+        assert_eq!(entries[0]["inputEpoch"], before["entries"][0]["inputEpoch"]);
+
+        // And the budget refreshed by derivation, not by a verb: the steer is
+        // new input, so the epoch the escalation was stamped with is no
+        // longer the task's, and nothing holds the task any more.
+        let steering = read_existing_local_steering(&lane.state_dir, &registration).unwrap();
+        let answered = current_task_input_epochs(&graph.task_input_hashes, &steering).unwrap();
+        assert_ne!(answered["foundation"], unanswered["foundation"]);
+        assert!(
+            active_escalated_tasks_from_receipts(&records, &revisions, &answered)
+                .unwrap()
+                .is_empty(),
+            "an answered escalation stops holding its task"
+        );
+        print_campaign_inbox_human(&after).unwrap();
     }
 
     /// The race the lease exists for. Two reconcile passes observe the same
@@ -10739,7 +11380,7 @@ fi
         // And the durable epoch counter moved once, not twice.
         let reread = lane
             .registry()
-            .read_campaign(READMISSION_REPOSITORY, READMISSION_WORKLIST)
+            .read_campaign(READMISSION_REPOSITORY, &lane.worklist)
             .unwrap()
             .unwrap();
         assert_eq!(reread.arm_serial, 2);
@@ -10848,7 +11489,7 @@ fi
             .unwrap();
         assert!(record.is_lapsed() && record.holder.is_none());
         assert_eq!(record.lapse.as_ref().unwrap(), &lapse);
-        assert_eq!(record.campaign, READMISSION_CAMPAIGN);
+        assert_eq!(record.campaign, lane.campaign);
 
         // Quiescence is now that fact rather than an operator's disarm: the
         // identity is still armed and still listed.
@@ -10932,7 +11573,7 @@ fi
 
         // Durable, not merely in hand: the next pass reads this from disk.
         let reread = registry
-            .read_campaign(READMISSION_REPOSITORY, READMISSION_WORKLIST)
+            .read_campaign(READMISSION_REPOSITORY, &lane.worklist)
             .unwrap()
             .unwrap();
         assert_eq!(reread.arm_serial, 2);
@@ -11095,7 +11736,7 @@ fi
         // The good epoch is untouched: a bad push costs nothing.
         assert_eq!(registration.arm_serial, 1);
         let reread = registry
-            .read_campaign(READMISSION_REPOSITORY, READMISSION_WORKLIST)
+            .read_campaign(READMISSION_REPOSITORY, &lane.worklist)
             .unwrap()
             .unwrap();
         assert_eq!(reread.arm_serial, 1);
