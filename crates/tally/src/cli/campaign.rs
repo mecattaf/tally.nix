@@ -741,6 +741,7 @@ pub(super) async fn run_campaign(
     command: CampaignCommand,
 ) -> Result<()> {
     match command {
+        CampaignCommand::Scaffold(args) => run_campaign_scaffold(args),
         CampaignCommand::Arm(args) => {
             run_campaign_arm(socket, config_path, rpc_timeout, args).await
         }
@@ -5679,29 +5680,53 @@ fn manifest_config_from_worklist(
     let pool = format!("campaign/{code_repository}");
     debug_assert!(is_campaign_pool_name(&pool));
     let steward = resolve_worklist_steward(&policy, adapters)?;
-    let name = policy.name.expect("campaign name was defaulted above");
+    let name = policy
+        .name
+        .clone()
+        .expect("campaign name was defaulted above");
     let (gates, gate_budgets) = resolve_worklist_gate_budgets(
         &policy.gates,
         &recorded_gate_observations(state_dir, &name)?,
     );
+    let agent = resolve_worklist_agent_policies(policy.agent.clone(), adapter);
     Ok((
-        json!({
-            "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
-            "name": name,
-            "repository": repository,
-            "maxTasks": policy.max_tasks,
-            "maxParallel": policy.max_parallel,
-            "driverRuntimeMaxSec": policy.driver_runtime_max_sec,
-            "runtimeMaxSec": policy.runtime_max_sec,
-            "pool": pool,
-            "mergeMethod": policy.merge_method,
-            "agent": resolve_worklist_agent_policies(policy.agent, adapter),
-            "steward": steward,
-            "gates": gates,
-            "tasks": [],
-        }),
+        worklist_policy_manifest_config(&name, &policy, repository, &pool, agent, steward, gates),
         gate_budgets,
     ))
+}
+
+/// Assemble the manifest configuration one parsed worklist policy states.
+///
+/// Everything this host has to answer for arrives already answered: the agent
+/// and steward bound to the adapter catalog, the gates carrying budgets
+/// derived from their own receipts. The scaffold rehearsal has neither a
+/// catalog nor a receipt history and passes what it does have, so a template
+/// cannot pass a rehearsal that admission would then refuse for a shape the
+/// two assembled differently.
+fn worklist_policy_manifest_config(
+    name: &str,
+    policy: &WorklistCampaignPolicy,
+    repository: &CampaignRepository,
+    pool: &str,
+    agent: CampaignAgent,
+    steward: Option<CampaignSteward>,
+    gates: Vec<CampaignGate>,
+) -> Value {
+    json!({
+        "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
+        "name": name,
+        "repository": repository,
+        "maxTasks": policy.max_tasks,
+        "maxParallel": policy.max_parallel,
+        "driverRuntimeMaxSec": policy.driver_runtime_max_sec,
+        "runtimeMaxSec": policy.runtime_max_sec,
+        "pool": pool,
+        "mergeMethod": policy.merge_method,
+        "agent": agent,
+        "steward": steward,
+        "gates": gates,
+        "tasks": [],
+    })
 }
 
 /// Bind the worklist's policy silence to the selected adapter's own answer.
@@ -8755,6 +8780,403 @@ fn validate_local_worklist_document(
     validate_worklist_document(document, Some(manifest_config))
 }
 
+/// Where a scaffolded worklist lands when the identity alone names it.
+///
+/// The fleet genre already proves this directory, and a campaign is armed by a
+/// committed pattern rather than by a path handed at run time, so one
+/// conventional home keeps the arm line short and the pattern stable.
+const SCAFFOLD_WORKLIST_DIRECTORY: &str = "silent-factory-worklists";
+
+/// The marker every value the author must replace is spelled with.
+///
+/// One greppable marker, named by the printed handoff, is the whole editing
+/// contract: no second list of fields to keep in sync with the template.
+const SCAFFOLD_EDIT_MARKER: &str = "EDIT-ME";
+
+/// The repository coordinate the handoff prints when the checkout names none.
+const SCAFFOLD_CODE_REPOSITORY_PLACEHOLDER: &str = "OWNER/REPO";
+
+/// One scaffolded worklist: rendered, rehearsed, and not yet on disk.
+#[derive(Debug, Clone)]
+struct ScaffoldedWorklist {
+    /// Absolute path the bytes go to.
+    target: PathBuf,
+    /// The checkout-relative pattern the arm line names.
+    pattern: String,
+    /// `OWNER/REPO`, read from the checkout's own remote when it spells one.
+    code_repository: String,
+    campaign_name: String,
+    task_id: String,
+    /// The exact bytes, already round-tripped through admission's validation.
+    bytes: String,
+}
+
+impl ScaffoldedWorklist {
+    fn arm_argv(&self) -> Vec<String> {
+        vec![
+            "tally".to_owned(),
+            "campaign".to_owned(),
+            "arm".to_owned(),
+            self.code_repository.clone(),
+            self.pattern.clone(),
+        ]
+    }
+}
+
+/// Derive the example task's id from the campaign identity.
+///
+/// A campaign name is a safe path component; a task id is the stricter
+/// lowercase-and-hyphen form. The derivation is the obvious one, and an
+/// identity that cannot reach the stricter form is refused here — at the verb
+/// that could still be re-run cheaply — rather than at arm.
+fn scaffold_task_id(identity: &str) -> Result<String> {
+    let mut derived = String::with_capacity(identity.len());
+    for character in identity
+        .chars()
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+    {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            derived.push(character);
+        } else if !derived.ends_with('-') {
+            derived.push('-');
+        }
+    }
+    let derived = derived.trim_matches('-').to_owned();
+    if !safe_task_id(&derived) {
+        return Err(invalid(format!(
+            "campaign identity {identity:?} derives no task id; use lowercase letters, digits, and hyphens"
+        )));
+    }
+    Ok(derived)
+}
+
+/// Render the minimal worklist one identity scaffolds to.
+///
+/// Minimal means what admission requires and nothing the fleet genre added on
+/// top of it: one gate, one implementation task, no spec plane and no citation
+/// apparatus. `readFirst.specSections` is non-empty because the local
+/// validator requires a non-empty list of strings there, not because a
+/// `specs/` tree has to exist — nothing resolves those strings against the
+/// filesystem, and an ordinary repository names an ordinary file.
+///
+/// The two example commands are deliberately real argv that fail: an unedited
+/// scaffold must not be able to run green, and the failure names the field to
+/// edit. Their text carries no path-shaped token, so an unedited template also
+/// arms without advisory conflict-domain warnings.
+fn scaffold_worklist_value(identity: &str, task_id: &str) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "campaign": {
+            "name": identity,
+            "agent": {
+                "adapter": "claude-code"
+            },
+            "gates": [{
+                "kind": "command",
+                "id": "tests",
+                "preflightArgv": ["sh", "-euc", "command -v bash >/dev/null"],
+                "argv": [
+                    "bash",
+                    "-lc",
+                    format!("echo '{SCAFFOLD_EDIT_MARKER}: replace this gate with the command every task of this campaign must pass before it merges' >&2; exit 1"),
+                ]
+            }]
+        },
+        "tasks": [{
+            "id": task_id,
+            "kind": "implementation",
+            "title": format!("{SCAFFOLD_EDIT_MARKER}: one line naming the change this task delivers"),
+            "goal": format!("{SCAFFOLD_EDIT_MARKER}: state what the tree does today, the change this task makes, and the boundary it must not cross. The lane reads this and nothing else about your intent, so state the problem before the remedy and name what stays untouched"),
+            "deliveredBehaviors": [
+                format!("{SCAFFOLD_EDIT_MARKER}: one behaviour the tree has after this task that it does not have now")
+            ],
+            "readFirst": {
+                "specSections": [
+                    format!("{SCAFFOLD_EDIT_MARKER}: one file or note the lane must read before it changes code; an ordinary repository needs no spec plane here")
+                ],
+                "styleReferences": []
+            },
+            "acceptanceCriteria": [{
+                "id": "tests-pass",
+                "description": format!("{SCAFFOLD_EDIT_MARKER}: one sentence saying what the command below proves"),
+                "argv": [
+                    "bash",
+                    "-lc",
+                    format!("echo '{SCAFFOLD_EDIT_MARKER}: replace this with the command that proves this task' >&2; exit 1"),
+                ]
+            }],
+            "dependencies": [],
+            "conflictDomains": ["src"]
+        }]
+    })
+}
+
+/// Round-trip rendered worklist bytes through the validation admission uses.
+///
+/// Admission reads the committed blob as JSON, parses the campaign policy,
+/// assembles a manifest configuration, and validates the local document
+/// against it; this does the same to bytes that are not committed yet, so
+/// template drift that arm would refuse fails at the verb and in its tests.
+///
+/// One binding it deliberately does not perform is the host adapter catalog's:
+/// the template names an adapter in that catalog's own vocabulary and the
+/// author may edit it before arming, so requiring the name to resolve here
+/// would refuse scaffolding on every host but the one that wrote the default.
+/// A steward is a catalog binding that cannot be deferred that way, so the
+/// rehearsal refuses one outright rather than validating a configuration it
+/// silently dropped. Base branch and remote are arm's own defaults; neither
+/// participates in worklist validity.
+fn rehearse_scaffolded_worklist(
+    bytes: &str,
+    source_path: &str,
+    checkout: &Path,
+    code_repository: &str,
+) -> Result<ValidatedWorklist> {
+    let document: Value = serde_json::from_str(bytes)
+        .map_err(|error| invalid(format!("scaffolded worklist is not valid JSON: {error}")))?;
+    let policy = parse_worklist_campaign_policy(&document, source_path)?;
+    if policy.steward.is_some() {
+        return Err(invalid(
+            "a scaffolded worklist declares no steward; resolving one needs the host adapter catalog this rehearsal does not read",
+        ));
+    }
+    let name = policy
+        .name
+        .clone()
+        .expect("campaign name was defaulted above");
+    let repository = CampaignRepository {
+        checkout: checkout.to_path_buf(),
+        base_branch: "main".to_owned(),
+        remote: "origin".to_owned(),
+        forge: "local".to_owned(),
+    };
+    let pool = format!("{CAMPAIGN_POOL_PREFIX}{code_repository}");
+    debug_assert!(is_campaign_pool_name(&pool));
+    // No receipts exist for a campaign that has never run, which is exactly
+    // the never-fired floor `resolve_gate_budget` already answers with.
+    let (gates, _) = resolve_worklist_gate_budgets(&policy.gates, &BTreeMap::new());
+    let config = worklist_policy_manifest_config(
+        &name,
+        &policy,
+        &repository,
+        &pool,
+        policy.agent.clone(),
+        None,
+        gates,
+    );
+    validate_local_worklist_document(&document, &config)
+}
+
+/// Resolve the Git worktree the scaffolded worklist will be armed from.
+fn scaffold_checkout(directory: &Path) -> Result<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("cannot execute git while resolving the scaffold checkout")?;
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "{} is not inside a Git worktree; a campaign is armed from a committed worklist, so scaffold inside the checkout that will carry it",
+            directory.display()
+        )));
+    }
+    let root = String::from_utf8(output.stdout)
+        .context("Git worktree root is not valid UTF-8")?
+        .trim_end_matches('\n')
+        .to_owned();
+    fs::canonicalize(&root).with_context(|| format!("cannot resolve Git worktree root {root}"))
+}
+
+/// Read the `OWNER/REPO` identity from the checkout's own remote.
+///
+/// A local campaign's repository coordinate is an identity, not a fetch
+/// target: nothing contacts a forge with it. Reading it from the remote is
+/// what makes the printed arm line copy-pasteable on the ordinary case, and a
+/// checkout with no remote — or one whose remote is a bare filesystem path —
+/// gets the placeholder the handoff then names.
+fn scaffold_code_repository(checkout: &Path, remote: &str) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["remote", "get-url", remote])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    let url = url.trim();
+    if !url.contains("://") && !url.contains('@') {
+        return None;
+    }
+    let url = url.trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let mut parts = url.rsplit(['/', ':']);
+    let repository = parts.next()?;
+    let owner = parts.next()?;
+    parse_repository(&format!("{owner}/{repository}")).ok()
+}
+
+/// Render and rehearse one scaffolded worklist without writing anything.
+///
+/// Splitting the decision from the write keeps every filesystem effect after
+/// every refusal, and lets the tests exercise the verb against a fixture
+/// checkout without moving the process's working directory.
+fn scaffold_worklist(
+    directory: &Path,
+    identity: &str,
+    path: Option<&Path>,
+) -> Result<ScaffoldedWorklist> {
+    if !safe_component(identity) {
+        return Err(invalid(
+            "campaign identity must be a safe path component: it becomes the campaign name",
+        ));
+    }
+    let task_id = scaffold_task_id(identity)?;
+    // Both sides of the later `strip_prefix` have to be spelled the same way,
+    // and the checkout arrives canonical: a relative `--path` is resolved
+    // against the canonical directory rather than the logical one.
+    let directory = fs::canonicalize(directory)
+        .with_context(|| format!("cannot resolve directory {}", directory.display()))?;
+    let checkout = scaffold_checkout(&directory)?;
+    let target = match path {
+        Some(path) => {
+            if path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(invalid("--path must not contain '..' components"));
+            }
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                directory.join(path)
+            }
+        }
+        None => checkout
+            .join(SCAFFOLD_WORKLIST_DIRECTORY)
+            .join(format!("{identity}.json")),
+    };
+    let pattern = target
+        .strip_prefix(&checkout)
+        .ok()
+        .and_then(|relative| relative.to_str())
+        .ok_or_else(|| {
+            invalid(format!(
+                "worklist {} is outside the checkout {} that would arm it",
+                target.display(),
+                checkout.display()
+            ))
+        })
+        .and_then(parse_worklist_pattern)?;
+    if target.exists() {
+        return Err(invalid(format!(
+            "{} already exists; scaffolding never overwrites an authored worklist",
+            target.display()
+        )));
+    }
+    let mut bytes = serde_json::to_string_pretty(&scaffold_worklist_value(identity, &task_id))
+        .context("cannot render the scaffolded campaign worklist")?;
+    bytes.push('\n');
+    let code_repository = scaffold_code_repository(&checkout, "origin")
+        .unwrap_or_else(|| SCAFFOLD_CODE_REPOSITORY_PLACEHOLDER.to_owned());
+    rehearse_scaffolded_worklist(&bytes, &pattern, &checkout, &code_repository)?;
+    Ok(ScaffoldedWorklist {
+        target,
+        pattern,
+        code_repository,
+        campaign_name: identity.to_owned(),
+        task_id,
+        bytes,
+    })
+}
+
+/// Write the rehearsed bytes, refusing an existing file at the syscall.
+fn write_scaffolded_worklist(scaffold: &ScaffoldedWorklist) -> Result<()> {
+    if let Some(parent) = scaffold.target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&scaffold.target)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                invalid(format!(
+                    "{} already exists; scaffolding never overwrites an authored worklist",
+                    scaffold.target.display()
+                ))
+            } else {
+                anyhow::Error::new(error)
+                    .context(format!("cannot create {}", scaffold.target.display()))
+            }
+        })?;
+    file.write_all(scaffold.bytes.as_bytes())
+        .with_context(|| format!("cannot write {}", scaffold.target.display()))?;
+    Ok(())
+}
+
+/// The handoff the verb prints so it documents its own next step.
+fn scaffold_handoff(scaffold: &ScaffoldedWorklist) -> String {
+    let mut lines = vec![
+        format!("Wrote {}", scaffold.target.display()),
+        String::new(),
+        format!(
+            "Campaign {:?}, one implementation task {:?}. Replace every value spelled {SCAFFOLD_EDIT_MARKER}, and check:",
+            scaffold.campaign_name, scaffold.task_id
+        ),
+        String::new(),
+        "  campaign.agent.adapter    an adapter this host's tally configuration declares".to_owned(),
+        "  campaign.gates            the commands that must pass before any task of this campaign merges".to_owned(),
+        "  tasks[0].conflictDomains  the paths this task is allowed to write".to_owned(),
+        String::new(),
+        "Commit the worklist to the base branch, then arm it:".to_owned(),
+        String::new(),
+        format!("    {}", scaffold.arm_argv().join(" ")),
+    ];
+    if scaffold.code_repository == SCAFFOLD_CODE_REPOSITORY_PLACEHOLDER {
+        lines.extend([
+            String::new(),
+            format!(
+                "This checkout names no remote, so {SCAFFOLD_CODE_REPOSITORY_PLACEHOLDER} above is a placeholder: any stable OWNER/REPO identity will do."
+            ),
+        ]);
+    }
+    let mut rendered = lines.join("\n");
+    rendered.push('\n');
+    rendered
+}
+
+fn run_campaign_scaffold(args: CampaignScaffoldArgs) -> Result<()> {
+    let directory = std::env::current_dir()
+        .context("cannot resolve the current directory for campaign scaffold")?;
+    let scaffold = scaffold_worklist(&directory, &args.identity, args.path.as_deref())?;
+    write_scaffolded_worklist(&scaffold)?;
+    // The compact first line is the scriptable one and human text follows after
+    // a blank line, the way `campaign release --plan` already serves both
+    // consumers from one rendering path.
+    outln!(
+        "{}",
+        serde_json::to_string(&json!({
+            "worklist": scaffold.target,
+            "pattern": scaffold.pattern,
+            "campaign": scaffold.campaign_name,
+            "taskId": scaffold.task_id,
+            "armArgv": scaffold.arm_argv(),
+        }))?
+    );
+    outln!();
+    outln!("{}", scaffold_handoff(&scaffold).trim_end());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8783,6 +9205,139 @@ mod tests {
             }],
             "tasks": tasks
         })
+    }
+
+    /// A repository with Git in it and nothing else — no spec plane, no
+    /// worklist, no commit. The lightweight path has to work here.
+    fn bare_scaffold_repository(directory: &Path) -> PathBuf {
+        let checkout = fs::canonicalize(directory).unwrap();
+        release_fixture_git(&checkout, &["init", "-b", "main"]);
+        checkout
+    }
+
+    #[test]
+    fn scaffold_template_validates_against_the_campaign_contract() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = bare_scaffold_repository(temporary.path());
+
+        let scaffold = scaffold_worklist(&checkout, "night_build", None).unwrap();
+        assert_eq!(scaffold.campaign_name, "night_build");
+        assert_eq!(scaffold.task_id, "night-build");
+        assert_eq!(
+            scaffold.pattern,
+            "silent-factory-worklists/night_build.json"
+        );
+        assert_eq!(
+            scaffold.arm_argv(),
+            [
+                "tally",
+                "campaign",
+                "arm",
+                SCAFFOLD_CODE_REPOSITORY_PLACEHOLDER,
+                "silent-factory-worklists/night_build.json",
+            ]
+        );
+
+        // The bytes on disk, not a value the renderer happened to keep: this is
+        // what arm would read, so template drift fails here forever.
+        write_scaffolded_worklist(&scaffold).unwrap();
+        let written = fs::read_to_string(&scaffold.target).unwrap();
+        assert_eq!(written, scaffold.bytes);
+        let validated = rehearse_scaffolded_worklist(
+            &written,
+            &scaffold.pattern,
+            &checkout,
+            &scaffold.code_repository,
+        )
+        .unwrap();
+
+        validate_manifest(&validated.manifest).unwrap();
+        assert_eq!(validated.manifest.name, "night_build");
+        assert_eq!(validated.tasks.len(), 1);
+        assert_eq!(validated.tasks[0].id, "night-build");
+        assert_eq!(validated.tasks[0].kind, "implementation");
+        assert_eq!(
+            validated.tasks[0].conflict_domains.as_deref(),
+            Some(["src".to_owned()].as_slice())
+        );
+        // maxParallel is the contract's leniency floor: at one, conflictDomains
+        // is optional, and the template still declares one boundary to edit.
+        assert_eq!(validated.manifest.max_parallel, 1);
+        assert!(
+            ownership_preflight_warnings(&validated.tasks).is_empty(),
+            "an unedited template must arm without advisory ownership warnings"
+        );
+        assert!(
+            validated.tasks[0].body.contains(SCAFFOLD_EDIT_MARKER),
+            "the rendered brief must carry the marker the handoff names"
+        );
+    }
+
+    #[test]
+    fn scaffold_worklist_validates_without_a_spec_plane() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = bare_scaffold_repository(temporary.path());
+        assert!(
+            !checkout.join("specs").exists(),
+            "the fixture repository must start without a spec plane"
+        );
+
+        let scaffold = scaffold_worklist(&checkout, "ordinary-work", None).unwrap();
+        write_scaffolded_worklist(&scaffold).unwrap();
+        let written = fs::read_to_string(&scaffold.target).unwrap();
+        rehearse_scaffolded_worklist(
+            &written,
+            &scaffold.pattern,
+            &checkout,
+            &scaffold.code_repository,
+        )
+        .unwrap();
+
+        assert!(
+            !checkout.join("specs").exists(),
+            "scaffolding must neither read nor write a spec plane"
+        );
+        assert!(
+            !written.contains("specs/"),
+            "a scaffolded worklist must cite no spec path"
+        );
+        let mut entries = fs::read_dir(&checkout)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries, [".git", SCAFFOLD_WORKLIST_DIRECTORY]);
+    }
+
+    #[test]
+    fn scaffold_refuses_to_overwrite_an_authored_worklist() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = bare_scaffold_repository(temporary.path());
+        let scaffold =
+            scaffold_worklist(&checkout, "ordinary-work", Some(Path::new("work.json"))).unwrap();
+        assert_eq!(scaffold.pattern, "work.json");
+        write_scaffolded_worklist(&scaffold).unwrap();
+        fs::write(&scaffold.target, "authored by hand\n").unwrap();
+
+        let refused = scaffold_worklist(&checkout, "ordinary-work", Some(Path::new("work.json")))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("already exists"), "{refused}");
+        // The syscall, not the check above, is the guard that cannot race.
+        let refused = write_scaffolded_worklist(&scaffold)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("already exists"), "{refused}");
+        assert_eq!(
+            fs::read_to_string(&scaffold.target).unwrap(),
+            "authored by hand\n"
+        );
+
+        let outside =
+            scaffold_worklist(&checkout, "ordinary-work", Some(Path::new("../work.json")))
+                .unwrap_err()
+                .to_string();
+        assert!(outside.contains("'..'"), "{outside}");
     }
 
     fn release_summary_ref_for_test(

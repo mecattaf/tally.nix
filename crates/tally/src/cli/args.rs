@@ -179,6 +179,8 @@ pub(super) enum ReaderStateCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum CampaignCommand {
+    /// Write a minimal admissible worklist for one campaign identity.
+    Scaffold(CampaignScaffoldArgs),
     /// Register a repository/worklist campaign and admit its current reconcile pass.
     Arm(CampaignArmArgs),
     /// Append human steering to an armed campaign's local ordered log.
@@ -198,6 +200,19 @@ pub(super) enum CampaignCommand {
     Quiescent(CampaignQuiescentArgs),
     /// Remove a local campaign registration.
     Disarm(CampaignDisarmArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignScaffoldArgs {
+    /// Campaign identity. Names the campaign, the default worklist file, and
+    /// the example task the template carries.
+    #[arg(value_name = "IDENTITY")]
+    pub(super) identity: String,
+    /// Write the worklist here instead of `silent-factory-worklists/IDENTITY.json`.
+    /// Relative paths resolve against the current directory, and the file must
+    /// land inside the checkout that will arm it.
+    #[arg(long, value_name = "FILE")]
+    pub(super) path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
