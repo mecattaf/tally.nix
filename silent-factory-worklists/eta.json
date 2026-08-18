@@ -917,34 +917,6 @@
       "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow", "examples/flows", "nix/lib", "doc", "test/fixtures"]
     },
     {
-      "id": "comment-sweep",
-      "kind": "implementation",
-      "title": "The comment sweep: provenance narration dies, constraint comments stay",
-      "goal": "The Aug 3 keep/delete rule, executed repo-wide (specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md §1): comment density tripled during wave 3 and the problem is style, not volume — 292 comments over 60 characters of narrative 'how this came to be' prose. After the v0.0.1 history cut every #NNN referent becomes a dangling pointer, so provenance comments do not merely deserve deletion — they stop resolving. The discriminator, applied comment by comment across crates/, examples/, nix/, and test/: KEEP constraint comments (an invariant the code cannot show — 'the ledger is deliberately not hash-chained because...'; every provenance marker the substrate-numerals check requires — ruling:/given:/measured: lines are load-bearing, never touch them); DELETE provenance and narration ('the evaluator found...', '#NNN moved this', 'this was changed because the previous shape...', wave and session references). Behavior must not change: the full gate ladder is the oracle that only prose died. Report the counts (comments examined, deleted, kept-as-constraint) in the final message. This lane runs AFTER vestige-excision so the sweep never polishes a comment the excision deletes. Lane discipline per specs/eta/evidence/sitting-c1.md: every command foreground, set -o pipefail before any piped build, cargo-only verification, one commit and a clean worktree (git log -1 && git status --porcelain last).",
-      "deliveredBehaviors": [
-        "provenance and narration comments are gone repo-wide; constraint comments and provenance markers survive",
-        "the gates prove zero behavior change"
-      ],
-      "readFirst": {
-        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md"],
-        "styleReferences": ["crates/tally-core/src"]
-      },
-      "acceptanceCriteria": [
-        {
-          "id": "narration-gone",
-          "description": "The narration genre's highest-signal markers are absent from source comments.",
-          "argv": ["bash", "-lc", "! grep -rEn '//.*(the evaluator found|wave [0-9] (added|moved|changed)|#[0-9]{3} (moved|added|renamed) this)' crates/ examples/"]
-        },
-        {
-          "id": "workspace-green",
-          "description": "Workspace tests pass.",
-          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
-        }
-      ],
-      "dependencies": ["vestige-excision", "test-isolation-guard"],
-      "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow", "crates/spec-build-driver", "crates/spec-lint", "examples/flows", "nix/modules", "nix/lib", "test/spec_build_driver_test.py"]
-    },
-    {
       "id": "test-isolation-guard",
       "kind": "implementation",
       "title": "Test isolation: no spawned tally touches the real host, and the flaky-test class dies",
@@ -976,6 +948,34 @@
       ],
       "dependencies": [],
       "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow"]
+    },
+    {
+      "id": "comment-sweep",
+      "kind": "implementation",
+      "title": "The comment sweep: provenance narration dies, constraint comments stay",
+      "goal": "The Aug 3 keep/delete rule, executed repo-wide (specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md §1): comment density tripled during wave 3 and the problem is style, not volume — 292 comments over 60 characters of narrative 'how this came to be' prose. After the v0.0.1 history cut every #NNN referent becomes a dangling pointer, so provenance comments do not merely deserve deletion — they stop resolving. The discriminator, applied comment by comment across crates/, examples/, nix/, and test/: KEEP constraint comments (an invariant the code cannot show — 'the ledger is deliberately not hash-chained because...'; every provenance marker the substrate-numerals check requires — ruling:/given:/measured: lines are load-bearing, never touch them); DELETE provenance and narration ('the evaluator found...', '#NNN moved this', 'this was changed because the previous shape...', wave and session references). Behavior must not change: the full gate ladder is the oracle that only prose died. Report the counts (comments examined, deleted, kept-as-constraint) in the final message. This lane runs AFTER vestige-excision so the sweep never polishes a comment the excision deletes. Lane discipline per specs/eta/evidence/sitting-c1.md: every command foreground, set -o pipefail before any piped build, cargo-only verification, one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "provenance and narration comments are gone repo-wide; constraint comments and provenance markers survive",
+        "the gates prove zero behavior change"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md"],
+        "styleReferences": ["crates/tally-core/src"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "narration-gone",
+          "description": "The narration genre's highest-signal markers are absent from source comments.",
+          "argv": ["bash", "-lc", "! grep -rEn '//.*(the evaluator found|wave [0-9] (added|moved|changed)|#[0-9]{3} (moved|added|renamed) this)' crates/ examples/"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["vestige-excision", "test-isolation-guard"],
+      "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow", "crates/spec-build-driver", "crates/spec-lint", "examples/flows", "nix/modules", "nix/lib", "test/spec_build_driver_test.py"]
     },
     {
       "id": "steward-timeout-legibility",
