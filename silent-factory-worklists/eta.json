@@ -826,6 +826,213 @@
         "baseline-parity-probe",
         "product-docs"
       ]
+    },
+    {
+      "id": "completion-unification",
+      "kind": "implementation",
+      "title": "One completion contract: the writer's tuple is the identity, and release renders coverage from durable facts",
+      "goal": "The ext2 'honest proofs' package, first item (EPSILON-EXTENSION.md, ext2 section, E1 — ruled 'yes, as early as dependency order allows; every interim release is bridge-grade'; specs/epsilon-extension/evidence/final-shape.md near :509 confirms 'ext2 stays as planned: identity unification'): today a task's completion identity mixes the writer's tuple with execution policy, so the same delivered work re-keys when gates, agent, steward, or mergeMethod change — policy edits masquerade as new work, the exact-match oracle dies, and a bridge heuristic answers instead. Settle it: the completion identity is the WRITER'S TUPLE alone (the task's content-bearing fields); execution policy (gates, agent, steward, mergeMethod) leaves the identity; the exact oracle revives; the bridge demotes to a legacy fallback that names itself when it fires; completionProofs and the plan document persist in the release record. Second half, the release side of X6: the campaign now writes a durable lease-lapse fact at completion and every attempt carries witness receipts, but release still leans on operator-authored intent for its coverage story. Make release render coverage FROM THE DURABLE FACTS: given a complete campaign (lapse fact present), tally campaign release derives the claim/task/witness coverage join from the durable record — 'the facts remain for release whenever, by anyone' (the final-shape lifecycle) — while operator intent text stays verbatim where provided. Name the tests so the filter completion selects them: a policy-only change must NOT re-key a task's completion identity (red today); an exact writer-tuple match revives without the bridge; the bridge, when it fires, names itself; release on a lapsed campaign renders coverage with no hand-authored table. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, set -o pipefail before any piped build, cargo-only verification in the lane, finish with one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "a policy-only change never re-keys completion identity; the exact oracle revives and the bridge demotes to a self-naming legacy path",
+        "release on a lapsed campaign renders coverage from durable facts alone"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/epsilon-extension/evidence/final-shape.md"],
+        "styleReferences": ["crates/tally/src/cli/campaign.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "completion-proven",
+          "description": "Identity unification and release-from-durable-facts proven; the filter completion selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace completion 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src", "crates/spec-build-driver", "examples/flows"]
+    },
+    {
+      "id": "judge-replay-harness",
+      "kind": "implementation",
+      "title": "The judge-tier corpus replay harness: diagnosis verdicts become replayable, disagreement becomes a number",
+      "goal": "The Aug-1 procedure, finally runnable (specs/eta/evidence/day-docs/AUGUST-01-DESIGN.md; EPSILON-EXTENSION.md ext2: 'replay the journaled diagnosis corpus against a smaller candidate; measure disagreement; downgrade only on the numbers'): every tier decision about which model may hold the judge/diagnosis seat has been made on instinct, and ETA.md §8.5 explicitly waits on P2's numbers. Build the harness, deterministic core first: (1) corpus assembly — a verb or driver mode that walks the durable record (reconciliation diagnosis records, their captured briefs in the capture archive, and the recorded verdicts) and emits a corpus directory of {brief, recorded-verdict} pairs; eta's own record (the chapter-4 auto-diagnosis and chapters 1–3's supervisor-recorded diagnoses in specs/eta/evidence/run-log.md) is the floor, epsilon's eighteen if their captures survive is the bonus — the assembler reports honestly what it found and what was unrecoverable; (2) replay — given a corpus dir and a candidate adapter name resolved from the host catalog, dispatch each brief to the candidate under the diagnosis result schema and record its verdict beside the recorded one; (3) the disagreement table — a byte-stable rendering per case (verdict match, verdict-class mismatch, schema failure) with totals, written to a file the seam sitting can commit as evidence. In tests NOTHING calls a model: a fixture candidate (a shell script answering canned verdicts) proves assembly, replay plumbing, and the table; the live replay run against real candidates is a seam act performed by the operator side at P4, not by this lane and not by any gate. Name the tests so the filter replay selects them. Anti-ceremony boundary: no new spec plane, no standing check — the harness gates exactly one named decision (§8.5) and is otherwise inert. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, set -o pipefail before any piped build, cargo-only verification, one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "corpus assembly from the durable record reports found and unrecoverable cases honestly",
+        "replay against a fixture candidate renders a byte-stable disagreement table; no test calls a model"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/eta/evidence/run-log.md", "specs/eta/evidence/day-docs/AUGUST-01-DESIGN.md"],
+        "styleReferences": ["crates/tally/src/cli/adapter.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "replay-proven",
+          "description": "Assembly, fixture replay, and the stable table proven; the filter replay selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace replay 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/spec-build-driver", "test/fixtures"]
+    },
+    {
+      "id": "vestige-excision",
+      "kind": "implementation",
+      "title": "Shim and vestige excision: the compat organs and the unreachable grammar go",
+      "goal": "The Aug 3 inventory, executed (specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md §2): every deliberate compat shim protects deployments of the pre-release lineage, and v0.0.1 is a clean break with a single operator — they protect nothing. Delete, each as its own commit-internal step with the gates as the net: (1) the retired_duplicate_acknowledged serde field (accepted on read, never written; the #340 repair); (2) the legacy refs/tags/ checkpoint-receipt namespace fallback (the #334 repair); (3) read-side absorption of pre-repair UUID renderings in flow-lineage.jsonl (the #251 repair); (4) the mention '@tally build' default kept for back-compat with the pre-release lineage; (5) the W-321 unreachable grammar — the full-form 'Closes owner/spec#N' parsing, the foreign-repository completion refusal, and issue-coordinate checkbox sync, all requiring task.brief which only the refused forge-native path sets: shipped, tested-looking, dead — delete the staged grammar and its tests rather than carry it (the Aug 3 ruling: reintroduce it someday with a design that reconciles the two seams). W-316 (the enqueue-kernel capsule visibility gap) is EXCLUDED — it waits on the operator's §8.1 seam ruling (surfaced at sitting-c3) and joins by amendment only if the ruling is 'unfreeze'. Update every doc page that documents a deleted shim honestly. Precedent that organ removal works: taskdb was deleted whole and its residue swept clean. Acceptance is absence plus green gates. Lane discipline per specs/eta/evidence/sitting-c1.md: every command foreground, set -o pipefail before any piped build, cargo-only verification, one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "the four compat shims and the W-321 unreachable grammar are absent from the tree with green gates",
+        "docs no longer document deleted compat behavior"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md"],
+        "styleReferences": ["crates/tally-core/src"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "shims-absent",
+          "description": "The named shims are gone.",
+          "argv": ["bash", "-lc", "! grep -rn 'retired_duplicate_acknowledged' crates/ && ! grep -rn '@tally build' crates/ nix/ examples/"]
+        },
+        {
+          "id": "w321-absent",
+          "description": "The unreachable full-form closes grammar is gone.",
+          "argv": ["bash", "-lc", "! grep -rEn 'Closes [a-z-]+/[a-z-]+#' crates/ | grep -v test"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow", "examples/flows", "nix/lib", "doc", "test/fixtures"]
+    },
+    {
+      "id": "comment-sweep",
+      "kind": "implementation",
+      "title": "The comment sweep: provenance narration dies, constraint comments stay",
+      "goal": "The Aug 3 keep/delete rule, executed repo-wide (specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md §1): comment density tripled during wave 3 and the problem is style, not volume — 292 comments over 60 characters of narrative 'how this came to be' prose. After the v0.0.1 history cut every #NNN referent becomes a dangling pointer, so provenance comments do not merely deserve deletion — they stop resolving. The discriminator, applied comment by comment across crates/, examples/, nix/, and test/: KEEP constraint comments (an invariant the code cannot show — 'the ledger is deliberately not hash-chained because...'; every provenance marker the substrate-numerals check requires — ruling:/given:/measured: lines are load-bearing, never touch them); DELETE provenance and narration ('the evaluator found...', '#NNN moved this', 'this was changed because the previous shape...', wave and session references). Behavior must not change: the full gate ladder is the oracle that only prose died. Report the counts (comments examined, deleted, kept-as-constraint) in the final message. This lane runs AFTER vestige-excision so the sweep never polishes a comment the excision deletes. Lane discipline per specs/eta/evidence/sitting-c1.md: every command foreground, set -o pipefail before any piped build, cargo-only verification, one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "provenance and narration comments are gone repo-wide; constraint comments and provenance markers survive",
+        "the gates prove zero behavior change"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/eta/evidence/day-docs/AUGUST-3-morning-thoughts.md"],
+        "styleReferences": ["crates/tally-core/src"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "narration-gone",
+          "description": "The narration genre's highest-signal markers are absent from source comments.",
+          "argv": ["bash", "-lc", "! grep -rEn '//.*(the evaluator found|wave [0-9] (added|moved|changed)|#[0-9]{3} (moved|added|renamed) this)' crates/ examples/"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": ["vestige-excision"],
+      "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow", "crates/spec-build-driver", "crates/spec-lint", "examples/flows", "nix/modules", "nix/lib", "test/spec_build_driver_test.py"]
+    },
+    {
+      "id": "test-isolation-guard",
+      "kind": "implementation",
+      "title": "Test isolation: no spawned tally touches the real host, and the flaky-test class dies",
+      "goal": "Three witnessed members of one class — tests that reach shared host state and fail or pollute under parallelism. (1) The F25 class (EPSILON-EXTENSION.md ext2 'test isolation guard'): a spawned tally in tests can inherit the real HOME/XDG_CONFIG_HOME — witnessed live 2026-08-18 when a chapter-gate cargo test dispatched task-one job units against the OPERATOR'S OWN user daemon and registry (specs/eta/evidence/run-log.md, chapter-4 entries). Build the guard: every test that spawns tally (or the daemon) does so through a helper that sets an isolated HOME/XDG_CONFIG_HOME/XDG_STATE_HOME and a private socket path, and a workspace test proves the guard bites — a spawned-with-real-HOME probe must fail the suite (red today). (2) The lease-scope race, still alive after its chapter-3 repair: lease_concurrent_passes_never_double_dispatch_one_frontier panicked on another test's Held lease for scope night-readmission-6 (crates/tally/src/cli/campaign.rs near :11971, witnessed in the pin-bump-3 package build, run-log) — the unique-scope fix missed at least one pair; derive every lease-test campaign scope from the test's own name so collision is impossible by construction, and audit every lease/readmission/inbox test for shared scopes. (3) The #440 launch-cwd continue-vs-sessionRef race (flaked once at the Phase-0 bootstrap gate, passed on rerun, queued since): make the completion path deterministic against the race or make the test's wait condition observe the actual settled state — no sleep-based ordering. Name the new tests so the filter isolation selects them. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, set -o pipefail before any piped build, cargo-only verification, one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "a test-spawned tally with the real HOME fails the suite; all spawned tallys run isolated",
+        "lease-test scopes derive from test names; the night-readmission contention and the #440 race are structurally dead"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/eta/evidence/run-log.md"],
+        "styleReferences": ["crates/tally/src/cli/campaign.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "isolation-bites",
+          "description": "The HOME guard bites and scope derivation is name-keyed; the filter isolation selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace isolation 2>&1 | tail -20"]
+        },
+        {
+          "id": "no-shared-lease-scopes",
+          "description": "No two lease tests share a literal campaign scope.",
+          "argv": ["bash", "-lc", "! grep -oE '\"night-readmission[a-z0-9-]*\"' crates/tally/src/cli/campaign.rs | sort | uniq -d | grep ."]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow"]
+    },
+    {
+      "id": "steward-timeout-legibility",
+      "kind": "implementation",
+      "title": "A steward death is a typed outcome, its budget is ruled, and red gate evidence survives",
+      "goal": "Three defects witnessed in one incident at the C1 re-witness (specs/eta/evidence/run-log.md, 2026-08-18): the checkpoint's diagnosis steward node hit a 120-second unit runtime limit while waiting on its model call (2.4s CPU over 2min wall), the resulting missing finalMessage projection surfaced as FlowResultError result-schema-mismatch and KILLED THE WHOLE PASS, and the red fleet-gate transcript that held the original failing check was overwritten by the next green re-run on the same sha. Fix all three. (1) The steward node budget: find where the 120s comes from (the steward role resolution or a default), replace it with a ruled diagnosis-role budget sized for checkpoint-scale briefs on a slow model — the ruling comment at the constant names the incident and the sizing logic; narration-role dispatches may keep a tighter budget where the template fallback covers them. (2) The death path: a steward-bound diagnosis node that exits without projecting its result — timeout, crash, empty answer — becomes a TYPED diagnosis-unavailable outcome that the flow records as a blocked escalation to the inbox (the diagnosis position: no diagnosis means stop and tell the operator, kin to the V-16 adapter-terminal class), never a FlowResultError that fails the pass; the pass completes its remaining frontier. Cover it in the driver suite: a steward node that projects nothing yields a blocked escalation and a surviving pass (red today). (3) Red evidence survives: fleet-gate transcripts gain a per-run unique component (sha plus a run stamp) so a re-run on the same head never overwrites a prior transcript, and the gate's FAIL line names the exact transcript file it wrote. Name the tests so the filter steward_timeout selects them. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, set -o pipefail before any piped build, cargo-only verification in the lane (the driver suite via its python entry is sanctioned — it is this task's acceptance), one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "a steward node that projects no result yields a typed blocked escalation and the pass survives",
+        "the diagnosis-role budget is a ruled constant naming its incident; re-runs never overwrite a red transcript"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c3.md", "specs/eta/evidence/run-log.md"],
+        "styleReferences": ["examples/flows/spec-build.js", "test/fleet-gate.sh"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "steward-death-typed",
+          "description": "A projection-less steward death is a blocked escalation, not a pass failure; the filter steward_timeout selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace steward_timeout 2>&1 | tail -20"]
+        },
+        {
+          "id": "driver-suite-green",
+          "description": "The driver suite passes with the typed death path.",
+          "argv": ["python3", "test/spec_build_driver_test.py"]
+        },
+        {
+          "id": "transcripts-unique",
+          "description": "Fleet-gate transcript names carry a per-run component.",
+          "argv": ["bash", "-lc", "grep -nE 'transcripts/.*\\$' test/fleet-gate.sh | head -3"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/spec-build-driver", "examples/flows", "nix/lib", "test/fleet-gate.sh", "test/spec_build_driver_test.py", "crates/tally-core/src", "crates/tally"]
+    },
+    {
+      "id": "chapter-gate-c4",
+      "kind": "checkpoint",
+      "title": "Checkpoint P4: full gate ladder plus the final conformance bar over chapter 5 — the campaign's last gate",
+      "argv": [
+        "bash",
+        "-lc",
+        "test/fleet-gate.sh \"$(git rev-parse HEAD)\" && exec test/final-bar/run \"$PWD\""
+      ],
+      "runtimeMaxSec": 10800,
+      "dependencies": [
+        "completion-unification",
+        "judge-replay-harness",
+        "vestige-excision",
+        "comment-sweep",
+        "test-isolation-guard",
+        "steward-timeout-legibility"
+      ]
     }
   ]
 }

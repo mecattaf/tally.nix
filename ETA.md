@@ -5,8 +5,11 @@ instruction, with the full ext0 record in hand. **This file supersedes the
 piecewise plans**: ZETA.md's operator acts A5–A9 (the zeta *task specs* in
 ZETA.md remain the verbatim authoring source and are referenced, not copied),
 the vestige ledger's standalone A10 packaging (its content is absorbed as
-Chapter 1), and the open-items lists in `main-thread-ext0-close.md` §6 and
-`AUG15-SESSION-FINDINGS.md` §3 (every item is mapped in §0 below). Standing
+Chapter 1), and the open-items lists in
+`specs/eta/evidence/day-docs/main-thread-ext0-close.md` §6 and
+`specs/eta/evidence/day-docs/AUG15-SESSION-FINDINGS.md` §3 (every item is
+mapped in §0 below; root day-docs migrated under E4 at the C3 sitting,
+2026-08-18). Standing
 consumers: the Phase-0 handoff session; the eta sitting commits; the
 supervising orchestrator for the whole buildout.
 

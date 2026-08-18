@@ -1967,7 +1967,7 @@ message into pull-request prose.
 ### The provenance trailer and the post-merge git-ai binding
 
 The squash commit is where a campaign's authorship becomes repository-native
-(`AUGUST-01-DESIGN.md` §7). Two separate things land there, and only one of
+(`specs/eta/evidence/day-docs/AUGUST-01-DESIGN.md` §7). Two separate things land there, and only one of
 them is proof.
 
 The **`Assisted-by:` trailer** is the pointer. The merge node appends
