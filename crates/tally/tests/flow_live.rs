@@ -1261,8 +1261,7 @@ async fn fs5_live_acceptance_matrix() {
             // The generation boundary: a durable rollover from the terminal old
             // run to a fresh successor, recorded once and safe to repeat.
             let supersede = || {
-                let host =
-                    IsolatedHost::under(temp.path().join("isolated-host-supersede"));
+                let host = IsolatedHost::under(temp.path().join("isolated-host-supersede"));
                 Command::new(env!("CARGO_BIN_EXE_tally"))
                     .isolated(&host)
                     .arg("--config")
@@ -4587,8 +4586,12 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             );
 
             // task-5 is beyond what the fixture agent implements, so both its
-            // implementation and its diagnosis die. A steering lane that throws
-            // must still leave the campaign a durable continuation to resume from.
+            // implementation and its diagnosis die. A judge that projects
+            // nothing is a typed diagnosis-unavailable outcome rather than a
+            // thrown pass (eta C1 re-witness, 2026-08-18): the task is blocked
+            // for the operator to answer, the pass still finishes its own
+            // frontier, and the campaign is still left a durable continuation
+            // to resume from.
             let halted = runner(
                 &config_path,
                 &daemon_paths.socket,
@@ -4600,7 +4603,12 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             .spawn()
             .unwrap();
             let halted = runner_output(halted).await;
-            assert_eq!(halted.status.code(), Some(1));
+            assert!(
+                halted.status.success(),
+                "a judge that projected nothing must not end the pass; stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&halted.stdout),
+                String::from_utf8_lossy(&halted.stderr)
+            );
             let halted_submitted = runner_events(&halted, "node-submitted");
             assert!(
                 halted_submitted
@@ -4612,11 +4620,20 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 halted_submitted
                     .iter()
                     .any(|event| event["label"] == "spec-build-continue"),
-                "a thrown steering lane must not swallow the continuation: {:?}",
+                "a dead steering lane must not swallow the continuation: {:?}",
                 halted_submitted
                     .iter()
                     .map(|event| event["label"].as_str().unwrap_or("<missing>"))
                     .collect::<Vec<_>>()
+            );
+            let halted_value = &flow_report(&halted)["report"]["finalValue"];
+            let halted_diagnoses = halted_value["diagnoses"].as_array().unwrap();
+            assert_eq!(halted_diagnoses.len(), 1, "{halted_value}");
+            assert_eq!(halted_diagnoses[0]["taskId"], "task-5");
+            assert_eq!(
+                halted_diagnoses[0]["blocked"],
+                json!(true),
+                "no diagnosis means stop and tell the operator: {halted_value}"
             );
             let continuation_ref = fixture_git(
                 &checkout,

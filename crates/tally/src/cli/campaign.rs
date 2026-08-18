@@ -23,8 +23,8 @@ use tally_core::campaign_contract::{
     validate_agent, validate_argv, validate_gates, CampaignAgent, CampaignGate, CampaignManifest,
     CampaignRepository, CampaignSteward, CanonicalCampaignGraphV1, CanonicalCampaignTaskV1,
     BRIEF_SENTINEL, CAMPAIGN_SCHEMA_VERSION, DEFAULT_AGENT_PRIORITY, DEFAULT_AGENT_RUNTIME_MAX_SEC,
-    DEFAULT_DRIVER_RUNTIME_MAX_SEC, DEFAULT_MAX_TASKS, DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN,
-    DEFAULT_STEWARD_RUNTIME_MAX_SEC, MAX_CAMPAIGN_TASKS,
+    DEFAULT_DRIVER_RUNTIME_MAX_SEC, DEFAULT_MAX_TASKS, DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC,
+    DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN, MAX_CAMPAIGN_TASKS,
 };
 use tally_core::campaign_folds::{
     campaign_digest, render_campaign_summary, stable_publish_branch, stage_scoped_summary_ref,
@@ -283,7 +283,7 @@ fn default_worklist_agent() -> CampaignAgent {
 }
 
 const fn default_worklist_steward_runtime_max_sec() -> u64 {
-    DEFAULT_STEWARD_RUNTIME_MAX_SEC
+    DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC
 }
 
 /// The six-field object an implementation brief has always consumed.
@@ -11871,8 +11871,7 @@ fi
     /// itself, and turns what would otherwise surface as another lane's `Held`
     /// lease into a refusal at the moment the second lane is opened.
     fn readmission_scope_is_fresh(scope: &str) -> bool {
-        static CLAIMED: std::sync::Mutex<BTreeSet<String>> =
-            std::sync::Mutex::new(BTreeSet::new());
+        static CLAIMED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
         CLAIMED
             .lock()
             .expect("readmission scope registry lock poisoned")
@@ -12326,7 +12325,10 @@ fi
     /// until the gate fires, and its own receipts after that.
     #[test]
     fn gate_budget_derives_from_seeded_receipts_when_the_worklist_is_silent() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
 
         let unobserved = lane.live_graph();
         assert_eq!(
@@ -12392,8 +12394,11 @@ fi
     /// receipt evidence revises it.
     #[test]
     fn gate_budget_declared_by_the_worklist_is_honored_verbatim() {
-        let lane =
-            ReadmissionLane::open_declaring(readmission_scope!(), "Build the foundation as first authored.", Some(45));
+        let lane = ReadmissionLane::open_declaring(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+            Some(45),
+        );
         lane.seed_gate_observation("tests", 620);
         lane.seed_gate_observation("tests", 3_000);
 
@@ -12424,7 +12429,10 @@ fi
     /// unbounded budget for every later pass.
     #[test]
     fn gate_budget_declarations_and_observations_stay_bounded() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         lane.push_worklist_declaring("Build the foundation as first authored.", Some(0));
         let failure = local_campaign_graph_from_worklist(
             &lane.state_dir,
@@ -12458,7 +12466,10 @@ fi
     /// with no supervising session grepping anything.
     #[test]
     fn inbox_blocked_escalation_lands_as_one_structured_entry() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let graph = lane.live_graph();
         let mut registration = lane.arm(&graph);
         let epoch =
@@ -12568,7 +12579,10 @@ fi
     /// current and the task is free to run again.
     #[test]
     fn inbox_answer_becomes_steering_that_refreshes_the_task_budget() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let graph = lane.live_graph();
         let registration = lane.arm(&graph);
         let revisions = graph_completion_revisions(&graph.canonical).unwrap();
@@ -12656,7 +12670,10 @@ fi
     /// two epochs on with two dispatches of one frontier in flight.
     #[test]
     fn lease_concurrent_passes_never_double_dispatch_one_frontier() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let first = lane.live_graph();
         let armed = lane.arm(&first);
         lane.push_worklist("Build the foundation and the amended edge case.");
@@ -12770,7 +12787,10 @@ fi
     /// attempt-epoch input hash beside it.
     #[test]
     fn an_armed_graph_hands_down_the_completion_identity_release_recomputes() {
-        let lane = ReadmissionLane::open_gated(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open_gated(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let graph = lane.live_graph();
         let expected = graph
             .canonical
@@ -12804,7 +12824,10 @@ fi
 
     #[test]
     fn lease_completion_writes_the_lapse_fact_a_release_can_rely_on() {
-        let lane = ReadmissionLane::open_gated(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open_gated(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let graph = lane.live_graph();
         let registration = lane.arm(&graph);
         let lease = lane.lease(&registration, &graph);
@@ -12923,7 +12946,10 @@ fi
 
     #[test]
     fn poll_readmission_admits_a_pushed_worklist_with_no_operator_verb() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let first = lane.live_graph();
         let mut registration = lane.arm(&first);
         let registry = lane.registry();
@@ -12987,7 +13013,10 @@ fi
 
     #[tokio::test]
     async fn poll_readmission_refuses_a_straddling_attempt_as_a_digest_mismatch() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let first = lane.live_graph();
         let mut registration = lane.arm(&first);
         let registry = lane.registry();
@@ -13092,7 +13121,10 @@ fi
 
     #[test]
     fn poll_readmission_refuses_a_push_this_host_cannot_serve_without_losing_the_epoch() {
-        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
         let first = lane.live_graph();
         let mut registration = lane.arm(&first);
         let registry = lane.registry();
@@ -13289,7 +13321,10 @@ fi
             "https://narrator.invalid/v1"
         );
         assert_eq!(config["steward"]["finalMessagePattern"], "^NARRATION=(.*)$");
-        assert_eq!(config["steward"]["runtimeMaxSec"], 120);
+        assert_eq!(
+            config["steward"]["runtimeMaxSec"],
+            DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC
+        );
 
         adapters.get_mut("narrator").unwrap().hardening = AdapterHardening::Strict;
         let failure = manifest_config_from_worklist(

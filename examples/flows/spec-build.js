@@ -2626,6 +2626,41 @@ function applyDiagnosisRole(spec) {
   return bound;
 }
 
+// The vocabulary the driver accepts for a machine-composed campaign token:
+// the same shape its `stage` validator holds. An engine failure code that
+// does not satisfy it is reported as the generic death rather than smuggled
+// into a receipt as a class name nobody declared.
+const MACHINE_CLASS_TOKEN = /^[a-z][a-z0-9:._-]{0,63}$/;
+
+// The diagnosis position, typed: no diagnosis means stop and tell the operator.
+//
+// A steward-bound diagnosis node can end without projecting anything -- its
+// unit budget expires mid model call, the harness crashes, the answer comes
+// back empty. Witnessed at the eta C1 re-witness (2026-08-18,
+// specs/eta/evidence/run-log.md): the node hit its 120-second budget, the
+// absent finalMessage surfaced as a result-schema-mismatch FlowResultError,
+// and one dead judge killed a pass whose remaining frontier had nothing to do
+// with it. The death is a typed outcome now, kin to the adapter-terminal
+// class the driver already rules on -- nothing judged this failure, so
+// nothing may be retried on a judgment nobody made, and the operator is the
+// only one who can move the task. Null means the node answered, and the
+// answer is the judge's.
+function diagnosisUnavailable(node) {
+  // Passing is not enough: a node whose answer failed the diagnosis schema
+  // settles with its verdict intact and its rejected value still attached, and
+  // reading that value as a judgment would hand the deterministic rails a
+  // verdict no judge ever returned.
+  if (nodePassed(node) && !node.error) {
+    return null;
+  }
+  const failure = node && node.error ? node.error : null;
+  const code = failure && typeof failure.code === "string" ? failure.code : "";
+  return {
+    code: MACHINE_CLASS_TOKEN.exec(code) === null ? "diagnosis-node-failed" : code,
+    detail: bounded(failure === null ? node : failure, 2000)
+  };
+}
+
 // Campaign-wide local records reach every task; a task-addressed record
 // reaches only that stable task ID.
 function authorizedComments(task) {
@@ -4116,13 +4151,18 @@ function sweepDeferral(sweepNode) {
           failure.baseRev || failure.prepared.baseRev
         );
       }
-      const diagnosed = await job(diagnosisSpec, { settle: false });
+      // Settled, never thrown. A judge that dies is data this lane records,
+      // not an error that ends the pass: see `diagnosisUnavailable`.
+      const diagnosed = await job(diagnosisSpec, { settle: true });
       const attempt = previousDiagnoses.length + 1;
+      const unavailable = diagnosisUnavailable(diagnosed);
       // Old scripted flow clients returned the pre-verdict string directly.
       // Production diagnosis nodes are schema-forced to the object above; the
       // compatibility arm keeps those clients useful without weakening the
       // model-facing result schema.
-      const diagnosisResult = typeof diagnosed.result === "string"
+      const diagnosisResult = unavailable !== null
+        ? { verdict: "blocked", diagnosis: null }
+        : typeof diagnosed.result === "string"
         ? {
             verdict: failure.breach || attempt === 2
               ? "blocked"
@@ -4141,7 +4181,12 @@ function sweepDeferral(sweepNode) {
         issue: args.issue,
         taskId: task.id,
         attempt,
-        diagnosis: diagnosisResult.diagnosis,
+        // A judgment this pass never received is not claimed as one: the
+        // driver composes the receipt for a diagnosis-unavailable outcome
+        // from the typed fact, exactly as it composes a breach note.
+        ...(unavailable === null
+          ? { diagnosis: diagnosisResult.diagnosis }
+          : { diagnosisUnavailable: unavailable }),
         ...(legacyDiagnosisSeam()
           ? {}
           : {

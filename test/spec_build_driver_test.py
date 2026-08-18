@@ -3077,6 +3077,157 @@ class SteeringGrammarTests(unittest.TestCase):
             self.assertNotIn("grammar-rejected", body)
 
 
+class DiagnosisUnavailableSteeringTests(unittest.TestCase):
+    """The judge that never answered, recorded as the operator's own entry.
+
+    Witnessed at the eta C1 re-witness (2026-08-18, specs/eta/evidence/run-log.md):
+    a steward-bound diagnosis node hit its unit budget mid model call and
+    projected nothing, and the missing projection killed the whole pass. The
+    flow now names that death as a typed fact; these tests pin what the driver
+    does with it -- a blocked receipt an operator reads, composed by the
+    machinery because no model wrote one, and no retry on a judgment nobody
+    made.
+    """
+
+    GATE_DETAIL = (
+        "forbidPaths gate 'forbid-secrets' rejected 1 path(s) touched in lane "
+        "history (a later removal does not clear this; the path must never "
+        "appear in any lane commit): "
+        '"secrets/key.pem" (matched "secrets/**")'
+    )
+
+    def brief(self, root: Path, checkout: Path, **overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "campaign": "fixture",
+            "repository": "acme/spec",
+            "repositoryConfig": repository_config(checkout, "local"),
+            "issue": issue(),
+            "taskId": "task-1",
+            "taskKind": "implementation",
+            "stage": "checkpoint",
+            "attempt": 1,
+            "diagnosisUnavailable": {
+                "code": "result-schema-mismatch",
+                "detail": "node returned no structured result",
+            },
+            "attemptReceipts": attempt_receipts(root),
+        }
+        base.update(overrides)
+        return base
+
+    def receipt_record(self, root: Path, steered: dict[str, object]) -> dict[str, object]:
+        sequence = int(str(steered["comment"]).rsplit("/", 1)[1])
+        return attempt_records(root)[sequence - 1]
+
+    def test_a_projection_less_steward_is_recorded_as_a_blocked_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            steered = run_driver("steer", self.brief(root, checkout))
+            self.assertEqual(steered["kind"], "diagnosis")
+            self.assertTrue(steered["posted"])
+            self.assertEqual(steered["verdict"], "blocked")
+            self.assertTrue(steered["blocked"])
+
+            record = self.receipt_record(root, steered)
+            self.assertEqual(record["kind"], "diagnosis")
+            self.assertEqual(record["verdict"], "blocked")
+            body = str(record["diagnosis"])
+            # Outcome-first, like every other public receipt: the machinery
+            # composed this one, and it reads the same as a judge's.
+            self.assertTrue(body.startswith("Recorded a diagnosis-unavailable outcome:"), body)
+            self.assertIn("task-1", body)
+            self.assertIn("result-schema-mismatch", body)
+            self.assertIn("node returned no structured result", body)
+
+    def test_a_retry_verdict_cannot_outrank_a_judge_that_never_answered(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            steered = run_driver(
+                "steer",
+                self.brief(
+                    root,
+                    checkout,
+                    verdict="retry",
+                    diagnosisUnavailable={
+                        "code": "diagnosis-node-failed",
+                        "detail": "the steward exited without a final message",
+                    },
+                ),
+            )
+            self.assertEqual(steered["verdict"], "blocked")
+            self.assertTrue(steered["blocked"])
+            self.assertEqual(steered["attempt"], 1)
+            self.assertIn(
+                "diagnosis-node-failed",
+                str(self.receipt_record(root, steered)["diagnosis"]),
+            )
+
+    def test_the_composed_receipt_carries_the_required_gate_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            steered = run_driver(
+                "steer",
+                self.brief(
+                    root,
+                    checkout,
+                    gateEvidence={"id": "gate:forbid-secrets", "detail": self.GATE_DETAIL},
+                ),
+            )
+            body = str(self.receipt_record(root, steered)["diagnosis"])
+            # The public grammar requires these literals of a judge's own
+            # diagnosis; a composed one that omitted them would be rewritten
+            # into a note claiming a steward wrote something it never did.
+            self.assertIn("gate:forbid-secrets", body)
+            self.assertIn("secrets/key.pem", body)
+            self.assertNotIn("grammar-rejected", body)
+
+    def test_a_dead_judge_may_not_carry_a_judgment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            with self.assertRaisesRegex(DriverFailure, "carries no diagnosis"):
+                run_driver(
+                    "steer",
+                    self.brief(root, checkout, diagnosis="Investigated the failure."),
+                )
+            with self.assertRaisesRegex(DriverFailure, "carries no proposal"):
+                run_driver(
+                    "steer",
+                    self.brief(
+                        root,
+                        checkout,
+                        verdict="blocked",
+                        proposal={
+                            "kind": "amendment-task",
+                            "paths": ["src/lib.rs"],
+                            "goal": "widen the domain",
+                            "acceptanceCriteria": [
+                                {"id": "builds", "description": "it builds", "argv": ["true"]}
+                            ],
+                            "dependencies": [],
+                        },
+                    ),
+                )
+            self.assertEqual(attempt_records(root), [])
+
+    def test_an_unsafe_failure_class_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            with self.assertRaisesRegex(DriverFailure, "safe machine class name"):
+                run_driver(
+                    "steer",
+                    self.brief(
+                        root,
+                        checkout,
+                        diagnosisUnavailable={"code": "Result Schema", "detail": "x"},
+                    ),
+                )
+
+
 class BreachSteeringTests(unittest.TestCase):
     """#386's breach-abort surface, pinned. Round-1 F3 and F5.
 
