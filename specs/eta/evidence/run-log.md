@@ -321,6 +321,26 @@ Retried once with the cause named (E6 satisfied); the complete
 per-test unique-scope repair is QUEUED UNDER P3 beside the #440
 launch-cwd flake — the flaky-test class now has two members.
 
+## Chapter 5 mid-flight: the lease flake becomes a tax; supervisor resequences (08-18 ~18:20 UTC)
+
+Chapter-5 ledger so far: completion-unification MERGED 94198901 (one
+gate re-run — the lease flake's second strike plus a second
+steward-timeout pass kill); judge-replay-harness MERGED first-try
+2e385f38; vestige-excision MERGED first-try 7af2c4cb (the four compat
+shims and the W-321 grammar are gone); comment-sweep attempt 1
+gate-refused by the SAME flake, fourth strike
+(night-readmission-7, campaign.rs:12609), followed by the THIRD
+steward-timeout pass kill. The flake now strikes roughly half of all
+package-building gate runs and its fix lane (test-isolation-guard)
+sat two positions back in authoring order. Supervisor intervention in
+a verified-quiet gap (poll timer stopped first — the valve, no
+straddle risk): amendment adds test-isolation-guard to the
+dependencies of comment-sweep and steward-timeout-legibility, so the
+isolation fix lands before any further dice rolls; epoch derivation
+refreshes comment-sweep's budget as designed. E6 held: every retry
+this chapter carries a named cause and the cause is one recorded
+class.
+
 Flash retry SUCCEEDED (exit 0, pipefail-verified). Post-flash
 checklist executed: fleet-deploy inactive, both timers stopped, daemon
 restarted on 5rd83q51...-tally-0.1.0. Seam verification, all green:

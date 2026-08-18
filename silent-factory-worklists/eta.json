@@ -941,7 +941,7 @@
           "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
         }
       ],
-      "dependencies": ["vestige-excision"],
+      "dependencies": ["vestige-excision", "test-isolation-guard"],
       "conflictDomains": ["crates/tally", "crates/tally-core", "crates/tally-flow", "crates/spec-build-driver", "crates/spec-lint", "examples/flows", "nix/modules", "nix/lib", "test/spec_build_driver_test.py"]
     },
     {
@@ -1012,7 +1012,7 @@
           "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
         }
       ],
-      "dependencies": [],
+      "dependencies": ["test-isolation-guard"],
       "conflictDomains": ["crates/spec-build-driver", "examples/flows", "nix/lib", "test/fleet-gate.sh", "test/spec_build_driver_test.py", "crates/tally-core/src", "crates/tally"]
     },
     {
