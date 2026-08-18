@@ -5,6 +5,13 @@ deployed surface: it creates the user daemon, producer units, usage meters, and
 declarative flows. tally also exports a NixOS module for a system daemon, but
 that module deliberately does not generate producers, meters, or flows.
 
+If what you want is tally on one machine, for campaigns on your own
+repositories, read [Install tally as a product](product.md) instead. That path
+installs the CLI with `nix profile install` and the daemon with the product
+profile beside this module, and it needs no coordinator, no fleet flake, and no
+deployed pin belonging to anyone else. The two are the same flake; nothing on
+this page is a prerequisite for that one.
+
 ## NixOS module upgrade note
 
 The NixOS module now creates a dedicated unprivileged service account through

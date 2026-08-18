@@ -5,6 +5,7 @@
 # Getting started
 
 - [Install tally](getting-started/install.md)
+- [Install tally as a product](getting-started/product.md)
 - [Run your first job](getting-started/first-job.md)
 - [Run your first flow](getting-started/first-flow.md)
 
@@ -26,6 +27,7 @@
 - [Host API reference](flows/host-api.md)
 - [Submission identity and replay](flows/submission-and-replay.md)
 - [Campaigns](flows/campaigns.md)
+- [A small worklist, end to end](flows/small-worklist.md)
 - [Pooled-review cookbook](flows/pooled-review.md)
 - [Two more cookbook recipes](flows/cookbook.md)
 - [Cross-host handoff](flows/cross-host-handoff.md)
