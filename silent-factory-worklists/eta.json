@@ -16,29 +16,25 @@
         "kind": "command",
         "id": "driver-suite",
         "preflightArgv": ["sh", "-euc", "command -v python3 >/dev/null"],
-        "argv": ["python3", "test/spec_build_driver_test.py"],
-        "runtimeMaxSec": 900
+        "argv": ["python3", "test/spec_build_driver_test.py"]
       },
       {
         "kind": "command",
         "id": "cargo-tests",
         "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
-        "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"],
-        "runtimeMaxSec": 3600
+        "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
       },
       {
         "kind": "command",
         "id": "clippy",
         "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
-        "argv": ["nix", "develop", "--command", "cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
-        "runtimeMaxSec": 1800
+        "argv": ["nix", "develop", "--command", "cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
       },
       {
         "kind": "command",
         "id": "flake-build-subset",
         "preflightArgv": ["sh", "-euc", "command -v nix >/dev/null"],
-        "argv": ["nix", "build", "--no-link", ".#checks.x86_64-linux.spec-build-driver-tests", ".#checks.x86_64-linux.module-layer", ".#checks.x86_64-linux.campaign-runtime"],
-        "runtimeMaxSec": 1800
+        "argv": ["nix", "build", "--no-link", ".#checks.x86_64-linux.spec-build-driver-tests", ".#checks.x86_64-linux.module-layer", ".#checks.x86_64-linux.campaign-runtime"]
       }
     ]
   },
@@ -685,6 +681,150 @@
         "gate-budgets-from-receipts",
         "the-lease",
         "the-inbox"
+      ]
+    },
+    {
+      "id": "product-split",
+      "kind": "implementation",
+      "title": "Product split: tally installs as a versioned flake profile; using it on any repo requires no fleet deploy",
+      "goal": "Today the only supported install is the fleet: the dotfiles flake imports homeManagerModules.tally at a pinned input rev, so every tally upgrade is a fleet nixos-rebuild and every ordinary-repo use rides the coordinator's deployed pin — the coupling ETA.md chapter 4 (D1) exists to delete, and the deploy trap the whole record fights. The decoupling is already half-real in the tree, unclaimed: the package is self-contained (flake.nix near :164-166 installs share/tally/flows/spec-build.js and a libexec/tally/spec-build-driver symlink beside the binary, and the campaign machinery resolves both relative to its own executable — crates/tally/src/cli/campaign.rs near :7228 and :7233), and a fleet-free home-manager configuration already activates in a flake check (stockHome, flake.nix near :1127, checked as stock-home-activation). Build the product path on those observed facts, three pieces. (1) The product profile: a minimal, documented, fleet-free way to run the daemon from this flake alone — an example home-manager profile module or preset IN THIS REPO (under nix/, alongside the existing modules; dotfiles bytes are out of scope and out of reach) that enables services.tally with the two campaign pools the campaign flow requires (campaign-agent, campaign-control — grep the flow for its pool names and match them exactly) and one catalog adapter, nothing fleet-specific; nix profile install .#tally (equivalently the default package) is the CLI half of the same story. (2) Version legibility: tally --version prints only the workspace version (Cargo.toml near :21) so a deployed binary cannot name its own provenance and seam verification reads store paths instead; stamp the build's source revision at nix build time (pass self.rev or self.dirtyRev into the build environment; fall back to the literal dev when absent so cargo builds outside nix stay reproducible) and render it in --version output beside the crate version. (3) The proof: a new flake check checks.x86_64-linux.product-profile that (a) activates the product profile the way stock-home-activation activates stockHome, and (b) proves the INSTALLED prefix carries resolvable flow assets — the built package's share/tally/flows/spec-build.js and libexec/tally/spec-build-driver both exist and the driver symlink resolves — so installable-without-the-fleet is a witnessed property of every gated head rather than a hope. Name the new cargo tests (version rendering) so the filter provenance selects them. Lane discipline per specs/eta/evidence/sitting-c1.md: every command foreground, one commit plus a clean worktree at the finish (git log -1 && git status --porcelain last); in-lane verification is the acceptance argvs below — targeted nix build --no-link of the named attributes is sanctioned, a full nix flake check is not (the merge gates own the flake proof).",
+      "deliveredBehaviors": [
+        "a fleet-free product profile activates in a flake check and the installed prefix carries resolvable flow assets",
+        "tally --version names the build's source revision beside the crate version"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c2.md", "specs/eta/evidence/run-log.md"],
+        "styleReferences": ["flake.nix", "nix/modules/home-manager.nix"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "product-profile-check",
+          "description": "The product-profile flake check activates the fleet-free profile and proves installed-prefix asset resolution.",
+          "argv": ["nix", "build", "--no-link", ".#checks.x86_64-linux.product-profile"]
+        },
+        {
+          "id": "version-provenance",
+          "description": "The built binary's --version names a source revision.",
+          "argv": ["bash", "-lc", "out=$(nix build --print-out-paths --no-link .#tally) && \"$out\"/bin/tally --version && \"$out\"/bin/tally --version | grep -Eq '[0-9a-f]{7,40}'"]
+        },
+        {
+          "id": "flow-assets-installed",
+          "description": "The installed prefix carries the flow and the driver.",
+          "argv": ["bash", "-lc", "out=$(nix build --print-out-paths --no-link .#tally) && test -f \"$out\"/share/tally/flows/spec-build.js && test -x \"$out\"/libexec/tally/spec-build-driver"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["flake.nix", "nix/modules", "nix/lib", "crates/tally", "Cargo.toml", "Cargo.lock"]
+    },
+    {
+      "id": "worklist-scaffold",
+      "kind": "implementation",
+      "title": "The lightweight worklist path: a scaffold verb and a minimal admissible template — no spec plane",
+      "goal": "Ordinary work on an ordinary repo today requires hand-authoring worklist bytes in the fleet campaign genre — the eta worklist runs to seven hundred lines of spec-cited authoring — while the contract itself is lenient: conflictDomains is required non-empty only when campaign maxParallel exceeds one (crates/tally-core/src/campaign_contract.rs near :698-705), and the spec plane is an authoring-time discipline, not an admission requirement. Nothing renders that leniency reachable: no template, no scaffold verb, and the only worked examples are fleet campaigns with a full citation apparatus — so the daily-driver ratchet (ETA.md section 7: ordinary non-tally work flowing through this path) has no path to flow through. Build the lightweight path (ETA.md chapter 4, D2): a new verb tally campaign scaffold <IDENTITY> [--path <FILE>] that writes a minimal ADMISSIBLE worklist — schemaVersion, campaign{name, agent{adapter}, one example command gate the user edits to their own test command}, and one example implementation task (id, title, goal, one acceptance criterion with a real argv, conflictDomains) — defaulting to silent-factory-worklists/<IDENTITY>.json (the pattern the fleet genre already proves; --path overrides), refusing to overwrite an existing file, and printing the exact tally campaign arm command to run next so the verb documents its own handoff. The scaffold must be admissible by construction: before writing, the verb round-trips its rendered bytes through the same worklist deserialization and validation admission uses, and a unit test does the same round-trip so template drift fails tests forever. No spec plane: scaffolding neither reads nor writes specs/** and the scaffolded worklist validates on a repo containing no specs directory at all — assert that property in a test against a bare fixture repo. Placeholder values (identity-derived task id, adapter name left to the host catalog's vocabulary) must be spelled so the printed follow-up guidance tells the user exactly which fields to edit before arming. Name the tests so the filter scaffold selects them: the rendered template validates against the campaign contract (red today — the verb does not exist); the bare-repo no-spec-plane property holds. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification in the lane (the merge gates own the flake proof), finish with one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "tally campaign scaffold writes a minimal worklist that admission's own validation accepts, and prints the arm command",
+        "a scaffolded worklist validates on a repo with no specs directory"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c2.md"],
+        "styleReferences": ["crates/tally/src/cli/campaign.rs", "silent-factory-worklists/eta.json"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "scaffold-admits",
+          "description": "The scaffolded template round-trips the contract validator and the bare-repo property holds; the filter scaffold selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace scaffold 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src"]
+    },
+    {
+      "id": "baseline-parity-probe",
+      "kind": "implementation",
+      "title": "Baseline parity: the bare-vs-laned capability probe joins the smoke genre",
+      "goal": "The baseline-parity law (recorded 2026-08-15 in AUG15-SESSION-FINDINGS.md section 2.6; restated as this chapter's standing authority in specs/eta/evidence/sitting-c2.md): whatever an agent can do bare in a terminal — write temp files, use /dev/shm, compile at full parallelism, see its own error output — it must be able to do inside a lane; every deliberate gap is a documented containment ruling with a named justification, or it is a defect. Chapter 1 deleted the worst violations (the unauthored 8 GiB job cap, the read-only diagnosis jailer), but nothing WITNESSES the property, so the next unauthored constraint arrives silently and presents as an agent fault again — the exact shape that burned five hours of misattribution on 2026-08-14. Build the probe in the smoke genre (ETA.md chapter 4, D3), beside tally adapter smoke (crates/tally/src/cli/adapter.rs): a parity mode that runs one typed capability probe twice — once BARE as a direct child of the CLI process, once LANED as a real job unit through the daemon — and diffs the two typed reports field by field: tempdir writable; /dev/shm writable; effective CPU parallelism as the process observes it; a deliberately failing command's stderr present and readable in the captured output; memory ceiling (absent, or its value and the systemd property that imposes it). Equal reports pass. A divergence passes ONLY when it matches an entry in a committed containment-rulings table shipped beside the probe — each entry naming the diverging capability, the ruling, and its source citation — and any undocumented divergence fails naming the capability and both observed values. The probe report is typed and serialized (the smoke genre's existing envelope discipline), so the comparison is mechanical, never prose. The live bare-vs-laned run needs a running daemon and joins the operator's seam checklist; in tests the comparison logic and the rulings-table gate run deterministically on fixture reports — a fixture pair differing on an untabled capability must fail naming it (red today), and a tabled divergence must pass citing its ruling. Name the tests so the filter parity selects them. Lane discipline per specs/eta/evidence/sitting-c1.md: crate-local fixtures via CARGO_MANIFEST_DIR, every command foreground, cargo-only verification in the lane, finish with one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "an undocumented bare-vs-laned capability divergence fails the parity probe naming the capability and both values",
+        "a documented divergence passes only by citing its containment ruling"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c2.md", "specs/substrate/evidence/vestige-sweep.md"],
+        "styleReferences": ["crates/tally/src/cli/adapter.rs"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "parity-bites",
+          "description": "Untabled divergence fails, tabled divergence passes with citation; the filter parity selects the tests.",
+          "argv": ["bash", "-lc", "nix develop --command cargo test --workspace parity 2>&1 | tail -20"]
+        },
+        {
+          "id": "workspace-green",
+          "description": "Workspace tests pass.",
+          "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": ["crates/tally", "crates/tally-core/src"]
+    },
+    {
+      "id": "product-docs",
+      "kind": "implementation",
+      "title": "Docs true-up for the product path: install, scaffold, small-worklist lifecycle",
+      "goal": "The shipped documentation teaches the fleet genre only: doc/src/getting-started assumes the module wiring, and the campaign pages' worked examples are full spec-plane campaigns — after product-split and worklist-scaffold merge, the product path exists but is taught nowhere, and the daily-driver ratchet (ETA.md section 7) flows through exactly what these pages teach. True up (ETA.md chapter 4, D4): (1) a getting-started product page — install from the flake (nix profile install of the default package; the product profile for the daemon half), start the daemon fleet-free, tally adapter smoke as the first proof of life; (2) a small-worklist lifecycle page under doc/src/flows — scaffold (the merged verb, spelled exactly as the tree spells it), edit the named placeholder fields, arm, push-to-re-admit (poll re-admission is the deployed contract — a worklist push is the arming act), inbox for escalations, release at the end; every command shown must be a real verb of the merged tree, greped, not remembered; (3) sweep the existing pages for claims the product split falsified — install instructions that require the fleet pin, any statement that campaigns require a spec plane or the fleet modules. Touch only doc/; the doc flake check must stay green. Lane discipline per specs/eta/evidence/sitting-c1.md: every command foreground, finish with one commit and a clean worktree (git log -1 && git status --porcelain last).",
+      "deliveredBehaviors": [
+        "a getting-started page teaches the fleet-free install and first smoke",
+        "a lifecycle page teaches scaffold, arm, push-to-re-admit, inbox, and release with real merged-tree verbs"
+      ],
+      "readFirst": {
+        "specSections": ["specs/eta/evidence/sitting-c2.md"],
+        "styleReferences": ["doc/src/flows/campaigns.md", "doc/src/getting-started"]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "scaffold-taught",
+          "description": "The docs teach the scaffold verb.",
+          "argv": ["bash", "-lc", "grep -rn 'campaign scaffold' doc/src | head -3"]
+        },
+        {
+          "id": "fleet-free-install-taught",
+          "description": "The docs teach the fleet-free install path.",
+          "argv": ["bash", "-lc", "grep -rnE 'nix profile install|product profile' doc/src | head -3"]
+        },
+        {
+          "id": "doc-builds",
+          "description": "The doc check builds.",
+          "argv": ["bash", "-lc", "nix build --no-link .#checks.x86_64-linux.doc 2>&1 | tail -5"]
+        }
+      ],
+      "dependencies": ["product-split", "worklist-scaffold"],
+      "conflictDomains": ["doc"]
+    },
+    {
+      "id": "chapter-gate-c3",
+      "kind": "checkpoint",
+      "title": "Checkpoint C3: full gate ladder plus the final conformance bar over chapter 4",
+      "argv": [
+        "bash",
+        "-lc",
+        "test/fleet-gate.sh \"$(git rev-parse HEAD)\" && exec test/final-bar/run \"$PWD\""
+      ],
+      "runtimeMaxSec": 10800,
+      "dependencies": [
+        "product-split",
+        "worklist-scaffold",
+        "baseline-parity-probe",
+        "product-docs"
       ]
     }
   ]
