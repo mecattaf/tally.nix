@@ -1258,7 +1258,7 @@ work on another. Three roles bind to entries of the campaign's own
 |---|---|
 | `codeRepository` | Lanes, publish branches, pull requests, merges, merge and checkpoint receipts, and the merged-pull-request scan. |
 | `specRepository` | The worklist artifact, read at the revision each pass pins. |
-| `issueRepository` | The campaign issue thread and every machine receipt: diagnoses, retries, escalation, and the closing summary. The next-pass continuation is not among them — it is a local events-directory drop and reaches no repository at all. (Also task sub-issues, for the shape described under *staged, not yet reachable* below.) |
+| `issueRepository` | The campaign issue thread and every machine receipt: diagnoses, retries, escalation, and the closing summary. The next-pass continuation is not among them — it is a local events-directory drop and reaches no repository at all. |
 
 Each defaults inward: `issueRepository` falls back to `specRepository`, and
 both `specRepository` and `codeRepository` fall back to the repository the
@@ -1298,32 +1298,17 @@ An ad-hoc forge-native campaign cannot span repositories. Its worklist, briefs
 and receipts are the one issue thread by construction, so a brief carrying the
 roles is refused rather than partially honoured.
 
-#### Staged, not yet reachable: task sub-issues on a split campaign
+#### Task sub-issues on a split campaign: not a supported shape
 
-Two behaviours in the driver exist for a shape no campaign can currently be
-configured into, and it is worth being exact about which:
-
-- **The full-form closing keyword.** When a task carries its own sub-issue and
-  that sub-issue lives on another repository, the publish node emits
-  `Closes owner/name#<n>` rather than `Closes #<n>`. The
-  [probe on #321](https://github.com/mecattaf/tally.nix/issues/321) verified
-  live that GitHub honours the full form across repositories — the sub-issue
-  closes on merge, the parent's progress bar advances, and
-  `closedByPullRequestsReferences` still returns the merged pull request as the
-  oracle — and that the short form links and closes nothing.
-- **The cross-repository completion narrowing.** When a closing reference from
-  the sub-issue walk names a repository, completion requires it to be the
-  campaign's own `codeRepository`. This narrows where proof may come from; it
-  never widens what counts as proof.
-
-Neither fires today. A task carries a sub-issue only on the forge-native read
-path, and a forge-native campaign refuses the roles above, so the only campaign
-shape that can be split is the shape whose tasks never carry sub-issues; the
-sub-issue walk is likewise built only for forge-native campaigns. Reconciling
-task sub-issues with the worklist-artifact path is design work that has not
-been done. Until it is, a split campaign gets the degraded projection: no task
-sub-issues, no walk, and machine receipts as comments or refs on the issue
-repository.
+A task carries its own sub-issue only on the forge-native read path, and a
+forge-native campaign refuses the roles above, so the only campaign shape that
+can be split is the shape whose tasks never carry sub-issues. Reconciling task
+sub-issues with the worklist-artifact path is design work that has not been
+done, and the tree carries no code for it: a cross-repository closing grammar
+and a repository-narrowed completion check were once staged against that shape
+and have been deleted rather than carried unreachable. A split campaign gets
+the degraded projection: no task sub-issues, no walk, and machine receipts as
+comments or refs on the issue repository.
 
 ## The recurring worklist node contract
 
@@ -1599,17 +1584,12 @@ not only their dependency closure.
 
 That namespace is hidden, and deliberately so: it is the same one the
 campaign's diagnosis and escalation state already uses, and it is served only
-on request. Receipts were published as tags below
-`refs/tags/tally/spec-build/v1/` until #307, and **tags are auto-fetched by
-every clone** — a private campaign's checkpoint ledger became part of a public
-target repository's surface. Already-published tag receipts are still read and
-honored, so the move re-executes nothing; nothing new is ever written there.
-To clean a target that already carries them, list them with
-`git ls-remote --tags <remote> 'refs/tags/tally/spec-build/v1/*'`, confirm the
-campaigns they belong to are finished, and delete them under the repository's
-ordinary destructive-change procedure
-(`git push <remote> --delete <ref>`); the campaign will re-record any still-live
-checkpoint into the hidden namespace on its next pass.
+on request. It is also the only namespace involved. **Tags are auto-fetched by
+every clone**, so a checkpoint ledger published below `refs/tags/` would make a
+private campaign's proof state part of a public target repository's surface:
+nothing is written there, and nothing is read from there. A ref outside the
+hidden namespace certifies nothing, and the campaign re-records the checkpoint
+on its next pass.
 
 Checkpoint refs are immutable and create-only; the driver never force-moves a
 receipt. A ruleset should allow the tally forge identity to create refs in

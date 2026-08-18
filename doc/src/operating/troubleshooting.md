@@ -373,9 +373,10 @@ the answer already durable there.
 
 A supersede naming a run with no durable node exits 4 (`not_found`). That run
 never recorded a script hash, so it can never trip an identity pin and never
-needs retiring — check the run ID for a typo. Renderings do not matter: upper
-case, unhyphenated, and braced UUIDs are all canonicalized to the hyphenated
-lowercase form on both write and read.
+needs retiring — check the run ID for a typo. The rendering you type does not
+matter: upper case, unhyphenated, and braced UUIDs are all canonicalized to the
+hyphenated lowercase form on the way in and on every lookup. The ledger itself
+stores only the canonical form.
 
 ## `flow-lineage-unusable`
 
@@ -393,8 +394,11 @@ escalates instead of retrying it every pass.
 An *interrupted* append — a crash, a power loss, or a short write under ENOSPC —
 never causes this: an unterminated final line is skipped on read and truncated by
 the next write. This message means a **complete** record cannot be decoded or
-validated, which in practice means a hand edit or bit rot. Failing closed is
-deliberate: skipping the line could resurrect a run an operator durably retired.
+validated, which in practice means a hand edit or bit rot. A hand edit that
+spells a run ID in any rendering other than the canonical hyphenated lowercase
+one lands here too: it is refused rather than indexed under a spelling no
+lookup asks for. Failing closed is deliberate: skipping the line could
+resurrect a run an operator durably retired.
 
 Repair it with the daemon stopped. The file is a plain JSONL index, not a hash
 chain, so removing the offending line is sufficient and nothing downstream needs
