@@ -149,10 +149,10 @@ impl DaemonHandler {
         // provider-capture authority — a measurement claimed for work that has
         // not run. Today the cloned row is usage-free because nothing writes a
         // scraped usage record back into `context.rows` at all: completion
-        // records it on the query fact instead (#395 removed the last writes it
-        // made to `context.jobs`), and `context.rows` is only written before
-        // execution. So this line is currently redundant; it is here so the
-        // discipline survives anyone making completion write rows back.
+        // records it on the query fact instead, and `context.rows` is only
+        // written before execution. So this line is currently redundant; it is
+        // here so the discipline survives anyone making completion write rows
+        // back.
         row.usage = None;
         row.usage_accounting = None;
 
@@ -451,12 +451,12 @@ impl DaemonHandler {
     ///
     /// The admission happened: the row is durable and the work is dispatching,
     /// so the honest answer is the disposition the kernel decided plus the task
-    /// UUID. What is degraded is *observability of one node*, and only until the
-    /// ledger is repaired: this run's window will be missing this node, which is
-    /// exactly the pre-#380 status quo for that one node rather than a
-    /// regression. The typed field lets a runner log it; the journal line is the
-    /// durable record an operator greps to know what to backfill, because the
-    /// store that would ordinarily hold that fact is the one that just failed.
+    /// UUID. What is degraded is *observability of one node*, and only until
+    /// the ledger is repaired: this run's window will be missing this node, and
+    /// nothing else. The typed field lets a runner log it; the journal line is
+    /// the durable record an operator greps to know what to backfill, because
+    /// the store that would ordinarily hold that fact is the one that just
+    /// failed.
     pub(crate) fn disclose_degraded_membership(
         &self,
         orchestration: &Orchestration,
@@ -484,16 +484,15 @@ impl DaemonHandler {
         });
     }
 
-    /// Wait for the continued job's post-ack enrichment to settle (#440).
+    /// Wait for the continued job's post-ack enrichment to settle.
     ///
     /// A `--wait` returns on the terminal acknowledgement, which is
     /// deliberately independent of the scrape that installs the session
-    /// pointer, so `queue continue` on the task that just finished used to
-    /// race it and lose — reported as "has no scraped session reference",
-    /// intermittently, in the bar case that flaked at the Phase-0 bootstrap
-    /// gate. The wait is on the enrichment task's own end, not on a duration,
-    /// and it costs nothing for a job whose enrichment already finished or
-    /// never had one.
+    /// pointer, so `queue continue` on the task that just finished races it and
+    /// loses — reported as "has no scraped session reference", intermittently.
+    /// The wait is on the enrichment task's own end, not on a duration, and it
+    /// costs nothing for a job whose enrichment already finished or never had
+    /// one.
     ///
     /// Taken before the context write lock, because the enrichment this waits
     /// on takes that same lock to install what it scraped.
@@ -580,7 +579,7 @@ impl DaemonHandler {
             }
             // The seed the job was admitted with, carrying the session pointer
             // and model its post-ack scrape observed — which for a job retired
-            // out of `context.jobs` come from the query fact (#395).
+            // out of `context.jobs` come from the query fact.
             let previous = found.observed_row();
             if previous.session_ref.is_none() {
                 return Err(WireError::invalid(format!(
@@ -1301,8 +1300,8 @@ impl DaemonHandler {
                     );
                     // A reused disposition is terminal on arrival, so it never
                     // joins the live map at all -- the same end state as a job
-                    // that runs and is then retired (#395). The three maps
-                    // written just above are what answers for it afterwards.
+                    // that runs and is then retired. The three maps written
+                    // just above are what answers for it afterwards.
                     let evidence = serde_json::to_string(&row.evidence).map_err(internal_wire)?;
                     drop(context);
                     self.emit_post_ack(enqueued_event(&job));

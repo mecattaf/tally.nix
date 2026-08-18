@@ -318,13 +318,12 @@ pub struct UsageMeterConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PoolConfig {
-    /// `None` when the operator declared no `resource` at all, distinct
-    /// from `Some(ResourceKind::Vram)`. `ResourceKind::Vram` is the
-    /// *effective* default for every admission decision that predates
-    /// #382 (see [`PoolConfig::resource`]) — but a witness fact that reads
-    /// "this job held a GPU pool" must not be derivable from an operator
-    /// saying nothing, so #382's `gpuSeconds` gate keys off this field
-    /// directly and only ever fires on an explicit `Some(Vram)`.
+    /// `None` when the operator declared no `resource` at all, distinct from
+    /// `Some(ResourceKind::Vram)`. `ResourceKind::Vram` is the *effective*
+    /// default for every admission decision (see [`PoolConfig::resource`]) —
+    /// but a witness fact that reads "this job held a GPU pool" must not be
+    /// derivable from an operator saying nothing, so the `gpuSeconds` gate keys
+    /// off this field directly and only ever fires on an explicit `Some(Vram)`.
     #[serde(default)]
     pub resource: Option<ResourceKind>,
     #[serde(default = "default_capacity")]
@@ -365,11 +364,10 @@ impl Default for PoolConfig {
 }
 
 impl PoolConfig {
-    /// The effective resource kind for admission and every other decision
-    /// this pool's shape drives — unchanged by #382. An undeclared
-    /// `resource` reads as `ResourceKind::default()` (`vram`) here exactly
-    /// as it always has; this is deliberately the *wide* reading, not the
-    /// narrow one `gpuSeconds` gates on (see the field doc).
+    /// The effective resource kind for admission and every other decision this
+    /// pool's shape drives. An undeclared `resource` reads as
+    /// `ResourceKind::default()` (`vram`) here; this is deliberately the *wide*
+    /// reading, not the narrow one `gpuSeconds` gates on (see the field doc).
     pub fn resource(&self) -> ResourceKind {
         self.resource.unwrap_or_default()
     }
@@ -1311,18 +1309,18 @@ mod tests {
             .contains("unknown executor"));
     }
 
-    /// The pinned cross-language vector for #382's HIGH-1 repair.
+    /// The pinned cross-language vector for the resource-declaration contract.
     ///
     /// `test/fixtures/pools/resource-declaration.golden.json` is rendered by
-    /// `nix/modules/common.nix`'s `mkRuntimeConfig`/`renderPool` from a
-    /// pool that declares no `resource` and one that declares `"vram"`
-    /// explicitly (`.#checks.<system>.pool-resource-declaration` re-renders
-    /// it live and `cmp`s against this exact file, so Nix's rendering and
-    /// this fixture cannot drift apart silently). This test pins the other
-    /// half of the contract: that `PoolConfig`'s `Deserialize` reads that
-    /// exact rendered shape the way #382 requires — an absent `resource`
-    /// key as `None` (undeclared), never as `Some(Vram)` by way of
-    /// defaulting, and a present `"vram"` key as `Some(Vram)` (declared).
+    /// `nix/modules/common.nix`'s `mkRuntimeConfig`/`renderPool` from a pool
+    /// that declares no `resource` and one that declares `"vram"` explicitly
+    /// (`.#checks.<system>.pool-resource-declaration` re-renders it live and
+    /// `cmp`s against this exact file, so Nix's rendering and this fixture
+    /// cannot drift apart silently). This test pins the other half of the
+    /// contract: that `PoolConfig`'s `Deserialize` reads that exact rendered
+    /// shape the way the gate requires — an absent `resource` key as `None`
+    /// (undeclared), never as `Some(Vram)` by way of defaulting, and a present
+    /// `"vram"` key as `Some(Vram)` (declared).
     #[test]
     fn pool_config_reads_the_nix_rendered_declared_vs_undeclared_fixture_correctly() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))

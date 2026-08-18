@@ -228,13 +228,12 @@ pub enum ExecutionTermination {
         exit_status: Option<String>,
     },
     /// A kernel OOM kill inside the unit's cgroup. This is a class of its own,
-    /// not a signal: before this variant existed, `service_result == "oom-kill"`
-    /// was folded into `Signaled` and a child-kill — the kernel kills `rustc`,
-    /// the agent survives, the unit exits with the agent's own status — was
-    /// indistinguishable from a clean exit, with no artifact anywhere recording
-    /// the kill (vestige-sweep V-3). The two fields carry what the exit
-    /// recorder measured at `ExecStopPost`; each stays a typed absence when the
-    /// accounting probe never ran or failed, never an invented number.
+    /// not a signal: folded into `Signaled`, a child-kill — the kernel kills
+    /// `rustc`, the agent survives, the unit exits with the agent's own status
+    /// — is indistinguishable from a clean exit, with no artifact anywhere
+    /// recording the kill (vestige-sweep V-3). The two fields carry what the
+    /// exit recorder measured at `ExecStopPost`; each stays a typed absence
+    /// when the accounting probe never ran or failed, never an invented number.
     #[serde(rename_all = "camelCase")]
     OomKilled {
         /// The cgroup `memory.events` `oom_kill` counter, when measured.
@@ -367,13 +366,13 @@ pub struct UnitExitRecord {
     pub exit_status: Option<String>,
     /// Best-effort cgroup accounting, filled by the exit recorder from one
     /// `systemctl show` call. `None` covers both "the probe never ran" (a
-    /// pre-#382 record) and "the probe ran and failed" — the failure is
-    /// logged to the job's captured stderr at the point it happens, and this
-    /// field never carries a value nobody measured. The heap indirection
-    /// keeps the record — and every container that embeds it, up to the
-    /// remote wire enum — small against the six measured facts it carries;
-    /// `Box` serializes transparently, so the durable JSON is exactly what
-    /// it was when the field was inline.
+    /// record written before the field existed) and "the probe ran and failed"
+    /// — the failure is logged to the job's captured stderr at the point it
+    /// happens, and this field never carries a value nobody measured. The heap
+    /// indirection keeps the record — and every container that embeds it, up to
+    /// the remote wire enum — small against the six measured facts it carries;
+    /// `Box` serializes transparently, so the durable JSON is exactly what it
+    /// is with the field inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounting: Option<Box<UnitAccounting>>,
 }

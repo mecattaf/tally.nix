@@ -116,16 +116,16 @@ pub(crate) fn is_nix_store_path(value: &str) -> bool {
 }
 
 /// The classification a terminal node gets when its exit evidence passed but
-/// its advisory finalMessage projection never arrived inside the wait window
-/// (#432). It is a distinct, greppable code: daemon congestion is not a schema
+/// its advisory finalMessage projection never arrived inside the wait window.
+/// It is a distinct, greppable code: daemon congestion is not a schema
 /// violation, and an operator reading a dead campaign must be able to tell the
-/// two apart. Both the live client (which raises it) and the engine host
-/// (which must not rewrite it into `result-schema-mismatch`) name this
-/// constant so the two halves cannot drift.
+/// two apart. Both the live client (which raises it) and the engine host (which
+/// must not rewrite it into `result-schema-mismatch`) name this constant so the
+/// two halves cannot drift.
 pub const RETRYABLE_PROJECTION_CODE: &str = "retryable-projection";
 
 /// The projection-missing classification a node keeps when its exit evidence
-/// did NOT pass. This is the pre-#432 behaviour, deliberately unchanged.
+/// did NOT pass. Failed evidence is never reclassified as congestion.
 pub const RESULT_PROJECTION_TIMEOUT_CODE: &str = "result-projection-timeout";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

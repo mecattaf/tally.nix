@@ -324,7 +324,7 @@ pub(super) async fn run_flow(
 }
 
 /// Resolve the projection wait from `--result-projection-wait-ms` and
-/// `TALLY_RESULT_PROJECTION_TIMEOUT_MS` (#432), flag first.
+/// `TALLY_RESULT_PROJECTION_TIMEOUT_MS`, flag first.
 ///
 /// Neither set keeps the client's 10 s default. A set value must be a positive
 /// whole number of milliseconds: widening the window is how an operator who
@@ -336,9 +336,9 @@ pub(super) async fn run_flow(
 /// The flag is the seam that reaches a campaign. A campaign pass runs as a
 /// daemon-launched transient unit whose environment is built from an explicit
 /// `--setenv` list, so an operator's shell environment never reaches it;
-/// `campaign arm --projection-wait-ms` records the value and `dispatch_campaign`
-/// puts it on this flag. The environment channel is for a `tally flow run` the
-/// operator launches themselves.
+/// `campaign arm --projection-wait-ms` records the value and
+/// `dispatch_campaign` puts it on this flag. The environment channel is for a
+/// `tally flow run` the operator launches themselves.
 fn resolve_result_projection_timeout(
     flag: Option<u64>,
     value: Option<OsString>,
@@ -532,7 +532,7 @@ pub(super) fn flow_error(error: FlowError) -> anyhow::Error {
 mod tests {
     use super::*;
 
-    /// #432 acceptance 2: the projection wait is configurable through
+    /// The projection wait is configurable through
     /// `--result-projection-wait-ms` and `TALLY_RESULT_PROJECTION_TIMEOUT_MS`.
     /// Neither set keeps the client default (the caller does not override); a
     /// positive value widens the window; a zero or unparsable value is refused

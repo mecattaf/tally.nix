@@ -10,14 +10,14 @@ use super::*;
 /// numeral on either end diverges and fails.
 pub const CAPTURE_EXCERPT_FRAMING_MARGIN: usize = 16 * 1024;
 
-/// The stderr peephole every failure is read through — a derivation over
-/// its consumer, not a number somebody sized (vestige-sweep V-4). The
-/// excerpt rides in `TALLY_STDERR_TAIL` on the Failed lifecycle event, and
-/// that record's envelope is `journal::MAX_STDOUT_RECORD_BYTES`; the
-/// envelope minus the framing margin is the widest an excerpt can be and
-/// still always fit the record it feeds. The 2 KiB bare numeral this
-/// replaced rendered ~20 lines of tail, so the causal error of a cargo run
-/// — thousands of lines up — never reached the channel attribution reads.
+/// The stderr peephole every failure is read through — a derivation over its
+/// consumer, not a number somebody sized (vestige-sweep V-4). The excerpt rides
+/// in `TALLY_STDERR_TAIL` on the Failed lifecycle event, and that record's
+/// envelope is `journal::MAX_STDOUT_RECORD_BYTES`; the envelope minus the
+/// framing margin is the widest an excerpt can be and still always fit the
+/// record it feeds. A bare 2 KiB numeral here renders ~20 lines of tail, so the
+/// causal error of a cargo run — thousands of lines up — never reaches the
+/// channel attribution reads.
 pub const CAPTURE_EXCERPT_MAX_BYTES: usize =
     crate::journal::MAX_STDOUT_RECORD_BYTES - CAPTURE_EXCERPT_FRAMING_MARGIN;
 
@@ -63,19 +63,19 @@ impl Executor {
     ///
     /// Two properties beyond "hold an exclusive `flock`" are load-bearing here.
     ///
-    /// The wait is bounded. `lock_exclusive` is a blocking syscall on a file
-    /// that used to live in a job-writable directory; the relocation removes the
-    /// hostile holder, but a wedged daemon-side holder would still stall every
-    /// caller, including the RPC failure-projection path. Callers already treat
-    /// a failure here as "no excerpt", which is strictly better than not
+    /// The wait is bounded. `lock_exclusive` is a blocking syscall, and the
+    /// lock file lives outside any job-writable directory so no hostile holder
+    /// can take it; a wedged daemon-side holder would still stall every caller,
+    /// including the RPC failure-projection path. Callers already treat a
+    /// failure here as "no excerpt", which is strictly better than not
     /// answering.
     ///
     /// The acquisition is revalidated. `flock` follows the inode, not the name,
     /// so a lock granted after the retention sweep unlinked the path guards
     /// nothing: the next caller creates a fresh file and locks it immediately,
     /// and two holders run at once. Re-stat after the lock is granted and, if
-    /// the name no longer resolves to the inode under the lock, drop it and open
-    /// again.
+    /// the name no longer resolves to the inode under the lock, drop it and
+    /// open again.
     fn lock_capture_within(
         &self,
         identity: &ExecutionIdentity,
@@ -771,12 +771,12 @@ pub fn read_exit_record(path: &Path, expected_unit: &str) -> Result<UnitExitReco
 }
 
 /// The exit recorder's entry point, run as `ExecStopPost`. Beyond the
-/// environment-derived fields `persist_exit_record` has always written, this
-/// issues the one accounting `systemctl show` while the unit is still
-/// queryable and embeds the result. A failed probe never fails the exit
-/// record: accounting is advisory to the verdict, so the failure is logged to
-/// the job's captured stderr (the executor module's diagnostics convention,
-/// #315) and the record is written with a typed absence instead.
+/// environment-derived fields `persist_exit_record` writes, this issues the one
+/// accounting `systemctl show` while the unit is still queryable and embeds the
+/// result. A failed probe never fails the exit record: accounting is advisory
+/// to the verdict, so the failure is logged to the job's captured stderr (the
+/// executor module's diagnostics convention) and the record is written with a
+/// typed absence instead.
 pub fn persist_exit_record_from_env(
     path: &Path,
     expected_unit: &str,
@@ -873,15 +873,15 @@ pub(super) fn classify_termination(
 ) -> Result<ExecutionTermination, ExecutorError> {
     // A kernel OOM kill names itself before every other shape, including a
     // clean-looking exit: the child-kill case (the kernel kills `rustc`, the
-    // agent survives) leaves `service_result` as `success`/`exit-code` with
-    // the agent's own status, and before this check existed no artifact
-    // anywhere recorded the kill (vestige-sweep V-3). A measured nonzero
-    // `memory.events` `oom_kill` counter wins even over a later `timeout`,
-    // because the cap that fired is exactly the constraint that must stop
-    // masquerading; the record's own `service_result` remains the durable raw
-    // fact beside the classification. A `service_result` of `oom-kill` is
-    // systemd's own statement of the kill and classifies the same way even
-    // when the accounting probe delivered no counter.
+    // agent survives) leaves `service_result` as `success`/`exit-code` with the
+    // agent's own status, and this check is the only thing that records the
+    // kill at all (vestige-sweep V-3). A measured nonzero `memory.events`
+    // `oom_kill` counter wins even over a later `timeout`, because the cap that
+    // fired is exactly the constraint that must stop masquerading; the record's
+    // own `service_result` remains the durable raw fact beside the
+    // classification. A `service_result` of `oom-kill` is systemd's own
+    // statement of the kill and classifies the same way even when the
+    // accounting probe delivered no counter.
     if let Some(oom) = oom_termination(record) {
         return Ok(oom);
     }

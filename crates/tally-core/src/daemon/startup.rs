@@ -41,9 +41,8 @@ impl Drop for DaemonLockGuard {
 /// How long any single startup phase may take before systemd gives up.
 ///
 /// Deliberately the same 90 s the user manager's `DefaultTimeoutStartSec`
-/// already imposed on the whole of startup, so the number an operator sees in
-/// a failure is the one they are used to. What changed is what it measures:
-/// one phase rather than all of them.
+/// imposes on the whole of startup, so the number an operator sees in a failure
+/// is the one they are used to. It measures one phase rather than all of them.
 pub(super) const STARTUP_PHASE_BUDGET: Duration = Duration::from_secs(90);
 
 /// How often the unit-facts loop renews the start timeout while it is making
@@ -51,13 +50,13 @@ pub(super) const STARTUP_PHASE_BUDGET: Duration = Duration::from_secs(90);
 ///
 /// The phase-boundary extension gives each phase one fresh budget, but the
 /// unit-facts phase probes the executor once per non-terminal durable row —
-/// O(event corpus) inside a single budget, ~90–95 s at the coordinator's
-/// ~25k rows, so whether a restart succeeded was a coin flip on load (#428).
-/// Renewing from inside the loop makes the budget bound progress stalls: a
-/// daemon still visiting rows keeps starting, one wedged on a single probe
-/// dies on the same 90 s clock. The interval is a small fraction of the
-/// budget so a slow-but-moving loop never comes near the deadline, while a
-/// fast startup (under 10 s of unit facts) sends nothing extra.
+/// O(event corpus) inside a single budget, ~90–95 s at the coordinator's ~25k
+/// rows, so whether a restart succeeded was a coin flip on load. Renewing from
+/// inside the loop makes the budget bound progress stalls: a daemon still
+/// visiting rows keeps starting, one wedged on a single probe dies on the same
+/// 90 s clock. The interval is a small fraction of the budget so a
+/// slow-but-moving loop never comes near the deadline, while a fast startup
+/// (under 10 s of unit facts) sends nothing extra.
 pub(super) const UNIT_FACTS_EXTEND_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Turns the unit-facts loop's per-row progress callbacks into throttled
@@ -110,21 +109,21 @@ impl UnitFactsExtension {
 /// Per-phase startup accounting, and the systemd budget that pays for it.
 ///
 /// Everything `Daemon::open` and the pre-`READY` half of `run_loop` do is
-/// charged to `TimeoutStartSec` and never to `WatchdogSec`, because the
-/// service watchdog is not armed until `READY=1` (#370). #379 measured what
-/// that costs at estate scale — 61 s of a 90 s budget on the coordinator, on a
-/// trend that had added 20 s in two days — and could attribute none of it,
-/// because the daemon says nothing at all between `Starting` and its first
-/// late-startup log line. This type is the answer to both halves of that.
+/// charged to `TimeoutStartSec` and never to `WatchdogSec`, because the service
+/// watchdog is not armed until `READY=1`. At estate scale that is most of the
+/// budget — measured at 61 s of 90 s on the coordinator — and none of it can be
+/// attributed, because the daemon says nothing at all between `Starting` and
+/// its first late-startup log line. This type is the answer to both halves of
+/// that.
 ///
 /// It tells systemd, at every phase boundary, that startup is still making
 /// progress, via `EXTEND_TIMEOUT_USEC=`. A growing estate no longer walks into
 /// a restart loop the operator only diagnoses afterwards; a phase that wedges
 /// still fails, on the same clock, with `STATUS=` naming which one.
 ///
-/// It tells the operator, in one line at `READY`, what each phase cost. That
-/// line is the durable artefact #379 asks for: the next lane that adds startup
-/// work has a number to check against instead of a silent minute.
+/// It tells the operator, in one line at `READY`, what each phase cost — the
+/// durable artefact a later lane that adds startup work checks its own number
+/// against, instead of a silent minute.
 pub(super) struct StartupTimeline {
     notifier: SystemdNotifier,
     started: std::time::Instant,
@@ -169,7 +168,7 @@ impl StartupTimeline {
             STARTUP_PHASE_BUDGET.as_secs()
         );
         // Field-per-phase rather than prose: an operator watching the trend
-        // #379 recorded needs to grep one phase out of the line, not read it.
+        // needs to grep one phase out of the line, not read it.
         for (name, elapsed) in &self.phases {
             line.push_str(&format!(" {name}={:.3}s", elapsed.as_secs_f64()));
         }
@@ -187,11 +186,10 @@ impl StartupTimeline {
     }
 
     fn extend(&self, phase: &str) {
-        // A notification failure is not made fatal here. Before #379 the
-        // daemon sent nothing at all between spawn and `READY=1`, so a broken
-        // notify socket could not fail startup earlier than `ready()`, and
-        // adding a new way for it to do so would trade a measured budget
-        // problem for an unmeasured availability one. `ready()` still reports.
+        // A notification failure is not made fatal here. A broken notify socket
+        // must not be able to fail startup any earlier than `ready()` does,
+        // which would trade a measured budget problem for an unmeasured
+        // availability one. `ready()` still reports.
         let _ = self
             .notifier
             .extend_start_timeout(STARTUP_PHASE_BUDGET, &format!("starting: {phase}"));
@@ -218,7 +216,7 @@ impl Daemon {
         executor: Executor,
     ) -> Result<Self, DaemonError> {
         // The notifier is built first so every phase below is inside the
-        // extended budget, not just the ones after the listener exists (#379).
+        // extended budget, not just the ones after the listener exists.
         let notifier = SystemdNotifier::from_environment()?;
         let mut timeline = StartupTimeline::begin(notifier.clone(), "prepare");
         config
@@ -624,10 +622,10 @@ pub(super) const FAILURE_STDERR_CURSOR_FILE: &str = "failure-stderr-cursor.json"
 
 /// The high-water mark of the failure-stderr recovery pass.
 ///
-/// Recovery of one terminal record is a one-shot: the capture it reads is
-/// final by the time the record is terminal, so a second attempt on the same
-/// record can only reach the same answer. Persisting how far the pass got is
-/// what makes that true across restarts (#407).
+/// Recovery of one terminal record is a one-shot: the capture it reads is final
+/// by the time the record is terminal, so a second attempt on the same record
+/// can only reach the same answer. Persisting how far the pass got is what
+/// makes that true across restarts.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct FailureStderrCursor {
@@ -656,20 +654,20 @@ enum FailureStderrOutcome {
     Deferred,
 }
 
-/// Attempt failure-stderr recovery for every terminal record not yet reconciled.
+/// Attempt failure-stderr recovery for every terminal record not yet
+/// reconciled.
 ///
-/// Before #407 this walked every terminal `Failed` record at every startup and
-/// called `persist_failure_stderr` on each. On an estate with real failure
-/// history that is hundreds of probes per start whose answer cannot change,
-/// each one printing its own warning line: 227 on the startup #379 measured,
-/// about 2,951 across five days, and enough noise to bury the genuine startup
-/// signal beside it. All of it charged to `TimeoutStartSec`.
+/// Walking every terminal `Failed` record at every startup means hundreds of
+/// probes per start, on an estate with real failure history, whose answer
+/// cannot change — each one printing its own warning line, enough noise to bury
+/// the genuine startup signal beside it, all of it charged to
+/// `TimeoutStartSec`.
 ///
-/// The cost is now one-shot. The cursor advances only across a contiguous run
-/// of definitive outcomes, so a transient failure — a lock this daemon lost a
-/// race for — is retried on the next start rather than silently abandoned, and
-/// the pass reports itself in one line with named fields instead of one line
-/// per doomed probe.
+/// The cost is one-shot instead. The cursor advances only across a contiguous
+/// run of definitive outcomes, so a transient failure — a lock this daemon lost
+/// a race for — is retried on the next start rather than silently abandoned,
+/// and the pass reports itself in one line with named fields instead of one
+/// line per doomed probe.
 pub(super) fn reconcile_failure_stderr(
     records: &[crate::witness::WitnessRecord],
     executor: &Executor,

@@ -399,9 +399,9 @@ pub(super) struct CampaignArmArgs {
     pub(super) workspace_root: Option<PathBuf>,
     /// How long each pass of this campaign waits for a node's advisory
     /// finalMessage projection before classifying the node
-    /// `retryable-projection` (#432). Recorded in the registration and passed
-    /// to every `tally flow run` this campaign dispatches, including the ones
-    /// `campaign poll` dispatches later. Defaults to the flow host's 10 s.
+    /// `retryable-projection`. Recorded in the registration and passed to every
+    /// `tally flow run` this campaign dispatches, including the ones `campaign
+    /// poll` dispatches later. Defaults to the flow host's 10 s.
     #[arg(long, value_name = "MILLISECONDS")]
     pub(super) projection_wait_ms: Option<u64>,
 }
@@ -656,8 +656,8 @@ pub(super) struct FlowRunArgs {
     #[arg(long, value_name = "SECONDS")]
     pub(super) rpc_call_deadline_sec: Option<u64>,
     /// How long a terminal node waits for its advisory finalMessage projection
-    /// before the node is classified `retryable-projection` (#432). Defaults to
-    /// 10 s. Takes precedence over `TALLY_RESULT_PROJECTION_TIMEOUT_MS`.
+    /// before the node is classified `retryable-projection`. Defaults to 10 s.
+    /// Takes precedence over `TALLY_RESULT_PROJECTION_TIMEOUT_MS`.
     #[arg(long, value_name = "MILLISECONDS")]
     pub(super) result_projection_wait_ms: Option<u64>,
 }
@@ -718,10 +718,9 @@ pub(super) struct ProducerDispatchArgs {
     pub(super) event: String,
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
-    /// Required. The brief store lives under the daemon data directory; the
-    /// former fallback to `--state-dir` silently recreated the split brief
-    /// layout #271 retired, and the sweep now treats that layout as a legacy
-    /// store to drain.
+    /// Required. The brief store lives under the daemon data directory; a
+    /// fallback to `--state-dir` silently recreates the retired split brief
+    /// layout, which the sweep now treats as a legacy store to drain.
     #[arg(long, value_name = "PATH")]
     pub(super) data_dir: PathBuf,
     #[arg(long, hide = true)]

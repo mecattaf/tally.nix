@@ -507,8 +507,8 @@ impl DaemonHandler {
         }
         // A run with no durable node never recorded a script hash, so it can
         // never trip a startup identity pin and never needs superseding. Every
-        // other run-keyed verb answers not-found for it; this one used to
-        // answer `ok: true`, which is the silent no-op #251 is about.
+        // other run-keyed verb answers not-found for it, and answering `ok:
+        // true` here would be a silent no-op.
         predecessor_pins(&details, predecessor)
     }
 
@@ -611,9 +611,10 @@ impl DaemonHandler {
     ) -> Result<(), WireError> {
         let path = self.context.read().await.paths.flow_membership_path();
         // Scoped so the borrowed index is dropped before the cache is taken:
-        // holding it here would keep the `Arc` strong count at two, `try_unwrap`
-        // below would fail, and every admission would deep-clone the whole
-        // index — linear in the ledger, which is the cost this repair removes.
+        // holding it here would keep the `Arc` strong count at two,
+        // `try_unwrap` below would fail, and every admission would deep-clone
+        // the whole index — linear in the ledger, which is exactly the cost
+        // this path must not pay.
         let already_held = {
             let held = self.flow_membership().await?;
             held.contains(&record.flow_run_id, &record.task_uuid)
@@ -626,17 +627,15 @@ impl DaemonHandler {
         // holding one, so a campaign cannot lose its membership to a bound
         // crossed by unrelated traffic while its work is still outstanding.
         //
-        // The cost is one pass over `context.jobs`. That map used to keep every
-        // job this daemon had admitted since it started, which made this pass
-        // grow without bound — a comment here once claimed it was bounded by
-        // concurrency, and for as long as the map was never pruned that was
-        // wrong. #395 retired terminal jobs out of it, so the map is now the
-        // live set and this pass is bounded by outstanding work after all. The
-        // filter below is what that prune removes, so the set it produces is
-        // unchanged. It is still collected below the `already_held` return so a
-        // repeat admission, which writes nothing, pays nothing for it, and it
-        // is still built on every admission that does write, because the writer
-        // cannot know in advance whether it will need to compact.
+        // The cost is one pass over `context.jobs`. That map is the live set —
+        // a job that reaches a terminal disposition is retired out of it — so
+        // the pass is bounded by outstanding work rather than by everything the
+        // daemon has ever admitted. The filter below is what that retirement
+        // removes, so the set it produces is unchanged. It is still collected
+        // below the `already_held` return so a repeat admission, which writes
+        // nothing, pays nothing for it, and it is still built on every
+        // admission that does write, because the writer cannot know in advance
+        // whether it will need to compact.
         let live_tasks = {
             let context = self.context.read().await;
             context
@@ -706,7 +705,7 @@ impl DaemonHandler {
         let mut context = self.context.write().await;
         let found = find_job(&context, task_uuid)?;
         // Answered before the live job is unwrapped, because a terminal job is
-        // retired out of `context.jobs` and there is nothing to unwrap (#395).
+        // retired out of `context.jobs` and there is nothing to unwrap.
         if found.terminal() {
             let mut response = json!({
                 "ok": true,
@@ -1125,8 +1124,8 @@ fn selected_pools(
 /// A job the daemon can still answer for.
 ///
 /// `context.jobs` is the *live* set: a job that reaches a terminal disposition
-/// is retired out of it (#395). Two verbs can still be asked about a job after
-/// that — `cancel`, which answers `alreadyTerminal`, and `--resume-from`, which
+/// is retired out of it. Two verbs can still be asked about a job after that —
+/// `cancel`, which answers `alreadyTerminal`, and `--resume-from`, which
 /// continues a finished session — so a retired job is answered from the two
 /// maps that outlive it: the row seed it was admitted with, and the query fact
 /// its post-ack scrape enriched.
@@ -1140,10 +1139,10 @@ pub(crate) enum FoundJob<'a> {
         /// and a continuation needs the observations, not the seed.
         session_ref: Option<&'a str>,
         model: Option<&'a str>,
-        /// The query-fact status this retired job was admitted on:
-        /// `Completed`, or `Deleted` for a row recovered as a deleted cache
-        /// entry (`startup.rs`). Carried so an already-terminal answer can
-        /// report the status that actually admitted it (#420).
+        /// The query-fact status this retired job was admitted on: `Completed`,
+        /// or `Deleted` for a row recovered as a deleted cache entry
+        /// (`startup.rs`). Carried so an already-terminal answer can report the
+        /// status that actually admitted it.
         status: RowStatus,
     },
 }
@@ -1158,11 +1157,11 @@ impl<'a> FoundJob<'a> {
 
     /// What an already-terminal answer reports this job "was".
     ///
-    /// Derived from the same fact `find_job` admitted the retired job on,
-    /// not asserted: a live job only reaches the already-terminal branch at
-    /// `JobState::Completed`, but a retired row recovered as `Deleted`
-    /// answers with the deleted-cache label its query projection uses,
-    /// instead of a `"completed"` constant standing in for evidence (#420).
+    /// Derived from the same fact `find_job` admitted the retired job on, not
+    /// asserted: a live job only reaches the already-terminal branch at
+    /// `JobState::Completed`, but a retired row recovered as `Deleted` answers
+    /// with the deleted-cache label its query projection uses, instead of a
+    /// `"completed"` constant standing in for evidence.
     pub(crate) fn terminal_was(&self) -> &'static str {
         match self {
             Self::Live(_) => state_name(JobState::Completed),

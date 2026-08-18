@@ -224,14 +224,14 @@ impl DaemonHandler {
                 let reader_state = self.reader_state_advisory().await;
                 let executor = self.executor.clone();
                 off_thread(move || {
-                    // Not read until the id is known to resolve (#404). The
-                    // chain is parsed and hash-verified end to end on every
-                    // read -- ~2.7 ms/MB, projecting ~120 ms per call at this
-                    // repo's own completion count -- and an id that does not
-                    // resolve never reaches the rollup that consumes it.
-                    // `query_run` raises its `UnknownJob` from the same
-                    // predicate, so it, not this, is still what answers;
-                    // skipping the read cannot change what comes back.
+                    // Not read until the id is known to resolve. The chain is
+                    // parsed and hash-verified end to end on every read -- ~2.7
+                    // ms/MB, projecting ~120 ms per call at this repo's own
+                    // completion count -- and an id that does not resolve never
+                    // reaches the rollup that consumes it. `query_run` raises
+                    // its `UnknownJob` from the same predicate, so it, not
+                    // this, is still what answers; skipping the read cannot
+                    // change what comes back.
                     let (ledger_verified, attestations) = if flow_run_exists(
                         &params.id,
                         &details,
@@ -492,11 +492,11 @@ impl DaemonHandler {
                             entry.state.clone_from(state);
                         }
                     }
-                    // Same deferral as `query.run` (#404): a window that touched
-                    // no flow run has nothing to roll up, and the chain read is a
-                    // full parse and hash-verify. `apply_standup_usage` computes
-                    // the touched set from this same function, so it cannot find
-                    // work this skipped the evidence for.
+                    // Same deferral as `query.run`: a window that touched no
+                    // flow run has nothing to roll up, and the chain read is a
+                    // full parse and hash-verify. `apply_standup_usage`
+                    // computes the touched set from this same function, so it
+                    // cannot find work this skipped the evidence for.
                     let (ledger_verified, attestations) =
                         if standup_touched_runs(&digest, &details, &membership).is_empty() {
                             (false, Vec::new())
@@ -542,12 +542,12 @@ impl DaemonHandler {
 ///
 /// The daemon's runtime is a single thread: every `select!` arm and every RPC
 /// connection share it, so query construction that scales with the durable
-/// corpus used to be time the dispatch loop could not re-enter its select —
-/// at ~30k durable rows, minutes of it (#431). The closure receives only
-/// immutable snapshots taken under the context lock, so it computes over one
-/// consistent frozen view: admission, scheduling, and completion proceed on
-/// the dispatch thread while it runs, and a mutation that lands after the
-/// snapshot is simply not visible to this answer — never partially visible.
+/// corpus is time the dispatch loop cannot re-enter its select — at ~30k
+/// durable rows, minutes of it. The closure receives only immutable snapshots
+/// taken under the context lock, so it computes over one consistent frozen
+/// view: admission, scheduling, and completion proceed on the dispatch thread
+/// while it runs, and a mutation that lands after the snapshot is simply not
+/// visible to this answer — never partially visible.
 async fn off_thread<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, WireError> + Send + 'static,
 ) -> Result<T, WireError> {
@@ -599,7 +599,7 @@ fn read_attestations_advisory(path: &Path) -> (bool, Vec<AttestationRecord>) {
 ///
 /// Built inside [`off_thread`] closures by the consumers that need it: it
 /// clones every record's fields, which is exactly the O(all lifecycle records)
-/// copying that must not run on the dispatch thread (#431).
+/// copying that must not run on the dispatch thread.
 fn journal_entries(history: &crate::history::LifecycleSnapshot) -> Vec<JournalEntry> {
     history
         .records
@@ -611,13 +611,13 @@ fn journal_entries(history: &crate::history::LifecycleSnapshot) -> Vec<JournalEn
         .collect()
 }
 
-// The shared read-only projection every fresh (non-continuation) query
-// envelope is built from. Assembling it re-verifies the witness ledger, so
-// continuation pages never construct one. Every field is Send and cheap to
-// move: the corpus-scale consumers run on the blocking pool, and what this
-// assembly leaves on the dispatch thread is amortized O(live jobs) per query
-// plus `Arc` clones — with one O(corpus) snapshot-cache rebuild per mutation,
-// paid by the first query after it (#431).
+// The shared read-only projection every fresh (non-continuation) query envelope
+// is built from. Assembling it re-verifies the witness ledger, so continuation
+// pages never construct one. Every field is Send and cheap to move: the
+// corpus-scale consumers run on the blocking pool, and what this assembly
+// leaves on the dispatch thread is amortized O(live jobs) per query plus `Arc`
+// clones — with one O(corpus) snapshot-cache rebuild per mutation, paid by the
+// first query after it.
 pub(crate) struct QueryProjection {
     pub(crate) history: std::sync::Arc<crate::history::LifecycleSnapshot>,
     pub(crate) rows: std::sync::Arc<Vec<RowFact>>,
@@ -775,7 +775,7 @@ impl DaemonHandler {
             let lanes = trace_lanes(&details, &live, &history);
             // Grouped once: resolving the lane set through the public
             // `trace_availability` scan once per item made this collection
-            // quadratic in the corpus (#431).
+            // quadratic in the corpus.
             let mut lanes_by_anchor = HashMap::<&str, Vec<&TraceLane>>::new();
             for lane in &lanes {
                 lanes_by_anchor

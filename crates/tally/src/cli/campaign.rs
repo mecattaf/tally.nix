@@ -6043,9 +6043,9 @@ fn worklist_policy_manifest_config(
 /// A worklist is adapter-neutral bytes: the three agent policy names are keys
 /// of some adapter's policy map and of no other's, so a worklist that names one
 /// has chosen an adapter, and a worklist that names none has said nothing at
-/// all. Silence used to be filled by campaign-contract constants holding one
-/// preset's vocabulary, which every other adapter then refused at render. It is
-/// filled here instead, from the adapter the campaign actually selected and
+/// all. Filling that silence from campaign-contract constants holding one
+/// preset's vocabulary is what every other adapter then refuses at render. It
+/// is filled here instead, from the adapter the campaign actually selected and
 /// only from what that adapter declares about itself -- the same seam that
 /// already resolves the steward catalog role against this host's catalog.
 ///
@@ -7135,7 +7135,7 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     (3 + preflight + manifest.max_parallel * (12 + 2 * manifest.gates.len())) as u32
 }
 
-/// The `--projection-wait-ms` an arm may record (#432).
+/// The `--projection-wait-ms` an arm may record.
 ///
 /// Refused at arm rather than at the first pass, because the value is durable:
 /// a zero here would be written into the registration and then rejected by
@@ -7173,7 +7173,7 @@ impl CampaignHost<'_> {
     /// child exactly like the host that admitted it. In particular, a NixOS
     /// host keeps its only configuration at `/etc/tally/config.json`; allowing
     /// the initial flow to fall back to the service account's XDG home made it
-    /// disagree with both the daemon and the continuation poll (#442).
+    /// disagree with both the daemon and the continuation poll.
     fn tally_argv_prefix(&self, executable: &Path) -> Vec<String> {
         let mut argv = vec![executable.display().to_string()];
         if let Some(config) = self.config_path {
@@ -7189,13 +7189,13 @@ impl CampaignHost<'_> {
     ///
     /// This is the only place a durable registration turns into something the
     /// pass actually executes, and an argv nothing constructs in a test is an
-    /// argv nothing notices the loss of (#432). `projection_wait_ms` travels on
-    /// the argv rather than in the environment because the pass runs as a
+    /// argv nothing notices the loss of. `projection_wait_ms` travels on the
+    /// argv rather than in the environment because the pass runs as a
     /// daemon-launched transient unit whose environment is an explicit
-    /// `--setenv` list, so nothing an operator exports at arm time is visible to
-    /// it. `None` adds no projection-wait elements: this vector is hashed into
-    /// the enqueue payload, so an unconditional flag would move every existing
-    /// campaign's payload identity.
+    /// `--setenv` list, so nothing an operator exports at arm time is visible
+    /// to it. `None` adds no projection-wait elements: this vector is hashed
+    /// into the enqueue payload, so an unconditional flag would move every
+    /// existing campaign's payload identity.
     fn dispatch_flow_argv(
         &self,
         executable: &Path,
@@ -7335,10 +7335,10 @@ async fn dispatch_campaign(
             "kind": "github-issue",
             "graphDigest": &registration.approved_graph_digest,
         },
-        // Keep #433's normalized manifest receipt at the public arm boundary.
+        // Keep the normalized manifest receipt at the public arm boundary.
         // Current flows carry the complete graph below; compatibility callers
-        // may carry only this manifest plus its graph digest, in which case
-        // the driver must reconstruct and verify the omitted task envelope.
+        // may carry only this manifest plus its graph digest, in which case the
+        // driver must reconstruct and verify the omitted task envelope.
         "armedManifest": manifest,
         // The complete graph Rust normalized and hashed. The packaged driver
         // consumes this envelope; it never reparses another manifest into a
@@ -8436,12 +8436,12 @@ fn campaign_list_values(registry: &CampaignRegistry) -> Result<Vec<Value>> {
 
 /// Quiescence, read from durable facts rather than observed.
 ///
-/// The predicate used to be "no registration is listed", which made an
-/// operator's `disarm` the only way a campaign could ever be quiet and left
-/// liveness to be inferred from `list-units` beside it. A campaign is quiet
-/// now when its lease has lapsed: the last task went terminal under a
-/// gate-proven, published head and a pass wrote that down. The identity stays
-/// armed through it, so a push to its worklist still reactivates it.
+/// A predicate of "no registration is listed" makes an operator's `disarm` the
+/// only way a campaign can ever be quiet and leaves liveness to be inferred
+/// from `list-units` beside it. A campaign is quiet when its lease has lapsed:
+/// the last task went terminal under a gate-proven, published head and a pass
+/// wrote that down. The identity stays armed through it, so a push to its
+/// worklist still reactivates it.
 fn run_campaign_quiescent(args: CampaignQuiescentArgs) -> Result<()> {
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
@@ -10777,9 +10777,9 @@ fi
         assert!(release_bridge_warnings(&exact).is_empty());
     }
 
-    /// The release side of the lease model: once the lapse fact is written,
-    /// the coverage join is a rendering of durable facts, and no operator has
-    /// to hand-author the table it used to be read from.
+    /// The release side of the lease model: once the lapse fact is written, the
+    /// coverage join is a rendering of durable facts, and no operator has to
+    /// hand-author a table to read it from.
     #[test]
     fn release_on_a_lapsed_campaign_renders_completion_coverage_from_durable_facts() {
         let fixture = completed_release_fixture();
@@ -11868,8 +11868,8 @@ fi
     ///
     /// The registry is the second half of the proof. Derivation makes two
     /// *tests* unable to collide; this makes one test unable to collide with
-    /// itself, and turns what used to surface as another lane's `Held` lease
-    /// into a refusal at the moment the second lane is opened.
+    /// itself, and turns what would otherwise surface as another lane's `Held`
+    /// lease into a refusal at the moment the second lane is opened.
     fn readmission_scope_is_fresh(scope: &str) -> bool {
         static CLAIMED: std::sync::Mutex<BTreeSet<String>> =
             std::sync::Mutex::new(BTreeSet::new());
@@ -12321,9 +12321,9 @@ fi
         ));
     }
 
-    /// The red one: a worklist that declares no gate budget used to be handed
-    /// 900 by a serde default nobody measured. It now gets the never-fired
-    /// floor until the gate fires, and its own receipts after that.
+    /// The red one: a worklist that declares no gate budget must not be handed
+    /// 900 by a serde default nobody measured. It gets the never-fired floor
+    /// until the gate fires, and its own receipts after that.
     #[test]
     fn gate_budget_derives_from_seeded_receipts_when_the_worklist_is_silent() {
         let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
@@ -13325,11 +13325,11 @@ fi
 
     /// The worklist stays adapter-neutral bytes; the arm binds its silence.
     ///
-    /// A worklist that writes no policy key used to be filled by
-    /// campaign-contract constants holding one preset's vocabulary, so the same
-    /// neutral bytes armed against any other adapter died at render quoting a
-    /// policy nobody wrote. The silence is bound here instead, from the adapter
-    /// the campaign selected and only from what that adapter declares.
+    /// A worklist that writes no policy key, filled by campaign-contract
+    /// constants holding one preset's vocabulary, means the same neutral bytes
+    /// armed against any other adapter die at render quoting a policy nobody
+    /// wrote. The silence is bound here instead, from the adapter the campaign
+    /// selected and only from what that adapter declares.
     #[test]
     fn a_policy_less_worklist_binds_its_silence_to_the_selected_adapter() {
         let document = json!({
@@ -14143,9 +14143,9 @@ fi
             loaded.approved_graph_digest,
             registration.approved_graph_digest
         );
-        // #432: the durable projection wait survives the round trip, which is
-        // what makes `campaign poll` dispatch later passes with the same
-        // widened window the operator armed with.
+        // The durable projection wait survives the round trip, which is what
+        // makes `campaign poll` dispatch later passes with the same widened
+        // window the operator armed with.
         assert_eq!(loaded.projection_wait_ms, Some(240_000));
     }
 
@@ -14382,23 +14382,22 @@ fi
         );
     }
 
-    /// #432 acceptance 2, the DELIVERY half of the seam.
+    /// The DELIVERY half of the projection-wait seam.
     ///
     /// Recording `--projection-wait-ms` in the registration is worth nothing on
     /// its own: what the operator is promised is that every pass this campaign
     /// dispatches waits that long. `CampaignHost::dispatch_flow_argv` is the
     /// only place that promise is kept, so it is asserted here directly — a
-    /// registration carrying `Some(n)` must put
-    /// `--result-projection-wait-ms n` on the dispatched pass's argv, spelled
-    /// exactly as `FlowRunArgs` parses it.
+    /// registration carrying `Some(n)` must put `--result-projection-wait-ms n`
+    /// on the dispatched pass's argv, spelled exactly as `FlowRunArgs` parses
+    /// it.
     ///
     /// The `None` half is not decoration. This argv is hashed into the enqueue
     /// payload, so a stray element would move the payload identity of every
     /// campaign armed without the flag; it is asserted element-by-element.
     ///
     /// Deleting the `--result-projection-wait-ms` push from the host's dispatch
-    /// argv makes this test red — that mutation used to leave the whole crate
-    /// green.
+    /// argv makes this test red, and leaves the rest of the crate green.
     #[test]
     fn a_recorded_projection_wait_reaches_the_dispatched_pass_argv() {
         let executable = Path::new("/nix/store/tally/bin/tally");
@@ -14465,7 +14464,7 @@ fi
         ));
     }
 
-    /// #432, the arm-side half of the refusal (the flow-side zero and
+    /// The arm-side half of the projection-wait refusal (the flow-side zero and
     /// unparsable refusals are pinned in `cli::flow::tests`). A zero recorded
     /// here would be durable: every pass this campaign ever dispatches,
     /// including the unattended poll ones, would then die on its own argv.
@@ -14484,10 +14483,10 @@ fi
         );
     }
 
-    /// #432 acceptance 2, the seam that actually reaches a campaign pass. A
-    /// registration written before `--projection-wait-ms` existed carries no
-    /// field at all; it must still load with the historical 10-second value
-    /// rather than being refused or defaulted to zero.
+    /// The seam that actually reaches a campaign pass. A registration written
+    /// before `--projection-wait-ms` existed carries no field at all; it must
+    /// still load with the historical 10-second value rather than being refused
+    /// or defaulted to zero.
     #[test]
     fn a_registration_without_a_projection_wait_still_loads() {
         let root = tempfile::tempdir().unwrap();

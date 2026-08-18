@@ -1732,7 +1732,7 @@ class LaneLifecycleTests(unittest.TestCase):
             git(worktree, "commit", "--quiet", "-m", "task-1: in flight")
             in_flight = git(worktree, "rev-parse", "HEAD")
 
-            # The pre-#312 lane: registered by git, carrying no tally identity.
+            # A lane registered by git and carrying no tally identity.
             command(
                 "git",
                 "-C",
@@ -3209,8 +3209,8 @@ class BreachSteeringTests(unittest.TestCase):
                 self.assertIn("declares no conflictDomains", body)
                 self.assertIn("No out-of-allowlist change has been established", body)
                 self.assertIn("will not be retried", body)
-                # The #386 sentence claims a write was found. It must not be
-                # recorded over a verdict that found nothing.
+                # The stray-delta sentence claims a write was found. It must not
+                # be recorded over a verdict that found nothing.
                 self.assertNotIn("permission breach found", body)
 
     def test_an_unknown_abort_reason_is_refused(self) -> None:
@@ -3265,8 +3265,8 @@ class BreachSteeringTests(unittest.TestCase):
         squeeze falls on the steward's prose, never on the evidence.
         """
         # The largest diagnosis the input validator admits. Composed with the
-        # label and the evidence it overflows, which is the case that used to
-        # record ~2x the bound.
+        # label and the evidence it overflows, which is the case that would
+        # otherwise record ~2x the bound.
         lead = "Investigated the writes. "
         prose = lead + ("x" * (MAX_DIAGNOSIS_CHARS - len(lead)))
         self.assertEqual(len(prose), MAX_DIAGNOSIS_CHARS)

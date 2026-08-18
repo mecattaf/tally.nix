@@ -299,11 +299,11 @@ impl LifecycleStore {
         }
     }
 
-    /// The same snapshot behind an `Arc`, deep-built at most once per
-    /// mutation. [`snapshot`](Self::snapshot) clones every record per call,
-    /// which on the daemon put O(all lifecycle records) of copying on the
-    /// dispatch thread for every fresh query (#431); readers that only need a
-    /// frozen view share this one instead.
+    /// The same snapshot behind an `Arc`, deep-built at most once per mutation.
+    /// [`snapshot`](Self::snapshot) clones every record per call, which on the
+    /// daemon put O(all lifecycle records) of copying on the dispatch thread
+    /// for every fresh query; readers that only need a frozen view share this
+    /// one instead.
     pub fn shared_snapshot(&mut self) -> Arc<LifecycleSnapshot> {
         if self.shared.is_none() {
             self.shared = Some(Arc::new(self.snapshot()));

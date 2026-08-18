@@ -125,7 +125,7 @@ impl FlowError {
 /// different answer; `resolution` names the bounded operation that clears it.
 /// The pair exists because an unattended queue that cannot tell a permanent
 /// identity refusal from a lost socket spends the night re-observing the
-/// permanent one — the failure #251 is about.
+/// permanent one.
 const RECOVERY_FACTS: &[(&str, bool, &str)] = &[
     // Permanent: the run's recorded identity and the current inputs disagree.
     // Only an explicit generation rollover clears these.
@@ -169,8 +169,8 @@ pub const SUPERSESSION_CODES: [&str; 5] = [
 /// All fourteen are present on every exit-20 error at every raising site, with
 /// `null` where the code has nothing to say. A monitor therefore reads one
 /// shape and never asks where the refusal came from — which is the whole point:
-/// the shape used to depend on whether the runner's startup scan or a mid-run
-/// admission raised it, so a driver had to special-case the site to find the
+/// a shape that depends on whether the runner's startup scan or a mid-run
+/// admission raised it forces a driver to special-case the site to find the
 /// hash that moved.
 pub const SUPERSESSION_DETAIL_FIELDS: [&str; 14] = [
     "flowRunId",
@@ -206,10 +206,10 @@ pub struct SupersessionDetails<'a> {
     /// this tree knows it; blank — empty or whitespace-only, the same test
     /// `run_script` applies — renders as `null` rather than as a blank string,
     /// and suppresses the `remedy` derived from it. A flag-shaped identity
-    /// (leading `-` after trim) is a run named badly rather than not named:
-    /// it stays visible, but suppresses the `remedy` the same way, because a
+    /// (leading `-` after trim) is a run named badly rather than not named: it
+    /// stays visible, but suppresses the `remedy` the same way, because a
     /// command interpolating it parses as flags and exits 2 in an operator's
-    /// hands (#414).
+    /// hands.
     pub flow_run_id: &'a str,
     /// The hash the ledger recorded for the divergent input.
     pub recorded_hash: Option<&'a str>,
@@ -308,13 +308,13 @@ fn complete_supersession_details(code: &str, details: &mut Map<String, Value>) {
             },
             "divergentInput" => family_divergent_input(code)
                 .map_or(Value::Null, |input| Value::String(input.to_owned())),
-            // A remedy is a command an operator can type, so it exists only when
-            // every argument of that command does. Only the three pins have one;
-            // `flow-run-superseded` names its successor instead, and
-            // `replay-divergence` resolves by investigation. A flag-shaped id is
-            // present but cannot be typed: interpolating it puts a flag where
-            // the command needs an operand, so the command exits 2 in an
-            // operator's hands and none is rendered (#414).
+            // A remedy is a command an operator can type, so it exists only
+            // when every argument of that command does. Only the three pins
+            // have one; `flow-run-superseded` names its successor instead, and
+            // `replay-divergence` resolves by investigation. A flag-shaped id
+            // is present but cannot be typed: interpolating it puts a flag
+            // where the command needs an operand, so the command exits 2 in an
+            // operator's hands and none is rendered.
             "remedy" => match (divergent_input(code), flow_run_id.as_deref()) {
                 (Some(_), Some(flow_run_id)) if !is_flag_shaped(flow_run_id) => {
                     supersede_remedy(code, flow_run_id).into()
@@ -395,12 +395,11 @@ pub fn supersede_remedy(code: &str, flow_run_id: &str) -> String {
 ///
 /// `trim().starts_with('-')` is the entire test — deliberately not UUID
 /// validation. A producer can send anything, and the fourteen-member map
-/// preserves whatever it sent; a pasted `--reason` names a run, badly, and
-/// #401 item 3's ruling says a badly named run stays visible rather than
-/// being dropped. But a remedy interpolates the id straight into argv, where
-/// anything starting with a dash parses as a flag and the advertised command
-/// exits 2 in the operator's hands, so no command may be derived from this
-/// shape (#414).
+/// preserves whatever it sent; a pasted `--reason` names a run, badly, and the
+/// ruling is that a badly named run stays visible rather than being dropped.
+/// But a remedy interpolates the id straight into argv, where anything starting
+/// with a dash parses as a flag and the advertised command exits 2 in the
+/// operator's hands, so no command may be derived from this shape.
 fn is_flag_shaped(flow_run_id: &str) -> bool {
     flow_run_id.trim().starts_with('-')
 }
@@ -412,13 +411,13 @@ fn is_flag_shaped(flow_run_id: &str) -> bool {
 /// `complete_supersession_details` applies to the `remedy` member: a refusal
 /// that cannot say which run this is must not hand an operator an invocation
 /// missing the argument that makes it run. A flag-shaped identity is the
-/// sibling case (#414): a run *was* named, but in a form that parses as a
-/// flag, so the sentence names the malformed identity instead of rendering a
-/// command that cannot parse — and keeps the raw id visible, because a badly
-/// named run is not the same fact as no run named. `message` is the field a
-/// human actually reads, so the guards have to be here too — every call site
-/// in this tree sits downstream of `run_script`'s `flow-run-id-missing`
-/// refusal, but this function is public and a future one need not.
+/// sibling case: a run *was* named, but in a form that parses as a flag, so the
+/// sentence names the malformed identity instead of rendering a command that
+/// cannot parse — and keeps the raw id visible, because a badly named run is
+/// not the same fact as no run named. `message` is the field a human actually
+/// reads, so the guards have to be here too — every call site in this tree sits
+/// downstream of `run_script`'s `flow-run-id-missing` refusal, but this
+/// function is public and a future one need not.
 #[must_use]
 pub fn identity_refusal_remedy_sentence(code: &str, flow_run_id: &str) -> String {
     let input = divergent_input(code).unwrap_or("input");

@@ -331,12 +331,12 @@ fn malformed_campaign_namespace_runners_stay_out_of_the_flow_schema() {
     }
 }
 
-/// #337: the deferral arm has to cover the whole deferred lane.
+/// The deferral arm has to cover the whole deferred lane.
 ///
 /// A checkpoint lane can fail at `prep`, at the checkpoint command itself, and
 /// at `checkpoint:record`. The reconciler defers a checkpoint whose verdict
 /// unrelated outstanding work can still change, and a deferred lane must spend
-/// no budget at any of those three stages: the #308 loop bound terminates by
+/// no budget at any of those three stages: the loop bound terminates by
 /// spending the task's retry and steering budget on attempts that mean
 /// something, and a deferred pass is not one of them.
 #[test]
@@ -357,8 +357,8 @@ fn every_stage_of_a_deferred_checkpoint_lane_is_unpriced() {
 
 /// The same three stages keep their ordinary prices once nothing defers the
 /// checkpoint, so the bound still reaches escalation on a checkpoint that
-/// genuinely cannot settle. `checkpoint:record` is the stage the #308 base-
-/// advanced failure lands on.
+/// genuinely cannot settle. `checkpoint:record` is the stage a base-advanced
+/// failure lands on.
 #[test]
 fn an_undeferred_checkpoint_lane_still_spends_its_budget() {
     let mut realm = CampaignFlowRealm::new(&json!({}));
@@ -388,10 +388,10 @@ fn an_undeferred_checkpoint_lane_still_spends_its_budget() {
     );
 }
 
-/// #386: a tree-delta permission breach is priced separately from an
-/// ordinary work failure -- it must never be routed through the retry or
-/// steering-attempt budget the way a red gate is, because the write already
-/// happened and there is nothing to redo.
+/// A tree-delta permission breach is priced separately from an ordinary work
+/// failure -- it must never be routed through the retry or steering-attempt
+/// budget the way a red gate is, because the write already happened and there
+/// is nothing to redo.
 #[test]
 fn a_tree_delta_failure_is_priced_as_a_breach_not_work() {
     let mut realm = CampaignFlowRealm::new(&json!({}));
@@ -407,8 +407,8 @@ fn a_tree_delta_failure_is_priced_as_a_breach_not_work() {
     );
 }
 
-/// #424: the gate refusing to judge a pass is priced as a gate verdict, not as
-/// the agent's work being wrong. It gets its own class rather than reusing
+/// The gate refusing to judge a pass is priced as a gate verdict, not as the
+/// agent's work being wrong. It gets its own class rather than reusing
 /// `breach`, because a receipt saying the task "wrote outside its authorized
 /// paths" would be a claim the gate never established -- it could not look.
 /// Both classes abort the lane and neither spends a steering attempt.
@@ -451,10 +451,10 @@ fn an_implementation_lane_is_priced_by_its_stage_alone() {
     );
 }
 
-/// #452: Codex 0.145 could terminate a session immediately after its tool
-/// router rejected a destructive command. The router refusal is adapter
-/// machinery, not evidence that the requested implementation is wrong, so it
-/// must buy the bounded machinery retry before it can consume steering.
+/// Codex 0.145 can terminate a session immediately after its tool router
+/// rejects a destructive command. The router refusal is adapter machinery, not
+/// evidence that the requested implementation is wrong, so it must buy the
+/// bounded machinery retry before it can consume steering.
 #[test]
 fn a_codex_tool_router_session_death_is_priced_as_machinery() {
     let mut realm = CampaignFlowRealm::new(&json!({

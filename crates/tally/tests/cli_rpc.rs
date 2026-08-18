@@ -650,10 +650,10 @@ impl RpcHandler for DegradedMembershipHandler {
     }
 }
 
-/// #380: an admission the daemon acknowledged with its run membership
-/// unrecorded must say so to the operator who caused it, at the point they
-/// caused it. Otherwise the only trace is a daemon journal line they have to
-/// already know to grep for — which is the gap this warning exists to close.
+/// An admission the daemon acknowledged with its run membership unrecorded must
+/// say so to the operator who caused it, at the point they caused it. Otherwise
+/// the only trace is a daemon journal line they have to already know to grep
+/// for — which is the gap this warning exists to close.
 #[tokio::test(flavor = "current_thread")]
 async fn a_degraded_membership_admission_warns_the_caller_that_the_node_will_be_invisible() {
     for degraded in [true, false] {
@@ -1154,14 +1154,13 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
     let record = temp.path().join("exit.json");
     let unit = "tally-job-recorder-test.service";
-    // A working accounting probe, so the recorder's happy path stays silent
-    // (#382): silence here is a property of nothing going wrong, not of the
-    // accounting probe being skipped. The probe's own failure-is-logged
-    // behavior is covered by
-    // `crates/tally/tests/record_unit_exit_accounting.rs`.
-    // Installed through the immutable provider, never written-then-chmoded:
-    // an executable this process wrote is unexecutable for as long as any
-    // process on the host still holds a write fd on it (#396).
+    // A working accounting probe, so the recorder's happy path stays silent:
+    // silence here is a property of nothing going wrong, not of the accounting
+    // probe being skipped. The probe's own failure-is-logged behavior is
+    // covered by `crates/tally/tests/record_unit_exit_accounting.rs`. Installed
+    // through the immutable provider, never written-then-chmoded: an executable
+    // this process wrote is unexecutable for as long as any process on the host
+    // still holds a write fd on it.
     let systemctl = temp.path().join("fake-systemctl-ok");
     shell_program::install(
         &systemctl,
@@ -2060,8 +2059,8 @@ impl RpcHandler for RefusingDrainHandler {
     }
 }
 
-/// A handler that is listening, connects, and then never answers
-/// `queue.drain` — the busy-daemon shape whose client deadline #427 absorbs.
+/// A handler that is listening, connects, and then never answers `queue.drain`
+/// — the busy-daemon shape whose client deadline the periodic drain absorbs.
 #[derive(Clone, Copy)]
 struct HangingDrainHandler;
 
@@ -2077,10 +2076,10 @@ impl RpcHandler for HangingDrainHandler {
     }
 }
 
-/// Issue #411: `tally-drain` runs every five seconds, so a daemon restart
-/// under it is routine, and exiting 3 on that turned every deploy that touches
-/// the daemon unit into a per-user unit failure the fleet's journal watcher
-/// reports as if it were the SIGABRT burst it was built to catch.
+/// `tally-drain` runs every five seconds, so a daemon restart under it is
+/// routine, and exiting 3 on that turns every deploy that touches the daemon
+/// unit into a per-user unit failure the fleet's journal watcher reports as if
+/// it were the SIGABRT burst it was built to catch.
 ///
 /// The absorption is scoped to the socket-absent case only, which is what this
 /// pins in all three directions: absent daemon exits 0 and still says so, the
@@ -2133,16 +2132,16 @@ async fn a_periodic_drain_that_finds_no_daemon_is_not_a_failure() {
         .await;
 }
 
-/// Issue #427: the daemon is present — the connection is established — but
-/// saturated enough that `queue.drain` cannot answer within the client's
-/// deadline. On the coordinator this surfaced as ~52 `tally-drain.service`
-/// failures in one day, every one self-healing on the next tick, because the
-/// producer event files are durable on disk and the next drain picks them up.
-/// The periodic drain therefore records a retryable skip — systemd success
-/// plus the warning line — and the pin holds the scope in all three
-/// directions: the skip happens, the identical hang through `queue drain`
-/// still fails, and the predicate unit tests hold every other
-/// established-connection error outside the skip.
+/// The daemon is present — the connection is established — but saturated enough
+/// that `queue.drain` cannot answer within the client's deadline. On the
+/// coordinator that surfaces as dozens of `tally-drain.service` failures in one
+/// day, every one self-healing on the next tick, because the producer event
+/// files are durable on disk and the next drain picks them up. The periodic
+/// drain therefore records a retryable skip — systemd success plus the warning
+/// line — and the pin holds the scope in all three directions: the skip
+/// happens, the identical hang through `queue drain` still fails, and the
+/// predicate unit tests hold every other established-connection error outside
+/// the skip.
 #[tokio::test(flavor = "current_thread")]
 async fn a_drain_whose_deadline_expires_on_a_busy_daemon_is_a_retryable_skip() {
     let temp = tempfile::tempdir().unwrap();
@@ -2368,8 +2367,8 @@ fn synthetic_lifecycle_window(items: usize) -> Value {
     })
 }
 
-/// #316/#247: the human view of a long flow run must show the whole window,
-/// not the first capped page with no indication that anything was withheld.
+/// The human view of a long flow run must show the whole window, not the first
+/// capped page with no indication that anything was withheld.
 #[tokio::test(flavor = "current_thread")]
 async fn human_query_log_follows_cursors_across_the_byte_cap_and_prints_the_whole_window() {
     let temp = tempfile::tempdir().unwrap();
@@ -2450,8 +2449,8 @@ async fn human_query_log_restarts_once_and_says_so_when_the_page_cursor_expires(
 }
 
 /// The oversized-item case: `query jobs` on a run holding one monstrous row
-/// succeeds, marks the elision, and exits 0. Before #316 the same input was a
-/// hard `one collection item exceeds the bounded response size` failure.
+/// succeeds, marks the elision, and exits 0, rather than failing hard with `one
+/// collection item exceeds the bounded response size`.
 #[tokio::test(flavor = "current_thread")]
 async fn query_jobs_serves_an_oversized_item_with_a_marked_elision_and_exits_zero() {
     let temp = tempfile::tempdir().unwrap();
@@ -2537,11 +2536,10 @@ async fn json_query_log_keeps_one_page_and_marks_it_truncated() {
         .await;
 }
 
-/// The intersection of #315 and #316: the window-walking human path buffers
-/// every page and then prints hundreds of lines at once, so it is exactly the
-/// shape that turns a hung-up reader into a panic. It must stay a quiet exit
-/// 0, and the stderr notices that follow the rows must not start speaking
-/// after the reader has gone.
+/// The window-walking human path buffers every page and then prints hundreds of
+/// lines at once, so it is exactly the shape that turns a hung-up reader into a
+/// panic. It must stay a quiet exit 0, and the stderr notices that follow the
+/// rows must not start speaking after the reader has gone.
 #[tokio::test(flavor = "current_thread")]
 async fn a_walked_window_whose_reader_hangs_up_exits_quietly_without_notices() {
     let temp = tempfile::tempdir().unwrap();
@@ -2602,11 +2600,11 @@ async fn a_walked_window_whose_reader_hangs_up_exits_quietly_without_notices() {
         .await;
 }
 
-/// #316 acceptance bullet 2's second half, which had no CLI-level coverage: an
-/// item too large to *elide* — its bulk is structure, not text — is still a
-/// hard failure, and the CLI must name it rather than passing the daemon's
-/// opaque internal error through. Anything less and an operator cannot tell
-/// this apart from a dead daemon.
+/// The acceptance half that has no other CLI-level coverage: an item too large
+/// to *elide* — its bulk is structure, not text — is still a hard failure, and
+/// the CLI must name it rather than passing the daemon's opaque internal error
+/// through. Anything less and an operator cannot tell this apart from a dead
+/// daemon.
 #[tokio::test(flavor = "current_thread")]
 async fn query_jobs_names_the_item_it_cannot_render_and_exits_nonzero() {
     let temp = tempfile::tempdir().unwrap();
@@ -2669,13 +2667,13 @@ async fn query_jobs_names_the_item_it_cannot_render_and_exits_nonzero() {
         .await;
 }
 
-/// #247 repair, at the surface an operator actually reads: a `--flow-run`
-/// window that resolved to no member tasks must say so. Since #380 made
-/// membership a durable admission fact, the commonest cause of a zero is a
-/// mistyped or stale run ID -- but the notice must not close the question,
-/// because a repaired or deleted ledger, a compacted-out idle run, and a
-/// degraded admission all produce a zero for a run that really did admit work,
-/// and a row-less node has no durable row to fall back on in any of them.
+/// At the surface an operator actually reads: a `--flow-run` window that
+/// resolved to no member tasks must say so. Because membership is a durable
+/// admission fact, the commonest cause of a zero is a mistyped or stale run ID
+/// -- but the notice must not close the question, because a repaired or deleted
+/// ledger, a compacted-out idle run, and a degraded admission all produce a
+/// zero for a run that really did admit work, and a row-less node has no
+/// durable row to fall back on in any of them.
 #[tokio::test(flavor = "current_thread")]
 async fn an_empty_flow_run_window_says_the_run_resolved_to_no_members() {
     let temp = tempfile::tempdir().unwrap();

@@ -17,10 +17,9 @@ pub(super) struct LeaseTickHook {
 ///
 /// The re-check exists because the whole scrape/capture/accounting stretch
 /// between the two is awaited with the context lock dropped, so the job can
-/// reach a terminal disposition and be retired (#395) underneath it. That
-/// window is real but it is not something a test can time, so this makes it
-/// enterable: the hook announces that phase one is done and blocks until the
-/// test says go.
+/// reach a terminal disposition and be retired underneath it. That window is
+/// real but it is not something a test can time, so this makes it enterable:
+/// the hook announces that phase one is done and blocks until the test says go.
 #[cfg(test)]
 #[derive(Clone)]
 pub(super) struct FinishJobHook {
@@ -147,9 +146,9 @@ impl Daemon {
         let dispatch_stall_hook = self.dispatch_stall_hook.clone();
         let mut keepalive = None;
         // Written before `READY=1`, so the phase breakdown is in the journal
-        // even for a start that then fails to notify (#379). This line is the
-        // only record of where the pre-`READY` minute went; the journal is
-        // otherwise silent from `Starting` to the first late-startup warning.
+        // even for a start that then fails to notify. This line is the only
+        // record of where the pre-`READY` minute went; the journal is otherwise
+        // silent from `Starting` to the first late-startup warning.
         if let Some(timeline) = self.startup.take() {
             let report = timeline.finish();
             #[cfg(test)]
@@ -162,18 +161,17 @@ impl Daemon {
             Err(error) => Err(error),
             Ok(()) => {
                 // READY=1 is what arms the service watchdog, so this is the
-                // first instant a keepalive is owed and the last instant it
-                // can be started from. Everything before it — the whole of
+                // first instant a keepalive is owed and the last instant it can
+                // be started from. Everything before it — the whole of
                 // `Daemon::open`, including unit-fact collection and the
                 // startup projection sweep — is covered by TimeoutStartSec
                 // instead, and cannot miss a watchdog deadline.
                 //
                 // The keepalive lives on its own OS thread from here. It is
-                // deliberately not a `select!` arm any more: an arm is only
-                // polled when the loop comes back around to poll it, so any
-                // one slow arm body used to hold the ping until systemd gave
-                // up. What the loop still owes is proof that it came back
-                // around, stamped below.
+                // deliberately not a `select!` arm: an arm is only polled when
+                // the loop comes back around to poll it, so any one slow arm
+                // body holds the ping until systemd gives up. What the loop
+                // still owes is proof that it came back around, stamped below.
                 keepalive = self.notifier.keepalive(self.handler.fatal.clone());
                 let progress = keepalive.as_ref().map(WatchdogKeepalive::progress);
                 loop {
@@ -356,10 +354,10 @@ impl Daemon {
             let context = self.handler.context.read().await;
             let Some(job) = context.jobs.get(&finished.job_id).cloned() else {
                 // Retired: the job already reached a terminal disposition, most
-                // often a forced cancel that raced this execution's own exit
-                // (#395). Absence from the live map is the same fact the
-                // `Completed` check below reports, so it takes the same exit.
-                // An id the daemon never admitted is still an error.
+                // often a forced cancel that raced this execution's own exit.
+                // Absence from the live map is the same fact the `Completed`
+                // check below reports, so it takes the same exit. An id the
+                // daemon never admitted is still an error.
                 return if context.rows.contains_key(&finished.job_id)
                     || context.query_rows.contains_key(&finished.job_id)
                 {
@@ -383,7 +381,7 @@ impl Daemon {
         // dropped above and everything from here to the second-phase re-check
         // is awaited without it, so the job can be retired underneath us. A
         // test cannot time that window; this lets it hold the window open and
-        // step into it deterministically (#395).
+        // step into it deterministically.
         #[cfg(test)]
         if let Some(hook) = &self.finish_job_hook {
             hook.between_phases().await;
@@ -584,8 +582,8 @@ impl Daemon {
             let mut context = self.handler.context.write().await;
             // Re-checked under the write lock, because everything between here
             // and the read above was awaited without it. `is_none_or`, not
-            // `is_some_and`: a job retired while this ran (#395) is terminal,
-            // and reading its absence as "still eligible" would append a second
+            // `is_some_and`: a job retired while this ran is terminal, and
+            // reading its absence as "still eligible" would append a second
             // canonical witness for one execution.
             if context.jobs.get(&finished.job_id).is_none_or(|job| {
                 job.state == JobState::Completed
@@ -670,15 +668,15 @@ impl Daemon {
                     .auto_bounded_requeue
                 && job.row.attempt < self.handler.settings.recovery_policy.max_attempts;
             if !auto_requeue {
-                // The pending mark goes up before the waiters are released,
-                // not after: a continuation admitted the instant a `--wait`
-                // returns must find something to wait on (#440).
+                // The pending mark goes up before the waiters are released, not
+                // after: a continuation admitted the instant a `--wait` returns
+                // must find something to wait on.
                 self.handler.begin_completion_settle(finished.job_id);
                 context.barriers.complete_job(&stable, result.value());
             }
-            // Terminal: the job leaves the live map (#395). Everything below
-            // reads the `job` clone taken above, and the two verbs that can
-            // still ask about a finished job read `context.rows` and
+            // Terminal: the job leaves the live map. Everything below reads the
+            // `job` clone taken above, and the two verbs that can still ask
+            // about a finished job read `context.rows` and
             // `context.query_rows`, which keep it.
             retire_job(&mut context, finished.job_id);
             release_child_charge(&mut context, &job)?;

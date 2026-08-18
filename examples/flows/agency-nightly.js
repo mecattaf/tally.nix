@@ -25,8 +25,8 @@
 //
 // CONTENTION CONTROL IS PRIORITY, NOT A BUDGET (ruling, 2026-07-27)
 // -----------------------------------------------------------------
-// Flows are excluded from windowed-consumption admission by design (#142), and
-// `budgetPool` no longer exists. Every node here runs at `priority: "low"` so
+// Flows are excluded from windowed-consumption admission by design, and
+// `budgetPool` does not exist. Every node here runs at `priority: "low"` so
 // that anything queued before bed runs first and a more important ask can
 // intercede mid-wave. That is the whole mechanism; there is no window
 // staggering and no per-node consumption estimate.
@@ -91,11 +91,11 @@
 // ineligible for any automatic policy. Resuming that wave is one operator
 // command against the runner's task UUID:
 //
-//     tally queue retry <runner-task-uuid>
+// tally queue retry <runner-task-uuid>
 //
 // A scheduler-side trigger that re-invokes an existing flowRunId on a timer,
-// which would close the gap without a clock inside the flow, is filed as a
-// separate design issue rather than improvised here.
+// which would close the gap without a clock inside the flow, is left to a
+// separate design rather than improvised here.
 export const meta = {
   name: "agency-nightly",
   description: "Run one overnight agency wave: implement, cross-review, culminate",

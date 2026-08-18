@@ -723,10 +723,10 @@ fn hidden_producer_dispatch_parses_a_typed_observation() {
 
 #[test]
 fn hidden_producer_dispatch_requires_the_data_directory() {
-    // The former fallback wrote briefs into `<stateDir>/briefs`, which is the
-    // split layout #271 retired and the retention sweep now drains as legacy.
-    // A direct call must name the daemon data directory like the generated
-    // units do, and clap must say which flag is missing.
+    // A fallback that wrote briefs into `<stateDir>/briefs` is the retired
+    // split layout the retention sweep now drains as legacy. A direct call must
+    // name the daemon data directory like the generated units do, and clap must
+    // say which flag is missing.
     let error = Opts::try_parse_from([
         "tally",
         "--config",

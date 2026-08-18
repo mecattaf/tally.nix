@@ -206,7 +206,7 @@ pub enum ExecRunError {
 /// never changes the child's propagated exit code.
 // `tally __exec` is a helper mode whose stderr is the job's captured failure
 // stream, not an operator pipeline; an advisory append failure is logged there
-// unconditionally (#315).
+// unconditionally.
 #[allow(clippy::disallowed_macros)]
 pub fn run_exec(request: ExecRunRequest) -> Result<ExecRunOutcome, ExecRunError> {
     validate_run_request(&request)?;

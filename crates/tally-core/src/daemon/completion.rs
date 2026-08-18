@@ -32,13 +32,13 @@ fn publish_completion_enrichment(job: &Job) {
 
 /// One job's post-ack enrichment, held for as long as it is still in flight.
 ///
-/// #440. The terminal acknowledgement is deliberately independent of the
-/// scrape (`run.rs`: waiters become runnable after the witness fsync and
-/// nothing else), so a `--wait` returns before the session pointer the
-/// completion scraped is installed. That is right for the ack and wrong for
-/// the one caller who needs the scraped fact — a continuation of the job that
-/// just finished — which used to lose the race by however long the scrape
-/// took and report "has no scraped session reference".
+/// The terminal acknowledgement is deliberately independent of the scrape
+/// (`run.rs`: waiters become runnable after the witness fsync and nothing
+/// else), so a `--wait` returns before the session pointer the completion
+/// scraped is installed. That is right for the ack and wrong for the one caller
+/// who needs the scraped fact — a continuation of the job that just finished,
+/// which would otherwise lose the race by however long the scrape took and
+/// report "has no scraped session reference".
 ///
 /// The guard turns the interval into something a reader can wait on. It is
 /// dropped on every path out of the enrichment task, including the error
@@ -79,7 +79,7 @@ pub(super) struct PreparedExecution {
 }
 
 impl DaemonHandler {
-    /// Declare that this job's post-ack enrichment is pending (#440).
+    /// Declare that this job's post-ack enrichment is pending.
     ///
     /// Called from inside the same critical section that releases the job's
     /// waiters, before the ack can reach anyone: a continuation admitted the
@@ -181,8 +181,8 @@ impl DaemonHandler {
                 if job.row.context_window.is_some() {
                     // Not written back to `context.jobs`: this runs post-ack,
                     // by which point the job is terminal and retired out of the
-                    // live map (#395). The query fact is where every reader of
-                    // a finished job's occupancy looks anyway.
+                    // live map. The query fact is where every reader of a
+                    // finished job's occupancy looks anyway.
                     let mut context = handler.context.write().await;
                     if let Some(detail) = job
                         .task_uuid
@@ -348,8 +348,8 @@ impl DaemonHandler {
             enriched.row.context_window = context_window;
             {
                 // Post-ack, so the job is terminal and already retired out of
-                // `context.jobs` (#395). The two facts a continuation needs --
-                // the session pointer and the observed model -- land in
+                // `context.jobs`. The two facts a continuation needs -- the
+                // session pointer and the observed model -- land in
                 // `query_rows` just below, which is where `find_job` reads them
                 // back for a retired job.
                 let mut context = handler.context.write().await;
@@ -1046,11 +1046,11 @@ pub(super) fn finalize_forced_locked(
 ) -> Result<Option<TerminalWork>, DaemonError> {
     let Some(job) = context.jobs.get(&job_id).cloned() else {
         // A job that already reached a terminal disposition is retired out of
-        // the live map (#395), so its absence there is the same fact the
-        // `Completed` check below reports: nothing left to force. An id the
-        // daemon has never heard of is still an error, which is why this asks
-        // the maps that do keep terminal jobs rather than answering `Ok(None)`
-        // for anything at all.
+        // the live map, so its absence there is the same fact the `Completed`
+        // check below reports: nothing left to force. An id the daemon has
+        // never heard of is still an error, which is why this asks the maps
+        // that do keep terminal jobs rather than answering `Ok(None)` for
+        // anything at all.
         return if context.rows.contains_key(&job_id) || context.query_rows.contains_key(&job_id) {
             Ok(None)
         } else {
@@ -1084,9 +1084,9 @@ pub(super) fn finalize_forced_locked(
     context
         .barriers
         .complete_job(&job.stable_key(), result.value());
-    // Terminal: the job leaves the live map (#395). `release_lease` used to
-    // clear the stored lease id; retiring the whole entry subsumes it, and the
-    // lease itself is still released below from the `job` clone.
+    // Terminal: the job leaves the live map. Retiring the whole entry subsumes
+    // clearing the stored lease id, and the lease itself is still released
+    // below from the `job` clone.
     retire_job(context, job_id);
     release_child_charge(context, &job)?;
     context.guardrails.retire_parent(&job.stable_key());

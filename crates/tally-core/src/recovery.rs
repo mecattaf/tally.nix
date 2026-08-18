@@ -234,16 +234,16 @@ pub fn collect_durable_recovery_facts(
     Ok(facts)
 }
 
-/// Collect the local unit facts recovery reconciles against, one durable
-/// event row at a time.
+/// Collect the local unit facts recovery reconciles against, one durable event
+/// row at a time.
 ///
 /// `progress` is invoked once per row, before that row is handled. The loop
 /// probes the executor for most rows — every local row, and every remote row
-/// without a canonically terminal witness — so its total cost is
-/// O(event corpus), which on a large-corpus host exceeds any fixed startup
-/// budget (#428). The daemon's caller turns those callbacks into
-/// `EXTEND_TIMEOUT_USEC=` notifications, so the budget bounds progress
-/// stalls rather than the phase's total cost.
+/// without a canonically terminal witness — so its total cost is O(event
+/// corpus), which on a large-corpus host exceeds any fixed startup budget. The
+/// daemon's caller turns those callbacks into `EXTEND_TIMEOUT_USEC=`
+/// notifications, so the budget bounds progress stalls rather than the phase's
+/// total cost.
 pub async fn collect_local_unit_facts(
     executor: &Executor,
     durable: &DurableRecoveryFacts,
@@ -1504,14 +1504,14 @@ mod tests {
         }
     }
 
-    /// The live wave-3 failure, as a test: three campaign-task rows whose
+    /// A startup-collection failure, as a test: three campaign-task rows whose
     /// `unit-exit` records were written by a binary from before task labels
-    /// entered the unit name (#265).
+    /// entered the unit name.
     ///
-    /// Before the fix this refused startup one record at a time, so an operator
-    /// paid one ~25 s restart per record to discover the next one. A single pass
-    /// must name all three and give the exact manual repair; applying that repair
-    /// must make collection succeed.
+    /// Refusing startup one record at a time costs an operator one ~25 s
+    /// restart per record to discover the next one. A single pass must name all
+    /// three and give the exact manual repair; applying that repair must make
+    /// collection succeed.
     #[tokio::test]
     async fn pre_label_unit_exit_records_are_all_reported_with_a_working_repair() {
         let temp = tempfile::tempdir().unwrap();
@@ -1774,11 +1774,11 @@ mod tests {
         );
     }
 
-    /// #428: the unit-facts loop reports progress once per durable event row
-    /// — including rows it skips without probing — so the daemon can renew
-    /// the start timeout from inside the loop. Deleting the in-loop callback
-    /// turns the phase budget back into a bound on total corpus size, which
-    /// is the restart loop this issue was filed on.
+    /// The unit-facts loop reports progress once per durable event row —
+    /// including rows it skips without probing — so the daemon can renew the
+    /// start timeout from inside the loop. Deleting the in-loop callback turns
+    /// the phase budget back into a bound on total corpus size, which is a
+    /// restart loop on any estate large enough.
     #[tokio::test]
     async fn unit_facts_report_progress_once_per_durable_row() {
         let temp = tempfile::tempdir().unwrap();

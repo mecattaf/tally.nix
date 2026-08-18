@@ -1,5 +1,5 @@
-//! Issue #382: the exit recorder's accounting probe, exercised through the
-//! real `__record-unit-exit` binary the same way `ExecStopPost` invokes it.
+//! The exit recorder's accounting probe, exercised through the real
+//! `__record-unit-exit` binary the same way `ExecStopPost` invokes it.
 //!
 //! This runs the compiled `tally` binary as a fresh child process for every
 //! case specifically so the environment variables the recorder reads
@@ -19,25 +19,25 @@ const UNIT: &str = "tally-job-00000000-0000-4000-8000-000000000001.service";
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 /// Install a fake `systemctl` through the immutable provider rather than
-/// writing an executable and `chmod`ing it (#396): a program still open for
-/// writing anywhere on the host cannot be `execve`d, and in a parallel test
-/// binary a sibling thread's fork holds exactly such an fd until its own
-/// `execve` closes it.
+/// writing an executable and `chmod`ing it: a program still open for writing
+/// anywhere on the host cannot be `execve`d, and in a parallel test binary a
+/// sibling thread's fork holds exactly such an fd until its own `execve` closes
+/// it.
 fn fake_systemctl(dir: &Path, name: &str, script: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     shell_program::install(&path, format!("#!/bin/sh\n{script}\n"));
     path
 }
 
-/// Issue #396: every caller of `shell_program::install` is immune to `ETXTBSY`
-/// for one reason only — the file the kernel is asked to `execve` is a
-/// checked-in fixture this process never opens. That is a property of the
-/// installer, so it is pinned once, here, rather than once per caller.
+/// Every caller of `shell_program::install` is immune to `ETXTBSY` for one
+/// reason only — the file the kernel is asked to `execve` is a checked-in
+/// fixture this process never opens. That is a property of the installer, so it
+/// is pinned once, here, rather than once per caller.
 ///
 /// It is deliberately not "the installed program runs". A program written and
 /// `chmod +x`'d a microsecond earlier also runs, whenever no fork happens to be
-/// holding it — which is precisely the race that red-gated an innocent sha and
-/// never reproduced on a quiet host.
+/// holding it — which is precisely the race that reddens an innocent sha and
+/// never reproduces on a quiet host.
 #[test]
 fn an_installed_program_is_a_symlink_to_the_checked_in_provider_not_a_written_file() {
     use std::os::unix::fs::PermissionsExt as _;

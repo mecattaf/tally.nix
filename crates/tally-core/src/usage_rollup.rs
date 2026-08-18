@@ -1,73 +1,14 @@
-//! Rolling per-attempt usage up to one flow run.
-//!
-//! The rollup is a derived projection. Durable rows, witness records, and
-//! attestation observations remain its canonical/advisory inputs; no aggregate
-//! here is written back as a second source of truth.
-//!
-//! [`crate::usage`] normalizes what one attempt's harness reported.  This
-//! module answers the next question — "what did this run cost" — and the whole
-//! of its difficulty is that the answer is a sum over evidence that is
-//! advisory, partial, and shaped differently per harness. A sum that hides any
-//! of those three is worse than no sum at all: it reads as a measurement, it is
-//! wrong in the reassuring direction, and nothing about its shape says so.
-//! Four rules follow, and every field below exists to keep one of them.
-//!
-//! **1. Derive attempts independently, then read their accounting from the
-//! attestation ledger.** A durable row's attempt counter defines the expected
-//! `1..=N` roster; when a member has no row detail, the latest canonical
-//! witness attempt is the fallback. The advisory ledger can satisfy that
-//! roster but cannot enlarge it. Every completed scrape, including both typed
-//! absences, has a durable `usageEvidence` seat keyed by
-//! `taskUuid`/`attempt`/`leaseEpoch`; duplicate leases select the last record
-//! and contribute once. The rollup sums exact per-attempt
-//! `accounting.usage`, never a raw cumulative observation. Missing,
-//! over-ceiling, and unknown-ceiling evidence is caveated. Pre-schema raw-only
-//! records are visible on job detail but are excluded here rather than guessed
-//! fresh. Their **reported-shape** remains diagnostic only: because the
-//! declared surface is unknown, it can explain an ambiguous total-only record
-//! but can never become a completeness denominator.
-//!
 //! **2. `inputTokens` alone is not the cross-harness fresh-input figure.**
 //! claude-code's `cache_creation_input_tokens` are fresh, uncached prompt
 //! tokens its `input_tokens` *excludes*; codex has no cache-write volume in any
 //! observed capture. A rollup that summed `inputTokens` alone would understate
-//! claude by its entire cache-write volume — in this project's own #381 fixture
-//! that is 23,000 of 65,312 tokens, more than a third — while printing a number
-//! that looks directly comparable to codex's. The comparable figure is
+//! claude by its entire cache-write volume — in this project's own claude-code
+//! fixture that is 23,000 of 65,312 tokens, more than a third — while printing
+//! a number that looks directly comparable to codex's. The comparable figure is
 //! the adapter's declared input convention plus `cacheWriteTokens` when that
 //! field was declared, surfaced here as
 //! [`UsageTokenRollup::fresh_input_tokens`], with the addition stated in
 //! [`ROLLUP_COMPOSITION`] rather than left for a reader to infer.
-//!
-//! **3. Reasoning tokens are nested inside output tokens, never added to
-//! them.** Codex reports `reasoning_output_tokens` *within* `output_tokens`
-//! (`16075 + 221 = 16296 = total_tokens`, with `reasoning_output_tokens: 71`
-//! inside the 221). It is rolled up so an operator can see how much of the
-//! output was reasoning; it is never part of any total.
-//!
-//! **4. Say where each number came from.** A total is `harness-reported` only
-//! when the adapter declared a `totalTokens` mapping and the harness filled it;
-//! otherwise tally derives the total from the components and grades it
-//! `derived-from-components`. **No shipped preset declares `totalTokens`** —
-//! not `codex`, whose real `turn.completed` carries no `total_tokens` at all,
-//! and not `claude-code`, whose `result` event carries a cumulative usage
-//! object of components without a total among them. So every run over the
-//! shipped presets reads `derived-from-components` today, including a run
-//! spanning both harnesses. `harness-reported`, and the
-//! [`UsageRollupTotalSource::Mixed`] grade that a run mixing the two produces,
-//! are reserved for an operator-defined adapter that declares the mapping
-//! (`extraConfig`-style adapter authoring, documented at
-//! `nix/modules/common.nix`). The grade is published either way, because a
-//! consumer must not have to know which kind of adapter ran to know what the
-//! number is. The whole rollup is graded
-//! [`FactAuthority::AdvisoryProviderCapture`]: it is what harnesses said about
-//! themselves, never a bill tally verified.
-//!
-//! Cost is summed only where a harness reported it, and it is the harness's own
-//! `costUsd`. Tally's cgroup `charge` is a different quantity, is not summed
-//! here, and — per the ratified `W-382-RECORDER` waiver — is a **floor** that
-//! includes tally's own exit-recorder overhead. [`UsageCostRollup::basis`]
-//! carries that statement onto the wire beside the number.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -408,7 +349,7 @@ pub struct UsageCoverage {
     pub attempts_unexpected: usize,
     /// Distinct `(task, attempt, leaseEpoch)` triples found for member tasks.
     ///
-    /// This is the pre-#402 physical-observation counter retained for wire
+    /// This is the physical-observation counter, retained for wire
     /// compatibility. It is not a completeness denominator; use
     /// `attemptsExpected`, `attemptsAttested`, and
     /// `attemptsMissingAttestation`.
@@ -2086,11 +2027,11 @@ mod tests {
     /// nothing obliges an adapter to declare components beside it.
     ///
     /// Produced by the real [`observe`] over that real declared map, not
-    /// hand-authored. The first draft of this fixture asserted `shape:
-    /// components` with all four components set, which the real path cannot
+    /// hand-authored. A hand-authored fixture asserting `shape: components`
+    /// with all four components set states something the real path cannot
     /// produce for a total-only mapping: it produces a `lump` with every
-    /// component absent. That gap is what let a completeness regression against
-    /// this exact configuration pass a green suite.
+    /// component absent. That gap is what lets a completeness regression
+    /// against this exact configuration pass a green suite.
     fn declared_total_adapter() -> AdapterConfig {
         AdapterConfig {
             argv: vec!["declared-total-agent".to_owned()],
@@ -3000,8 +2941,8 @@ mod tests {
 
     /// The `contributed` predicate counts cost, so an attempt whose token
     /// mapping drifted entirely but whose cost capture still resolves is not
-    /// `reportedWithoutFigures` — and used to grade complete with no token
-    /// figure at all.
+    /// `reportedWithoutFigures` — which would otherwise grade complete with no
+    /// token figure at all.
     #[test]
     fn a_cost_only_attempt_is_not_a_complete_token_rollup() {
         // Every declared token path drifts; `total_cost_usd` carries no

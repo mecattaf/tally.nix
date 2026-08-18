@@ -534,8 +534,8 @@ fn systemd_argv_is_direct_stable_and_complete() {
 #[test]
 fn absent_limits_render_no_memory_cap_or_cpu_weight_on_the_job_unit() {
     // A job nobody gave limits to renders neither directive: the unit runs
-    // under the host's own accounting (vestige-sweep V-1). Red before the
-    // cap was deleted, when both directives were stamped unconditionally.
+    // under the host's own accounting (vestige-sweep V-1). Red the moment
+    // either directive is stamped unconditionally.
     let mut request = request();
     request.limits = UnitLimits::default();
     let args = strings(
@@ -1127,10 +1127,9 @@ fn buried_causal_error_five_kb_above_the_tail_survives_the_failure_excerpt() {
     .unwrap();
 
     // A gate-shaped capture: setup noise, then the causal error exactly five
-    // kilobytes above the tail, then exit chatter. Under the historical
-    // 2 KiB peephole the rendered failure fact showed only the exit chatter
-    // and the causal error never reached the channel attribution reads
-    // (vestige-sweep V-4).
+    // kilobytes above the tail, then exit chatter. Under a 2 KiB peephole the
+    // rendered failure fact shows only the exit chatter and the causal error
+    // never reaches the channel attribution reads (vestige-sweep V-4).
     let tail_line = "noise: process exited with status 1\n";
     let causal = "error: the causal fixture failure (excerpt-derivations)\n";
     let mut capture = Vec::new();
@@ -2114,14 +2113,14 @@ async fn launcher_failure_without_visible_unit_preserves_error_promptly() {
         .with_systemd_run(systemd_run)
         .with_unit_probe(AbsentProbe);
 
-    // "Promptly" is counted, not timed (#419). The masked behaviour this test
-    // exists to catch is `reclaim_identity_exact` entering its retry loop
-    // because the reservation is still held: with an absent unit that loop
-    // inspects the identity once per iteration, 201 times before it gives up,
-    // or for the whole 60 s `LAUNCH_VISIBILITY_TIMEOUT` if a launch was
-    // registered. The prompt path inspects exactly twice -- once in `execute`'s
-    // pre-launch check, once in `reclaim_identity_exact` before it observes the
-    // dropped reservation and returns.
+    // "Promptly" is counted, not timed. The masked behaviour this test exists
+    // to catch is `reclaim_identity_exact` entering its retry loop because the
+    // reservation is still held: with an absent unit that loop inspects the
+    // identity once per iteration, 201 times before it gives up, or for the
+    // whole 60 s `LAUNCH_VISIBILITY_TIMEOUT` if a launch was registered. The
+    // prompt path inspects exactly twice -- once in `execute`'s pre-launch
+    // check, once in `reclaim_identity_exact` before it observes the dropped
+    // reservation and returns.
     //
     // The previous form asserted a 100 ms wall clock, which is a deadline
     // assumption inside a test that forks and execs a shell script, so a loaded
@@ -3146,13 +3145,12 @@ fn parse_unit_accounting_treats_not_set_as_typed_absence() {
     assert_eq!(accounting.wall_seconds(), None);
 }
 
-/// LOW-1 (post-merge eval repair): `systemctl show` reports the monotonic
-/// timestamps of a unit it never ran as the literal `0`, not `[not set]` —
-/// confirmed against real systemd. Left unhandled, `wall_seconds()` would
-/// return `Some(0.0)`, a zero nobody measured, for exactly the shape
-/// acceptance bullet 4 forbids. `CPUUsageNSec=[not set]` in this same
-/// output is the real "never measured" marker for that property; `0` is
-/// only special-cased for the two timestamps.
+/// `systemctl show` reports the monotonic timestamps of a unit it never ran as
+/// the literal `0`, not `[not set]` — confirmed against real systemd. Left
+/// unhandled, `wall_seconds()` would return `Some(0.0)`, a zero nobody
+/// measured, for exactly the shape acceptance bullet 4 forbids.
+/// `CPUUsageNSec=[not set]` in this same output is the real "never measured"
+/// marker for that property; `0` is only special-cased for the two timestamps.
 #[test]
 fn parse_unit_accounting_treats_a_zero_monotonic_timestamp_as_never_measured() {
     let accounting = parse_unit_accounting(
@@ -3272,18 +3270,18 @@ echo "MemoryEvents={{\"low\":0,\"high\":2,\"max\":9,\"oom\":1,\"oom_kill\":1}}"
     assert!(calls.contains("tally-job-example.service"));
 }
 
-/// Install a fake program through the immutable provider rather than writing
-/// an executable and marking it executable (#396): the kernel refuses to
-/// `execve` a file any process still holds open for writing, and in a parallel
-/// test binary a sibling thread's fork inherits exactly such an fd until its
-/// own `execve` closes it.
+/// Install a fake program through the immutable provider rather than writing an
+/// executable and marking it executable: the kernel refuses to `execve` a file
+/// any process still holds open for writing, and in a parallel test binary a
+/// sibling thread's fork inherits exactly such an fd until its own `execve`
+/// closes it.
 fn write_fake_program(path: &Path, body: &str) {
     crate::test_support::install_shell_program(path, format!("#!/bin/sh\n{body}"));
 }
 
-/// An `N-1` fixture: the exact `UnitExitRecord` shape written before #382,
-/// with no `accounting` field in the JSON at all. A binary that gained the
-/// field must still read a record an older binary wrote.
+/// An `N-1` fixture: a `UnitExitRecord` with no `accounting` field in the JSON
+/// at all. A binary that gained the field must still read a record an older
+/// binary wrote.
 #[test]
 fn a_pre_382_exit_record_with_no_accounting_field_still_parses() {
     let json = format!(
@@ -3295,7 +3293,7 @@ fn a_pre_382_exit_record_with_no_accounting_field_still_parses() {
     record.validate("unit.service").unwrap();
 
     // And the round trip: a record this binary writes with no measured
-    // accounting serializes exactly like the pre-#382 shape, so a fleet mid
+    // accounting serializes exactly like the field-absent shape, so a fleet mid
     // rollout never disagrees about what "unmeasured" looks like on disk.
     assert!(!serde_json::to_string(&record)
         .unwrap()
@@ -3332,21 +3330,21 @@ fn a_record_with_a_measured_accounting_sample_round_trips() {
     assert_eq!(round_tripped, record);
 }
 
-/// #378: what a pre-label campaign row's captures are actually reachable by.
+/// What a pre-label campaign row's captures are actually reachable by.
 ///
-/// `664463b` changed `capture_stem` in the same edit that changed `unit_stem`.
-/// #371 fixed the `unit_stem` half. This is the other half: a row whose
-/// orchestration carries a `taskRef` had its captures written by the old binary
-/// at `capture/<uuid>.*`, and the current binary derives
+/// `capture_stem` and `unit_stem` moved together, and only the `unit_stem` half
+/// is covered elsewhere. This is the other half: a row whose orchestration
+/// carries a `taskRef` had its captures written by the old binary at
+/// `capture/<uuid>.*`, and the current binary derives
 /// `capture/<uuid>.<task_id>.*`.
 ///
-/// The question the issue leaves open is whether that strands anything an
-/// operator can see. It does. `retained_capture_paths` is what `query.run`
-/// calls to attach `capturePath` and `stderrTail` to a failure, and it resolves
-/// every stream through `capture_stem` with no fallback to the bare-uuid name.
-/// The capture generation is keyed on the bare uuid, so it still matches, which
-/// is exactly what makes the failure quiet: the lookup succeeds and reports no
-/// failure capture rather than reporting that it could not find one.
+/// The open question is whether that strands anything an operator can see. It
+/// does. `retained_capture_paths` is what `query.run` calls to attach
+/// `capturePath` and `stderrTail` to a failure, and it resolves every stream
+/// through `capture_stem` with no fallback to the bare-uuid name. The capture
+/// generation is keyed on the bare uuid, so it still matches, which is exactly
+/// what makes the failure quiet: the lookup succeeds and reports no failure
+/// capture rather than reporting that it could not find one.
 #[test]
 fn pre_label_campaign_captures_are_unreachable_through_the_current_derivation() {
     let temp = tempfile::tempdir().unwrap();

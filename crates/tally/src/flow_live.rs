@@ -25,11 +25,11 @@ const LIVE_RETRY_LIMIT: u32 = 64;
 const LIVE_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
 const LIVE_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const RESULT_PROJECTION_RETRY: Duration = Duration::from_millis(10);
-/// The retry backoff cap while polling for an advisory finalMessage
-/// projection. The daemon's dispatch loop can stall for minutes under
-/// congestion (#431); polling flat-out during that window only loads it, so
-/// the interval backs off exponentially from `RESULT_PROJECTION_RETRY` to this
-/// cap. The total wait is still bounded by `result_projection_timeout`.
+/// The retry backoff cap while polling for an advisory finalMessage projection.
+/// The daemon's dispatch loop can stall for minutes under congestion; polling
+/// flat-out during that window only loads it, so the interval backs off
+/// exponentially from `RESULT_PROJECTION_RETRY` to this cap. The total wait is
+/// still bounded by `result_projection_timeout`.
 const RESULT_PROJECTION_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const RESULT_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -306,16 +306,15 @@ impl LiveFlowClient {
         Ok(())
     }
 
-    /// Poll `query.job` for the advisory finalMessage projection until it
-    /// lands or the (configurable) wait budget is exhausted.
+    /// Poll `query.job` for the advisory finalMessage projection until it lands
+    /// or the (configurable) wait budget is exhausted.
     ///
-    /// This is the #432 bounded-retry loop: each poll is a retry, the gap
-    /// between polls backs off exponentially from `RESULT_PROJECTION_RETRY` to
-    /// `RESULT_PROJECTION_MAX_BACKOFF`, and the whole thing is bounded by
-    /// `result_projection_timeout`. A daemon whose dispatch loop briefly
-    /// stalls (#431) is exactly the case this has to out-wait, so a projection
-    /// that lands late still completes the node instead of being treated as a
-    /// schema mismatch.
+    /// Each poll is a retry, the gap between polls backs off exponentially from
+    /// `RESULT_PROJECTION_RETRY` to `RESULT_PROJECTION_MAX_BACKOFF`, and the
+    /// whole thing is bounded by `result_projection_timeout`. A daemon whose
+    /// dispatch loop briefly stalls is exactly the case this has to out-wait,
+    /// so a projection that lands late still completes the node instead of
+    /// being treated as a schema mismatch.
     async fn await_projected_result(&self, task_uuid: &str) -> Result<Option<Value>, ClientError> {
         let deadline = Instant::now() + self.result_projection_timeout;
         let mut backoff = RESULT_PROJECTION_RETRY;
@@ -364,8 +363,8 @@ impl LiveFlowClient {
         } else if let Some(expectation) = expectation.filter(|_| result.error.is_none()) {
             // Exit evidence passed but the advisory projection never landed:
             // that is daemon congestion, not a contract violation, and it gets
-            // its own retryable classification (#432). A node whose exit
-            // evidence failed keeps the pre-#432 result-projection-timeout.
+            // its own retryable classification. A node whose exit evidence
+            // failed keeps `result-projection-timeout`.
             let exit_evidence_passed = result.verdict.is_pass();
             let code = if exit_evidence_passed {
                 RETRYABLE_PROJECTION_CODE
@@ -2548,9 +2547,9 @@ export const meta = {
         client
     }
 
-    /// #441 acceptance 3: the terminal waiter already delivered the
-    /// synchronous executor rejection, so consulting the advisory projection
-    /// would both hide the cause and spend the entire projection wait budget.
+    /// The terminal waiter already delivered the synchronous executor
+    /// rejection, so consulting the advisory projection would both hide the
+    /// cause and spend the entire projection wait budget.
     #[tokio::test]
     async fn executor_validation_failure_skips_the_advisory_projection_wait() {
         let temp = tempfile::tempdir().unwrap();
@@ -2581,7 +2580,7 @@ export const meta = {
         );
     }
 
-    /// #432: a node whose exit evidence passed but whose advisory projection is
+    /// A node whose exit evidence passed but whose advisory projection is
     /// blocked must be bounded AND classified `retryable-projection` — daemon
     /// congestion, never `result-schema-mismatch`. Restoring the fatal
     /// classification (returning `result-projection-timeout` here) makes this
@@ -2614,10 +2613,9 @@ export const meta = {
         server.abort();
     }
 
-    /// #432 acceptance 1, second clause: a node whose exit evidence FAILED
-    /// keeps the pre-#432 `result-projection-timeout` classification. This pins
-    /// the "failed evidence keeps today's behaviour" half so the retryable
-    /// path cannot quietly swallow it.
+    /// A node whose exit evidence FAILED keeps the `result-projection-timeout`
+    /// classification. This pins the "failed evidence keeps the fatal
+    /// classification" half so the retryable path cannot quietly swallow it.
     #[tokio::test]
     async fn a_failed_node_with_a_missing_projection_keeps_result_projection_timeout() {
         let temp = tempfile::tempdir().unwrap();
@@ -2643,7 +2641,7 @@ export const meta = {
 
     /// A daemon whose dispatch loop is stalled: every `query.job` is answered,
     /// but without the finalMessage projection, until `stall` has elapsed. That
-    /// is the observed #431 shape — the daemon is reachable and the job row is
+    /// is the observed stall shape — the daemon is reachable and the job row is
     /// there, the projection is simply not moving yet.
     fn stalled_projection_server(socket: &Path, stall: Duration) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
@@ -2673,7 +2671,7 @@ export const meta = {
         })
     }
 
-    /// #432 acceptance 3, both halves, against one stall.
+    /// Both halves of the projection wait, against one stall.
     ///
     /// The daemon withholds the projection for longer than the flow host's
     /// window while the node's exit evidence is green. Under a window narrower
@@ -2687,12 +2685,11 @@ export const meta = {
     /// The design choice this pins, stated: the node completes on the
     /// projection, not on exit evidence alone. A `resultSchema` node has to
     /// hand its caller a value, and inventing one from a green exit code would
-    /// be a fabricated result. What #432 changes is that the wait is long
-    /// enough to out-wait a stall and that exhausting it is named as
-    /// congestion.
+    /// be a fabricated result. The wait is long enough to out-wait a stall, and
+    /// exhausting it is named as congestion.
     ///
-    /// Removing the retry loop (returning after the first empty poll) makes
-    /// the widened half red.
+    /// Removing the retry loop (returning after the first empty poll) makes the
+    /// widened half red.
     #[tokio::test]
     async fn a_projection_slower_than_the_window_is_retryable_and_survives_a_widened_window() {
         const STALL: Duration = Duration::from_millis(400);

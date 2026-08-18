@@ -3243,7 +3243,7 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-3")
                     .count(),
-                // #386: `tree-delta-task-3` carries task-3's own taskRef.
+                // `tree-delta-task-3` carries task-3's own taskRef.
                 11
             );
             assert_eq!(
@@ -3266,7 +3266,7 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-3")
                     .count(),
-                // #386: `tree-delta-task-3` carries task-3's own taskRef.
+                // `tree-delta-task-3` carries task-3's own taskRef.
                 11
             );
             let mut failed_constraint = None;
@@ -3304,23 +3304,23 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
                 "preflight:task-1:first\npreflight:task-1:second\n"
             );
 
-            // #320: once every base-safe probe was green the pass also ran each
+            // Once every base-safe probe is green the pass also runs each
             // gate's real merge-criterion argv once, on the same lane, as a
-            // non-gating witness. Both are red there -- the fixture gate needs a
+            // non-gating witness. Both are red here -- the fixture gate needs a
             // `build` directory no agent has created yet -- and the pass still
             // dispatched both frontier agents and merged task-3 above. The exit
-            // code and stderr are the evidence #264's split left unavailable at
-            // t=0.
+            // code and stderr are the evidence a probe-only pass cannot supply
+            // at t=0.
             //
             // The two phases must not interleave. A probe is declared base-safe
-            // and this fixture's probe asserts the pristine premise
-            // (`test ! -e preflight-witness-ran`, preflight.sh); the witness
-            // writes that marker, because a gate's real argv is the merge
-            // criterion and is expected to build and write. So a witness running
-            // between two probes turns the second gate's probe red and refuses
-            // admission naming the innocent gate. Asserting the submission order
-            // states the invariant directly; the fixture pair is the tripwire
-            // that fires if it is ever broken.
+            // and this fixture's probe asserts the pristine premise (`test ! -e
+            // preflight-witness-ran`, preflight.sh); the witness writes that
+            // marker, because a gate's real argv is the merge criterion and is
+            // expected to build and write. So a witness running between two
+            // probes turns the second gate's probe red and refuses admission
+            // naming the innocent gate. Asserting the submission order states
+            // the invariant directly; the fixture pair is the tripwire that
+            // fires if it is ever broken.
             let preflight_labels = second_submitted
                 .iter()
                 .filter_map(|event| event["label"].as_str())
@@ -3441,8 +3441,8 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(third_value["diagnoses"], json!([]));
             assert!(control.join("task-1-steering-visible").exists());
             let third_submitted = runner_events(&third, "node-submitted");
-            // #386: `tree-delta-task-1` is a new node in the chain now that
-            // task-1's ownership passes and it reaches the gate.
+            // `tree-delta-task-1` is a new node in the chain now that task-1's
+            // ownership passes and it reaches the gate.
             assert_eq!(third_submitted.len(), 14);
             assert_eq!(
                 third_submitted
@@ -3540,9 +3540,9 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(fourth_value["retries"], json!([]));
             assert_eq!(fourth_value["continuation"]["created"], true);
             let fourth_submitted = runner_events(&fourth, "node-submitted");
-            // #386: `tree-delta-task-4` and `tree-delta-task-6` are new nodes
-            // now that both tasks' ownership passes and each reaches the gate.
-            // A red checkpoint also snapshots its output before cleanup.
+            // `tree-delta-task-4` and `tree-delta-task-6` are new nodes now
+            // that both tasks' ownership passes and each reaches the gate. A
+            // red checkpoint also snapshots its output before cleanup.
             assert_eq!(fourth_submitted.len(), 32);
             assert!(fourth_submitted
                 .iter()
@@ -3842,8 +3842,8 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(sixth_value["diagnoses"][0]["blocked"], false);
             assert_eq!(sixth_value["continuation"]["created"], true);
             let sixth_submitted = runner_events(&sixth, "node-submitted");
-            // #386: `tree-delta-task-2` -- task-2 passes ownership this pass,
-            // so it reaches the gate. The fourteenth node is the standing
+            // `tree-delta-task-2` -- task-2 passes ownership this pass, so it
+            // reaches the gate. The fourteenth node is the standing
             // publication: a proven head is re-offered to `main` every pass,
             // which is what makes an interrupted fast-forward and a record
             // commit landing on `main` mid-campaign both self-repairing.
@@ -4002,9 +4002,9 @@ async fn spec_build_campaign_reconciles_local_state_across_parallel_fresh_runs()
             assert_eq!(seventh_value["diagnoses"][0]["blocked"], true);
             assert_eq!(seventh_value["continuation"]["created"], true);
             let seventh_submitted = runner_events(&seventh, "node-submitted");
-            // #386: `tree-delta-task-2` -- task-2 passes ownership this pass
-            // too, so it reaches the gate again before blocking. The publish
-            // node runs beside it and finds the same head already published.
+            // `tree-delta-task-2` -- task-2 passes ownership this pass too, so
+            // it reaches the gate again before blocking. The publish node runs
+            // beside it and finds the same head already published.
             assert_eq!(seventh_submitted.len(), 14);
             assert_eq!(seventh_value["published"]["action"], "already-published");
             assert_eq!(

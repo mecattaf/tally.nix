@@ -126,7 +126,7 @@ let
     # An adapter may declare the policy it launches under when a job names none.
     # The declaration is only meaningful in this adapter's own vocabulary, so it
     # must name a policy this adapter declares -- caught here rather than at
-    # render, where the equivalent mistake used to surface mid-campaign.
+    # render, where the equivalent mistake surfaces mid-campaign.
     assert lib.assertMsg (builtins.all
       (
         {
@@ -211,13 +211,13 @@ let
         framing = "json-lines";
       };
       # No trailing `--`: pi has no end-of-options separator and rejects one
-      # outright (`Error: Unknown option: --`, exit 1, zero bytes on stdout),
-      # so the `--`-terminated argv this preset used to declare could never
-      # produce the stream the trace block above describes. Without a
-      # separator, a first workload element beginning with `-` is still parsed
-      # by pi as a provider flag; a valid flag such as `-p` can make pi exit 0
-      # without doing the requested work. The typed launch policy below makes
-      # that limitation executable for both fresh and resumed invocations.
+      # outright (`Error: Unknown option: --`, exit 1, zero bytes on stdout), so
+      # a `--`-terminated argv could never produce the stream the trace block
+      # above describes. Without a separator, a first workload element beginning
+      # with `-` is still parsed by pi as a provider flag; a valid flag such as
+      # `-p` can make pi exit 0 without doing the requested work. The typed
+      # launch policy below makes that limitation executable for both fresh and
+      # resumed invocations.
       argv = [
         "pi"
         "--mode"
@@ -379,30 +379,24 @@ let
         };
         # The wall, named by the adapter itself (vestige-sweep V-16). The four
         # captures above all read the LAST VALID turn, which is the right
-        # reading for every question an operator asks about work that
-        # happened -- and it is precisely why an attempt that ended because
-        # the provider refused had nothing to say for itself: the records
-        # stating the refusal are the ones those guards exclude, so the lane
-        # exited with no envelope at all and the machinery guessed.
+        # reading for every question an operator asks about work that happened
+        # -- and it is precisely why an attempt that ends because the provider
+        # refused has nothing to say for itself: the records stating the refusal
+        # are the ones those guards exclude, so the lane exits with no envelope
+        # at all and the machinery is left guessing.
         #
         # This capture is the same guard read from the other side, and it is
         # scoped to the shape the `occupancy` note above already names: pi's
-        # in-stream error signal arrives on the same `message_end` every
-        # message uses, under `stopReason: "error"` -- the branch that note
-        # records as the one a non-interactive `pi --mode json` can actually
-        # reach -- with the text at `errorMessage`, the field
-        # `pi-aborted-turn.jsonl` shows carrying `Operation aborted` on that
-        # fixture's `aborted` sibling. So the clause the reader captures
-        # exclude as "not a valid turn" is exactly the clause this one keeps
-        # as "the adapter said why it stopped", and one record serves both
-        # readings without either lying. No stream-level error genre is
-        # declared for pi because none has been observed here; silence is
-        # "unmeasured", not "absent".
-        #
-        # What reaches the driver is the message text, and the text is the
-        # whole point: a quota refusal names its own reset time, so the
-        # outcome envelope carries a dated, non-retryable fact instead of an
-        # empty exit that read as transient machinery congestion.
+        # in-stream error signal arrives on the same `message_end` every message
+        # uses, under `stopReason: "error"` -- the branch that note records as
+        # the one a non-interactive `pi --mode json` can actually reach -- with
+        # the text at `errorMessage`, the field `pi-aborted-turn.jsonl` shows
+        # carrying `Operation aborted` on that fixture's `aborted` sibling. So
+        # the clause the reader captures exclude as "not a valid turn" is
+        # exactly the clause this one keeps as "the adapter said why it
+        # stopped", and one record serves both readings without either lying. No
+        # stream-level error genre is declared for pi because none has been
+        # observed here; silence is "unmeasured", not "absent".
         terminal = mkScrapeCapture {
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'message_end' && @.message.stopReason == 'error'].message";

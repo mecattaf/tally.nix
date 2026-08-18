@@ -4,27 +4,26 @@
 //! (`AUG15-SESSION-FINDINGS.md` §2.6) and restated as this chapter's standing
 //! authority in `specs/eta/evidence/sitting-c2.md`: whatever an agent can do
 //! bare in a terminal — write temp files, use `/dev/shm`, compile at full
-//! parallelism, see its own error output — it must be able to do inside a
-//! lane; every deliberate gap is a documented containment ruling with a named
+//! parallelism, see its own error output — it must be able to do inside a lane;
+//! every deliberate gap is a documented containment ruling with a named
 //! justification, or it is a defect.
 //!
-//! Chapter 1 deleted the worst two violations (the unauthored 8 GiB job cap,
+//! Deleting a violation is not the same as binding the property. The worst two
+//! are gone (the unauthored 8 GiB job cap,
 //! `specs/substrate/evidence/vestige-sweep.md` V-1; the read-only diagnosis
-//! jailer, V-2) but nothing *witnessed* the property, so the next unauthored
-//! constraint would arrive silently and present as an agent fault again — the
-//! shape that burned five hours of misattribution on 2026-08-14. This module
-//! is the witness. It runs one typed capability probe twice — BARE as a direct
-//! child of the CLI process, LANED as a real job unit through the daemon — and
-//! diffs the two typed reports field by field. Equal reports pass. A
-//! divergence passes only when the committed containment-rulings table beside
-//! this file carries an entry naming the capability, the ruling, and its
-//! source; any other divergence fails naming the capability and both observed
-//! values.
+//! jailer, V-2), but without a witness the next unauthored constraint arrives
+//! silently and presents as an agent fault. This module is the witness. It runs
+//! one typed capability probe twice — BARE as a direct child of the CLI
+//! process, LANED as a real job unit through the daemon — and diffs the two
+//! typed reports field by field. Equal reports pass. A divergence passes only
+//! when the committed containment-rulings table beside this file carries an
+//! entry naming the capability, the ruling, and its source; any other
+//! divergence fails naming the capability and both observed values.
 //!
-//! The reports are typed and serialized rather than scraped from prose,
-//! because the whole point is that the comparison is mechanical: prose is what
-//! let the 8 GiB cap live for a month without anyone being able to point at
-//! the line that imposed it.
+//! The reports are typed and serialized rather than scraped from prose, because
+//! the whole point is that the comparison is mechanical: prose is what lets an
+//! 8 GiB cap live for a month without anyone being able to point at the line
+//! that imposed it.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -409,9 +408,8 @@ pub(super) fn adjudicate(
     })
 }
 
-/// The failure line. It names the capability and both observed values because
-/// the incident this probe descends from cost five hours to a message that
-/// named neither.
+/// The failure line. It names the capability and both observed values, because
+/// a message that names neither is a misattribution waiting to happen.
 pub(super) fn undocumented_divergence_message(undocumented: &[Divergence]) -> String {
     let named = undocumented
         .iter()
@@ -916,10 +914,9 @@ mod tests {
             }]
         );
 
-        // The message is the whole point: the 2026-08-14 misattribution cost
-        // five hours to a failure that named neither the capability nor the
-        // values, so a defect that only says "parity failed" is the same
-        // defect.
+        // The message is the whole point: a failure that names neither the
+        // capability nor the values costs an operator the whole diagnosis, so a
+        // defect that only says "parity failed" is the same defect.
         let message = undocumented_divergence_message(&adjudication.undocumented);
         assert!(message.contains("devShmWritable"), "{message}");
         assert!(message.contains("bare: true"), "{message}");

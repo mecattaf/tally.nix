@@ -2284,11 +2284,11 @@ mod tests {
         );
     }
 
-    /// #425. The invariant a cwd-keyed harness holds and tally cannot express
-    /// in argv: the session lives where it was launched, so a resume anywhere
-    /// else reaches nothing and — for pi specifically — exits 0 having done no
-    /// work. The refusal names both directories because which one is wrong
-    /// decides what the operator does next.
+    /// The invariant a cwd-keyed harness holds and tally cannot express in
+    /// argv: the session lives where it was launched, so a resume anywhere else
+    /// reaches nothing and — for pi specifically — exits 0 having done no work.
+    /// The refusal names both directories because which one is wrong decides
+    /// what the operator does next.
     #[test]
     fn a_cwd_keyed_resume_is_refused_off_its_launch_directory_and_names_both() {
         let mut keyed = adapter();
@@ -2339,10 +2339,10 @@ mod tests {
             "{undeclared_resume}"
         );
 
-        // The two facts a single `None` used to collapse (#425 repair, F2).
-        // A row that DECLARED none ran in the daemon's own directory, and a
-        // resume that also declares none runs in that same directory -- so the
-        // session is reachable and the continuation is admitted.
+        // The two facts a single `None` would otherwise collapse. A row that
+        // DECLARED none ran in the daemon's own directory, and a resume that
+        // also declares none runs in that same directory -- so the session is
+        // reachable and the continuation is admitted.
         engine
             .guard_resume_launch_cwd(
                 "keyed",
@@ -2590,10 +2590,10 @@ mod tests {
     #[test]
     fn a_terminator_less_prefix_takes_pre_prompt_options_at_its_end() {
         // The shape `pi` declares: no `--`, because pi rejects one outright.
-        // Every pre-prompt placement used to be refused on that ground, which
-        // is a rule about codex's argv convention rather than about whether
-        // the options can be placed. They can: the end of the prefix is
-        // exactly where the harness expects its own flags.
+        // Refusing every pre-prompt placement on that ground is a rule about
+        // codex's argv convention rather than about whether the options can be
+        // placed. They can: the end of the prefix is exactly where the harness
+        // expects its own flags.
         let terminator_less = AdapterConfig {
             argv: vec!["pi".to_owned(), "--mode".to_owned(), "json".to_owned()],
             resume: Some(vec![

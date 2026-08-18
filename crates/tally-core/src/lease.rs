@@ -565,15 +565,15 @@ impl LeaseEngine {
     }
 
     /// Whether a pool was **explicitly** configured `resource = "vram"` —
-    /// `None` both when the name names no pool and when the operator
-    /// declared no `resource` at all. `vram` is the codebase's one
-    /// definition of "GPU pool" (see `doc/src/configuration/mechanisms.md`),
-    /// but `vram` is also `ResourceKind`'s default: reading the *effective*
-    /// resource (`PoolConfig::resource()`) would make every pool that
-    /// declared nothing register as a GPU pool. This is the narrower
-    /// question #382's `gpuSeconds` gate needs — "did the operator say GPU
-    /// pool", not "assume GPU pool because nothing was said" — so it reads
-    /// the raw declared field, not the defaulted one.
+    /// `None` both when the name names no pool and when the operator declared
+    /// no `resource` at all. `vram` is the codebase's one definition of "GPU
+    /// pool" (see `doc/src/configuration/mechanisms.md`), but `vram` is also
+    /// `ResourceKind`'s default: reading the *effective* resource
+    /// (`PoolConfig::resource()`) would make every pool that declared nothing
+    /// register as a GPU pool. This is the narrower question the `gpuSeconds`
+    /// gate needs — "did the operator say GPU pool", not "assume GPU pool
+    /// because nothing was said" — so it reads the raw declared field, not the
+    /// defaulted one.
     pub fn declared_resource_kind(&self, pool: &str) -> Option<ResourceKind> {
         self.pools.get(pool)?.config.resource
     }
@@ -2276,12 +2276,11 @@ mod tests {
         assert_eq!(engine.declared_resource_kind("unknown"), None);
     }
 
-    /// #382 HIGH-1: `vram` is `ResourceKind`'s default, so a pool that
-    /// declares no `resource` at all must read as "undeclared" here, not
-    /// silently as "GPU pool". `PoolConfig::resource()` (the *effective*,
-    /// defaulted reading every admission decision already used) still
-    /// resolves the same undeclared pool to `Vram` — that behavior is
-    /// unchanged by #382 and is asserted here precisely so the two readings
+    /// `vram` is `ResourceKind`'s default, so a pool that declares no
+    /// `resource` at all must read as "undeclared" here, not silently as "GPU
+    /// pool". `PoolConfig::resource()` — the *effective*, defaulted reading
+    /// every admission decision uses — still resolves the same undeclared pool
+    /// to `Vram`, and that is asserted here precisely so the two readings
     /// cannot drift back together by accident.
     #[test]
     fn declared_resource_kind_is_none_for_a_pool_that_declares_no_resource_at_all() {

@@ -1,10 +1,10 @@
-//! #434 — what the CLI is allowed to say when the daemon stops answering.
+//! What the CLI is allowed to say when the daemon stops answering.
 //!
-//! The incident these tests are written from: on 2026-08-07 two adapter smokes
-//! whose daemon-side verdicts were exit 0 and witness-emitted PASS were reported
-//! as **failures**, because their `query.job` read timed out during a daemon
-//! stall (#431). A false negative from the estate's own preflight tool costs
-//! diagnosis time and poisons the operator's model of what is broken.
+//! The shape these tests are written from: an adapter smoke whose daemon-side
+//! verdict is exit 0 and a witness-emitted PASS, reported as a **failure**
+//! because its `query.job` read timed out during a daemon stall. A false
+//! negative from the estate's own preflight tool costs diagnosis time and
+//! poisons the operator's model of what is broken.
 //!
 //! The stall is injected rather than reproduced: a socket that speaks the wire
 //! protocol, answers what the client needs to get as far as the result read,
@@ -233,7 +233,7 @@ fn parse_stdout(output: &std::process::Output) -> Value {
     })
 }
 
-/// Acceptance 1 and 2 of #434 together: a timed-out result read is reported as
+/// Both halves together: a timed-out result read is reported as
 /// VERDICT-UNAVAILABLE with its own exit code rather than as adapter failure,
 /// and the knob that bounds that read is the operator's `--rpc-timeout-sec`.
 #[tokio::test(flavor = "current_thread")]
@@ -296,8 +296,9 @@ async fn a_timed_out_smoke_result_read_is_unavailable_not_a_failure() {
             assert_eq!(result["taskUuid"], "00000000-0000-4000-8000-0000000004aa");
 
             // The knob demonstrably reaches the result read: the private
-            // 10-second capture-projection constant used to bound it, and a run
-            // that returned in about a second cannot have used that one.
+            // 10-second capture-projection constant is the other candidate
+            // bound, and a run that returned in about a second cannot have used
+            // that one.
             assert!(
                 elapsed < Duration::from_secs(9),
                 "the --rpc-timeout-sec value did not reach the query.job read: {elapsed:?}"
@@ -504,12 +505,11 @@ async fn query_run_falls_back_to_a_labelled_durable_view_that_agrees_with_the_li
             );
             assert_eq!(parse_stdout(&explicit)["view"], "durable-state");
 
-            // #434 (eval F1). The deployment this surface exists for: the
-            // operator can read the daemon's data and cannot write it. The
-            // view must still *render* — it used to probe the membership
-            // ledger for appendability and die with an I/O error that was
-            // itself false, on the automatic fallback path as well as this
-            // one.
+            // The deployment this surface exists for: the operator can read the
+            // daemon's data and cannot write it. The view must still *render*:
+            // probing the membership ledger for appendability dies with an I/O
+            // error that is itself false, on the automatic fallback path as
+            // well as this one.
             let membership = paths.data_dir.join("flow-membership.jsonl");
             if !membership.exists() {
                 std::fs::write(&membership, "").unwrap();

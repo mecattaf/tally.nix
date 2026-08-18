@@ -553,9 +553,9 @@ struct BriefSweep {
 
 /// Marks briefs required by an unwitnessed attempt or a witness inside the
 /// configured retention horizon, then sweeps the canonical data store. The
-/// state store is the legacy producer location shipped by #250; it receives an
-/// age floor as well as the same live-row floor so an upgrade can retire those
-/// duplicate and orphaned files safely.
+/// state store is a legacy producer location; it receives an age floor as well
+/// as the same live-row floor so an upgrade can retire those duplicate and
+/// orphaned files safely.
 ///
 /// A file whose bytes do not verify against the hash in its own name is
 /// **counted and skipped**, never pruned and never renamed. Two facts decide
@@ -565,7 +565,7 @@ struct BriefSweep {
 /// it can prove are unreferenced; a file it cannot even parse is an operator's
 /// decision, not a timer's. Skipping also keeps a single damaged file from
 /// aborting `run_gc` before the state-directory and projection sweeps, which is
-/// what propagating the verification error used to do on every subsequent run.
+/// what propagating the verification error would do on every subsequent run.
 /// The counter rides in every `tally gc` report so the condition stays visible
 /// instead of being announced once and then forgotten.
 fn sweep_brief_stores(
@@ -1748,18 +1748,19 @@ mod tests {
         // Once the holder is gone the same file becomes collectable, which is
         // the only reason the age floor is not the whole rule.
         //
-        // Release the lock explicitly rather than by closing the file (#419).
-        // `flock` binds to the open file description, and every `fork` in this
-        // process — every `Command::spawn` a sibling test makes, on any thread —
+        // Release the lock explicitly rather than by closing the file. `flock`
+        // binds to the open file description, and every `fork` in this process
+        // — every `Command::spawn` a sibling test makes, on any thread —
         // duplicates that description into the child until it `exec`s. Closing
-        // only drops *this* descriptor, so the lock survives in a child that has
-        // not reached `exec` yet and the sweep below reads a live holder that no
-        // longer exists. `LOCK_UN` removes the lock from the description itself,
-        // so no duplicate can outlive it. Measured on this tree: 56 spurious
-        // `WouldBlock` probes in 8,000 close-only release/probe pairs under
-        // four concurrent spawner threads, 0 in 8,000 with the explicit unlock.
-        // This mirrors what the production holder already does — see
-        // `UnitReservation::drop` in `executor/lifecycle.rs`.
+        // only drops *this* descriptor, so the lock survives in a child that
+        // has not reached `exec` yet and the sweep below reads a live holder
+        // that no longer exists. `LOCK_UN` removes the lock from the
+        // description itself, so no duplicate can outlive it. Measured on this
+        // tree: 56 spurious `WouldBlock` probes in 8,000 close-only
+        // release/probe pairs under four concurrent spawner threads, 0 in 8,000
+        // with the explicit unlock. This mirrors what the production holder
+        // already does — see `UnitReservation::drop` in
+        // `executor/lifecycle.rs`.
         FileExt::unlock(&holder).unwrap();
         drop(holder);
         let released = run_gc(

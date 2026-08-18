@@ -1500,14 +1500,14 @@ const ownershipSchema = {
   additionalProperties: false
 };
 
-// #386: the tree-delta permission gate's own result. `allowlistBasis` names
-// which of the three documented allowlist derivations governed this task, so
-// a reader of the witnessed result never has to guess whether an absent
-// `conflictDomains` fell back to something permissive. #424: `ownershipRan`
-// names which of the gate's two call sites produced the verdict -- after a
-// passing agent and its ownership node, or in place of ownership on a pass
-// whose agent failed -- so a reader can tell whether an `ownedPaths` fallback
-// was even available, and can see that a failed pass was in fact judged.
+// The tree-delta permission gate's own result. `allowlistBasis` names which of
+// the three documented allowlist derivations governed this task, so a reader of
+// the witnessed result never has to guess whether an absent `conflictDomains`
+// fell back to something permissive. `ownershipRan` names which of the gate's
+// two call sites produced the verdict -- after a passing agent and its
+// ownership node, or in place of ownership on a pass whose agent failed -- so a
+// reader can tell whether an `ownedPaths` fallback was even available, and can
+// see that a failed pass was in fact judged.
 const treeDeltaSchema = {
   type: "object",
   required: [
@@ -2403,9 +2403,9 @@ function failureClass(reconciliation, failure) {
     return "impossible";
   }
   // Bare codex 0.147 survives a tool-router rejection and finishes its JSONL
-  // turn. Older 0.145 sessions observed in #452 sometimes exited immediately
-  // after the same router ERROR. That is an adapter-session fault, not evidence
-  // about the task, so it spends the bounded machinery budget first.
+  // turn. Older 0.145 sessions sometimes exit immediately after the same router
+  // ERROR. That is an adapter-session fault, not evidence about the task, so it
+  // spends the bounded machinery budget first.
   if (
     stage === "agent" &&
     effective &&
@@ -2417,10 +2417,10 @@ function failureClass(reconciliation, failure) {
   }
   // The whole deferred lane is unpriced, not just its checkpoint command. A
   // checkpoint lane fails at three stages -- `prep`, `checkpoint`, and
-  // `checkpoint:record` -- and matching only the middle one left the other two
-  // buying a machinery retry and then a steering attempt out of the budget of
-  // a task the reconciler has just said has no meaningful verdict yet. The
-  // #308 loop bound terminates by spending that budget on attempts that mean
+  // `checkpoint:record` -- and matching only the middle one leaves the other
+  // two buying a machinery retry and then a steering attempt out of the budget
+  // of a task the reconciler has just said has no meaningful verdict yet. The
+  // loop bound terminates by spending that budget on attempts that mean
   // something; spending it on passes where the checkpoint could not have
   // settled either way escalates a checkpoint that was never really run. The
   // deferral set only ever names checkpoints, and it drains as unrelated work
@@ -2431,15 +2431,15 @@ function failureClass(reconciliation, failure) {
   ) {
     return "deferred";
   }
-  // #386: an out-of-allowlist tree delta is a breach, not a gate-fail -- the
-  // write already happened, so it is not redoable the way a red gate is.
-  // Routed separately from "work" so it never buys a retried dispatch; see
-  // the `steerable`/breach-tagging split below, which records it through the
+  // An out-of-allowlist tree delta is a breach, not a gate-fail -- the write
+  // already happened, so it is not redoable the way a red gate is. Routed
+  // separately from "work" so it never buys a retried dispatch; see the
+  // `steerable`/breach-tagging split below, which records it through the
   // existing diagnosis ledger already blocked at attempt 2.
   if (stage === "treeDelta") {
     return "breach";
   }
-  // #424: the gate refusing to judge a pass is not the same event as the gate
+  // The gate refusing to judge a pass is not the same event as the gate
   // catching a write, and must not be recorded under the other one's sentence.
   // It is priced the same -- a gate verdict, never the agent's fault, never a
   // steering attempt -- and it aborts the lane for the same reason: nothing
@@ -3121,11 +3121,11 @@ function sweepDeferral(sweepNode) {
 
   // A checkpoint reads the accumulated tree, so it is executed after this
   // pass's own merges rather than beside them. Sharing a frontier with a
-  // mergeable implementation task used to guarantee waste: the checkpoint
-  // recorded a receipt against the pre-merge base and the pass then moved that
-  // base out from under it, so the next reconcile found nothing and ran the
-  // whole checkpoint again. Prepared after the merges, the tested revision is
-  // the one the next pass reconciles.
+  // mergeable implementation task guarantees waste: the checkpoint records a
+  // receipt against the pre-merge base and the pass then moves that base out
+  // from under it, so the next reconcile finds nothing and runs the whole
+  // checkpoint again. Prepared after the merges, the tested revision is the one
+  // the next pass reconciles.
   const laneFor = task => (async () => {
     const taskRef = taskRefFor(task.id);
     const prepBrief = {
@@ -3455,13 +3455,13 @@ function sweepDeferral(sweepNode) {
       return { task, prepared: prepared.result, failure };
     }
     if (agent.verdict !== "pass") {
-      // #424: the pass still runs the tree-delta gate before it ends. A
-      // failing agent is the single most likely context for a rogue write and
-      // it was the one context this gate was silent in: the lane used to
-      // return here, and the next pass's `prep` re-snapshotted the worktree
-      // with the stray write already in it, so nothing could ever see it
-      // again. `ownership` never ran, so the gate has no certified
-      // `ownedPaths` and only a declared allowlist can govern.
+      // The pass still runs the tree-delta gate before it ends. A failing agent
+      // is the single most likely context for a rogue write and is the one
+      // context this gate would otherwise be silent in: returning here lets the
+      // next pass's `prep` re-snapshot the worktree with the stray write
+      // already in it, so nothing could ever see it again. `ownership` never
+      // ran, so the gate has no certified `ownedPaths` and only a declared
+      // allowlist can govern.
       //
       // The stage is chosen from what this lane already knows, so the receipt
       // it produces is true either way: a task that declares conflictDomains
@@ -3567,9 +3567,9 @@ function sweepDeferral(sweepNode) {
       };
     }
 
-    // #386: fingerprinted before the agent ran (`prep`), compared against
-    // the worktree's content right now -- detective, not preventive. Runs
-    // after ownership so an absent `conflictDomains` can fall back to
+    // Fingerprinted before the agent ran (`prep`), compared against the
+    // worktree's content right now -- detective, not preventive. Runs after
+    // ownership so an absent `conflictDomains` can fall back to
     // `ownership.result.ownedPaths`, the paths the ownership node just
     // certified as this task's own committed change-set.
     //
@@ -3884,20 +3884,19 @@ function sweepDeferral(sweepNode) {
     } else if (kind === "work") {
       steerable.push(failure);
     } else if (kind === "breach") {
-      // #386: shares the diagnose-and-record pipeline below (the path list
-      // still reaches the steward's diagnose slot) but never the retry
-      // budget -- `steerBrief.breach` makes the driver record both the
-      // attempt-1 and attempt-2 diagnosis receipts atomically, so the task
-      // is permanently blocked as of this pass rather than steered once and
-      // retried.
+      // Shares the diagnose-and-record pipeline below (the path list still
+      // reaches the steward's diagnose slot) but never the retry budget --
+      // `steerBrief.breach` makes the driver record both the attempt-1 and
+      // attempt-2 diagnosis receipts atomically, so the task is permanently
+      // blocked as of this pass rather than steered once and retried.
       failure.breach = true;
       steerable.push(failure);
     } else if (kind === "ungated") {
-      // #424: the gate could not judge this pass at all. It takes the breach
-      // routing -- both receipts recorded at once, lane aborted, no steering
-      // attempt spent as if the agent were at fault -- but it is tagged
-      // separately, because "wrote outside its authorized paths" is not what
-      // happened and the recorded receipt must not say it did.
+      // The gate could not judge this pass at all. It takes the breach routing
+      // -- both receipts recorded at once, lane aborted, no steering attempt
+      // spent as if the agent were at fault -- but it is tagged separately,
+      // because "wrote outside its authorized paths" is not what happened and
+      // the recorded receipt must not say it did.
       failure.breach = true;
       failure.ungated = true;
       steerable.push(failure);
@@ -4040,12 +4039,12 @@ function sweepDeferral(sweepNode) {
       const diagnosisBrief = {
         schemaVersion: 1,
         role: "diagnosis",
-        // #386: a breach has no next attempt -- the lane is aborted, not
-        // retried -- so the mission asks for a record of what happened
-        // rather than steering for a redispatch that will never come. #424:
-        // an unjudgeable pass is aborted for the same reason but is not the
-        // same event, and asking a model to explain paths that were never
-        // named would be asking it to invent them.
+        // A breach has no next attempt -- the lane is aborted, not retried --
+        // so the mission asks for a record of what happened rather than
+        // steering for a redispatch that will never come. An unjudgeable pass
+        // is aborted for the same reason but is not the same event, and asking
+        // a model to explain paths that were never named would be asking it to
+        // invent them.
         mission: (
           failure.impossibleClaim
             ? `Worker task ${task.id} returned an impossibility claim. Assess that claim independently; the worker does not grade its own exit, so treat the claim as evidence rather than proof. Do not modify the repository.`
@@ -4131,10 +4130,10 @@ function sweepDeferral(sweepNode) {
             diagnosis: diagnosed.result
           }
         : diagnosed.result;
-      // #386: a breach carries its own deterministic evidence -- the paths
-      // the tree-delta gate named in its own failure -- straight into the
-      // durable receipt, so the offending paths are witnessed regardless of
-      // what the steward's diagnosis says.
+      // A breach carries its own deterministic evidence -- the paths the
+      // tree-delta gate named in its own failure -- straight into the durable
+      // receipt, so the offending paths are witnessed regardless of what the
+      // steward's diagnosis says.
       const steerBrief = withSeam({
         campaign: effective.campaign,
         repository: codeRepository,
@@ -4162,10 +4161,10 @@ function sweepDeferral(sweepNode) {
                 failure.node && failure.node.error ? failure.node.error : failure.node,
                 2000
               ),
-              // #424: which abort this is. The driver composes a different
-              // label sentence for each, because the local receipt must claim
-              // exactly what happened --
-              // a gate that could not judge is not a gate that caught a write.
+              // Which abort this is. The driver composes a different label
+              // sentence for each, because the local receipt must claim exactly
+              // what happened -- a gate that could not judge is not a gate that
+              // caught a write.
               ...(failure.ungated ? { abortReason: "tree-delta-ungated" } : {})
             }
           : {})

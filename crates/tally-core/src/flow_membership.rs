@@ -1,14 +1,13 @@
 //! Durable flow-run membership: which task UUIDs a run was actually handed.
 //!
-//! Run membership used to be *recomputed* on every query by scanning durable
-//! rows and witness records for an orchestration capsule naming the run. That
-//! works only for admissions that write a row of their own. Three do not —
-//! `attached`, and full-mode `reused` and `terminal` — and each of them hands
-//! the caller a task UUID for work that is real and running while the row, and
-//! therefore the scanned membership, stays with whichever run created it. The
-//! submitting run's own window then filters its own node out: same items,
-//! `nextCursor: null`, no page cap in sight. That is waiver W-316, and #247
-//! before it.
+//! Run membership recomputed on every query — by scanning durable rows and
+//! witness records for an orchestration capsule naming the run — works only for
+//! admissions that write a row of their own. Three do not — `attached`, and
+//! full-mode `reused` and `terminal` — and each of them hands the caller a task
+//! UUID for work that is real and running while the row, and therefore the
+//! scanned membership, stays with whichever run created it. The submitting
+//! run's own window then filters its own node out: same items, `nextCursor:
+//! null`, no page cap in sight. That is waiver W-316.
 //!
 //! This ledger is the missing fact. One record per `(flowRunId, taskUuid)`
 //! pair, appended synchronously with the admission decision and durable before
@@ -25,12 +24,12 @@
 //! union of this ledger and the original scan, which is what makes the store
 //! safe to introduce: a row written by an older binary carries its capsule and
 //! is still found by the scan with no record here, and a ledger that is missing
-//! or empty degrades exactly to the pre-#380 behaviour rather than to an empty
+//! or empty degrades exactly to the scan-only behaviour rather than to an empty
 //! run.
 //!
-//! **Durability class: canonical.** A row-less admission's membership cannot
-//! be rebuilt from another store. The parsed [`FlowMembership`] lookup map is
-//! the derived surface replayed from these records.
+//! **Durability class: canonical.** A row-less admission's membership cannot be
+//! rebuilt from another store. The parsed [`FlowMembership`] lookup map is the
+//! derived surface replayed from these records.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -49,33 +48,30 @@ pub const FLOW_MEMBERSHIP_FILE: &str = "flow-membership.jsonl";
 
 /// Records kept before the ledger is compacted.
 ///
-/// **Re-derived for what this store actually accumulates.** The first draft
-/// copied 100,000 from [`crate::flow_lineage`], which records *rollover* events
-/// — one per retired generation, rare by construction. Membership is one record
-/// per **admitted flow node**: a per-dispatch surface. Sizing a per-dispatch
-/// store with a rare-event bound is a named recurring class here.
+/// **Sized for what this store actually accumulates.**
+/// [`crate::flow_lineage`]'s bound of 100,000 counts *rollover* events — one
+/// per retired generation, rare by construction. Membership is one record per
+/// **admitted flow node**: a per-dispatch surface. Sizing a per-dispatch store
+/// with a rare-event bound is a named recurring class here.
 ///
-/// What the bound is *not* sized by, any more, is the admission path. Appending
-/// is one set lookup, one write, and one fsync, so per-admission cost is **flat
-/// in the ledger's size**: 2.13 / 1.91 / 2.16 / 2.02 ms across ledgers of 0,
-/// 5,000, 20,000, and 25,000 records (debug profile, ext4, via
+/// What the bound is *not* sized by is the admission path. Appending is one set
+/// lookup, one write, and one fsync, so per-admission cost is **flat in the
+/// ledger's size**: 2.13 / 1.91 / 2.16 / 2.02 ms across ledgers of 0, 5,000,
+/// 20,000, and 25,000 records (debug profile, ext4, via
 /// `membership_admission_cost_sweep`).
 ///
 /// The flatness is the claim, not the constant. Absolute numbers move with host
 /// load — an independent measurement of the same code on the same host under
-/// different load read 3.27 / 3.33 / 2.89 / 3.39 ms — and at an empty ledger the
-/// figure is indistinguishable from the pre-#380 admission path, because at zero
-/// records there was never anything to improve. What the repair removed is the
-/// *growth*: the same sweep against the first draft read 2.8 ms empty, 17.4 ms
-/// at 10,000, 77.5 ms at 50,000, and 977 ms past the bound, where every
-/// admission rewrote the whole ledger.
+/// different load read 3.27 / 3.33 / 2.89 / 3.39 ms. What the shape rules out
+/// is *growth*: an append that rewrites the whole ledger measures 2.8 ms empty,
+/// 17.4 ms at 10,000, 77.5 ms at 50,000, and 977 ms past the bound.
 ///
-/// What the bound *is* sized by is the cost that stayed linear:
+/// What the bound *is* sized by is the cost that stays linear:
 ///
 /// - **The one-time parse**, paid at daemon open and again whenever the ledger
 ///   changes underneath the cache: ~10 µs/record, so ~200 ms at 20,000 records
-///   and ~1 s at 100,000. That lands in the budget #379 is open about, and it is
-///   the binding constraint.
+///   and ~1 s at 100,000. That lands in the startup budget, and it is the
+///   binding constraint.
 /// - **Resident memory.** The parsed index is `BTreeMap<run, BTreeMap<task,
 ///   record>>` over two UUID strings and a timestamp per record, held for the
 ///   daemon's lifetime.
@@ -90,23 +86,21 @@ pub const FLOW_MEMBERSHIP_FILE: &str = "flow-membership.jsonl";
 /// reassuring-direction lie this store exists to remove. It drops
 /// least-recently-touched first and never touches a run holding work that has
 /// not completed — running, queued, or paused alike; see
-/// [`FlowMembership::eviction_plan`]. A run that is wholly
-/// evicted falls back to the row scan, which is what an operator got before this
-/// ledger existed and is what the observability chapter documents — with the
-/// limit that a row-less admission has nothing to fall back to, which is why
-/// eviction has to keep away from live runs rather than merely be tidy about
-/// whole ones.
+/// [`FlowMembership::eviction_plan`]. A run that is wholly evicted falls back
+/// to the row scan, which is what the observability chapter documents — with
+/// the limit that a row-less admission has nothing to fall back to, which is
+/// why eviction has to keep away from live runs rather than merely be tidy
+/// about whole ones.
 pub const FLOW_MEMBERSHIP_MAX_RECORDS: usize = 20_000;
 
 /// What a compaction compacts *down to*, as a fraction of the bound.
 ///
-/// Compacting to exactly the bound is a trap this store fell into: drop the
-/// oldest run, land back on the bound, and the very next append compacts again.
-/// With single-node runs that degenerates to a full rewrite per admission —
-/// which is precisely the failure the first draft shipped, by a different
-/// route. Compacting to 90% of the bound means a rewrite is followed by at least
-/// `max_records / 10` ordinary appends, so the amortised cost of compaction is
-/// one rewrite per two thousand admissions rather than one per admission.
+/// Compacting to exactly the bound is a trap: drop the oldest run, land back on
+/// the bound, and the very next append compacts again. With single-node runs
+/// that degenerates to a full rewrite per admission. Compacting to 90% of the
+/// bound means a rewrite is followed by at least `max_records / 10` ordinary
+/// appends, so the amortised cost of compaction is one rewrite per two thousand
+/// admissions rather than one per admission.
 ///
 /// `flow_lineage` does not need this because its records arrive rarely enough
 /// that even the degenerate case is invisible; a per-dispatch store does.
@@ -122,15 +116,16 @@ pub const fn flow_membership_compact_to(max_records: usize) -> usize {
 const TAIL_SCAN_BYTES: u64 = 64 * 1024;
 
 /// Which admission handed the run this task: the parsed view of
-/// [`FlowMembershipRecord::disposition`], which is stored as the raw wire string.
+/// [`FlowMembershipRecord::disposition`], which is stored as the raw wire
+/// string.
 ///
 /// Open on the read side on purpose. A closed vocabulary that hard-fails on an
 /// unknown string would mean a ledger written by a newer daemon crashes an
-/// older one's queries on a pin rollback — the #371 failure, imported into a
+/// older one's queries on a pin rollback — a rollback failure imported into a
 /// store whose whole job is to keep a window honest. `Unknown` is this binary
 /// saying it does not recognise the value, never a replacement for it: the
-/// record keeps what was written, so a compaction rewrite cannot flatten a newer
-/// daemon's disposition into the literal `"unknown"`.
+/// record keeps what was written, so a compaction rewrite cannot flatten a
+/// newer daemon's disposition into the literal `"unknown"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MembershipDisposition {
@@ -190,8 +185,8 @@ impl std::fmt::Display for MembershipDisposition {
 /// **Deliberately not `deny_unknown_fields`, and deliberately diverging from
 /// [`crate::flow_lineage`] here.** This store's stated purpose is surviving a
 /// pin move in *both* directions. Rejecting an unknown field would reintroduce
-/// the same #371 failure one level down, and worse: `read` fails the whole
-/// ledger, so one field written by a newer daemon would take out every
+/// that same pin-rollback failure one level down, and worse: `read` fails the
+/// whole ledger, so one field written by a newer daemon would take out every
 /// run-scoped query and every flow admission on an older one, not one record.
 ///
 /// **Reading is not enough: the record must survive being written back.**
@@ -200,8 +195,8 @@ impl std::fmt::Display for MembershipDisposition {
 /// first time it compacted — while leaving the higher `schemaVersion` label in
 /// place, so rolling the pin forward again could not even detect the loss. The
 /// residual would not be "an older daemon over-reports a member a newer one
-/// retracted", which is visible and investigable; it would be "the retraction is
-/// gone". So unknown fields are *captured* in [`Self::extra`] and re-emitted
+/// retracted", which is visible and investigable; it would be "the retraction
+/// is gone". So unknown fields are *captured* in [`Self::extra`] and re-emitted
 /// verbatim, and `disposition` is stored as the raw wire string rather than as
 /// the parsed enum, whose `Unknown` variant would otherwise write back the
 /// literal `"unknown"` and destroy the original value.
@@ -610,18 +605,18 @@ pub fn probe_appendable(path: &Path) -> Result<(), FlowMembershipError> {
 
 /// Append one membership fact, fsync it, and return the index that results.
 ///
-/// Takes the caller's index **by value and hands it back** so the caller's cache
-/// is always the index the file now holds. The first draft returned only a
-/// disposition and left the caller to patch its own cache, which meant a
-/// compaction shrank the file but not the cache: the cache then stayed
-/// permanently over the bound and every later admission rewrote the whole
-/// ledger. Ownership makes that class unrepresentable.
+/// Takes the caller's index **by value and hands it back** so the caller's
+/// cache is always the index the file now holds. Returning only a disposition
+/// and leaving the caller to patch its own cache means a compaction shrinks the
+/// file but not the cache: the cache then stays permanently over the bound and
+/// every later admission rewrites the whole ledger. Ownership makes that class
+/// unrepresentable.
 ///
 /// Idempotent against the index: a run handed the same task twice writes once.
 /// The check is the caller's parsed index rather than a re-read, and on the
 /// happy path nothing is cloned — one lookup, one append, one fsync, whatever
-/// the ledger's size. A duplicate written by a racing second writer is harmless;
-/// the read path is set-valued and collapses it.
+/// the ledger's size. A duplicate written by a racing second writer is
+/// harmless; the read path is set-valued and collapses it.
 ///
 /// `live_tasks` are task UUIDs still executing. Their runs are exempt from
 /// compaction; see [`FlowMembership::eviction_plan`].
@@ -755,12 +750,12 @@ fn truncate_torn_tail(file: &mut std::fs::File, path: &Path) -> Result<(), FlowM
 
 /// Replace the ledger with the retained set, atomically.
 ///
-/// Write-and-rename, exactly as [`crate::flow_lineage`] does, and for the reason
-/// that store states: a reader observes either the whole old file or the whole
-/// new one, never a half-written ledger. The first draft truncated in place and
-/// reasoned only about lock ownership, which is the wrong axis — the danger is
-/// not a concurrent reader racing the lock but a crash mid-rewrite, which leaves
-/// a short file that the read path accepts as a *smaller, valid* membership. A
+/// Write-and-rename, exactly as [`crate::flow_lineage`] does, and for the
+/// reason that store states: a reader observes either the whole old file or the
+/// whole new one, never a half-written ledger. Truncating in place and
+/// reasoning only about lock ownership is the wrong axis — the danger is not a
+/// concurrent reader racing the lock but a crash mid-rewrite, which leaves a
+/// short file that the read path accepts as a *smaller, valid* membership. A
 /// silently smaller run set is precisely the reassuring-direction lie this
 /// module's own doc comment says the store exists to remove, so the write path
 /// must not be able to manufacture it.
@@ -1062,9 +1057,9 @@ mod tests {
         );
     }
 
-    /// The regression behind HIGH-2: compacting to exactly the bound means the
-    /// next append compacts again, forever. The low-water mark is what makes a
-    /// rewrite rare, and "rare" has to be asserted, not asserted-about.
+    /// Compacting to exactly the bound means the next append compacts again,
+    /// forever. The low-water mark is what makes a rewrite rare, and "rare" has
+    /// to be asserted, not asserted-about.
     #[test]
     fn a_compaction_is_followed_by_ordinary_appends_rather_than_more_compactions() {
         let temp = tempdir().unwrap();
@@ -1246,19 +1241,21 @@ mod tests {
     }
 
     /// When *everything* above the target is protected there is nothing to
-    /// evict, and the ledger grows rather than deleting membership that is still
-    /// in use. The contract has three parts and all three matter:
+    /// evict, and the ledger grows rather than deleting membership that is
+    /// still in use. The contract has three parts and all three matter:
     ///
     /// 1. the record is still written — the admission is not failed;
     /// 2. `AppendedOverTarget` is reported, so the daemon can say so on its
     ///    journal (this module does not log);
     /// 3. **no rewrite happens** — the file is appended to, not re-serialized.
     ///    Rewriting the whole ledger on every admission because compaction
-    ///    cannot make progress would be round 1's HIGH-2 by a third route.
+    ///    cannot make progress is the per-admission-rewrite failure by a third
+    ///    route.
     ///
     /// The reachable operator state for this is `queue pause --all`: every job
-    /// is `Paused`, which counts as not-completed, so every run is protected. It
-    /// is deliberately not `Running` here — protecting paused work is the point.
+    /// is `Paused`, which counts as not-completed, so every run is protected.
+    /// It is deliberately not `Running` here — protecting paused work is the
+    /// point.
     #[test]
     fn nothing_evictable_grows_the_ledger_and_says_so_instead_of_rewriting_it() {
         use std::os::unix::fs::MetadataExt;

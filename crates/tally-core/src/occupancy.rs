@@ -263,10 +263,10 @@ mod tests {
         // cache_creation_input_tokens=309 -- residency 227316.
         assert_eq!(context_tokens(&claude_adapter(), &captures), Some(227_316));
 
-        // The number this repairs: #381's own normalized total for the same
-        // stream is the `result` event's session-lifetime roll-up, 50x
-        // larger than the real resident figure and larger than the window
-        // it would have been measured against.
+        // The number this must not report: the `result` event's
+        // session-lifetime roll-up for the same stream, 50x larger than the
+        // real resident figure and larger than the window it would have been
+        // measured against.
         let usage = crate::usage::observe(&claude_adapter(), &captures);
         assert_eq!(
             usage.breakdown().unwrap().total_tokens.unwrap().value,

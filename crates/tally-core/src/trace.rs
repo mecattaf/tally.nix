@@ -178,7 +178,7 @@ pub fn trace_availability(
 /// The public entry above scans the whole lane table to resolve a task-or-job
 /// spelling; a caller decorating every item of a collection has already grouped
 /// lanes by anchor and must not pay that scan once per item — at ~30k rows the
-/// per-item scan alone made one `query.jobs` collection quadratic (#431).
+/// per-item scan alone made one `query.jobs` collection quadratic.
 pub fn anchor_trace_availability(
     mut selected: Vec<&TraceLane>,
     adapters: &BTreeMap<String, AdapterConfig>,
@@ -698,16 +698,15 @@ mod tests {
     #[test]
     fn acceptance_24_3_harness_jsonl_captures_are_lossless_ordered_and_advisory() {
         // The third element says whether the fixture carries the synthetic
-        // tail this test was originally written around: one unknown future
-        // event followed by one malformed line. `claude-code.jsonl` and
-        // `codex.jsonl` were authored with that tail; `pi.jsonl` is a pure
-        // real `pi --mode json` capture (see test/fixtures/traces/README.md)
-        // with no invented event type and no invented trailing garbage, so
-        // the tail assertions do not apply to it. Forcing them would mean
-        // corrupting the capture to satisfy the test — the opposite of what
-        // the fixture is for. What replaces them for pi is stronger in the
-        // direction that matters for a real capture: every one of its lines
-        // must parse.
+        // tail: one unknown future event followed by one malformed line.
+        // `claude-code.jsonl` and `codex.jsonl` are authored with that tail;
+        // `pi.jsonl` is a pure real `pi --mode json` capture (see
+        // test/fixtures/traces/README.md) with no invented event type and no
+        // invented trailing garbage, so the tail assertions do not apply to it.
+        // Forcing them would mean corrupting the capture to satisfy the test —
+        // the opposite of what the fixture is for. What replaces them for pi is
+        // stronger in the direction that matters for a real capture: every one
+        // of its lines must parse.
         for (adapter, fixture, synthetic_tail) in [
             (
                 "claude-code",
