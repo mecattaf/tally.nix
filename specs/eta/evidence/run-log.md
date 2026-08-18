@@ -190,3 +190,25 @@ checks.x86_64-linux.spec-lint executing inside the ladder; final bar
 The coverage table above this entry's commit was rendered by
 spec-lint --coverage specs/eta — the first tool-rendered close-out;
 the hand-rendered table is dead as designed.
+
+## Chapter 3 CLOSED — C2 green, published, deployed. 2026-08-18 05:55 UTC
+
+All seven ext1 verbs merged on claude-code (host-default model), five of
+them first-try; X4 took two attempts (fixture domains), X7 two (its gate
+inherited a test-isolation race from the lease merge, repaired in the
+same lane). The campaign reached `complete` with 20/20 done and the C2
+checkpoint witnessed; fleet gate PASS b54ea267 on the published main
+head, final bar 24/24. Pin-bump 2 flashed (daemon at as412bk3...,
+smoke PASS): the single-line integration model, poll re-admission, the
+acceptance-domain lint, the spec deny-list, receipt-derived gate
+budgets, the lease, and the inbox are now the deployed contract — this
+seam's manual cherry-pick publish was the last one; from the next
+armed campaign, main advances only by machine fast-forward of a
+gate-proven head, and a worklist push is the arming act.
+
+Carried finding, still open (host catalog): the narrator shim answers
+the diagnosis role with its fixed commit-narration schema
+(result-schema-mismatch on every diagnosis dispatch); the fix is a
+role-aware steward shim in dotfiles/home/tally.nix — queued for the
+chapter-4 sitting. Buildout stands at chapters 1–3 of 5; stopped here
+per operator instruction.
