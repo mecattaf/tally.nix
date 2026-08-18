@@ -17,8 +17,8 @@ const CAPTURE_PROJECTION_POLL: Duration = Duration::from_millis(100);
 /// opposite next actions, and conflating them cost real diagnosis time on
 /// 2026-08-07: two smokes whose daemon-side verdicts were exit 0 and
 /// witness-emitted PASS were reported as failures because a `query.job` read
-/// timed out during a daemon stall (#431). A timed-out read is never rendered
-/// as adapter failure.
+/// timed out during a daemon stall. A timed-out read is never rendered as
+/// adapter failure.
 pub(super) const VERDICT_UNAVAILABLE_EXIT: i32 = 5;
 const DEFAULT_SMOKE_PROMPT: &str = "Reply with the single word ok.";
 pub(super) const COMMIT_PROBE_FILE: &str = "tally-commit-probe.txt";
@@ -675,12 +675,13 @@ enum CaptureRead {
 /// Poll the daemon until every declared capture is projected, the projection
 /// window closes, or the read itself stops returning.
 ///
-/// `rpc_timeout` is the operator's `--rpc-timeout-sec` / `TALLY_RPC_TIMEOUT_SEC`
-/// and it is the deadline for each `query.job` reply. It used to be
-/// [`CAPTURE_PROJECTION_TIMEOUT`], a private 10 s constant no flag could
-/// reach, so the one knob an operator had did not govern the one read that
-/// timed out under a stall. The projection window stays its own bound: it
-/// answers "not projected yet", the deadline answers "not answered at all".
+/// `rpc_timeout` is the operator's `--rpc-timeout-sec` /
+/// `TALLY_RPC_TIMEOUT_SEC` and it is the deadline for each `query.job` reply.
+/// Bounding it with [`CAPTURE_PROJECTION_TIMEOUT`] instead — a private 10 s
+/// constant no flag can reach — leaves the one knob an operator has not
+/// governing the one read that times out under a stall. The projection window
+/// stays its own bound: it answers "not projected yet", the deadline answers
+/// "not answered at all".
 async fn await_declared_captures(
     socket: &Path,
     config_path: Option<&Path>,

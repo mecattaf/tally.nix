@@ -33,10 +33,10 @@ mod tests {
     };
     use tally_client::RpcClient;
 
-    /// Positive test progress is never a latency assertion (#419). The suite
-    /// can be sharing a loaded host with other full suites, so every event,
-    /// count, and state-publication wait gets the same generous ceiling. The
-    /// deadline only distinguishes a wedged test from a slow one.
+    /// Positive test progress is never a latency assertion. The suite can be
+    /// sharing a loaded host with other full suites, so every event, count, and
+    /// state-publication wait gets the same generous ceiling. The deadline only
+    /// distinguishes a wedged test from a slow one.
     const POSITIVE_PROGRESS_BACKSTOP: Duration = Duration::from_secs(60);
 
     async fn await_positive_progress<T>(
@@ -796,15 +796,15 @@ mod tests {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
 
-                // The claim is "one sample per configured interval", and its two
-                // halves have opposite relationships with load (#419). The
-                // lower bound -- no sample before the interval elapses -- is
+                // The claim is "one sample per configured interval", and its
+                // two halves have opposite relationships with load. The lower
+                // bound -- no sample before the interval elapses -- is
                 // load-safe, because load can only delay a timer, never advance
-                // it. The upper bound is not: this used to sleep 1,150 ms and
-                // assert the sample had landed, which gives a tick plus a
-                // blocking filesystem walk 150 ms of slack on a host that may
-                // be running a hundred other test threads. So the lower bound
-                // is asserted and the upper bound is waited for.
+                // it. The upper bound is not: sleeping 1,150 ms and asserting
+                // the sample had landed gives a tick plus a blocking filesystem
+                // walk 150 ms of slack on a host that may be running a hundred
+                // other test threads. So the lower bound is asserted and the
+                // upper bound is waited for.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 assert_eq!(
                     handler.cached_storage().sampled_at,
@@ -2357,7 +2357,7 @@ mod tests {
         );
     }
 
-    /// #407: a terminal failure whose adapter stderr never existed was probed
+    /// A terminal failure whose adapter stderr never existed must not be probed
     /// again at every startup, forever, one warning per probe, all of it
     /// charged to `TimeoutStartSec`.
     ///
@@ -2365,8 +2365,8 @@ mod tests {
     /// fsynced before `systemd-run` creates the unit, and
     /// `archive_current_capture` returns early when any of the capture set is
     /// missing — so an attempt that failed before its stderr stream existed
-    /// leaves a generation marker nothing ever retires, and this pass read
-    /// that marker as "recoverable" at every start.
+    /// leaves a generation marker nothing ever retires, and an unbounded pass
+    /// would read that marker as "recoverable" at every start.
     ///
     /// What is asserted here is the disposition: a definitive answer is
     /// recorded once, a transient one is not, and the pass stops before the
@@ -3322,12 +3322,12 @@ mod tests {
             .map(|pair| pair[1].as_str())
     }
 
-    /// #232 gave a flow node the right *process* cwd by deriving it from the
-    /// workspace, but the adapter argv was rendered from the raw row cwd,
-    /// which a flow never submits. The witnessed argv therefore omitted
-    /// `-C <worktree>` while the process ran in it. Admission, recovery, and
-    /// the execution request now resolve one effective cwd, so they cannot
-    /// disagree; an explicit payload cwd still outranks the workspace.
+    /// A flow node's *process* cwd is derived from the workspace, while the raw
+    /// row cwd is something a flow never submits: rendering the adapter argv
+    /// from the row alone omits `-C <worktree>` while the process runs in it,
+    /// so the witnessed argv and the process disagree. Admission, recovery, and
+    /// the execution request resolve one effective cwd, so they cannot; an
+    /// explicit payload cwd still outranks the workspace.
     #[tokio::test(flavor = "current_thread")]
     async fn flow_workspace_without_cwd_renders_the_adapter_cwd_argv() {
         let local = LocalSet::new();
@@ -3432,8 +3432,8 @@ mod tests {
                 );
 
                 // Recovery re-renders the invocation from the durable row
-                // alone. Before the shared helper it lost the -C argument the
-                // admitted job had.
+                // alone, so without the shared helper it loses the -C argument
+                // the admitted job had.
                 drop(daemon);
                 let recovered = Daemon::open_with_executor(
                     config,
@@ -3463,7 +3463,7 @@ mod tests {
     }
 
     /// The retry path re-renders from the durable row too, so it is the third
-    /// site that used to drop the flow node's `-C <worktree>`.
+    /// site that can drop the flow node's `-C <worktree>`.
     #[tokio::test(flavor = "current_thread")]
     async fn retried_flow_node_keeps_its_workspace_cwd_argv() {
         let local = LocalSet::new();
@@ -3600,9 +3600,8 @@ mod tests {
                 daemon.handler.drain_post_ack_tasks().await;
                 let first_id = first["job_id"].as_str().unwrap();
                 // The scraped session pointer outlives the job: the job is
-                // terminal and retired from the live map (#395), and the
-                // continuation below reads the pointer back from exactly this
-                // fact.
+                // terminal and retired from the live map, and the continuation
+                // below reads the pointer back from exactly this fact.
                 let first_uuid = Uuid::parse_str(first_id).unwrap();
                 {
                     let context = daemon.handler.context.read().await;
@@ -3672,12 +3671,12 @@ mod tests {
             .await;
     }
 
-    /// #443. The stock Codex stream does not identify the model when Codex
-    /// selected its default. Recovery must retain that absence: a required
-    /// `%<model>%` would make this real, complete capture impossible to
-    /// continue, while inventing a model would silently pin a choice Codex
-    /// never reported. An explicit job option is a different fact and remains
-    /// a typed, durable request on both sides of the restart.
+    /// The stock Codex stream does not identify the model when Codex selected
+    /// its default. Recovery must retain that absence: a required `%<model>%`
+    /// would make this real, complete capture impossible to continue, while
+    /// inventing a model would silently pin a choice Codex never reported. An
+    /// explicit job option is a different fact and remains a typed, durable
+    /// request on both sides of the restart.
     #[tokio::test(flavor = "current_thread")]
     async fn default_model_codex_recovery_is_model_less_while_explicit_model_is_preserved() {
         const CODEX_CAPTURE: &str =
@@ -3979,12 +3978,12 @@ mod tests {
             .await;
     }
 
-    /// #425. A harness that resolves a session by the directory it was
-    /// launched in cannot reach that session from anywhere else, and pi's
-    /// version of "cannot reach" is exit 0 with an interactive prompt on
-    /// stderr — a successful attempt that did no work, which is the worst
-    /// shape a headless pipeline can be handed. `queue.continue` is the one
-    /// seam where the directory can move, so it is the one that refuses.
+    /// A harness that resolves a session by the directory it was launched in
+    /// cannot reach that session from anywhere else, and pi's version of
+    /// "cannot reach" is exit 0 with an interactive prompt on stderr — a
+    /// successful attempt that did no work, which is the worst shape a headless
+    /// pipeline can be handed. `queue.continue` is the one seam where the
+    /// directory can move, so it is the one that refuses.
     #[tokio::test(flavor = "current_thread")]
     async fn a_continuation_off_the_launch_directory_is_refused_naming_both_directories() {
         let local = LocalSet::new();
@@ -4125,8 +4124,8 @@ mod tests {
             .await;
     }
 
-    /// The adapter both #425 tests below share: cwd-keyed, resumable, and it
-    /// prints one session pointer.
+    /// The adapter both launch-directory tests below share: cwd-keyed,
+    /// resumable, and it prints one session pointer.
     fn cwd_keyed_config(program: &Path) -> Config {
         let mut config = one_pool_config();
         config.adapters.insert(
@@ -4213,8 +4212,8 @@ mod tests {
             .unwrap();
     }
 
-    /// #440. A pool-return representation recovers its session pointer from
-    /// the previous attempt's attestation before it is installed. The launch
+    /// A pool-return representation recovers its session pointer from the
+    /// previous attempt's attestation before it is installed. The launch
     /// directory record must be hydrated at that same represent-only seam.
     #[test]
     fn represent_hydration_records_launch_cwd_beside_the_pointer() {
@@ -4254,9 +4253,9 @@ mod tests {
         );
     }
 
-    /// #440. An adopted attempt has no current capture to scrape, so its
-    /// continuation identity comes from the latest prior attestation. Bind
-    /// the launch record to that adopted-metadata path specifically.
+    /// An adopted attempt has no current capture to scrape, so its continuation
+    /// identity comes from the latest prior attestation. Bind the launch record
+    /// to that adopted-metadata path specifically.
     #[test]
     fn adopted_metadata_records_launch_cwd_beside_the_pointer() {
         let temp = tempdir().unwrap();
@@ -4293,7 +4292,7 @@ mod tests {
         );
     }
 
-    /// #440. A durable continued row keeps `session_ref`, while serde drops
+    /// A durable continued row keeps `session_ref`, while serde drops
     /// `session_cwd`. `QueueExisting` therefore has to reinstall the record
     /// when it turns that recovered row into a live job.
     #[tokio::test(flavor = "current_thread")]
@@ -4348,9 +4347,9 @@ mod tests {
         );
     }
 
-    /// #440. Completion scrapes after the terminal acknowledgement and the
-    /// live job has already been retired. Observe that exact enriched job so
-    /// this test cannot pass through `FoundJob::observed_row`'s later recovery.
+    /// Completion scrapes after the terminal acknowledgement and the live job
+    /// has already been retired. Observe that exact enriched job so this test
+    /// cannot pass through `FoundJob::observed_row`'s later recovery.
     #[tokio::test(flavor = "current_thread")]
     async fn completion_scrape_records_launch_cwd_beside_the_pointer() {
         let local = LocalSet::new();
@@ -4417,22 +4416,22 @@ mod tests {
             .await;
     }
 
-    /// #440's flake, killed at its cause rather than waited out.
+    /// The continuation/enrichment race, killed at its cause rather than waited
+    /// out.
     ///
-    /// The `launch-cwd-ordinary-completion` bar case enqueues with `--wait`
-    /// and continues the instant the wait returns. The terminal
-    /// acknowledgement is deliberately independent of the post-ack scrape --
-    /// `run.rs` releases waiters after the witness fsync and nothing else --
-    /// so the continuation could reach the row before the session pointer was
-    /// installed and be refused with "has no scraped session reference". It
-    /// was: once at the Phase-0 bootstrap gate, green on rerun, which is the
-    /// signature of a race and not of a defect the case can see.
+    /// The `launch-cwd-ordinary-completion` bar case enqueues with `--wait` and
+    /// continues the instant the wait returns. The terminal acknowledgement is
+    /// deliberately independent of the post-ack scrape -- `run.rs` releases
+    /// waiters after the witness fsync and nothing else -- so an unguarded
+    /// continuation reaches the row before the session pointer is installed and
+    /// is refused with "has no scraped session reference". That is a race, so a
+    /// bar case sees it intermittently at best and is green on rerun.
     ///
     /// This drives the losing side of that race with no timing in it at all.
     /// `finish_job` returns with the enrichment task spawned and not yet
-    /// polled, so the continuation below is admitted at exactly the moment
-    /// the old code lost -- every time, not intermittently. Nothing here
-    /// sleeps, drains, or observes the enrichment: the continuation's own
+    /// polled, so the continuation below is admitted at exactly the moment an
+    /// unguarded admission loses -- every time, not intermittently. Nothing
+    /// here sleeps, drains, or observes the enrichment: the continuation's own
     /// wait on the settled completion is the whole mechanism under test.
     #[tokio::test(flavor = "current_thread")]
     async fn a_continuation_admitted_at_the_terminal_ack_reads_the_scraped_session() {
@@ -4514,9 +4513,9 @@ mod tests {
             .await;
     }
 
-    /// #425 (F2). "This row declared no working directory" and "nothing
-    /// recorded where this session was launched" are different facts, and only
-    /// the second is a reason to refuse.
+    /// "This row declared no working directory" and "nothing recorded where
+    /// this session was launched" are different facts, and only the second is a
+    /// reason to refuse.
     ///
     /// A row that declares no cwd runs wherever the service manager put the
     /// daemon; a continuation that also declares none runs in that same
@@ -4608,10 +4607,10 @@ mod tests {
             .await;
     }
 
-    /// #425. The record has to survive a daemon restart, because the pointer
-    /// does: startup re-derives `session_ref` from the retained adapter
-    /// attestation, and a record that is not re-derived beside it leaves a
-    /// recovered row refusing its own continuation with `UnrecordedLaunchCwd`.
+    /// The record has to survive a daemon restart, because the pointer does:
+    /// startup re-derives `session_ref` from the retained adapter attestation,
+    /// and a record that is not re-derived beside it leaves a recovered row
+    /// refusing its own continuation with `UnrecordedLaunchCwd`.
     ///
     /// This binds the `apply_adapter_metadata` seam in `daemon/startup.rs`
     /// directly -- the row in `context.rows` after recovery is asserted, not
@@ -4824,23 +4823,21 @@ mod tests {
             .await;
     }
 
-    /// Issue #382: a GPU-pool job's witness carries real, measured
-    /// `gpuSeconds` and `charge` — never the always-`None` and always-
-    /// fabricated-`Some(0.0)` these fields used to carry through this exact
-    /// completion path (`run.rs`'s `finish_job`).
+    /// A GPU-pool job's witness carries real, measured `gpuSeconds` and
+    /// `charge` — never an always-`None` and never a fabricated `Some(0.0)` —
+    /// through this exact completion path (`run.rs`'s `finish_job`).
     ///
     /// The exit recorder's own accounting probe is exercised end to end
-    /// elsewhere (`crates/tally/tests/record_unit_exit_accounting.rs`,
-    /// against the real `tally` binary and a fake `systemctl`). This test
-    /// instead proves the daemon-side wiring: a measured `UnitAccounting`
-    /// sample on the `ExecutionOutcome` reaches the witness record, the
-    /// completion lifecycle event, and `canonical_gpu_seconds`, gated
-    /// correctly on the job's pool actually being `vram`-resource. The
-    /// direct-fallback backend this suite otherwise uses never sets
-    /// `accounting` (it has no `ExecStopPost`), so the sample is placed on
-    /// `finished.outcome` the one place a test can reach it before
-    /// `finish_job` consumes it — the same shape a real systemd completion
-    /// would have handed the daemon.
+    /// elsewhere (`crates/tally/tests/record_unit_exit_accounting.rs`, against
+    /// the real `tally` binary and a fake `systemctl`). This test instead
+    /// proves the daemon-side wiring: a measured `UnitAccounting` sample on the
+    /// `ExecutionOutcome` reaches the witness record, the completion lifecycle
+    /// event, and `canonical_gpu_seconds`, gated correctly on the job's pool
+    /// actually being `vram`-resource. The direct-fallback backend this suite
+    /// otherwise uses never sets `accounting` (it has no `ExecStopPost`), so
+    /// the sample is placed on `finished.outcome` the one place a test can
+    /// reach it before `finish_job` consumes it — the same shape a real systemd
+    /// completion would have handed the daemon.
     #[tokio::test(flavor = "current_thread")]
     async fn a_gpu_pool_jobs_witness_carries_measured_gpu_seconds_and_charge() {
         let local = LocalSet::new();
@@ -4930,10 +4927,10 @@ mod tests {
                 //
                 // `completed_event` is emitted from the post-ack `spawn_local`
                 // task, so `await_job` returning terminal says nothing about
-                // whether that task has run (#419). Awaiting it is the only
-                // thing that puts the event before this assertion; without the
-                // drain the assertion wins the race almost always and loses it
-                // under a loaded host, which is a flake, not a bug.
+                // whether that task has run. Awaiting it is the only thing that
+                // puts the event before this assertion; without the drain the
+                // assertion wins the race almost always and loses it under a
+                // loaded host, which is a flake, not a bug.
                 daemon.handler.drain_post_ack_tasks().await;
                 assert!(history.borrow().snapshot().records.iter().any(|entry| {
                     entry.fields.task_uuid == task_uuid && entry.fields.gpu_seconds == Some(3.5)
@@ -4942,15 +4939,14 @@ mod tests {
             .await;
     }
 
-    /// #382 HIGH-1 (post-merge repair): `vram` is `ResourceKind`'s default,
-    /// so a pool whose config omits `resource` entirely must NOT read as a
-    /// GPU pool. Before this repair, `resource_kind(pool) ==
-    /// Some(ResourceKind::Vram)` compared against the *effective*
-    /// (defaulted) resource, so a job in a pool that declared nothing at
-    /// all — `{"capacity": 2}`, no `resource` key — got a real,
-    /// non-fabricated-looking `gpuSeconds` on a host with no GPU. This pins
-    /// the fix: `declared_resource_kind` reads the raw `Option` the pool
-    /// config carries, so silence never reads as a declaration.
+    /// `vram` is `ResourceKind`'s default, so a pool whose config omits
+    /// `resource` entirely must NOT read as a GPU pool. Comparing
+    /// `resource_kind(pool) == Some(ResourceKind::Vram)` against the
+    /// *effective* (defaulted) resource gives a job in a pool that declared
+    /// nothing at all — `{"capacity": 2}`, no `resource` key — a real,
+    /// non-fabricated-looking `gpuSeconds` on a host with no GPU.
+    /// `declared_resource_kind` reads the raw `Option` the pool config carries
+    /// instead, so silence never reads as a declaration.
     #[tokio::test(flavor = "current_thread")]
     async fn a_pool_that_declares_no_resource_never_gets_gpu_seconds() {
         let local = LocalSet::new();
@@ -5123,8 +5119,8 @@ mod tests {
             .await;
     }
 
-    /// A probe that never measured anything (the exit recorder's
-    /// `systemctl` call failed, or this is a pre-#382 record) must never
+    /// A probe that never measured anything (the exit recorder's `systemctl`
+    /// call failed, or the record predates the accounting probe) must never
     /// surface as a fabricated `Some(0.0)` anywhere downstream — not on the
     /// witness, and not on the completion lifecycle event.
     #[tokio::test(flavor = "current_thread")]
@@ -5262,8 +5258,8 @@ mod tests {
                 let absent_uuid =
                     Uuid::parse_str(absent["task_uuid"].as_str().unwrap()).unwrap();
                 // From `context.rows`, which keeps the admitted seed for the
-                // daemon's lifetime; the job itself is terminal and retired
-                // out of the live map (#395).
+                // daemon's lifetime; the job itself is terminal and retired out
+                // of the live map.
                 assert!(daemon
                     .handler
                     .context
@@ -5312,8 +5308,8 @@ mod tests {
 
     /// A run's cost, end to end: a real attempt is scraped, normalized, and
     /// attested, and `query.run` and `query.standup` both sum it per attempt
-    /// over the run's **durable membership** — including for a run that owns
-    /// no row for the task at all, which is the W-316 shape.
+    /// over the run's **durable membership** — including for a run that owns no
+    /// row for the task at all, which is the W-316 shape.
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_384_run_and_standup_roll_per_attempt_usage_up_to_the_run() {
         const RUN_A: &str = "00000000-0000-4000-8000-0000000003a0";
@@ -5762,10 +5758,10 @@ mod tests {
 
                 await_positive_progress("adapter metadata publication", async {
                     loop {
-                        // Read from the query fact, not `context.jobs`: the
-                        // job is terminal by now and terminal jobs are retired
-                        // out of the live map (#395). The query fact is where
-                        // the post-ack scrape has always landed too.
+                        // Read from the query fact, not `context.jobs`: the job
+                        // is terminal by now and terminal jobs are retired out
+                        // of the live map. The query fact is where the post-ack
+                        // scrape has always landed too.
                         let enriched = daemon
                             .handler
                             .context
@@ -5839,7 +5835,7 @@ mod tests {
                 assert_eq!(witness[0].charge, None);
                 assert_eq!(witness[0].model, None);
                 // Same reason as the poll above: the observed model survives
-                // the job on the query fact, not in the live map (#395).
+                // the job on the query fact, not in the live map.
                 assert_eq!(
                     daemon
                         .handler
@@ -5905,12 +5901,11 @@ mod tests {
                 // narrower capture, never derived from `usage`'s
                 // session-lifetime total: this synthetic adapter declares no
                 // `occupancy` capture (it is not claude-code-shaped), so
-                // `contextTokens` is absent rather than reusing the same
-                // 999999 `usage` reports -- proof the two are no longer the
-                // same number under two names. `contextWindow` is
-                // config-declared here and renders with the advisory,
-                // non-durable authority true of a live-config value that
-                // vanishes on restart.
+                // `contextTokens` is absent rather than reusing the same 999999
+                // `usage` reports -- proof the two are not the same number
+                // under two names. `contextWindow` is config-declared here and
+                // renders with the advisory, non-durable authority true of a
+                // live-config value that vanishes on restart.
                 assert_eq!(
                     before["job"].get("contextTokens"),
                     None,
@@ -7064,8 +7059,8 @@ mod tests {
                 assert_eq!(low_result["verdict"], "preempted");
                 await_positive_progress("urgent job retirement", async {
                     loop {
-                        // Terminal now means retired from the live map
-                        // (#395), not present-and-`Completed`.
+                        // Terminal now means retired from the live map, not
+                        // present-and-`Completed`.
                         if !daemon
                             .handler
                             .context
@@ -7924,7 +7919,7 @@ mod tests {
                     LaborClass::Reused
                 );
                 // Every job in this fixture is terminal, so the live map is
-                // empty (#395).
+                // empty.
                 assert!(context.read().await.jobs.is_empty());
                 let standup = client.call("query.standup", Some(json!({}))).await.unwrap();
                 assert_eq!(standup["reused"], 1);
@@ -8488,11 +8483,11 @@ mod tests {
         }
     }
 
-    /// #379: startup is charged to `TimeoutStartSec`, so every phase boundary
-    /// has to buy more of it. `EXTEND_TIMEOUT_USEC=` restarts the start
-    /// timeout from receipt, which turns one budget for the whole of
-    /// `Daemon::open` into one budget per phase; `STATUS=` makes a slow start
-    /// legible in `systemctl status` instead of silent.
+    /// Startup is charged to `TimeoutStartSec`, so every phase boundary has to
+    /// buy more of it. `EXTEND_TIMEOUT_USEC=` restarts the start timeout from
+    /// receipt, which turns one budget for the whole of `Daemon::open` into one
+    /// budget per phase; `STATUS=` makes a slow start legible in `systemctl
+    /// status` instead of silent.
     #[test]
     fn every_startup_phase_extends_the_start_timeout_and_names_itself() {
         let temp = tempdir().unwrap();
@@ -8521,14 +8516,13 @@ mod tests {
         }
         // Nothing else is sent by the timeline: its extension is per phase.
         // (The unit-facts loop additionally renews on its own time-throttled
-        // cadence while it is visiting rows — #428 — but that is driven by
-        // row progress, not by these phase boundaries.)
+        // cadence while it is visiting rows, but that is driven by row
+        // progress, not by these phase boundaries.)
         let mut buffer = [0_u8; 256];
         assert!(socket.recv(&mut buffer).is_err());
 
         // The report is the durable half. Every phase is named with its own
-        // wall-clock, because a total alone is what #379 already had and could
-        // not attribute.
+        // wall-clock, because a total alone cannot be attributed.
         assert!(report.starts_with("startup complete in "), "{report}");
         assert!(report.contains("of a 90s per-phase budget"), "{report}");
         for phase in ["prepare", "row-migration", "unit-facts"] {
@@ -8539,13 +8533,12 @@ mod tests {
         }
     }
 
-    /// #428: the unit-facts phase renews the start timeout from inside its
-    /// per-row loop, so the 90 s budget bounds progress stalls rather than
-    /// the phase's total O(corpus) cost. The throttle is time-based; driving
-    /// it with a zero interval makes every visited row renew, which is the
-    /// seam that proves the notification actually flows from inside
-    /// `collect_local_unit_facts` — remove the in-loop extension and this
-    /// observes no datagrams.
+    /// The unit-facts phase renews the start timeout from inside its per-row
+    /// loop, so the 90 s budget bounds progress stalls rather than the phase's
+    /// total O(corpus) cost. The throttle is time-based; driving it with a zero
+    /// interval makes every visited row renew, which is the seam that proves
+    /// the notification actually flows from inside `collect_local_unit_facts` —
+    /// remove the in-loop extension and this observes no datagrams.
     #[tokio::test]
     async fn unit_facts_progress_renews_the_start_timeout_from_inside_the_loop() {
         let temp = tempdir().unwrap();
@@ -8604,8 +8597,9 @@ mod tests {
     /// what `Daemon::open` returns, so it stops one phase short:
     /// `initial-recovery` is opened inside `run_loop`, which is precisely where
     /// the initial job recovery loop lives — the pre-`READY` work a later lane
-    /// is most likely to extend. Deleting that phase left the whole suite green, which made
-    /// #379's claim that the list is pinned one level stronger than the code.
+    /// is most likely to extend. Deleting that phase leaves the whole suite
+    /// green, which would make the claim that the list is pinned one level
+    /// stronger than the code.
     ///
     /// This asserts the artefact instead: the rendered report line, in order,
     /// with the total and the budget it names. `doc/src/operating/recovery.md`
@@ -8662,9 +8656,9 @@ mod tests {
     }
 
     /// The phase list is a contract, not decoration: it is what a later lane
-    /// adding startup work checks its own cost against (#379). Pinning it here
-    /// means work added outside a named phase shows up as a failing test
-    /// rather than as another silent minute in the journal.
+    /// adding startup work checks its own cost against. Pinning it here means
+    /// work added outside a named phase shows up as a failing test rather than
+    /// as another silent minute in the journal.
     ///
     /// This covers the eleven phases `Daemon::open` owns and fails with the
     /// offending name visible in the diff; the twelfth is covered by
@@ -8699,16 +8693,16 @@ mod tests {
     /// Read every datagram already queued on `socket`. The socket must carry a
     /// short read timeout.
     ///
-    /// Deliberately untimed (#419). This used to stamp `Instant::now()` on each
-    /// datagram as it was read, and the keepalive assertion then measured the
-    /// gaps between those stamps — which are observation instants, not send
-    /// instants. Datagrams queue in the socket buffer, so a collector thread
-    /// descheduled for longer than one watchdog period reads a burst of pings
-    /// with one large gap in front of it and reddens a daemon that pinged
-    /// perfectly. Measured: injecting a single 500 ms sleep into the collector
-    /// loop fails both keepalive tests with `a 551ms silence would have missed
-    /// a 400ms service watchdog` while the payload list still holds all 19
-    /// keepalives the daemon sent.
+    /// Deliberately untimed. Stamping `Instant::now()` on each datagram as it
+    /// is read makes the keepalive assertion measure the gaps between those
+    /// stamps — which are observation instants, not send instants. Datagrams
+    /// queue in the socket buffer, so a collector thread descheduled for longer
+    /// than one watchdog period reads a burst of pings with one large gap in
+    /// front of it and reddens a daemon that pinged perfectly. Measured:
+    /// injecting a single 500 ms sleep into the collector loop fails both
+    /// keepalive tests with `a 551ms silence would have missed a 400ms service
+    /// watchdog` while the payload list still holds all 19 keepalives the
+    /// daemon sent.
     fn drain_notifications(socket: &UnixDatagram) -> Vec<String> {
         let mut seen = Vec::new();
         loop {
@@ -8720,10 +8714,10 @@ mod tests {
         }
     }
 
-    /// The defect: the keepalive used to be a `select!` arm, so it was only
-    /// polled when the dispatch loop came back around to poll it. One slow arm
-    /// body held the ping past `WatchdogSec` and systemd killed a daemon that
-    /// was working fine.
+    /// The failure mode: a keepalive written as a `select!` arm is only polled
+    /// when the dispatch loop comes back around to poll it, so one slow arm
+    /// body holds the ping past `WatchdogSec` and systemd kills a daemon that
+    /// is working fine.
     ///
     /// The stall here is five watchdog periods long. The keepalive must ping
     /// right through it.
@@ -8799,13 +8793,12 @@ mod tests {
                 // from the stall under test.
                 let collector = std::thread::spawn(move || {
                     // The deadline is a liveness backstop, not a measurement
-                    // bound (#419). It used to be `stall + watchdog * 8`, which
-                    // on a loaded host can expire before the daemon's own
-                    // `STOPPING=1` arrives -- and then the assertion that
-                    // STOPPING is last fails for no reason but this thread's
-                    // scheduling. The loop still ends the instant STOPPING is
-                    // seen, so a generous ceiling costs nothing and only bounds
-                    // a daemon that never stops at all.
+                    // bound. `stall + watchdog * 8` can expire on a loaded host
+                    // before the daemon's own `STOPPING=1` arrives -- and then
+                    // the assertion that STOPPING is last fails for no reason
+                    // but this thread's scheduling. The loop still ends the
+                    // instant STOPPING is seen, so a generous ceiling costs
+                    // nothing and only bounds a daemon that never stops at all.
                     let deadline = Instant::now() + POSITIVE_PROGRESS_BACKSTOP;
                     let mut seen = Vec::new();
                     while Instant::now() < deadline {
@@ -8852,22 +8845,22 @@ mod tests {
     /// pinging right through a stalled dispatch loop, from `READY=1` to
     /// `STOPPING=1`.
     ///
-    /// Counted, not timed (#419), for the reason [`drain_notifications`]
-    /// records: the only clock available to an observer is its own, and its own
-    /// is the one that load perturbs. The count is not perturbed — every
-    /// datagram the daemon sent is still queued and still read — so this
-    /// asserts what the daemon did rather than when this thread noticed.
+    /// Counted, not timed, for the reason [`drain_notifications`] records: the
+    /// only clock available to an observer is its own, and its own is the one
+    /// that load perturbs. The count is not perturbed — every datagram the
+    /// daemon sent is still queued and still read — so this asserts what the
+    /// daemon did rather than when this thread noticed.
     ///
     /// `stall` is how long the dispatch arm was held. The keepalive owes one
     /// ping per [`keepalive_cadence`], a quarter period, so a stall of N
     /// service periods is covered by roughly 4N pings; requiring N is a floor
     /// with a factor of four of headroom over correct behaviour and two orders
-    /// of magnitude over the defect, which emitted none at all because the
-    /// keepalive was a `select!` arm the stalled loop never came back to poll.
-    /// What it no longer catches is a keepalive that pings in a burst and then
-    /// falls silent inside the stall; production cadence is a fixed timer, so
-    /// that shape is not a regression this suite can produce, and a false red
-    /// on every loaded host is a certainty.
+    /// of magnitude over a keepalive written as a `select!` arm, which emits
+    /// none at all because the stalled loop never comes back to poll it. What
+    /// it does not catch is a keepalive that pings in a burst and then falls
+    /// silent inside the stall; production cadence is a fixed timer, so that
+    /// shape is not a regression this suite can produce, and a false red on
+    /// every loaded host is a certainty.
     fn assert_keepalive_held(observed: &[String], watchdog: Duration, stall: Duration) {
         let payloads = observed.iter().map(String::as_str).collect::<Vec<_>>();
         assert_eq!(
@@ -9328,14 +9321,12 @@ mod tests {
             .await;
     }
 
-    /// Issue #395, the guard the prune's neutrality actually rests on.
+    /// The guard that terminal-job retirement's neutrality actually rests on.
     ///
     /// `finish_job` reads the job, then awaits the scrape, the capture and the
     /// accounting **with the context lock dropped**, then re-checks under the
-    /// write lock. Before the prune the job was still in the map when it
-    /// reached a terminal disposition mid-flight, so `is_some_and` was the
-    /// right polarity there; after it, a job retired underneath that window is
-    /// *absent*, and reading absence as "still eligible" falls straight through
+    /// write lock. A job retired underneath that window is *absent* from the
+    /// live map, and reading absence as "still eligible" falls straight through
     /// to `append_context_witness` — a **second canonical witness for one
     /// execution**, on top of the cancelled witness the forced path already
     /// appended.
@@ -9454,14 +9445,13 @@ mod tests {
             .await;
     }
 
-    /// Issue #395: `context.jobs` is the daemon's *live* set, and stays one.
+    /// `context.jobs` is the daemon's *live* set, and stays one.
     ///
-    /// It used to keep every job the daemon had admitted since it started, for
-    /// the daemon's whole lifetime, with no `remove`, `retain` or `clear`
-    /// anywhere in the tree. That is hot-path cost and not only resident
-    /// memory: the compaction live set, the dedup sweep and the guardrail
-    /// child count are all rebuilt over this map on the admission path, and
-    /// every one of them discards `Completed` entries on the way past.
+    /// Keeping every job the daemon has admitted since it started, for the
+    /// daemon's whole lifetime, is hot-path cost and not only resident memory:
+    /// the compaction live set, the dedup sweep and the guardrail child count
+    /// are all rebuilt over this map on the admission path, and every one of
+    /// them discards `Completed` entries on the way past.
     ///
     /// Three things have to hold together, so all three are pinned here: a job
     /// that reaches a terminal disposition is gone from the map, the map does
@@ -9608,9 +9598,9 @@ mod tests {
                 assert_eq!(reused["verdict"], "pass");
                 assert_eq!(reused["witnessSeq"], terminal["witness_seq"]);
                 assert_eq!(reused["payloadHash"], created["payloadHash"]);
-                // Both dispositions are terminal, so neither is in the live map
-                // (#395): the first was retired when it completed, the reused
-                // one was terminal on arrival and never joined.
+                // Both dispositions are terminal, so neither is in the live
+                // map: the first was retired when it completed, the reused one
+                // was terminal on arrival and never joined.
                 assert!(context.read().await.jobs.is_empty());
                 assert_eq!(
                     read_acknowledged_events(&paths.events_dir()).unwrap().len(),
@@ -11099,11 +11089,11 @@ mod tests {
         payload
     }
 
-    /// #247/#316: a monitor watching a live flow run must be able to tell "no
-    /// new events" from "you are looking at a stale or capped page". The
-    /// reported symptom was a `query log --flow-run` window that stayed frozen
-    /// at the first node with `nextCursor: null` while the run advanced. Every
-    /// poll here must surface the events the run just produced.
+    /// A monitor watching a live flow run must be able to tell "no new events"
+    /// from "you are looking at a stale or capped page". The symptom is a
+    /// `query log --flow-run` window that stays frozen at the first node with
+    /// `nextCursor: null` while the run advances. Every poll here must surface
+    /// the events the run just produced.
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_316_repeated_polls_surface_new_lifecycle_events_on_a_live_run() {
         let local = LocalSet::new();
@@ -11154,13 +11144,13 @@ mod tests {
                 sorted.dedup();
                 assert_eq!(sorted, positions, "positions did not advance monotonically");
 
-                // The #247 symptom itself, pinned. The lifecycle window is
-                // ordered oldest-first, so page one is *permanently* stale by
-                // construction: a reader who only ever sees page one watches
-                // an advancing run without observing a single new event. The
-                // one signal that this is not the whole window is `truncated`
-                // / `nextCursor` -- which is why the human path now follows
-                // the cursor to the end instead of stopping here.
+                // The frozen-window symptom itself, pinned. The lifecycle
+                // window is ordered oldest-first, so page one is *permanently*
+                // stale by construction: a reader who only ever sees page one
+                // watches an advancing run without observing a single new
+                // event. The one signal that this is not the whole window is
+                // `truncated` / `nextCursor` -- which is why the human path
+                // follows the cursor to the end instead of stopping here.
                 let first_page = |ordinal: usize| {
                     let handler = &daemon.handler;
                     let flow_run_id = flow_run_id.clone();
@@ -11202,27 +11192,27 @@ mod tests {
             .await;
     }
 
-    /// The wave-3 W-316 reproduction, now run against the fix (#380).
+    /// The W-316 shape, bound end to end.
     ///
-    /// It used to assert the defect: a second run submitting an identical node
-    /// while the first was still in flight is told `attached`, is handed the
-    /// task UUID, and could never see that task in its own window — **same
-    /// items, `nextCursor: null`, ground truth advancing**, with no truncation
-    /// involved. The mechanism was that membership was recomputed per call by
-    /// scanning durable row details and witness records for an orchestration
-    /// capsule naming that `flowRunId` (`query_v2::flow_run_tasks`), a
-    /// lifecycle event whose task was not in that set was dropped outright
-    /// (`lifecycle_matches`), and an `attached` admission writes no row
+    /// A second run submitting an identical node while the first is still in
+    /// flight is told `attached` and is handed the task UUID. Membership is not
+    /// derivable from rows for that node: the row belongs to the first run,
+    /// membership recomputed per call by scanning durable row details and
+    /// witness records for an orchestration capsule naming that `flowRunId`
+    /// (`query_v2::flow_run_tasks`) never names the second, a lifecycle event
+    /// whose task is not in that set is dropped outright (`lifecycle_matches`),
+    /// and an `attached` admission writes no row
     /// (`enqueue::full_live_disposition` returns before any
     /// `query_details.insert`) while the canonical payload hash excludes the
-    /// orchestration capsule (`wire::canonical_payload`).
+    /// orchestration capsule (`wire::canonical_payload`). Without a durable
+    /// membership record the attaching run's window reads **same items,
+    /// `nextCursor: null`, ground truth advancing**, with no truncation
+    /// involved.
     ///
-    /// Everything above the fix line still holds — the admission is still
-    /// `attached`, the row still belongs to the first run, the capsule is still
-    /// out of the payload hash. What changed is that the admission now also
-    /// writes durable membership, so the run that was handed the task UUID
-    /// resolves it back to itself. The assertions below are the old ones,
-    /// inverted.
+    /// The durable admission fact is what makes it resolvable: the admission is
+    /// still `attached`, the row still belongs to the first run, the capsule is
+    /// still out of the payload hash, and the run that was handed the task UUID
+    /// still resolves it back to itself.
     #[tokio::test(flavor = "current_thread")]
     async fn repro_316_an_attached_node_is_visible_to_the_run_that_submitted_it() {
         let local = LocalSet::new();
@@ -11335,8 +11325,8 @@ mod tests {
                 );
 
                 // ...and the second run's window advances by exactly the same
-                // two events, because it is looking at the same real work. The
-                // frozen window is gone: this is what #247 should have shown.
+                // two events, because it is looking at the same real work. No
+                // frozen window.
                 let after = poll(second_run.clone()).await;
                 assert_eq!(
                     after["items"].as_array().unwrap().len(),
@@ -11347,10 +11337,10 @@ mod tests {
                 assert_eq!(after["truncated"], false);
 
                 // The position still advances, because it is the head of the
-                // whole lifecycle stream rather than of this filter. That is
-                // also LOW-3 reproduced: the docs used to state the proof of
-                // quiet as "empty items AND the same position", a conjunction
-                // that cannot hold on any daemon with concurrent work.
+                // whole lifecycle stream rather than of this filter. The proof
+                // of quiet is therefore not "empty items AND the same
+                // position": that conjunction cannot hold on any daemon with
+                // concurrent work.
                 assert_ne!(
                     after["position"], before["position"],
                     "the stream head must move even when the filtered window does not"
@@ -11463,15 +11453,14 @@ mod tests {
         }
     }
 
-    /// #380, the acceptance bullet in full: an admission under a `flowRunId`
-    /// makes the run's membership in its outcome durable, for **every**
-    /// disposition, including the three that write no row of their own.
+    /// The acceptance bullet in full: an admission under a `flowRunId` makes
+    /// the run's membership in its outcome durable, for **every** disposition,
+    /// including the three that write no row of their own.
     ///
     /// The corpus is built so its truth is known independently of anything the
     /// query surface computes: each phase-one node's task UUID comes back in
-    /// its own admission response, and those UUIDs — not a count, and not a
-    /// diff against the old behaviour — are what the second run's window is
-    /// checked against.
+    /// its own admission response, and those UUIDs — not a count — are what the
+    /// second run's window is checked against.
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_380_every_disposition_binds_the_run_to_the_task_it_was_handed() {
         let local = LocalSet::new();
@@ -11805,18 +11794,18 @@ mod tests {
         .ino()
     }
 
-    /// The HIGH-2 regression, at the level it actually bit.
+    /// The compaction/cache agreement, at the level it actually bites.
     ///
-    /// The daemon used to rebuild its cached index as *pre-append cache plus the
-    /// new record*, never from the compacted set. So once the ledger passed its
-    /// bound the cache stayed permanently over it, every later admission decided
-    /// it had to compact, and each one serialised and fsynced the entire ledger
+    /// A daemon that rebuilds its cached index as *pre-append cache plus the
+    /// new record*, never from the compacted set, leaves the cache permanently
+    /// over the bound once the ledger passes it: every later admission decides
+    /// it has to compact, and each one serialises and fsyncs the entire ledger
     /// — measured at 977 ms per admission against 151 ms for the identical file
-    /// after a restart. The cache also grew without limit and answered queries
-    /// with runs the file no longer contained.
+    /// after a restart. The cache also grows without limit and answers queries
+    /// with runs the file no longer contains.
     ///
-    /// Three things are asserted, and the first is the root cause: the index the
-    /// daemon holds is the index the file holds.
+    /// Three things are asserted, and the first is the root cause: the index
+    /// the daemon holds is the index the file holds.
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_380_the_daemons_index_never_diverges_from_the_ledger_it_writes() {
         let local = LocalSet::new();
@@ -12009,12 +11998,11 @@ mod tests {
 
     /// The per-admission cost of membership bookkeeping, at several ledger
     /// sizes. Ignored by default because it seeds tens of thousands of records
-    /// and reports rather than asserts; run it with
-    /// `cargo test -p tally-core --lib membership_admission_cost_sweep
-    /// -- --ignored --nocapture`.
+    /// and reports rather than asserts; run it with `cargo test -p tally-core
+    /// --lib membership_admission_cost_sweep -- --ignored --nocapture`.
     ///
-    /// It exists because "measure the hot path you added" is the lesson #379 is
-    /// open about, and because the numbers are the only honest way to size
+    /// It exists because a hot path that was added has to be measured, and
+    /// because the numbers are the only honest way to size
     /// `FLOW_MEMBERSHIP_MAX_RECORDS`.
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "seeds a large ledger; run explicitly with --ignored"]
@@ -12132,9 +12120,9 @@ mod tests {
     }
 
     /// Membership is durable, not cached: it survives a restart. And it is
-    /// exactly the *delta* over the old scan — remove the ledger and the
-    /// pre-#380 answer comes back, node for node, which is what makes an
-    /// estate that advances its pin across this commit safe in both
+    /// exactly the *delta* over the row scan — remove the ledger and the
+    /// scan-only answer comes back, node for node, which is what makes an
+    /// estate that advances its pin across this boundary safe in both
     /// directions.
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_380_membership_is_durable_and_is_exactly_the_delta_over_the_scan() {
@@ -12193,7 +12181,7 @@ mod tests {
 
                 // Now take the ledger away. The run whose row carries the
                 // capsule is unaffected -- the scan half is untouched -- and
-                // the attaching run falls back to exactly the pre-#380 answer.
+                // the attaching run falls back to exactly the scan-only answer.
                 std::fs::remove_file(
                     paths
                         .data_dir
@@ -13128,9 +13116,8 @@ mod tests {
             .await;
     }
 
-    /// The repair's two halves at the daemon boundary: a rollover must name a
-    /// run that exists, and one run must have exactly one key however its ID is
-    /// spelled.
+    /// The two halves at the daemon boundary: a rollover must name a run that
+    /// exists, and one run must have exactly one key however its ID is spelled.
     #[tokio::test(flavor = "current_thread")]
     async fn a_supersede_refuses_an_unknown_predecessor_and_keys_every_rendering_alike() {
         let local = LocalSet::new();
@@ -13157,7 +13144,8 @@ mod tests {
                 };
 
                 // A run that never existed cannot have tripped an identity pin,
-                // so it can never need retiring. It used to answer ok:true.
+                // so it can never need retiring. Answering ok:true here would
+                // be a silent no-op.
                 let invented = supersede(unknown, new_run).await.unwrap_err();
                 assert!(
                     matches!(invented, WireIoError::Rpc(WireErrorCode::NotFound, _, _)),
@@ -13289,10 +13277,10 @@ mod tests {
             .await;
     }
 
-    /// #389: `query.jobs`/`query.run`/`query.standup` filter on archived
+    /// `query.jobs`/`query.run`/`query.standup` filter on archived
     /// reader-state, and no *daemon* code path writes that file -- only
-    /// `crate::reader_state::set_reader_state`, called here exactly the way
-    /// the `tally reader-state` CLI calls it, off the daemon entirely.
+    /// `crate::reader_state::set_reader_state`, called here exactly the way the
+    /// `tally reader-state` CLI calls it, off the daemon entirely.
     #[tokio::test(flavor = "current_thread")]
     async fn query_run_jobs_and_standup_hide_archived_runs_by_default_and_expose_the_flag() {
         let local = LocalSet::new();
@@ -13534,17 +13522,17 @@ mod tests {
             .await;
     }
 
-    /// #389 MEDIUM-6: `query.jobs`'s pagination cache-key fingerprint must
-    /// include `archived`, so a cursor minted under one archived selection
-    /// can never be followed under the other -- an operator would otherwise
-    /// be served rows their own `--archived`/`--no-archived` filter says are
-    /// absent. Nothing short of driving a real cursor through the daemon
-    /// pins this: `PageCache`'s own fingerprint-mismatch mechanism is
-    /// generic (`pagination::tests::cursors_are_snapshot_bound_and_expire_explicitly`
-    /// proves the cache itself), but nothing previously asserted that the
-    /// `query.jobs` RPC handler actually feeds `archived` into that
-    /// mechanism -- deleting `"archived": params.archived,` from its
-    /// fingerprint `json!` block passed all 676 tests.
+    /// `query.jobs`'s pagination cache-key fingerprint must include `archived`,
+    /// so a cursor minted under one archived selection can never be followed
+    /// under the other -- an operator would otherwise be served rows their own
+    /// `--archived`/`--no-archived` filter says are absent. Nothing short of
+    /// driving a real cursor through the daemon pins this: `PageCache`'s own
+    /// fingerprint-mismatch mechanism is generic
+    /// (`pagination::tests::cursors_are_snapshot_bound_and_expire_explicitly`
+    /// proves the cache itself), and nothing else asserts that the `query.jobs`
+    /// RPC handler actually feeds `archived` into that mechanism -- deleting
+    /// `"archived": params.archived,` from its fingerprint `json!` block leaves
+    /// the whole suite green.
     #[tokio::test(flavor = "current_thread")]
     async fn query_jobs_cursor_from_one_archived_selection_is_refused_under_the_other() {
         let local = LocalSet::new();
@@ -13595,8 +13583,8 @@ mod tests {
                 assert_eq!(same_selection["items"].as_array().unwrap().len(), 1);
 
                 // Following it under the OPPOSITE archived selection must be
-                // refused, not silently served -- exactly the property MEDIUM-6
-                // found unbound.
+                // refused, not silently served -- the property the fingerprint
+                // exists to bind.
                 let error = daemon
                     .handler
                     .query(
@@ -13727,12 +13715,13 @@ mod tests {
         (paths, uuids)
     }
 
-    /// #431 acceptance: with a ~30k-row durable corpus, the dispatch loop's
+    /// The dispatch-loop acceptance: with a ~30k-row durable corpus, the loop's
     /// maximum absence over a sustained scheduling period stays under a
     /// single-digit-second bound, and RPCs issued during that period answer
     /// within the 10 s client deadline the estate's readers use.
     ///
     /// Shape of the proof:
+    ///
     /// - The corpus is 30,000 terminal rows plus 40 queued rows that recovery
     ///   re-presents; the queued cohort dispatches, runs, and completes through
     ///   the live loop, and twelve more admissions land mid-storm, so
@@ -13748,9 +13737,10 @@ mod tests {
     /// - The bound is 5 s. That is deliberately far above the healthy ~100 ms
     ///   cadence (this suite shares hosts with compiling siblings and the
     ///   corpus makes some O(live)+fsync arm bodies real) and far below the
-    ///   60–183 s absences measured live on 2026-08-07 — which one inline
-    ///   corpus-scale query reproduces, so the unfixed loop fails this test by
-    ///   minutes, not by margin.
+    ///   60–183 s absences measured against on-thread query construction —
+    ///   which one inline corpus-scale query reproduces, so a loop that
+    ///   constructs queries on-thread fails this test by minutes, not by
+    ///   margin.
     #[tokio::test(flavor = "current_thread")]
     async fn dispatch_loop_stays_live_under_query_storm_at_estate_scale() {
         const STORM: Duration = Duration::from_secs(6);
@@ -13967,11 +13957,11 @@ mod tests {
             .await;
     }
 
-    /// #431: an RPC read that races a scheduling mutation answers from the
-    /// frozen snapshot its projection took — the mutation is either entirely
-    /// invisible to that answer or entirely visible to a later one, never
-    /// partially visible. This is the torn-read discipline that moving query
-    /// construction off the dispatch thread must keep.
+    /// An RPC read that races a scheduling mutation answers from the frozen
+    /// snapshot its projection took — the mutation is either entirely invisible
+    /// to that answer or entirely visible to a later one, never partially
+    /// visible. This is the torn-read discipline that moving query construction
+    /// off the dispatch thread must keep.
     #[tokio::test(flavor = "current_thread")]
     async fn query_projection_is_frozen_against_racing_mutations() {
         let local = LocalSet::new();
@@ -14027,12 +14017,11 @@ mod tests {
             .await;
     }
 
-    /// #431 repair (eval finding D1-1): the trace decoration on job envelopes
-    /// is pinned. `query.jobs` decorates every item through the per-anchor
-    /// lane index and `query.job` decorates its single summary; both surfaces
-    /// were rewritten by #431 and neither was asserted anywhere, so emptying
-    /// the index — or deleting `query.job`'s assignment outright — shipped
-    /// every job as "no trace metadata" with the whole suite green.
+    /// The trace decoration on job envelopes is pinned. `query.jobs` decorates
+    /// every item through the per-anchor lane index and `query.job` decorates
+    /// its single summary; nothing else asserts either, so emptying the index —
+    /// or deleting `query.job`'s assignment outright — ships every job as "no
+    /// trace metadata" with the whole suite green.
     ///
     /// Positive shape: a completed job under a trace-declaring adapter with
     /// retained captures reports `trace.available == true` on both verbs.
@@ -14150,12 +14139,11 @@ mod tests {
     }
 
 
-    /// #420 (2): `cancel`'s already-terminal answer derives `was` from the
-    /// query fact that admitted the retired job, instead of asserting
-    /// `completed`. A row recovered as `Deleted` — latest witness verdict
-    /// `cancelled` — answers with the same `deleted-cache` label its query
-    /// projection uses; reporting it `completed` claimed a verdict the daemon
-    /// does not hold.
+    /// `cancel`'s already-terminal answer derives `was` from the query fact
+    /// that admitted the retired job, instead of asserting `completed`. A row
+    /// recovered as `Deleted` — latest witness verdict `cancelled` — answers
+    /// with the same `deleted-cache` label its query projection uses; reporting
+    /// it `completed` would claim a verdict the daemon does not hold.
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_reports_deleted_cache_for_a_row_recovered_as_deleted() {
         let local = LocalSet::new();
@@ -14219,9 +14207,10 @@ mod tests {
             .await;
     }
 
-    /// Timing probe for #431: what does each dispatch-loop-resident operation
-    /// cost against a corpus at estate scale? Run with
-    /// `TALLY_EXP_CORPUS=30000 cargo test -p tally-core exp_corpus -- --ignored --nocapture`.
+    /// Timing probe for the dispatch loop: what does each loop-resident
+    /// operation cost against a corpus at estate scale? Run with
+    /// `TALLY_EXP_CORPUS=30000 cargo test -p tally-core exp_corpus -- --ignored
+    /// --nocapture`.
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn exp_corpus_scale_timing() {

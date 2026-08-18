@@ -346,10 +346,10 @@ in
       ];
 
       # The deployment's data directory, in the operator's own session
-      # environment (#416): the direct-file verbs are the operator's, run
-      # from the operator's shell on this module, so the export belongs to
-      # the session as well as to the units below. mkDefault, so an
-      # operator's own sessionVariables declaration wins.
+      # environment: the direct-file verbs are the operator's, run from the
+      # operator's shell on this module, so the export belongs to the session as
+      # well as to the units below. mkDefault, so an operator's own
+      # sessionVariables declaration wins.
       home.sessionVariables.TALLY_DATA_DIR = lib.mkDefault (toString cfg.dataDir);
 
       home.activation.tallyRuntimeDirectories =
@@ -401,11 +401,10 @@ in
               "TALLY_CONFIG_GENERATION=${checkedConfig}"
               "TALLY_NIX_PROGRAM=${pkgs.nix}/bin/nix"
               "TALLY_NIX_STORE_PROGRAM=${pkgs.nix}/bin/nix-store"
-              # The deployment's data directory, exported wherever this
-              # module configures one (#416): a direct-file verb that
-              # resolves its default through TALLY_DATA_DIR aims at this
-              # store instead of creating a fresh one wherever its XDG
-              # fallback lands.
+              # The deployment's data directory, exported wherever this module
+              # configures one: a direct-file verb that resolves its default
+              # through TALLY_DATA_DIR aims at this store instead of creating a
+              # fresh one wherever its XDG fallback lands.
               "TALLY_DATA_DIR=${toString cfg.dataDir}"
             ];
             RuntimeDirectory = "tally";
@@ -459,10 +458,10 @@ in
             # gone. The timer fires every five seconds and a daemon restart
             # takes longer than that, so an activation that restarts
             # tally-daemon reliably catches a drain mid-flight and turns a
-            # benign deploy into a per-user unit failure (#411). Conditioning
-            # on the socket the command actually connects to makes that
-            # invocation a recorded *skip* instead. systemd ANDs repeated
-            # conditions, so the config guard is kept, not replaced.
+            # benign deploy into a per-user unit failure. Conditioning on the
+            # socket the command actually connects to makes that invocation a
+            # recorded *skip* instead. systemd ANDs repeated conditions, so the
+            # config guard is kept, not replaced.
             ConditionPathExists = [
               configPath
               socketPath

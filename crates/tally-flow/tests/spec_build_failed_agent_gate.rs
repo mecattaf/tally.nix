@@ -1,12 +1,11 @@
-//! #424 ruling 2, bound at the flow: a pass whose agent node fails still runs
-//! the tree-delta permission gate before the pass ends.
+//! Ruling 2, bound at the flow: a pass whose agent node fails still runs the
+//! tree-delta permission gate before the pass ends.
 //!
 //! The driver half of that ruling is covered thoroughly in Python
 //! (`action_tree_delta` with `ownershipRan: false`, the declared allowlist, the
 //! refusal). None of it proves the flow ever *calls* the gate on a failed pass.
-//! The round-1 eval deleted the whole `strayDelta` block from `spec-build.js`
-//! — restoring the exact pre-#424 "never runs treeDelta (no call made)"
-//! behaviour the issue describes — and every suite in the workspace stayed
+//! Deleting the whole `strayDelta` block from `spec-build.js` — the "never runs
+//! treeDelta (no call made)" behaviour — leaves every suite in the workspace
 //! green. This file is the binding: it drives the real `spec-build.js` end to
 //! end against a scripted client, fails the agent node, and reads the
 //! submissions the flow actually made.
@@ -412,14 +411,14 @@ fn on_flow_test_stack(test: fn()) {
     }
 }
 
-/// #424 ruling 2. The agent node fails; the pass must still dispatch the
-/// tree-delta gate before it ends, and must dispatch it with
-/// `ownershipRan: false` — ownership never ran, so the driver has no certified
-/// `ownedPaths` to fall back to and only a declared allowlist may govern.
+/// Ruling 2. The agent node fails; the pass must still dispatch the tree-delta
+/// gate before it ends, and must dispatch it with `ownershipRan: false` —
+/// ownership never ran, so the driver has no certified `ownedPaths` to fall
+/// back to and only a declared allowlist may govern.
 ///
-/// Deleting the `strayDelta` block from `spec-build.js` (the eval's M8:
-/// restoring the pre-#424 return at stage "agent") makes this red on the
-/// `tree-delta-build` submission that is then never made.
+/// Deleting the `strayDelta` block from `spec-build.js` — returning at stage
+/// "agent" instead — makes this red on the `tree-delta-build` submission that
+/// is then never made.
 fn a_failed_agent_pass_still_dispatches_the_tree_delta_gate_case() {
     let task = implementation_task(Some(json!(["README.md"])));
     // The gate finds the stray write the failing agent left.
@@ -597,7 +596,7 @@ fn assert_keyless_task_reaches_ungated_gate(arm: &str, task: Value) {
     );
 }
 
-/// The refusal branch of `action_tree_delta` — #424 ruling 3, "no allowlist, no
+/// The refusal branch of `action_tree_delta` — ruling 3, "no allowlist, no
 /// pass" — is the required failed-agent outcome when an admitted serial task
 /// declares no `conflictDomains`: no ownership receipt exists to supply the
 /// passing path's owned-path fallback. The flow must accept that task and keep
@@ -605,7 +604,8 @@ fn assert_keyless_task_reaches_ungated_gate(arm: &str, task: Value) {
 /// unjudgeable pass into a false declared-empty breach.
 ///
 /// If the file-task schema makes the field required again or a composition step
-/// inserts `[]`, this test fails at the exact boundary that lost the third state.
+/// inserts `[]`, this test fails at the exact boundary that lost the third
+/// state.
 fn implementation_tasks_preserve_an_omitted_conflict_domain_case() {
     assert_keyless_task_reaches_ungated_gate(
         "file-based implementationTaskSchema",

@@ -870,7 +870,7 @@ pub struct StandupRunUsage {
     pub flow_run_id: String,
     /// The full rollup in memory; on the wire, the three constants every entry
     /// repeats verbatim are stated once at [`StandupDigest::usage_basis`]
-    /// instead of ~650 bytes per run (#404). See [`digest_rollup`].
+    /// instead of ~650 bytes per run. See [`digest_rollup`].
     #[serde(with = "digest_rollup")]
     pub usage: UsageRollup,
 }
@@ -907,19 +907,19 @@ impl Default for StandupUsageBasis {
 }
 
 /// `UsageRollup` on a standup digest's wire, with the three fields
-/// [`StandupUsageBasis`] states once omitted when they match it (#404).
+/// [`StandupUsageBasis`] states once omitted when they match it.
 ///
 /// `query.run` returns one rollup and keeps all three inline; a digest walks
 /// every run history holds, so at 500 runs the repetition was ~325 KB of
 /// identical bytes per response. Omission is conditional, never assumed: a
 /// rollup whose statements differ from the constants carries its own inline.
 ///
-/// A reader that finds a field omitted takes it from the digest's
-/// `usageBasis` — the producer's copy, which travelled with the payload — and
-/// only from its own compiled constants when the payload states no basis at
-/// all. See [`StandupDigest::inherit_usage_basis`], which is where that
-/// happens: this module cannot see the digest its entry belongs to, so it
-/// leaves an omitted field empty and the digest fills it.
+/// A reader that finds a field omitted takes it from the digest's `usageBasis`
+/// — the producer's copy, which travelled with the payload — and only from its
+/// own compiled constants when the payload states no basis at all. See
+/// [`StandupDigest::inherit_usage_basis`], which is where that happens: this
+/// module cannot see the digest its entry belongs to, so it leaves an omitted
+/// field empty and the digest fills it.
 mod digest_rollup {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -1080,36 +1080,34 @@ pub struct StandupDigest {
     #[serde(default)]
     pub archived_runs_hidden: usize,
     /// The three statements every entry in `runs` would otherwise repeat
-    /// verbatim, stated once (#404).
+    /// verbatim, stated once.
     ///
     /// **Present exactly when `runs` is non-empty.** That is an invariant of
     /// the *composition* of the two calls that build a digest, not of either
-    /// alone: [`crate::query_v2::apply_standup_usage`] sets it when it leaves
-    /// a non-empty `runs`, and
-    /// [`crate::query_v2::apply_reader_state_to_standup`] clears it again if
-    /// it hides every run — a digest that shows no run must not carry a
-    /// statement about how its runs were summed. Both fields are skipped on
-    /// the wire when empty, so they appear and disappear together.
+    /// alone: [`crate::query_v2::apply_standup_usage`] sets it when it leaves a
+    /// non-empty `runs`, and [`crate::query_v2::apply_reader_state_to_standup`]
+    /// clears it again if it hides every run — a digest that shows no run must
+    /// not carry a statement about how its runs were summed. Both fields are
+    /// skipped on the wire when empty, so they appear and disappear together.
     ///
-    /// That is a statement about what THIS build emits, not a rule a reader
-    /// may apply to any payload: a producer predating the field emits `runs`
-    /// with no basis at all, stating the three constants inline on each entry
-    /// instead. So absence must not be read as "this digest has no runs".
-    /// Among digests this build produces, what separates a window that
-    /// touched no run from one whose runs were all hidden is
-    /// [`Self::archived_runs_hidden`].
+    /// That is a statement about what THIS build emits, not a rule a reader may
+    /// apply to any payload: a producer predating the field emits `runs` with
+    /// no basis at all, stating the three constants inline on each entry
+    /// instead. So absence must not be read as "this digest has no runs". Among
+    /// digests this build produces, what separates a window that touched no run
+    /// from one whose runs were all hidden is [`Self::archived_runs_hidden`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_basis: Option<StandupUsageBasis>,
 }
 
 impl StandupDigest {
-    /// Give every entry in `runs` the basis the *producer* stated (#404).
+    /// Give every entry in `runs` the basis the *producer* stated.
     ///
     /// [`digest_rollup`] omits the three constants from each entry and this
     /// digest states them once, so on the way back in the entries have to be
     /// told what they were. They are told by `usage_basis` — the copy that
-    /// travelled with the payload — and only by this build's own constants
-    /// when a payload carries no basis at all. A payload like that is not
+    /// travelled with the payload — and only by this build's own constants when
+    /// a payload carries no basis at all. A payload like that is not
     /// necessarily an old one: a current producer emits no basis whenever the
     /// digest has no `runs` (see [`StandupDigest::usage_basis`]), and then the
     /// loop below is zero-trip.
@@ -1119,11 +1117,11 @@ impl StandupDigest {
     /// field carries a NON-empty `runs`, so the loop does run over it — it
     /// simply substitutes nothing, because each of that producer's entries
     /// states all three constants inline and the `is_empty()` guards never
-    /// fire. The default is what makes that path total rather than a panic.
-    /// The alternative, filling from
-    /// the reader's constants while the payload's basis says otherwise, would
-    /// make the digest state one thing and every entry in it state another,
-    /// across exactly the mixed-generation fleet this runs on.
+    /// fire. The default is what makes that path total rather than a panic. The
+    /// alternative, filling from the reader's constants while the payload's
+    /// basis says otherwise, would make the digest state one thing and every
+    /// entry in it state another, across exactly the mixed-generation fleet
+    /// this runs on.
     fn inherit_usage_basis(&mut self) {
         let basis = self.usage_basis.clone().unwrap_or_default();
         for run in &mut self.runs {

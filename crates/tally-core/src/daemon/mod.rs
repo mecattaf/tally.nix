@@ -8,7 +8,7 @@
 
 // The daemon's stdout/stderr is its log surface, read by journald rather than
 // by an operator's pipeline. `cli::out`'s hang-up mapping is a CLI contract and
-// deliberately does not reach here (#315).
+// deliberately does not reach here.
 
 mod barriers;
 mod completion;
@@ -234,8 +234,8 @@ impl SharedAttestations {
 
 /// A map that serves cheap Arc-shared value snapshots per mutation epoch.
 ///
-/// Fresh query envelopes previously deep-cloned every row projection per
-/// query; this rebuilds the Vec only after a mutation and hands queries a
+/// Deep-cloning every row projection per fresh query envelope is what this
+/// avoids: the Vec is rebuilt only after a mutation and each query is handed a
 /// clone of the Arc. Read-only access passes through Deref; the mutating
 /// methods invalidate the cached snapshot.
 pub(crate) struct SnapshotMap<V> {
@@ -595,12 +595,12 @@ impl Job {
     }
 }
 
-/// Retire a job that has reached its terminal disposition (#395).
+/// Retire a job that has reached its terminal disposition.
 ///
-/// `context.jobs` used to keep every job the daemon had ever admitted, for the
-/// daemon's whole lifetime, and a `Job` is a `RowSeed` plus a rendered adapter
-/// invocation — far larger than the membership record whose growth it
-/// dominated. It is not only resident cost: the compaction live set
+/// `context.jobs` must not keep every job the daemon has ever admitted for the
+/// daemon's whole lifetime: a `Job` is a `RowSeed` plus a rendered adapter
+/// invocation — far larger than the membership record whose growth it would
+/// dominate. It is not only resident cost: the compaction live set
 /// (`rpc::control`) and the dedup, guardrail, and pool sweeps all walk this map
 /// on the admission path, and every one of them already discards `Completed`
 /// entries on the way past. Retiring those entries is therefore neutral for all
@@ -610,9 +610,9 @@ impl Job {
 /// keeps the query fact the post-ack scrape enriched, both for the daemon's
 /// lifetime and both restored across a restart; [`rpc::control::find_job`]
 /// answers the two verbs that can still be asked about a terminal job from
-/// those. The startup path never installed terminal jobs in the first place, so
-/// this makes the live map mean the same thing at minute one as at minute
-/// ten thousand.
+/// those. The startup path never installs terminal jobs in the first place, so
+/// this makes the live map mean the same thing at minute one as at minute ten
+/// thousand.
 fn retire_job(context: &mut Context, job_id: Uuid) {
     context.jobs.remove(&job_id);
 }
@@ -668,7 +668,7 @@ struct DaemonHandler {
     fatal: mpsc::UnboundedSender<DaemonError>,
     post_ack_tasks: Rc<RefCell<Vec<JoinHandle<()>>>>,
     /// Jobs whose terminal acknowledgement has been sent but whose post-ack
-    /// enrichment has not yet installed the facts a continuation reads (#440).
+    /// enrichment has not yet installed the facts a continuation reads.
     ///
     /// Each entry is the sender a waiter subscribes to; the entry is removed
     /// and signalled when the enrichment task ends, however it ends.
@@ -687,7 +687,7 @@ struct DaemonHandler {
 /// Every flow start reads this store, so it is cached rather than re-parsed per
 /// run. The stamp is revalidated on each read, so an operator repairing the
 /// ledger by hand does not have to restart the daemon. `Arc`, not `Rc`: query
-/// construction reads this index from the blocking pool (#431).
+/// construction reads this index from the blocking pool.
 pub(crate) struct CachedFlowLineage {
     stamp: Option<(u64, Option<std::time::SystemTime>)>,
     lineage: Arc<FlowLineage>,
@@ -701,7 +701,7 @@ pub(crate) struct CachedFlowLineage {
 /// admission would make admission linear in the ledger. The stamp is still
 /// revalidated on every read, so an operator repairing the ledger by hand does
 /// not have to restart the daemon. `Arc`, not `Rc`: query construction reads
-/// this index from the blocking pool (#431).
+/// this index from the blocking pool.
 pub(crate) struct CachedFlowMembership {
     stamp: Option<(u64, Option<std::time::SystemTime>)>,
     membership: Arc<FlowMembership>,
@@ -1056,7 +1056,7 @@ pub struct Daemon {
     completion_rx: mpsc::UnboundedReceiver<ExecutionFinished>,
     fatal_rx: mpsc::UnboundedReceiver<DaemonError>,
     notifier: SystemdNotifier,
-    /// Per-phase startup accounting, reported at `READY=1` (#379). Taken in
+    /// Per-phase startup accounting, reported at `READY=1`. Taken in
     /// `run_loop`, which owns the last pre-`READY` phase.
     startup: Option<startup::StartupTimeline>,
     initial_jobs: Vec<Job>,
@@ -1075,7 +1075,7 @@ pub struct Daemon {
     /// `run_loop` consumes the daemon, so the line it actually emits — the
     /// artefact `doc/src/operating/recovery.md` advertises, and the only
     /// surface carrying the phase `run_loop` itself opens — is otherwise
-    /// unobservable to a test (#379).
+    /// unobservable to a test.
     #[cfg(test)]
     startup_report_hook: Option<mpsc::UnboundedSender<String>>,
 }

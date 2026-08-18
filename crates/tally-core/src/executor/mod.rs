@@ -7,7 +7,7 @@
 //! replaying terminal witness records over those captures.
 
 // Executor diagnostics land in the job's captured streams, not on an operator's
-// terminal; they keep the stock macros (#315).
+// terminal; they keep the stock macros.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};

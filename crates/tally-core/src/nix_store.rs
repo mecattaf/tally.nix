@@ -10,10 +10,9 @@ use thiserror::Error;
 use crate::witness::Derivation;
 
 /// ruling: vestige-sweep V-14 — a validity check is latency-tolerant, and a
-/// store busy with GC or a large parallel build can exceed 10s, which used to
-/// fail the witness path as a store-check error on a valid path; 60s costs
-/// nothing on a check that polls every 10ms and returns the moment the store
-/// answers.
+/// store busy with GC or a large parallel build can exceed 10s, which fails the
+/// witness path as a store-check error on a valid path; 60s costs nothing on a
+/// check that polls every 10ms and returns the moment the store answers.
 pub const STORE_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 

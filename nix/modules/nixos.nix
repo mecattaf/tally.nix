@@ -132,14 +132,13 @@ in
       environment.etc."tally/config.json".source = checkedConfig;
 
       # The deployment's data directory in the login environment as well as in
-      # the units below (#416). The units are given `--data-dir` explicitly and
-      # never needed it; the operator's own shell is where an omitted
-      # `--data-dir` used to resolve to `~/.local/share/tally` and turn
-      # `reader-state archive` into a silent no-op with a success message.
-      # This store is mode 0700 and owned by `cfg.user`, so an operator who is
-      # not that user now gets a refusal naming the path instead — which is the
-      # point: the failure becomes visible. `mkDefault`, so a host that wants a
-      # different value keeps it.
+      # the units below. The units are given `--data-dir` explicitly and never
+      # needed it; the operator's own shell is where an omitted `--data-dir`
+      # resolves to `~/.local/share/tally` and turns `reader-state archive` into
+      # a silent no-op with a success message. This store is mode 0700 and owned
+      # by `cfg.user`, so an operator who is not that user gets a refusal naming
+      # the path instead — which is the point: the failure becomes visible.
+      # `mkDefault`, so a host that wants a different value keeps it.
       environment.variables.TALLY_DATA_DIR = lib.mkDefault (toString cfg.dataDir);
 
       users.groups.${cfg.group} = { };
@@ -214,9 +213,9 @@ in
             "TALLY_NIX_PROGRAM=${pkgs.nix}/bin/nix"
             "TALLY_NIX_STORE_PROGRAM=${pkgs.nix}/bin/nix-store"
             # The deployment's data directory, exported wherever this module
-            # configures one (#416): a direct-file verb that resolves its
-            # default through TALLY_DATA_DIR aims at this store instead of
-            # creating a fresh one wherever its XDG fallback lands.
+            # configures one: a direct-file verb that resolves its default
+            # through TALLY_DATA_DIR aims at this store instead of creating a
+            # fresh one wherever its XDG fallback lands.
             "TALLY_DATA_DIR=${toString cfg.dataDir}"
           ];
           RuntimeDirectory = "tally";
@@ -293,9 +292,9 @@ in
         # The timer fires every five seconds and a daemon restart takes longer
         # than that, so an activation that restarts tally-daemon reliably
         # catches a drain mid-flight and turns a benign deploy into a unit
-        # failure (#411). Conditioning on the socket the command actually
-        # connects to makes that invocation a recorded *skip* instead. systemd
-        # ANDs repeated conditions, so the config guard is kept, not replaced.
+        # failure. Conditioning on the socket the command actually connects to
+        # makes that invocation a recorded *skip* instead. systemd ANDs repeated
+        # conditions, so the config guard is kept, not replaced.
         unitConfig.ConditionPathExists = [
           configPath
           socketPath

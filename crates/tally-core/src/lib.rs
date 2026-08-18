@@ -84,15 +84,15 @@ pub(crate) mod test_support {
         use super::*;
         use std::os::unix::fs::PermissionsExt as _;
 
-        /// Issue #396: every caller of this installer is immune to `ETXTBSY`
-        /// for one reason only — the file the kernel is asked to `execve` is a
-        /// checked-in fixture this process never opens. That is a property of
-        /// the installer, so it is pinned here rather than once per caller.
+        /// Every caller of this installer is immune to `ETXTBSY` for one reason
+        /// only — the file the kernel is asked to `execve` is a checked-in
+        /// fixture this process never opens. That is a property of the
+        /// installer, so it is pinned here rather than once per caller.
         ///
         /// It is deliberately not "the installed program runs". A program
         /// written and `chmod +x`'d a microsecond earlier also runs, whenever
         /// no fork happens to be holding it — which is precisely the race that
-        /// red-gated an innocent sha and never reproduced on a quiet host.
+        /// reddens an innocent sha and never reproduces on a quiet host.
         #[test]
         fn an_installed_program_is_a_symlink_to_the_checked_in_provider_not_a_written_file() {
             let temporary = tempfile::tempdir().unwrap();

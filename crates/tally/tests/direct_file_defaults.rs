@@ -1,12 +1,12 @@
-//! Issue #416: the direct-file verb family resolves an omitted `--data-dir`
-//! through `TALLY_DATA_DIR` before falling back to the XDG default.
+//! The direct-file verb family resolves an omitted `--data-dir` through
+//! `TALLY_DATA_DIR` before falling back to the XDG default.
 //!
 //! Precedence, proven at the `default_data_dir()` seam: an explicit
 //! `--data-dir` flag wins, then `TALLY_DATA_DIR` taken verbatim, then
-//! `$XDG_DATA_HOME/tally`, else `~/.local/share/tally`. The failure this
-//! closes is the silent no-op: `reader-state archive` against the wrong
-//! store creates a brand-new store there, prints an affirmative record,
-//! exits 0, and changes nothing any `query` command shows.
+//! `$XDG_DATA_HOME/tally`, else `~/.local/share/tally`. The failure this closes
+//! is the silent no-op: `reader-state archive` against the wrong store creates
+//! a brand-new store there, prints an affirmative record, exits 0, and changes
+//! nothing any `query` command shows.
 //!
 //! Every case runs the real binary as a subprocess, so the environment
 //! manipulation cannot leak into a sibling test.
@@ -268,10 +268,10 @@ async fn tally_data_dir_beats_a_set_xdg_data_home_and_yields_to_none() {
 }
 
 /// The variable is taken verbatim as the directory, not searched: pointed at
-/// something that cannot hold the store, the write verb fails naming that
-/// path. It must not fall back to the XDG default, because a fallback would
-/// restore the exact failure #416 closes — an affirmative success line about
-/// a store somewhere else.
+/// something that cannot hold the store, the write verb fails naming that path.
+/// It must not fall back to the XDG default, because a fallback would restore
+/// the exact silent no-op this closes — an affirmative success line about a
+/// store somewhere else.
 #[tokio::test]
 async fn an_unusable_tally_data_dir_fails_loudly_instead_of_falling_back() {
     let temp = tempfile::tempdir().unwrap();

@@ -85,16 +85,15 @@ fn is_table_separator(line: &str) -> bool {
 /// anti-recurrence guarantee this helper does not provide — which is the same
 /// gap between a claim and its evidence that these pins exist to close.
 ///
-/// What the end guard rejects, exactly, is a *bare row* after the marker: a
-/// row with no header and separator of its own, which renders as literal-pipe
-/// prose whether or not a blank line sits between it and the marker. A
-/// following *complete* table — header row and separator row — is accepted:
-/// a blank line genuinely ends a table in markdown, so the second table
-/// renders as its own table (#418, probe B). An earlier version fired on
-/// that shape too, and its message claimed a marker inside a table splits it
-/// in the rendered book — false of a separated second table — which steered
-/// the obvious fix, re-merging the two tables, straight back into the
-/// rendering defect this pin exists to prevent.
+/// What the end guard rejects, exactly, is a *bare row* after the marker: a row
+/// with no header and separator of its own, which renders as literal-pipe prose
+/// whether or not a blank line sits between it and the marker. A following
+/// *complete* table — header row and separator row — is accepted: a blank line
+/// genuinely ends a table in markdown, so the second table renders as its own
+/// table (probe B). An earlier version fired on that shape too, and its message
+/// claimed a marker inside a table splits it in the rendered book — false of a
+/// separated second table — which steered the obvious fix, re-merging the two
+/// tables, straight back into the rendering defect this pin exists to prevent.
 fn marked_table<'a>(doc: &'a str, name: &str) -> &'a str {
     let (span, after) = marked_and_after(doc, name);
     let mut rest = after.lines().skip_while(|line| line.trim().is_empty());
@@ -282,10 +281,10 @@ fn the_error_reference_states_the_derived_members_the_code_computes() {
 /// absence produces it. Both are read out of the marked span and used to drive
 /// the code check, so the sentence is load-bearing: a span that states a
 /// different value, blames a different member, or states nothing at all fails
-/// here. An earlier version of this test asserted only that the two spans were
-/// identical *to each other* and, separately, that the code returns `null` —
-/// two claims sharing a name and nothing else, under which both public pages
-/// could be emptied or inverted in lockstep and the test still passed.
+/// here. Asserting only that the two spans are identical *to each other* and,
+/// separately, that the code returns `null` is two claims sharing a name and
+/// nothing else — under which both public pages could be emptied or inverted in
+/// lockstep and the test still pass.
 ///
 /// What it still cannot do is read English: a sentence built from the right
 /// operands but negated ("`null` is never returned when no `flowRunId` is
@@ -348,12 +347,11 @@ fn the_remedy_nullity_rule_is_stated_once_and_the_code_obeys_the_stated_rule() {
     );
 }
 
-/// Issue #414: the stated rule has a second half now — a `flowRunId` that
-/// reads as a command flag also yields `null` — and the same discipline
-/// applies to it: the sentence is checked against what the code does, not
-/// against itself. A rule that names only the missing-id half while the code
-/// suppresses two shapes is the defect this file exists to catch, one level
-/// up.
+/// The stated rule has a second half — a `flowRunId` that reads as a command
+/// flag also yields `null` — and the same discipline applies to it: the
+/// sentence is checked against what the code does, not against itself. A rule
+/// that names only the missing-id half while the code suppresses two shapes is
+/// the defect this file exists to catch, one level up.
 #[test]
 fn the_stated_rule_covers_the_flag_shaped_identity_the_code_also_suppresses() {
     let flag_shaped = supersession_details(
@@ -402,11 +400,11 @@ fn both_pages_state_the_size_of_the_contract() {
     assert!(ERROR_DOC.contains(&phrase), "errors.md must say {phrase:?}");
 }
 
-/// Issue #418, probe B, rendered not reasoned: a blank line ends a table in
-/// markdown, so a *complete* second table after the end marker renders as
-/// its own table — `tables=10`, zero literal-pipe paragraphs — and the pin
-/// must not fire on it. The probe doc is synthetic on purpose: the shape is
-/// about the helper, not about any page currently in the tree.
+/// Probe B, rendered not reasoned: a blank line ends a table in markdown, so a
+/// *complete* second table after the end marker renders as its own table —
+/// `tables=10`, zero literal-pipe paragraphs — and the pin must not fire on it.
+/// The probe doc is synthetic on purpose: the shape is about the helper, not
+/// about any page currently in the tree.
 #[test]
 fn the_end_of_span_check_accepts_a_complete_table_after_the_marker() {
     let doc = concat!(
@@ -443,9 +441,9 @@ fn a_horizontal_rule_is_not_the_delimiter_row_that_makes_a_second_table() {
     marked_table(doc, "probe");
 }
 
-/// Issue #418, probe A: the shape the check was written against. A bare row
-/// after the marker — here behind a blank line — falls out of the table and
-/// renders as literal pipes, so the pin stays red on it.
+/// Probe A: the shape the check was written against. A bare row after the
+/// marker — here behind a blank line — falls out of the table and renders as
+/// literal pipes, so the pin stays red on it.
 #[test]
 #[should_panic(expected = "a bare table row")]
 fn the_end_of_span_check_rejects_a_bare_row_after_a_blank_line() {
@@ -461,8 +459,8 @@ fn the_end_of_span_check_rejects_a_bare_row_after_a_blank_line() {
     marked_table(doc, "probe");
 }
 
-/// The original defect shape: the end marker sitting directly between two
-/// rows, no blank line. Same rejection.
+/// The end marker sitting directly between two rows, no blank line. Same
+/// rejection.
 #[test]
 #[should_panic(expected = "a bare table row")]
 fn the_end_of_span_check_rejects_a_bare_row_directly_after_the_marker() {

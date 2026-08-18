@@ -75,9 +75,9 @@ impl Default for PageCache {
 /// [`prepare_snapshot`] is deliberately a free function: splitting and sizing
 /// an envelope touches every item, which at estate scale is corpus-sized work,
 /// and the daemon runs it on the blocking pool next to the query construction
-/// that built the envelope (#431). Inserting the prepared snapshot into the
-/// cache ([`PageCache::page_prepared`]) is what needs the cache borrow, and
-/// that is O(evictions), not O(items).
+/// that built the envelope. Inserting the prepared snapshot into the cache
+/// ([`PageCache::page_prepared`]) is what needs the cache borrow, and that is
+/// O(evictions), not O(items).
 #[derive(Debug)]
 pub struct PreparedSnapshot {
     template: Value,
@@ -644,9 +644,9 @@ mod tests {
         assert_eq!(consumed, items.len());
     }
 
-    /// #316: a campaign runner row whose argv embeds an issue body used to
-    /// make `query jobs --flow-run` fail outright with `ItemTooLarge`, which
-    /// made the whole run unmonitorable. The oversized field is elided and
+    /// A campaign runner row whose argv embeds an issue body must not make
+    /// `query jobs --flow-run` fail outright with `ItemTooLarge`, which would
+    /// make the whole run unmonitorable. The oversized field is elided and
     /// marked; the page is served.
     #[test]
     fn an_oversized_item_is_elided_and_marked_instead_of_destroying_the_page() {
@@ -713,8 +713,7 @@ mod tests {
     }
 
     /// `truncated` is the field a monitor can read without reasoning about
-    /// cursors: the #247 report was a reader who could not tell a capped page
-    /// from a quiet run.
+    /// cursors: without it a reader cannot tell a capped page from a quiet run.
     #[test]
     fn truncated_marks_every_incomplete_page_and_only_those() {
         let envelope = serde_json::json!({

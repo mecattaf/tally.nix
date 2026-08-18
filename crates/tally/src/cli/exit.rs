@@ -38,17 +38,17 @@ pub(super) fn is_daemon_absent(error: &anyhow::Error) -> bool {
 }
 
 /// Whether this failure is the drain RPC's client deadline expiring on an
-/// ESTABLISHED connection (#427).
+/// ESTABLISHED connection.
 ///
 /// The daemon is present — the socket connected — but too busy to answer
 /// `queue.drain` within the client's deadline. The producer event files are
-/// durable on disk and the next `tally-drain` tick picks them up, so nothing
-/// is lost: for the periodic drain this is a retryable skip, symmetric with
-/// #411's connect-time absence handling. Deliberately narrow: only
-/// `queue.drain`'s own client deadline counts. A drained rearm window
-/// (`RearmDeadlineExceeded`) is a different path this verb never takes, and
-/// every other established-connection failure — including a daemon that is
-/// listening and refuses — keeps failing the unit.
+/// durable on disk and the next `tally-drain` tick picks them up, so nothing is
+/// lost: for the periodic drain this is a retryable skip, symmetric with the
+/// connect-time absence handling. Deliberately narrow: only `queue.drain`'s own
+/// client deadline counts. A drained rearm window (`RearmDeadlineExceeded`) is
+/// a different path this verb never takes, and every other
+/// established-connection failure — including a daemon that is listening and
+/// refuses — keeps failing the unit.
 pub(super) fn is_drain_deadline_exceeded(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
@@ -162,15 +162,15 @@ pub(super) fn default_state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/tally"))
 }
 
-/// The default data directory for the direct-file verbs (#416).
+/// The default data directory for the direct-file verbs.
 ///
 /// Precedence: an explicit `--data-dir` flag wins at every call site (each
 /// resolves the flag first and only falls back here), then `TALLY_DATA_DIR`
 /// taken verbatim as the directory itself, then the XDG default
-/// (`$XDG_DATA_HOME/tally`, else `~/.local/share/tally`). The variable is
-/// what a deployment exports so the whole verb family — reader-state,
-/// `witness verify`, and the rest — aims at the deployment's store by
-/// default; unset or empty, local use keeps resolving exactly as before.
+/// (`$XDG_DATA_HOME/tally`, else `~/.local/share/tally`). The variable is what
+/// a deployment exports so the whole verb family — reader-state, `witness
+/// verify`, and the rest — aims at the deployment's store by default; unset or
+/// empty, local use keeps resolving exactly as before.
 pub(super) fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("TALLY_DATA_DIR").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
@@ -187,8 +187,8 @@ pub(super) fn default_data_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Issue #411: the absorption is scoped to "there is no daemon there", and
-    /// that scope is the whole of what keeps it honest.
+    /// The absorption is scoped to "there is no daemon there", and that scope
+    /// is the whole of what keeps it honest.
     ///
     /// `RearmDeadlineExceeded` maps to the same exit code 3 and is the reason
     /// this cannot be written as "is the exit code 3" — it describes a daemon
@@ -237,9 +237,9 @@ mod tests {
         .context("draining the queue");
         assert!(is_daemon_absent(&wrapped));
 
-        // #427: the deadline skip is a separate predicate, and the absence
-        // predicate must not grow to cover it — a busy daemon answering
-        // nothing is still present.
+        // The deadline skip is a separate predicate, and the absence predicate
+        // must not grow to cover it — a busy daemon answering nothing is still
+        // present.
         let busy = anyhow::Error::new(WireIoError::DeadlineExceeded {
             method: "queue.drain".to_owned(),
             deadline: Duration::from_secs(60),
@@ -252,11 +252,11 @@ mod tests {
         );
     }
 
-    /// Issue #427: the absorption is scoped to "the drain's own RPC deadline
-    /// expired on a connection that was established", and that scope is what
-    /// keeps it honest. Nothing is lost — the event files are durable and the
-    /// next tick drains them — but the same latitude for any other error would
-    /// turn a genuinely failing drain into a quiet success.
+    /// The absorption is scoped to "the drain's own RPC deadline expired on a
+    /// connection that was established", and that scope is what keeps it
+    /// honest. Nothing is lost — the event files are durable and the next tick
+    /// drains them — but the same latitude for any other error would turn a
+    /// genuinely failing drain into a quiet success.
     #[test]
     fn only_the_drain_deadline_counts_as_a_retryable_drain_skip() {
         // The case itself: connected, answered nothing within the deadline.
@@ -305,7 +305,7 @@ mod tests {
         ));
         assert!(!is_drain_deadline_exceeded(&refused));
 
-        // The socket-absent case is #411's predicate, not this one.
+        // The socket-absent case is the absence predicate's, not this one's.
         let absent = anyhow::Error::new(WireIoError::Unreachable {
             path: PathBuf::from("/run/user/0/tally/tally.sock"),
             source: std::io::Error::from(std::io::ErrorKind::NotFound),

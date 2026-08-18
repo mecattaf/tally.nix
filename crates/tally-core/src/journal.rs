@@ -189,10 +189,10 @@ pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
     ("TALLY_EXIT_CODE", FieldRequirement::AtCompletedOrFailed),
     ("TALLY_STDERR_TAIL", FieldRequirement::Conditional),
     ("TALLY_STDERR_TRUNCATED", FieldRequirement::Conditional),
-    // Was `AtCompletedOrFailed` until #382: every completion fabricated
-    // `Some(0.0)` to satisfy this, which is exactly the fabricated-zero
-    // pattern #382 removes. The field is real cgroup accounting for a
-    // GPU-pool job now, present only when the exit recorder measured it.
+    // Only ever present when the exit recorder measured it. Requiring it at
+    // completion would mean fabricating `Some(0.0)` to satisfy the requirement,
+    // which is the fabricated-zero pattern this field exists to keep out: it is
+    // real cgroup accounting for a GPU-pool job or it is absent.
     ("TALLY_GPU_SECONDS", FieldRequirement::Conditional),
     // Occupancy, recorded beside `TALLY_SESSION_REF` for the same reason: a
     // query surface reconstructed after retention still needs it. Never
@@ -436,13 +436,12 @@ impl EmitEvent {
 }
 
 /// The past-tense opening verb for each of the 11 lifecycle events' default
-/// `MESSAGE` template (#385): an outcome-first leading word, so a reader of
-/// the raw journal sees what happened before any key=value detail, the same
-/// content contract the narrate slot enforces at the publish boundary. Most
-/// events use a bare `Enqueued`/`Started`-shaped past participle; the two
-/// that read as an internal record of an action needed a said action
-/// spelled out (`Recorded a heartbeat for`, `Emitted the witness record
-/// for`) to stay grammatical.
+/// `MESSAGE` template: an outcome-first leading word, so a reader of the raw
+/// journal sees what happened before any key=value detail, the same content
+/// contract the narrate slot enforces at the publish boundary. Most events use
+/// a bare `Enqueued`/`Started`-shaped past participle; the two that read as an
+/// internal record of an action needed a said action spelled out (`Recorded a
+/// heartbeat for`, `Emitted the witness record for`) to stay grammatical.
 fn synthesize_message_verb(event: TallyEvent) -> &'static str {
     match event {
         TallyEvent::Enqueued => "Enqueued",
@@ -1389,8 +1388,8 @@ mod tests {
 
     #[test]
     fn daemon_authored_messages_lead_with_a_past_tense_outcome() {
-        // #385 audits the daemon's own default `MESSAGE` templates against the
-        // same outcome-first contract the narrate slot enforces at the publish
+        // Audits the daemon's own default `MESSAGE` templates against the same
+        // outcome-first contract the narrate slot enforces at the publish
         // boundary: every one of TALLY_EVENTS' 11 kinds gets its own assertion
         // here, named explicitly, so a 12th event added later fails this test
         // instead of silently going unaudited.

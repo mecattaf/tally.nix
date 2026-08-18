@@ -397,26 +397,24 @@ pub struct CollectionEnvelope<T> {
     /// How many task UUIDs a `flowRun` filter resolved to, present only when
     /// one was supplied.
     ///
-    /// Membership is a durable admission fact as of #380: every admission under
-    /// a `flowRunId` records `(run, task)` in the membership ledger before it is
+    /// Membership is a durable admission fact: every admission under a
+    /// `flowRunId` records `(run, task)` in the membership ledger before it is
     /// acknowledged, including the row-less dispositions — `attached`, and
-    /// full-mode `reused` and `terminal` — that used to hand a run a task UUID
-    /// it could never see in its own window. `flow_run_tasks` resolves that
-    /// ledger unioned with the rows and witnesses carrying the run's capsule,
-    /// so a run submitted before that ledger existed still resolves exactly as
-    /// it did.
+    /// full-mode `reused` and `terminal` — that would otherwise hand a run a
+    /// task UUID it could never see in its own window. `flow_run_tasks`
+    /// resolves that ledger unioned with the rows and witnesses carrying the
+    /// run's capsule, so a run submitted before the ledger existed still
+    /// resolves through the scan exactly as it did.
     ///
-    /// The count remains reported for a different reason than it was
-    /// introduced: it is still the difference between a window that is empty
-    /// because the run is quiet and one that is empty because the run has no
-    /// members at all — which now means the run really admitted nothing, rather
-    /// than that its nodes went missing.
+    /// The count is the difference between a window that is empty because the
+    /// run is quiet and one that is empty because the run has no members at all
+    /// — which means the run really admitted nothing, rather than that its
+    /// nodes went missing.
     ///
     /// An explicit `flowRun` filter is a by-ID inspection, so reader-state
     /// never withholds its jobs: an archived member remains in `items` with
-    /// `archived: true`. Consequently `flowRunTasks: N, items: []` retains its
-    /// original meaning: the run has members, but none matched the remaining
-    /// job filters or window.
+    /// `archived: true`. Consequently `flowRunTasks: N, items: []` means the
+    /// run has members, but none matched the remaining job filters or window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_run_tasks: Option<usize>,
     pub snapshot: QuerySnapshotMetadata,
@@ -620,12 +618,12 @@ pub fn query_jobs(
         .iter()
         .map(|fact| (fact.anchor.as_str(), fact))
         .collect::<BTreeMap<_, _>>();
-    // Grouped in one pass each. Filtering the whole history and ledger once
-    // per anchor made this collection O(anchors x (records + witnesses)) --
-    // at estate scale (~30k rows, ~150k lifecycle records) that is minutes of
-    // CPU for one call, and it used to run on the daemon's dispatch thread
-    // (#431). Iteration order within a group is preserved, so per-anchor
-    // consumers still see records in ledger order.
+    // Grouped in one pass each. Filtering the whole history and ledger once per
+    // anchor makes this collection O(anchors x (records + witnesses)) -- at
+    // estate scale (~30k rows, ~150k lifecycle records) that is minutes of CPU
+    // for one call, on the daemon's dispatch thread. Iteration order within a
+    // group is preserved, so per-anchor consumers still see records in ledger
+    // order.
     let mut events_by_task = HashMap::<&str, Vec<&LifecycleRecord>>::new();
     for record in &history.records {
         events_by_task
@@ -1332,7 +1330,7 @@ struct ReconcileCheckpointTask {
 /// Whether [`query_run`] would find this run.
 ///
 /// Split out and made the sole definition of that check so a caller can answer
-/// an unknown run id *before* reading the attestation chain (#404).
+/// an unknown run id *before* reading the attestation chain.
 /// `read_attestations` parses and hash-verifies the whole append-only ledger on
 /// every `query.run` — measured at ~2.7 ms/MB — and an id that does not resolve
 /// never reaches the rollup that needs it. Because `query_run` raises its own
@@ -2267,18 +2265,19 @@ pub fn query_campaign_status(
 /// different stores from the rows, journal, and witness that projection reads,
 /// and the handler is where they are joined.
 ///
-/// "Touched" is decided per entry, from two sources that disagree on purpose.
-/// A row's orchestration capsule names the run that *created* the node, while
-/// the membership ledger names every run that was *handed* it — so a node one
-/// run created and another attached (the W-316 shape) appears under both, and
-/// the run that only attached it does not silently drop out of the digest.
-/// The flow runs a digest's window touched, in run-ID order.
+/// "Touched" is decided per entry, from two sources that disagree on purpose. A
+/// row's orchestration capsule names the run that *created* the node, while the
+/// membership ledger names every run that was *handed* it — so a node one run
+/// created and another attached (the W-316 shape) appears under both, and the
+/// run that only attached it does not silently drop out of the digest. The flow
+/// runs a digest's window touched, in run-ID order.
 ///
 /// Split out and made the sole definition so a caller can find out whether
-/// there is anything to roll up *before* reading the attestation chain (#404):
-/// a window that touched no run needs no attestations at all, and the read is a
-/// full parse and hash-verify of the append-only ledger. [`apply_standup_usage`]
-/// uses this same function, so the two cannot disagree about emptiness.
+/// there is anything to roll up *before* reading the attestation chain: a
+/// window that touched no run needs no attestations at all, and the read is a
+/// full parse and hash-verify of the append-only ledger.
+/// [`apply_standup_usage`] uses this same function, so the two cannot disagree
+/// about emptiness.
 #[must_use]
 pub fn standup_touched_runs(
     digest: &StandupDigest,
@@ -2336,9 +2335,9 @@ pub fn apply_standup_usage(
             }
         })
         .collect();
-    // Stated once beside the list rather than ~650 bytes per entry (#404). Set
-    // only when there is a list to state it for, so a digest that touched no
-    // run carries no claim about how its runs were summed.
+    // Stated once beside the list rather than ~650 bytes per entry. Set only
+    // when there is a list to state it for, so a digest that touched no run
+    // carries no claim about how its runs were summed.
     digest.usage_basis = (!digest.runs.is_empty()).then(StandupUsageBasis::default);
 }
 
@@ -2409,25 +2408,24 @@ pub fn apply_reader_state_to_jobs(
     before - items.len()
 }
 
-/// Remove every entry `keep` rejects from `items`, adding the number removed
-/// to `hidden`.
+/// Remove every entry `keep` rejects from `items`, adding the number removed to
+/// `hidden`.
 ///
 /// Filtering and counting are deliberately ONE operation, and *this* part is
 /// unconditional: a caller cannot remove an entry through this helper without
-/// the removal reaching the counter it passed. Round-2 HIGH-11 found the
-/// previous shape — a `retain` here, a `before`/`after` sum over a
-/// hand-written list of collections there — pinned for exactly one of the
-/// five collections it filtered: dropping `cancelled`, `gate_fails` or
-/// `in_flight` from the sum left the whole suite green while the digest
-/// under-reported what it had withheld.
+/// the removal reaching the counter it passed. The alternative shape — a
+/// `retain` here, a `before`/`after` sum over a hand-written list of
+/// collections there — binds exactly one of the five collections it filters:
+/// dropping `cancelled`, `gate_fails` or `in_flight` from the sum leaves the
+/// whole suite green while the digest under-reports what it withheld.
 ///
 /// A sum over the digest's collections still exists — [`filterable_entries`],
-/// which the conservation backstop compares before and after. What changed is
+/// which the conservation backstop compares before and after. The difference is
 /// that the sum can no longer silently omit a field: it destructures
-/// `StandupDigest` exhaustively, so a new field is a compile error there
-/// rather than a quiet blind spot. Using this helper is what keeps the two
-/// numbers in agreement; the exhaustive destructure is what keeps the
-/// enumeration honest. Neither alone is the whole guarantee.
+/// `StandupDigest` exhaustively, so a new field is a compile error there rather
+/// than a quiet blind spot. Using this helper is what keeps the two numbers in
+/// agreement; the exhaustive destructure is what keeps the enumeration honest.
+/// Neither alone is the whole guarantee.
 fn retain_counting<T>(items: &mut Vec<T>, hidden: &mut usize, keep: impl FnMut(&T) -> bool) {
     let before = items.len();
     items.retain(keep);
@@ -2437,25 +2435,24 @@ fn retain_counting<T>(items: &mut Vec<T>, hidden: &mut usize, keep: impl FnMut(&
 /// Every entry [`apply_reader_state_to_standup`] could remove, summed across
 /// the digest's filterable collections.
 ///
-/// Deliberately written as an exhaustive destructure rather than a sum of
-/// field accesses. Round-3 (MUTATION H) showed why: when the enumerator is a
-/// hand-written list, a removal from a collection it does not mention changes
-/// neither side of the conservation check, so the backstop was blind to
-/// exactly the case it was introduced for. Destructuring without `..` makes a
-/// new `StandupDigest` field a compile error here —
-/// `error[E0027]: pattern does not mention field ...` — so the decision about
-/// whether that field is filterable is *forced and visible*.
+/// Deliberately written as an exhaustive destructure rather than a sum of field
+/// accesses. When the enumerator is a hand-written list, a removal from a
+/// collection it does not mention changes neither side of the conservation
+/// check, so the backstop is blind to exactly the case it exists for.
+/// Destructuring without `..` makes a new `StandupDigest` field a compile error
+/// here — `error[E0027]: pattern does not mention field ...` — so the decision
+/// about whether that field is filterable is *forced and visible*.
 ///
 /// What this does **not** buy: an author facing that error can bind the new
-/// field to `_` and move on, and nothing here will notice a bare `retain` on
-/// it later. The honest invariant is only this:
+/// field to `_` and move on, and nothing here will notice a bare `retain` on it
+/// later. The honest invariant is only this:
 ///
 /// > A new `Vec` field on [`StandupDigest`] does not compile until this
 /// > function names it. Naming it `_` is a deliberate, visible decision that
 /// > the field is not filterable here.
 ///
 /// Do not add `..` to this pattern; `..` is precisely the escape hatch that
-/// restores the blindness MUTATION H found.
+/// restores that blindness.
 fn filterable_entries(digest: &StandupDigest) -> usize {
     let StandupDigest {
         schema_version: _,
@@ -2471,9 +2468,9 @@ fn filterable_entries(digest: &StandupDigest) -> usize {
         archived_hidden: _,
         archived_runs_hidden: _,
         // Not a collection of entries: one optional statement about how the
-        // `runs` rollups were summed (#404). Nothing is ever removed *from*
-        // it, so it contributes no filterable entries. It is not independent
-        // of `runs`, though — see the basis clear at the end of
+        // `runs` rollups were summed. Nothing is ever removed *from* it, so it
+        // contributes no filterable entries. It is not independent of `runs`,
+        // though — see the basis clear at the end of
         // `apply_reader_state_to_standup`.
         usage_basis: _,
     } = digest;
@@ -2675,23 +2672,23 @@ pub fn apply_reader_state_to_standup(
          archived_runs_hidden exist to prevent"
     );
 
-    // `usage_basis` states how the entries in `runs` were summed (#404), and
-    // `apply_standup_usage` sets it exactly when it leaves a non-empty
-    // `runs`. This function can empty `runs` afterwards, so the basis is
-    // cleared with them: a digest that shows no run must not carry a
-    // statement about how its runs were summed.
+    // `usage_basis` states how the entries in `runs` were summed, and
+    // `apply_standup_usage` sets it exactly when it leaves a non-empty `runs`.
+    // This function can empty `runs` afterwards, so the basis is cleared with
+    // them: a digest that shows no run must not carry a statement about how its
+    // runs were summed.
     //
     // The invariant `StandupDigest::usage_basis` documents — present exactly
-    // when `runs` is non-empty — is therefore a property of the COMPOSITION
-    // of the two calls, not of `apply_standup_usage` alone. It is kept rather
-    // than weakened deliberately. The alternative, "present when the producer
-    // had runs", is a claim about production history, which no consumer can
-    // check against the payload it holds; a reader CAN check this one. What
+    // when `runs` is non-empty — is therefore a property of the COMPOSITION of
+    // the two calls, not of `apply_standup_usage` alone. It is kept rather than
+    // weakened deliberately. The alternative, "present when the producer had
+    // runs", is a claim about production history, which no consumer can check
+    // against the payload it holds; a reader CAN check this one. What
     // distinguishes "the window touched no run" from "reader-state hid them
     // all" is `archived_runs_hidden`, which is still set above.
     //
-    // Clearing is lossless: `inherit_usage_basis` only fills entries of
-    // `runs`, so with `runs` empty there is nothing left the basis could tell.
+    // Clearing is lossless: `inherit_usage_basis` only fills entries of `runs`,
+    // so with `runs` empty there is nothing left the basis could tell.
     if digest.runs.is_empty() {
         digest.usage_basis = None;
     }
@@ -3571,14 +3568,14 @@ const fn passing_verdict(verdict: Verdict) -> bool {
 /// A lifecycle event carries no orchestration capsule, so a `--flow-run` filter
 /// has to resolve the run's nodes from records that do.
 ///
-/// The union is not belt-and-braces, it is the compatibility story. Membership
-/// became a durable admission fact in #380; every row written before that, and
-/// every row recovered from a durable enqueue event, carries its capsule and
-/// nothing else. Resolving membership from the ledger alone would empty every
-/// pre-existing run's window the moment a host advanced its pin. Resolving it
-/// from the scan alone is W-316: a row-less admission (`attached`, and
-/// full-mode `reused` and `terminal`) hands a run a task UUID whose row belongs
-/// to a different run, and the submitting run never sees its own node.
+/// The union is not belt-and-braces, it is the compatibility story. Every row
+/// written before membership became a durable admission fact, and every row
+/// recovered from a durable enqueue event, carries its capsule and nothing
+/// else. Resolving membership from the ledger alone would empty every such
+/// run's window the moment a host advanced its pin. Resolving it from the scan
+/// alone is W-316: a row-less admission (`attached`, and full-mode `reused` and
+/// `terminal`) hands a run a task UUID whose row belongs to a different run,
+/// and the submitting run never sees its own node.
 fn flow_run_tasks(
     flow_run: &str,
     details: &[RowDetailFact],
@@ -5600,8 +5597,8 @@ mod tests {
         assert!(detail.attempts[1].timestamps.terminal_at.is_some());
     }
 
-    /// #380: the durable ledger and the original scan agree wherever both can
-    /// see, and the ledger is exactly the difference where the scan is blind.
+    /// The durable ledger and the original scan agree wherever both can see,
+    /// and the ledger is exactly the difference where the scan is blind.
     ///
     /// The truth of this corpus is fixed by construction rather than derived
     /// from either mechanism: run A created two nodes and owns both rows; run B
@@ -6119,7 +6116,7 @@ mod tests {
         );
         assert!(orphan.runs.is_empty());
         // Nothing to roll up means nothing to state a basis for, and it is what
-        // lets `query.standup` skip the chain read entirely (#404).
+        // lets `query.standup` skip the chain read entirely.
         assert!(orphan.usage_basis.is_none());
         assert!(standup_touched_runs(&orphan, &details, &ledger).is_empty());
     }
@@ -6165,8 +6162,8 @@ mod tests {
         assert!(!digest.runs[0].usage.is_complete());
     }
 
-    /// Issue #404: the predicate that lets the RPC layer skip the attestation
-    /// chain read is exactly the one `query_run` raises `UnknownJob` from.
+    /// The predicate that lets the RPC layer skip the attestation chain read is
+    /// exactly the one `query_run` raises `UnknownJob` from.
     ///
     /// The read is a full parse and hash-verify of the append-only ledger on
     /// every call, before the run id is even known to exist. Deferring it is
@@ -6251,8 +6248,8 @@ mod tests {
         .is_ok());
     }
 
-    /// Issue #404: a digest states the three rollup constants once instead of
-    /// repeating ~650 bytes of them per run.
+    /// A digest states the three rollup constants once instead of repeating
+    /// ~650 bytes of them per run.
     ///
     /// Hoisting is only honest if the fields really are invariant across every
     /// run a window can contain. They are, structurally: `provenance` and
@@ -6354,8 +6351,8 @@ mod tests {
         assert_eq!(round_tripped, divergent);
     }
 
-    /// Issue #404, the half a same-build round-trip cannot see: what an omitted
-    /// entry field is filled from.
+    /// The half a same-build round-trip cannot see: what an omitted entry field
+    /// is filled from.
     ///
     /// Filling it from the *reader's* compiled constants makes the digest state
     /// one thing and every entry in it state another, and it does so silently
@@ -6833,14 +6830,13 @@ mod tests {
     /// non-empty, across the COMPOSITION of the two calls the `query.standup`
     /// handler makes — not just within either one.
     ///
-    /// `apply_standup_usage` (#404) sets the basis when it leaves a non-empty
-    /// `runs`; `apply_reader_state_to_standup` (#389) can then hide every run.
-    /// Both lanes tested their own function in isolation and neither gate
-    /// could see the pair, so this asserts the invariant where a consumer
-    /// actually observes it: on the digest the handler hands out, and on the
-    /// wire, where both fields are `skip_serializing_if`-omitted and a basis
-    /// surviving alone would be a statement about runs the payload does not
-    /// contain.
+    /// `apply_standup_usage` sets the basis when it leaves a non-empty `runs`;
+    /// `apply_reader_state_to_standup` can then hide every run. Both lanes
+    /// tested their own function in isolation and neither gate could see the
+    /// pair, so this asserts the invariant where a consumer actually observes
+    /// it: on the digest the handler hands out, and on the wire, where both
+    /// fields are `skip_serializing_if`-omitted and a basis surviving alone
+    /// would be a statement about runs the payload does not contain.
     #[test]
     fn standup_usage_basis_is_present_exactly_when_runs_is_after_reader_state_is_applied() {
         let run = "00000000-0000-4000-8000-0000000004c0";
@@ -6901,13 +6897,12 @@ mod tests {
         assert!(kept.usage_basis.is_some());
     }
 
-    /// HIGH-3's exact reproduction: a run that only ATTACHED a task (the
-    /// W-316 shape -- present in `digest.runs` via `apply_standup_usage`'s
-    /// membership union, per its own doc comment, without being that task's
-    /// *creating* run) is archived. Task-entry attribution is
-    /// creating-run-only by design, so `archived_hidden` correctly stays 0
-    /// -- but the attached run's cost row is still removed from `runs`, and
-    /// that removal must not be invisible.
+    /// A run that only ATTACHED a task (the W-316 shape -- present in
+    /// `digest.runs` via `apply_standup_usage`'s membership union, per its own
+    /// doc comment, without being that task's *creating* run) is archived.
+    /// Task-entry attribution is creating-run-only by design, so
+    /// `archived_hidden` correctly stays 0 -- but the attached run's cost row
+    /// is still removed from `runs`, and that removal must not be invisible.
     #[test]
     fn apply_reader_state_to_standup_counts_an_attach_only_archived_run_that_hides_no_task_entry() {
         let creating_run = "00000000-0000-4000-8000-000000000290";
@@ -6956,16 +6951,15 @@ mod tests {
         );
     }
 
-    /// HIGH-4: proves `archived_hidden` is a before/after difference over the
-    /// digest's own collections, never a recount over `details`. A detail
-    /// whose run is archived but which produced no digest entry at all
-    /// (still pending, dropped by a `source` filter, or otherwise never
-    /// bucketed by `query_standup`) must contribute nothing to the count --
-    /// nothing was hidden from a reader who never saw it. A recount over
-    /// `details` cannot express that and gets it wrong, which is exactly
-    /// what mutation M1 in the round-1 eval substituted and which survived
-    /// 676/676 tests. This test is the one named in this function's own doc
-    /// comment as failing against that mutation.
+    /// Proves `archived_hidden` is a before/after difference over the digest's
+    /// own collections, never a recount over `details`. A detail whose run is
+    /// archived but which produced no digest entry at all (still pending,
+    /// dropped by a `source` filter, or otherwise never bucketed by
+    /// `query_standup`) must contribute nothing to the count -- nothing was
+    /// hidden from a reader who never saw it. A recount over `details` cannot
+    /// express that and gets it wrong, and a recount survives the whole suite.
+    /// This test is the one named in this function's own doc comment as failing
+    /// against that substitution.
     #[test]
     fn apply_reader_state_to_standup_never_counts_an_archived_detail_that_produced_no_digest_entry()
     {
@@ -7008,12 +7002,12 @@ mod tests {
         );
     }
 
-    /// Round-2 HIGH-11: `archived_hidden` claims to cover four collections,
-    /// and before this test only `completed` was pinned -- dropping
-    /// `cancelled`, `gate_fails` or `in_flight` from the count left all 679
-    /// tests green while the digest under-reported what it withheld. One
-    /// archived entry is placed in EVERY filtered collection, so no single
-    /// collection can be dropped from the count without this going red.
+    /// `archived_hidden` claims to cover four collections. With only
+    /// `completed` pinned, dropping `cancelled`, `gate_fails` or `in_flight`
+    /// from the count leaves the whole suite green while the digest
+    /// under-reports what it withheld. One archived entry is placed in EVERY
+    /// filtered collection, so no single collection can be dropped from the
+    /// count without this going red.
     #[test]
     fn apply_reader_state_to_standup_counts_a_removal_from_every_collection_it_filters() {
         let archived_run = "00000000-0000-4000-8000-0000000002a0";
@@ -7087,20 +7081,17 @@ mod tests {
     }
 
     /// A *further* predicate on an already-enumerated collection — one this
-    /// test was not written for — must still be caught: the conservation
-    /// check inside `apply_reader_state_to_standup` compares
-    /// `filterable_entries` before and after, so a removal there that
-    /// reaches no counter fails. Round-2 MUT-C is exactly that shape and
-    /// this test catches it.
+    /// test was not written for — must still be caught: the conservation check
+    /// inside `apply_reader_state_to_standup` compares `filterable_entries`
+    /// before and after, so a removal there that reaches no counter fails.
     ///
-    /// Note the reach honestly. This test computes `before` and `removed`
-    /// by calling `filterable_entries` itself, so it is exactly as blind as
-    /// that enumerator: it cannot catch a removal from a collection the
-    /// enumerator does not name (round-3 MUTATION H). What stops that case
-    /// is not this test but the exhaustive destructure in
-    /// `filterable_entries`, which turns a new `StandupDigest` field into a
-    /// compile error. Also exercises the opted-in path, where the correct
-    /// answer is "nothing removed, both counts zero".
+    /// Note the reach honestly. This test computes `before` and `removed` by
+    /// calling `filterable_entries` itself, so it is exactly as blind as that
+    /// enumerator: it cannot catch a removal from a collection the enumerator
+    /// does not name. What stops that case is not this test but the exhaustive
+    /// destructure in `filterable_entries`, which turns a new `StandupDigest`
+    /// field into a compile error. Also exercises the opted-in path, where the
+    /// correct answer is "nothing removed, both counts zero".
     #[test]
     fn apply_reader_state_to_standup_conserves_entries_between_removals_and_counts() {
         let archived_run = "00000000-0000-4000-8000-0000000002b0";

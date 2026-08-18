@@ -94,10 +94,10 @@ const VERSION: &str = concat!(
 const DEFAULT_RPC_TIMEOUT_SEC: u64 = 60;
 const RPC_TIMEOUT_ENV: &str = "TALLY_RPC_TIMEOUT_SEC";
 /// How long `flow run` waits for an advisory finalMessage projection after a
-/// node's exit evidence passes (#432). Milliseconds, so a test can widen the
-/// window without touching seconds. Unset keeps the 10 s default. It is
-/// captured before the inherited-environment sanitize removes `TALLY_*`, the
-/// same way `TALLY_RPC_TIMEOUT_SEC` is.
+/// node's exit evidence passes. Milliseconds, so a test can widen the window
+/// without touching seconds. Unset keeps the 10 s default. It is captured
+/// before the inherited-environment sanitize removes `TALLY_*`, the same way
+/// `TALLY_RPC_TIMEOUT_SEC` is.
 const RESULT_PROJECTION_TIMEOUT_ENV: &str = "TALLY_RESULT_PROJECTION_TIMEOUT_MS";
 use adapter::*;
 use args::*;
@@ -292,16 +292,16 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
                 Some(json!({})),
             )
             .await;
-            // A periodic drain that finds no daemon is not an error (#411).
+            // A periodic drain that finds no daemon is not an error.
             // `tally-drain.timer` fires every five seconds and a daemon restart
             // takes longer than that, so every activation that restarts
             // `tally-daemon` has a good chance of catching a drain mid-flight;
-            // the exit 3 that produced surfaced as a genuine per-user unit
+            // the exit 3 that produces surfaces as a genuine per-user unit
             // failure, which is exactly the shape the fleet's journal watcher
             // exists to catch. Spending that alarm on a benign restart is the
             // cost being removed here.
             //
-            // Narrow on purpose: only the socket-absent case and #427's
+            // Narrow on purpose: only the socket-absent case and the
             // deadline-expired case are absorbed, and the line naming each is
             // still written, so an operator running the verb by hand still
             // learns which case it was. Every other drain failure -- including
@@ -311,13 +311,13 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
                     let _ = out::write_error_line(format_args!("tally: {error:#}"));
                     Ok(())
                 }
-                // #427: the daemon is present -- the connection was
-                // established -- but too busy to answer `queue.drain` within
-                // the deadline. The producer event files are durable on disk
-                // and the next `tally-drain` tick picks them up, so nothing is
-                // lost: the periodic drain records a retryable skip (systemd
-                // success plus the warning line below) instead of a unit
-                // failure the fleet watcher would report dozens of times a day.
+                // The daemon is present -- the connection was established --
+                // but too busy to answer `queue.drain` within the deadline. The
+                // producer event files are durable on disk and the next
+                // `tally-drain` tick picks them up, so nothing is lost: the
+                // periodic drain records a retryable skip (systemd success plus
+                // the warning line below) instead of a unit failure the fleet
+                // watcher would report dozens of times a day.
                 Err(error) if is_drain_deadline_exceeded(&error) => {
                     let _ = out::write_error_line(format_args!(
                         "tally: {error:#} (retryable skip: the event files remain on disk and \
@@ -389,9 +389,9 @@ async fn run_producer_dispatch(
         .context("--event must be a producer observation JSON object")?;
     let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
     // Not optional: the brief store belongs to the daemon data directory, and
-    // defaulting it to the state directory recreated the split brief layout
-    // #271 retired. Generated units always pass the flag; a direct call must
-    // name it too.
+    // defaulting it to the state directory recreates the retired split brief
+    // layout. Generated units always pass the flag; a direct call must name it
+    // too.
     let data_dir = args.data_dir;
     let events_dir = state_dir.join("events");
     let engine = ProducerEngine::new(&config.producers, &events_dir, &data_dir);

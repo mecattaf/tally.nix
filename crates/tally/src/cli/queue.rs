@@ -277,7 +277,7 @@ pub(super) async fn run_query(
                 Ok(result) => result,
                 // Automatic rather than flag-only, deliberately. A read that
                 // exceeds its deadline is the exact moment an operator is
-                // diagnosing a stalled daemon (#431), and making them rerun the
+                // diagnosing a stalled daemon, and making them rerun the
                 // command with a flag they have to remember costs the minutes
                 // this fallback exists to give back. The fallback is safe to
                 // take automatically because it is labelled in both renderings
@@ -534,16 +534,17 @@ fn report_page_completeness(envelope: &Value) -> Result<()> {
 
 /// A `--flow-run` window that resolved to no member tasks means **the daemon
 /// holds no membership for this run ID** — which is not the same claim as "this
-/// run admitted nothing", and the difference is the whole subject of #380.
+/// run admitted nothing", and that difference is the whole subject of this
+/// notice.
 ///
-/// Since #380 every admission under a `flowRunId` writes durable membership
-/// before it is acknowledged, including the row-less dispositions `attached`,
-/// and full-mode `reused` and `terminal`, so the commonest cause of a zero is a
-/// mistyped or stale run ID. But the ledger can also be missing what the run
-/// really did: an operator following the `repair-flow-membership-ledger` runbook
-/// deletes a line or the whole file, compaction can evict a run that has been
-/// idle long enough, and an admission that degraded post-commit records nothing.
-/// A row-less node has no durable row to fall back on in any of those cases, so
+/// Every admission under a `flowRunId` writes durable membership before it is
+/// acknowledged, including the row-less dispositions `attached`, and full-mode
+/// `reused` and `terminal`, so the commonest cause of a zero is a mistyped or
+/// stale run ID. But the ledger can also be missing what the run really did: an
+/// operator following the `repair-flow-membership-ledger` runbook deletes a
+/// line or the whole file, compaction can evict a run that has been idle long
+/// enough, and an admission that degraded post-commit records nothing. A
+/// row-less node has no durable row to fall back on in any of those cases, so
 /// this notice must keep pointing at the seam rather than closing the question.
 fn report_empty_flow_run(envelope: &Value) -> Result<()> {
     if envelope["flowRunTasks"].as_u64() == Some(0) {
@@ -584,7 +585,7 @@ async fn call_page(
 }
 
 /// Turn the daemon's bounded-response errors into something a reader can act
-/// on. The oversized-item failure in particular used to surface as an opaque
+/// on. The oversized-item failure in particular otherwise surfaces as an opaque
 /// internal error with no hint that the query itself was still answerable.
 fn annotate_page_error(method: &str, error: WireIoError) -> anyhow::Error {
     if let WireIoError::Rpc(WireErrorCode::Internal, message, _) = &error {
@@ -808,10 +809,9 @@ fn print_run_usage(usage: &Value, label: &str) -> Result<()> {
     let count = |key: &str| coverage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let tasks = count("tasks");
     let observed = count("attemptsObserved");
-    // Protocol-5 daemons publish the independent denominator. Fall back to
-    // the pre-#402 physical count only when rendering an older daemon's
-    // payload; a duplicate lease or over-ceiling record must not enlarge the
-    // current headline.
+    // Protocol-5 daemons publish the independent denominator. Fall back to the
+    // physical count only when rendering an older daemon's payload; a duplicate
+    // lease or over-ceiling record must not enlarge the current headline.
     let attested = coverage
         .get("attemptsAttested")
         .and_then(Value::as_u64)

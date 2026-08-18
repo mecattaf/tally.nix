@@ -2,18 +2,18 @@
 //!
 //! A poll scans a fleet, but every emitted fact belongs to exactly one durable
 //! registration. Keeping that attribution in the type prevents a caller from
-//! recreating the old ambiguous fleet counters when it serializes outcomes to
-//! a journal.
+//! recreating ambiguous fleet-wide counters when it serializes outcomes to a
+//! journal.
 //!
-//! Schema 2 deleted the `stabilizing`/`rearm-required` pair. A changed graph
-//! is no longer a refusal waiting for an operator verb: `forge:"local"`
-//! promises REMOTE-AUTHORITY, so a push to the armed identity's worklist is
-//! itself the arming act and the observing pass re-admits it.
+//! Schema 2 deleted the `stabilizing`/`rearm-required` pair. A changed graph is
+//! not a refusal waiting for an operator verb: `forge:"local"` promises
+//! REMOTE-AUTHORITY, so a push to the armed identity's worklist is itself the
+//! arming act and the observing pass re-admits it.
 //!
 //! Schema 3 reports the campaign lease. `deferred` is a pass that found the
-//! identity already leased and dispatched nothing, and `complete` now carries
-//! the lapse — the written completion fact — instead of the registration
-//! prune that used to stand in for one.
+//! identity already leased and dispatched nothing, and `complete` carries the
+//! lapse — the written completion fact — rather than a registration prune
+//! standing in for one.
 
 use std::fmt;
 
@@ -308,8 +308,8 @@ mod tests {
         assert!(deferred.get("action").is_none());
         assert!(deferred["detail"].as_str().unwrap().contains("4242"));
 
-        // Completion is a written fact about a revision now, so the prune
-        // that used to stand in for one must fail loudly on the wire.
+        // Completion is a written fact about a revision, so a prune standing in
+        // for one must fail loudly on the wire.
         let complete = serde_json::to_string(&CampaignPollEvent::complete(
             "0198f000-0000-7000-8000-000000000005",
             "local://acme/five/specs/five.json",
@@ -381,7 +381,8 @@ mod tests {
             rendered.contains("arm 4") && rendered.contains("arm 5"),
             "{rendered}"
         );
-        // The two sentences the incident produced, and the verb it demanded.
+        // The two sentences a stale digest mismatch must not print, and the
+        // verb it must not demand.
         for forbidden in ["produced no commit", "re-arm", "campaign arm"] {
             assert!(!rendered.contains(forbidden), "{forbidden:?} in {rendered}");
         }

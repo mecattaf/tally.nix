@@ -1079,11 +1079,10 @@ mod tests {
         );
     }
 
-    /// The E1 contract, stated as the case that used to fail: policy is not
+    /// The E1 contract, stated as the case it exists to govern: policy is not
     /// work. Each edit below is one an operator makes mid-campaign — a gate
-    /// added, the agent retuned, a steward attached, the merge method
-    /// switched — and none of them is an instruction to the task that already
-    /// landed.
+    /// added, the agent retuned, a steward attached, the merge method switched
+    /// — and none of them is an instruction to the task that already landed.
     #[test]
     fn a_policy_only_change_never_re_keys_a_task_completion_identity() {
         let manifest: CampaignManifest = serde_json::from_value(json!({

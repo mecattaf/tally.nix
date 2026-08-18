@@ -49,14 +49,13 @@ const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
 const MAX_MACHINE_RETRIES: usize = 2;
 // The diagnosis slot's peepholes, each a derivation over the slot it feeds
-// (vestige-sweep V-5) — the bare 8 KiB / 10-line / 8 KiB numerals these
-// replaced sized the verdict that gates attempt 2 through a 10-line window
-// of up-to-3-hour gate runs.
+// (vestige-sweep V-5): a bare 8 KiB / 10-line / 8 KiB numeral sizes the verdict
+// that gates attempt 2 through a 10-line window of up-to-3-hour gate runs.
 //
-// One worker's findings may fill at most two thirds of the diagnosis slot
-// the findings inform; the rest of the slot stays room for the diagnosis
-// prose itself. The slot counts chars and this bound counts bytes, so any
-// multibyte text surviving redaction fits with room to spare.
+// One worker's findings may fill at most two thirds of the diagnosis slot the
+// findings inform; the rest of the slot stays room for the diagnosis prose
+// itself. The slot counts chars and this bound counts bytes, so any multibyte
+// text surviving redaction fits with room to spare.
 const MAX_WORKER_FINDINGS_BYTES: usize = MAX_DIAGNOSIS_CHARS * 2 / 3;
 const MAX_CONTINUATION_EVENT_BYTES: usize = 1024 * 1024;
 // One stored checkpoint-capture stream may fill the diagnosis slot it
@@ -3306,8 +3305,8 @@ fn action_retry(brief: &Json) -> Result<Json> {
     // The lane's own stream is read before the budget is charged, because an
     // adapter that stated its own terminal condition has already answered the
     // question a retry would ask (vestige-sweep V-16). A quota wall is dated
-    // and non-retryable; re-dispatching against it is how five hours went
-    // last time, and the message naming the reset hour was in this capture
+    // and non-retryable; re-dispatching against it spends the whole retry
+    // budget on a wall, and the message naming the reset hour is in the capture
     // the whole time.
     if lane_capture_outcome(data.get("laneCapture"))?
         .is_some_and(|outcome| !outcome.dispatches_retry())
@@ -4325,10 +4324,10 @@ fn checkpoint_capture_note(value: Option<&Json>, campaign: &str, task_id: &str) 
     let available = CHECKPOINT_STDERR_WINDOW_CHARS.saturating_sub(heading.chars().count());
     if excerpt.chars().count() > available {
         let marker = "    [... earlier checkpoint stderr lines shortened ...]\n";
-        // An error-aware shortening: the lifted first-error block is exactly
-        // the evidence the old 10-line window buried, so when the excerpt
-        // lifted one, the shortening preserves the block and the gap marker
-        // and cuts only the tail region, keeping its end (vestige-sweep V-5).
+        // An error-aware shortening: a plain 10-line window buries the lifted
+        // first-error block, so when the excerpt lifted one, the shortening
+        // preserves the block and the gap marker and cuts only the tail region,
+        // keeping its end (vestige-sweep V-5).
         let gap_marker = format!(
             "    {}\n",
             tally_core::executor::CAPTURE_EXCERPT_GAP_MARKER.trim_end_matches('\n')
@@ -13818,8 +13817,8 @@ mod tests {
             ),
             rebased
         );
-        // The operator's record commit is now on the integration line, so the
-        // ritual that used to move it by hand has nothing left to do.
+        // The operator's record commit is now on the integration line, so no
+        // hand-moving ritual is left to perform.
         summary_ref_test_git(
             &fixture.checkout,
             &["merge-base", "--is-ancestor", &record, &rebased],

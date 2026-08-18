@@ -3,10 +3,10 @@
 //! Every observability read normally goes through the daemon, which holds the
 //! reconciled task table in memory. That is the right default and it has one
 //! failure mode: when the daemon stops answering, observability stops with it —
-//! exactly when an operator is diagnosing the stall (#431). The durable stores
-//! the daemon reconstructs that table from at startup are still on disk and
-//! still answer most of the question, so this module reconstructs the same
-//! projection from the same inputs, without an RPC.
+//! exactly when an operator is diagnosing the stall. The durable stores the
+//! daemon reconstructs that table from at startup are still on disk and still
+//! answer most of the question, so this module reconstructs the same projection
+//! from the same inputs, without an RPC.
 //!
 //! The legacy `query run --durable` projection remains a deliberately weaker
 //! view and says so. [`rebuild_run_view`] is the promoted primary replay: it
@@ -34,8 +34,8 @@
 //! to read is covered without anyone remembering to extend it.
 //!
 //! **Durability class: derived rebuild.** The complete typed input declaration
-//! is [`crate::durability::DURABLE_RUN_VIEW_INPUTS`]; this module never persists
-//! the resulting [`DurableRunView`].
+//! is [`crate::durability::DURABLE_RUN_VIEW_INPUTS`]; this module never
+//! persists the resulting [`DurableRunView`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -903,14 +903,13 @@ mod tests {
         found
     }
 
-    /// #434 (eval F1). The module doc, the operator docs, the CHANGELOG and the
-    /// PR body all give "it never creates, locks, or repairs a durable store"
-    /// as the *reason* an automatic fallback into a live daemon's data
-    /// directory is safe. That claim was false: the view called
-    /// `flow_membership::preflight`, whose `probe_appendable` half
-    /// `create_dir_all`s the parent and opens the ledger
-    /// `create(true).append(true)`, so the diagnostic materialised a `0600`
-    /// membership ledger inside the store it was diagnosing.
+    /// This view never creates, locks, or repairs a durable store — that is the
+    /// *reason* an automatic fallback into a live daemon's data directory is
+    /// safe, and it has to be true rather than merely stated. A membership
+    /// `preflight` here would be enough to break it: its `probe_appendable`
+    /// half `create_dir_all`s the parent and opens the ledger
+    /// `create(true).append(true)`, so the diagnostic would materialise a
+    /// `0600` membership ledger inside the store it was diagnosing.
     ///
     /// Asserted over the whole tree rather than over one filename, so the next
     /// store this view learns to read is covered without anyone remembering to
@@ -949,12 +948,12 @@ mod tests {
         );
     }
 
-    /// #434 (eval F1). The deployment this surface exists for: the operator can
-    /// read the daemon's data directory and cannot write it. An appendability
-    /// probe dies here with an I/O error that is itself false — the file is
-    /// readable and the read would have succeeded — and it dies on the
-    /// *automatic* fallback path too, so the operator's only honest window into
-    /// a stalled daemon closes exactly when it is needed.
+    /// The deployment this surface exists for: the operator can read the
+    /// daemon's data directory and cannot write it. An appendability probe dies
+    /// here with an I/O error that is itself false — the file is readable and
+    /// the read would have succeeded — and it dies on the *automatic* fallback
+    /// path too, so the operator's only honest window into a stalled daemon
+    /// closes exactly when it is needed.
     #[test]
     fn an_unwritable_membership_ledger_is_read_rather_than_probed() {
         use std::os::unix::fs::PermissionsExt;

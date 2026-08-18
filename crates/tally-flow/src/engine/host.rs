@@ -664,11 +664,11 @@ impl HostShared {
         if let Some(schema) = &plan.result_schema {
             let validation = result.result.as_ref().map_or_else(
                 || {
-                    // #432: a node whose exit evidence passed but whose advisory
+                    // A node whose exit evidence passed but whose advisory
                     // projection never arrived is retryable-projection. That is
-                    // daemon congestion, not a contract violation, so the engine
-                    // must propagate that classification instead of rewriting it
-                    // into result-schema-mismatch.
+                    // daemon congestion, not a contract violation, so the
+                    // engine must propagate that classification instead of
+                    // rewriting it into result-schema-mismatch.
                     if let Some(projection_error) = result
                         .error
                         .as_ref()

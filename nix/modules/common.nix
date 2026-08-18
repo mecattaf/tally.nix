@@ -1137,13 +1137,12 @@ let
 
   # `null` is "the operator declared nothing", distinct from `"vram"` declared
   # explicitly. Every admission-relevant reading in this module — the shape
-  # assertions below, and every other option that predates #382 — must keep
-  # resolving an undeclared pool to `"vram"` exactly as it always has; this is
-  # the Nix-side mirror of `PoolConfig::resource()` on the Rust side. Only the
-  # rendered runtime config (`renderPool`) is allowed to see the raw `null`,
-  # because that is the one place the distinction is meant to survive: the
-  # daemon's own `gpuSeconds` gate reads "was `vram` declared", not "what does
-  # this pool behave like".
+  # assertions below, and every other option — must resolve an undeclared pool
+  # to `"vram"`; this is the Nix-side mirror of `PoolConfig::resource()` on the
+  # Rust side. Only the rendered runtime config (`renderPool`) is allowed to see
+  # the raw `null`, because that is the one place the distinction is meant to
+  # survive: the daemon's own `gpuSeconds` gate reads "was `vram` declared", not
+  # "what does this pool behave like".
   effectivePoolResource = pool: if pool.resource == null then "vram" else pool.resource;
 
   mkPoolType = types.submodule (
@@ -2113,10 +2112,10 @@ let
             inherit (pool.usageMeter) argv pollIntervalSec budgetClass;
           };
     }
-    # `resource` is rendered only when the operator declared it. This is the
-    # one place `null` must survive unresolved to `"vram"`: the daemon's own
-    # `PoolConfig.resource: Option<ResourceKind>` (#382) reads an absent key
-    # as "undeclared" and an emitted `"vram"` as "declared", and every other
+    # `resource` is rendered only when the operator declared it. This is the one
+    # place `null` must survive unresolved to `"vram"`: the daemon's own
+    # `PoolConfig.resource: Option<ResourceKind>` reads an absent key as
+    # "undeclared" and an emitted `"vram"` as "declared", and every other
     # admission decision on both sides of the wire keeps defaulting an
     # undeclared pool to `vram` regardless.
     // optionalAttrs (pool.resource != null) { inherit (pool) resource; };

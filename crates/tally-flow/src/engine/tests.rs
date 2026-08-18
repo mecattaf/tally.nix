@@ -50,8 +50,8 @@ impl Reply {
     }
 
     /// A node whose exit evidence passed but whose advisory projection never
-    /// arrived (#432): verdict pass, no structured result, and the live client
-    /// has already raised `retryable-projection`.
+    /// arrived: verdict pass, no structured result, and the live client has
+    /// already raised `retryable-projection`.
     fn retryable_projection() -> Self {
         Self {
             disposition: Disposition::Created,
@@ -632,10 +632,10 @@ fn payload_divergence_stops_admission_at_the_mismatched_ordinal() {
     assert_eq!(error.details["flowRunId"], "run-1");
     assert_eq!(error.details["divergentInput"], "payload");
     assert_eq!(error.details["recordedHash"], "sha256:divergent");
-    // Which member carries which side of the label disagreement, bound
-    // against two strings that differ — the shape the live replay-divergence
-    // fixture structurally cannot produce (#418): recordedLabel is what the
-    // ledger's admission returned, currentLabel what this runner derived.
+    // Which member carries which side of the label disagreement, bound against
+    // two strings that differ — the shape the live replay-divergence fixture
+    // structurally cannot produce: recordedLabel is what the ledger's admission
+    // returned, currentLabel what this runner derived.
     assert_eq!(error.details["recordedLabel"], "ledger-label");
     assert_eq!(error.details["currentLabel"], "re-derived");
     // A rollover does not clear a payload divergence, so the resolution differs
@@ -732,11 +732,11 @@ fn identity_divergence_carries_machine_readable_recovery_facts() {
     assert_eq!(error.details["resolution"], "supersede");
 }
 
-/// The second half of the wave-3 pin advance: four in-flight runs recorded by
-/// the old binary were refused on the new one for arguments the operator never
-/// touched, and the error said only which two hashes disagreed. It now names
-/// why a byte-identical input can still be refused and the exact command that
-/// retires the run.
+/// The second half of the pin advance: in-flight runs recorded by an older
+/// binary are refused on the newer one for arguments the operator never
+/// touched, and an error that says only which two hashes disagree is not
+/// enough. It must name why a byte-identical input can still be refused, and
+/// the exact command that retires the run.
 #[test]
 fn an_identity_refusal_names_the_command_that_clears_it() {
     let source = format!("{}\n42;", meta(&["cpu"], &[]));
@@ -931,13 +931,13 @@ fn a_refusal_that_names_no_run_advertises_no_command_anywhere() {
     );
 }
 
-/// Issue #414: a flag-shaped identity is a run named badly, not a run not
-/// named. The raw value stays visible in `flowRunId` — #401 item 3's
-/// invariant — but nothing may derive a command from it: interpolating
-/// `--reason` into the supersede argv makes clap read it as the next flag,
-/// and the advertised command exits 2 in an operator's hands. The split is
-/// rendered identically in both fields the operator can read, and no UUID
-/// validation is introduced: the leading dash after trim is the entire test.
+/// A flag-shaped identity is a run named badly, not a run not named. The raw
+/// value stays visible in `flowRunId` — that is the ruling — but nothing may
+/// derive a command from it: interpolating `--reason` into the supersede argv
+/// makes clap read it as the next flag, and the advertised command exits 2 in
+/// an operator's hands. The split is rendered identically in both fields the
+/// operator can read, and no UUID validation is introduced: the leading dash
+/// after trim is the entire test.
 #[test]
 fn a_flag_shaped_run_identity_keeps_its_name_and_loses_its_command() {
     for flag_like in ["--reason", "-", "-x", "  --flow-run-id"] {
@@ -1166,12 +1166,12 @@ fn duplicate_keys_and_result_mismatches_are_typed_with_positions() {
     );
 }
 
-/// #432: a node whose exit evidence passed but whose advisory projection never
+/// A node whose exit evidence passed but whose advisory projection never
 /// arrived is `retryable-projection`. The engine must propagate that
 /// classification instead of rewriting it into `result-schema-mismatch`, so an
-/// operator grepping a dead campaign can tell daemon congestion from a
-/// contract violation. Restoring the rewrite (converting this to
-/// result-schema-mismatch) makes the test red.
+/// operator grepping a dead campaign can tell daemon congestion from a contract
+/// violation. Restoring the rewrite (converting this to result-schema-mismatch)
+/// makes the test red.
 #[test]
 fn an_unprojected_advisory_capture_is_retryable_projection_not_schema_mismatch() {
     let failing = format!(
@@ -1208,10 +1208,10 @@ fn an_unprojected_advisory_capture_is_retryable_projection_not_schema_mismatch()
     );
 }
 
-/// #441 acceptance 3: a pre-launch executor rejection is already the node's
-/// terminal cause. A result schema must not relabel it as a missing advisory
-/// projection or a schema mismatch, and non-settled flow code receives the
-/// validation message directly.
+/// A pre-launch executor rejection is already the node's terminal cause. A
+/// result schema must not relabel it as a missing advisory projection or a
+/// schema mismatch, and non-settled flow code receives the validation message
+/// directly.
 #[test]
 fn executor_validation_failure_reaches_the_flow_error_without_reclassification() {
     let source = format!(

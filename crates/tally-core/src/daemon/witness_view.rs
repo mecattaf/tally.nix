@@ -16,10 +16,10 @@ use crate::witness::{verify_suffix_bytes, ChainHead, VerifyReport, WitnessError,
 /// Built from one full verification pass; afterwards every read verifies only
 /// the bytes appended past the cached verified prefix, so queries and dedup
 /// probes are O(new records) instead of O(ledger). Per-task and per-dedup-key
-/// indexes answer the governing-record lookups that previously scanned the
-/// whole ledger linearly. Prefix tampering after the initial pass is caught
-/// at startup, view rebuilds, and explicit `tally witness verify` runs —
-/// suffix tampering is caught here on the next read.
+/// indexes answer the governing-record lookups rather than scanning the whole
+/// ledger linearly. Prefix tampering after the initial pass is caught at
+/// startup, view rebuilds, and explicit `tally witness verify` runs — suffix
+/// tampering is caught here on the next read.
 pub(crate) struct WitnessView {
     path: PathBuf,
     records: Arc<Vec<WitnessRecord>>,

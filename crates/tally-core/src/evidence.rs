@@ -386,11 +386,11 @@ pub fn run_evidence_gate_with_store(
     checks.push(CheckOutcome {
         spec: format!("exit:{expected_exit}"),
         passed: exit_ok,
-        // #385: every evidence-check reason leads with a past-tense outcome.
-        // These strings are what `evidence_pass`/`evidence_fail` put in the
-        // journal's MESSAGE field -- `evidence_event` always supplies them
-        // explicitly, so `synthesize_message`'s default never runs for those
-        // two kinds and this is the text an operator actually reads.
+        // Every evidence-check reason leads with a past-tense outcome. These
+        // strings are what `evidence_pass`/`evidence_fail` put in the journal's
+        // MESSAGE field -- `evidence_event` always supplies them explicitly, so
+        // `synthesize_message`'s default never runs for those two kinds and
+        // this is the text an operator actually reads.
         reason: if exit_ok {
             format!("Matched exit code {} == {expected_exit}", outcome.exit_code)
         } else {
@@ -1440,27 +1440,26 @@ mod tests {
         assert!(probe_dedup(Some("same"), &evidence, &[record]).hit);
     }
 
-    /// #385: the reasons this module authors ARE the journal's `MESSAGE` for
+    /// The reasons this module authors ARE the journal's `MESSAGE` for
     /// `evidence_pass`/`evidence_fail`.
     ///
     /// `evidence_event` always passes `Some(check.reason.clone())`, so
-    /// `synthesize_message`'s default -- which `journal.rs`'s own audit
-    /// covers -- is unreachable for those two of the eleven event kinds.
-    /// These strings are what an operator actually reads for them, so they
-    /// are held to the same outcome-first shape that audit pins: a
-    /// past-tense opening verb and no exclamation mark.
+    /// `synthesize_message`'s default -- which `journal.rs`'s own audit covers
+    /// -- is unreachable for those two of the eleven event kinds. These strings
+    /// are what an operator actually reads for them, so they are held to the
+    /// same outcome-first shape that audit pins: a past-tense opening verb and
+    /// no exclamation mark.
     ///
-    /// Two failing arms are excluded, and not because they come from
-    /// somewhere else -- tally authors both. A failed `hash_artifact_file`
-    /// reports `EvidenceError::ArtifactIo`'s `Display` (`cannot read
-    /// artifact {path}: {source}`, declared in this same file), and a
-    /// rejected store path reports `NixStoreError`'s `Display` (declared in
-    /// `nix_store.rs`, same crate). They are left alone because that text is
-    /// shared with every other display site of those errors, so rewording it
-    /// to suit the journal would change error prose on surfaces that have
-    /// nothing to do with the journal. The assertion below therefore drives
-    /// only the reasons written inline here, where the journal is the only
-    /// consumer.
+    /// Two failing arms are excluded, and not because they come from somewhere
+    /// else -- tally authors both. A failed `hash_artifact_file` reports
+    /// `EvidenceError::ArtifactIo`'s `Display` (`cannot read artifact {path}:
+    /// {source}`, declared in this same file), and a rejected store path
+    /// reports `NixStoreError`'s `Display` (declared in `nix_store.rs`, same
+    /// crate). They are left alone because that text is shared with every other
+    /// display site of those errors, so rewording it to suit the journal would
+    /// change error prose on surfaces that have nothing to do with the journal.
+    /// The assertion below therefore drives only the reasons written inline
+    /// here, where the journal is the only consumer.
     #[test]
     fn evidence_check_reasons_lead_with_a_past_tense_outcome() {
         fn assert_outcome_first(reason: &str, label: &str) {

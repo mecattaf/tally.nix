@@ -107,9 +107,9 @@ fn policy_less_diagnosis_node_renders_against_every_catalog_adapter_portability(
     }
 }
 
-/// The matrix is not vacuous: the exact literals the contract used to supply
-/// still fail against the adapters that never declared them. That is what a
-/// policy-less worklist met on every adapter but one, and what any
+/// The matrix is not vacuous: the exact literals a cross-adapter default would
+/// supply still fail against the adapters that never declared them. That is
+/// what a policy-less worklist meets on every adapter but one, and what any
 /// reintroduced cross-adapter default would meet again.
 #[test]
 fn the_deleted_cross_adapter_literals_still_refuse_to_render_portability() {

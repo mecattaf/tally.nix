@@ -1,24 +1,23 @@
 //! The adapter-terminal outcome class: a wall that names itself.
 //!
-//! An agent lane can end for a reason the agent had no say in. A provider
-//! quota refuses the turn, the stream stops, and the harness writes the
-//! refusal as a stdout stream event -- so stderr is empty, no final message
-//! is ever projected, and the lane exits carrying nothing. The machinery then
-//! reads that emptiness the only way it could: the advisory projection never
-//! landed, the node is classified `result-projection-timeout`, the failure
-//! looks transient, and the bounded machinery-retry budget is spent
-//! re-dispatching against a wall whose own message states the hour it lifts.
-//! That is V-16 of `specs/substrate/evidence/vestige-sweep.md`, and the truth
-//! it burned attempts guessing at was sitting in the capture archive the
-//! whole time.
+//! An agent lane can end for a reason the agent had no say in. A provider quota
+//! refuses the turn, the stream stops, and the harness writes the refusal as a
+//! stdout stream event -- so stderr is empty, no final message is ever
+//! projected, and the lane exits carrying nothing. The machinery then reads
+//! that emptiness the only way it could: the advisory projection never landed,
+//! the node is classified `result-projection-timeout`, the failure looks
+//! transient, and the bounded machinery-retry budget is spent re-dispatching
+//! against a wall whose own message states the hour it lifts. That is V-16 of
+//! `specs/substrate/evidence/vestige-sweep.md`, and the truth it costs attempts
+//! to guess at is sitting in the capture archive the whole time.
 //!
 //! So this module reads the archive. Every preset that can state a terminal
 //! condition declares a `terminal` capture beside `finalMessage`
-//! (`nix/lib/adapters.nix`), naming the event genre its harness ends on and
-//! the path to the human-readable text inside it. When that capture resolves,
-//! the adapter has stated the outcome itself, and a stated outcome outranks
-//! an inferred one: the class is `adapter-terminal` no matter what the
-//! machinery's own fallback code says, and it dispatches nothing further.
+//! (`nix/lib/adapters.nix`), naming the event genre its harness ends on and the
+//! path to the human-readable text inside it. When that capture resolves, the
+//! adapter has stated the outcome itself, and a stated outcome outranks an
+//! inferred one: the class is `adapter-terminal` no matter what the machinery's
+//! own fallback code says, and it dispatches nothing further.
 //!
 //! Two properties are worth naming because they are what makes this
 //! deterministic rather than a second opinion:
@@ -33,9 +32,9 @@
 //!   the judge. It is kin to the judge's own `blocked` verdict, but no
 //!   judgment slot is needed: the adapter stated it.
 //!
-//! The same read answers the second question an operator used to reconstruct
-//! by hand -- what did this lane spend. The token totals come from the
-//! adapter's declared usage mapping through [`tally_core::usage`], so they
+//! The same read answers the second question an operator would otherwise
+//! reconstruct by hand -- what did this lane spend. The token totals come from
+//! the adapter's declared usage mapping through [`tally_core::usage`], so they
 //! are the harness's own figures under logical names, and they ride the same
 //! envelope whether or not the lane hit a wall.
 
@@ -109,11 +108,11 @@ impl LaneOutcome {
         self.terminal_message.as_deref()
     }
 
-    /// The durable envelope. This is the artifact the class exists to
-    /// produce: a lane that used to exit with nothing now exits with the
-    /// adapter's own sentence and its own token figures. [`Self::note`]
-    /// renders it into the receipt an operator reads, block included, so the
-    /// structured form and the prose can never disagree.
+    /// The durable envelope. This is the artifact the class exists to produce:
+    /// a lane that would otherwise exit with nothing exits with the adapter's
+    /// own sentence and its own token figures. [`Self::note`] renders it into
+    /// the receipt an operator reads, block included, so the structured form
+    /// and the prose can never disagree.
     fn envelope(&self) -> Json {
         Json::object([
             ("adapter", Json::from(self.adapter.as_str())),
