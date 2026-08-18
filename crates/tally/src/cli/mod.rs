@@ -65,6 +65,22 @@ use tally_flow::{
 
 use crate::flow_live::{LiveFlowClient, RunnerIdentity};
 
+/// What `tally --version` renders: the crate version the workspace declares
+/// beside the source revision the build came from, so one line answers both
+/// "which release" and "which tree". The revision is stamped by `build.rs`
+/// from the build environment and is the literal `dev` when the environment
+/// named none. A deployed binary that cannot name its own provenance forces
+/// seam verification to read store paths instead of asking the program, which
+/// is how a pinned fleet input becomes the only legible version there is.
+/// `concat!` rather than a formatted string because clap wants a `&'static
+/// str` and both halves are already compile-time literals.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (rev ",
+    env!("TALLY_BUILD_REV"),
+    ")"
+);
+
 /// ruling: vestige-sweep V-7 — the single authority for the client RPC
 /// deadline. It bounds one deadline-bounded round trip: enqueue admission,
 /// `__campaign.status`, and `query.*` reads, all of which the daemon answers
