@@ -32,6 +32,11 @@ use tally_core::campaign_folds::{
     DeferralFact, DiagnosisFact, MergedFact, ReconciledTask, RetryFact, TALLY_REVISION_PREFIX,
     TALLY_TASK_PREFIX,
 };
+use tally_core::campaign_lease::{
+    lease_disposition, CampaignActivation, CampaignLapseV1, CampaignLeaseDisposition,
+    CampaignLeaseError, CampaignLeaseFacts, CampaignLeaseGuard, CampaignLeaseStore,
+    CampaignLeaseTask,
+};
 use tally_core::campaign_poll::{CampaignDigestMismatch, CampaignPollEvent, CampaignPollStatus};
 use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV4, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
@@ -706,7 +711,16 @@ struct CampaignReleasePayloads {
 #[derive(Debug)]
 enum CampaignPollAttempt {
     Dispatched,
-    Unchanged,
+    /// Nothing to do, and the sentence saying why when the lease knows one.
+    Unchanged {
+        detail: Option<String>,
+    },
+    /// Another pass holds this identity's lease.
+    Deferred {
+        detail: String,
+    },
+    /// The lease lapsed: this identity is finished on a published head.
+    Complete(CampaignLapseV1),
 }
 
 pub(super) async fn run_campaign(
@@ -4783,6 +4797,30 @@ fn attach_campaign_status_outcomes(
     )
 }
 
+/// Attach the identity's lease to a status projection.
+///
+/// The status view renders the reconciled past; the lease is the one durable
+/// fact in it that speaks to the present and to the end. A reader asking
+/// whether a campaign is still going, or finished and on which revision, now
+/// has an answer in the same object instead of a unit listing beside it.
+fn attach_campaign_lease(
+    state_dir: &Path,
+    registration: Option<&CampaignRegistration>,
+    status: &mut Value,
+) -> Result<()> {
+    let Some(registration) = registration else {
+        return Ok(());
+    };
+    let Some(record) = campaign_lease_store(state_dir, registration).read()? else {
+        return Ok(());
+    };
+    status
+        .as_object_mut()
+        .ok_or_else(|| invalid("daemon returned a non-object campaign status"))?
+        .insert("lease".to_owned(), serde_json::to_value(record)?);
+    Ok(())
+}
+
 fn sha256_json(value: &Value) -> Result<String> {
     let canonical = tally_core::campaign_contract::canonical_json(value)?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
@@ -4884,6 +4922,22 @@ fn campaign_observation(
     }))
 }
 
+/// What the identity's most recent pass is doing right now.
+///
+/// The lease is decided against this reading: a pass with nodes in flight
+/// renews it, a pass at rest with dispatchable work arms the frontier, and a
+/// pass at rest with nothing left to dispatch is the only place completion
+/// can be decided at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CampaignPassLiveness {
+    /// Work is flowing under this lease.
+    Live { nodes: usize },
+    /// At rest with dispatchable work; the flow run is the liveness arm.
+    Dispatchable(String),
+    /// At rest with nothing to dispatch.
+    AtRest,
+}
+
 /// Arm an otherwise unchanged poll only when its latest pass is truly at rest
 /// and the admitted graph still contains work that pass can dispatch.
 ///
@@ -4897,7 +4951,7 @@ fn dispatchable_poll_liveness_arm(
     registration_id: &str,
     escalated: &BTreeSet<String>,
     status: &Value,
-) -> Result<Option<String>> {
+) -> Result<CampaignPassLiveness> {
     let state = status["state"]
         .as_str()
         .ok_or_else(|| invalid("daemon returned campaign status without a state"))?;
@@ -4907,9 +4961,15 @@ fn dispatchable_poll_liveness_arm(
     let running = status["counts"]["running"]
         .as_u64()
         .ok_or_else(|| invalid("daemon returned campaign status without a running-task count"))?;
-    // `currentNodes` excludes the flow root; the campaign state includes it.
+    // `currentNodes` excludes the flow root; the campaign state includes it,
+    // so a running state with an empty table is still one live node.
     if state == "running" || running != 0 || !current_nodes.is_empty() {
-        return Ok(None);
+        return Ok(CampaignPassLiveness::Live {
+            nodes: usize::try_from(running)
+                .unwrap_or(usize::MAX)
+                .max(current_nodes.len())
+                .max(1),
+        });
     }
     let tasks = match status.get("tasks") {
         None => &[][..],
@@ -4941,10 +5001,10 @@ fn dispatchable_poll_liveness_arm(
                 .ok_or_else(|| {
                     invalid("daemon returned dispatchable campaign work without a flow run")
                 })?;
-            return Ok(Some(flow_run_id.to_owned()));
+            return Ok(CampaignPassLiveness::Dispatchable(flow_run_id.to_owned()));
         }
     }
-    Ok(None)
+    Ok(CampaignPassLiveness::AtRest)
 }
 
 async fn campaign_poll_liveness_arm(
@@ -4952,7 +5012,7 @@ async fn campaign_poll_liveness_arm(
     graph: &CampaignGraph,
     registration: &CampaignRegistration,
     observation: &str,
-) -> Result<Option<String>> {
+) -> Result<CampaignPassLiveness> {
     let params = json!({
         "issueUrl": campaign_issue_url(
             &registration.code_repository,
@@ -6469,6 +6529,13 @@ fn campaign_dispatch_dedup_key(
     }
 }
 
+/// Enqueue one reconcile pass for the frontier this lease owns.
+///
+/// The lease is a parameter rather than a check because it is the whole
+/// no-double-dispatch story: a caller that cannot produce a held
+/// [`CampaignLeaseGuard`] cannot reach this code path, and the enqueue that
+/// succeeds renews the lease it dispatched under. Activation and work are the
+/// same fact, held together by the type.
 async fn dispatch_campaign(
     host: CampaignHost<'_>,
     graph: &CampaignGraph,
@@ -6476,6 +6543,7 @@ async fn dispatch_campaign(
     registration: &mut CampaignRegistration,
     wait: bool,
     liveness_arm: Option<&str>,
+    lease: &mut CampaignLeaseGuard,
 ) -> Result<Value> {
     let CampaignHost {
         socket,
@@ -6646,6 +6714,8 @@ async fn dispatch_campaign(
         .await?;
     steering_dispatch.commit(&revision, Utc::now())?;
     report_degraded_membership(&admitted)?;
+    // Work is flowing again under this lease, so the lease says so.
+    lease.renew(Utc::now())?;
     registration.last_observation = Some(revision);
     if !wait || admitted.get("verdict").and_then(Value::as_str).is_some() {
         return Ok(admitted);
@@ -6854,6 +6924,11 @@ async fn run_campaign_arm(
         return Ok(());
     }
     let repository_progress = repository_progress_value(&graph)?;
+    // Activation: the doorbell acquires the lease the passes then renew. A
+    // campaign already leased by a live pass, or already lapsed on this very
+    // graph, says so here instead of dispatching a second frontier.
+    let store = campaign_lease_store(&state_dir, &registration);
+    let mut lease = store.acquire(&campaign_activation(&graph, &registration), Utc::now())?;
     let result = dispatch_campaign(
         CampaignHost {
             socket,
@@ -6866,6 +6941,7 @@ async fn run_campaign_arm(
         &mut registration,
         args.wait,
         None,
+        &mut lease,
     )
     .await?;
     registry.write(&mut registration)?;
@@ -6928,6 +7004,165 @@ fn readmit_campaign_epoch(
     Ok(superseded_graph_digest)
 }
 
+/// This identity's durable lease.
+///
+/// It is named for the identity — repository and worklist — and never for the
+/// registration serving it. The lapse fact outlives every pass, and a release
+/// reads it with no registration in hand at all.
+fn campaign_lease_store(
+    state_dir: &Path,
+    registration: &CampaignRegistration,
+) -> CampaignLeaseStore {
+    CampaignLeaseStore::new(
+        state_dir,
+        &registration.code_repository,
+        &registration.worklist_pattern,
+    )
+}
+
+fn campaign_activation(
+    graph: &CampaignGraph,
+    registration: &CampaignRegistration,
+) -> CampaignActivation {
+    CampaignActivation {
+        campaign: graph.canonical.manifest.name.clone(),
+        repository: registration.code_repository.clone(),
+        worklist: registration.worklist_pattern.clone(),
+        arm_serial: registration.arm_serial,
+        graph_digest: graph.canonical.executable_digest.clone(),
+    }
+}
+
+/// The witnessed facts this identity's lease decision rests on.
+///
+/// Everything here comes from the authority remote the pass already queried
+/// for its observation revision: the base head it publishes and the
+/// campaign-scoped refs its merges, checkpoints, and publications wrote. No
+/// second source, and nothing the pass predicted about itself.
+fn campaign_lease_facts(
+    graph: &CampaignGraph,
+    repository_progress: &Value,
+    live_nodes: usize,
+) -> Result<CampaignLeaseFacts> {
+    let published_head = repository_progress["base"]["target"]
+        .as_str()
+        .ok_or_else(|| invalid("campaign repository progress carries no base head"))?;
+    let campaign_refs = repository_progress["campaignRefs"]
+        .as_object()
+        .ok_or_else(|| invalid("campaign repository progress carries no campaign refs"))?
+        .iter()
+        .map(|(name, target)| {
+            let target = target.as_str().ok_or_else(|| {
+                invalid(format!("campaign repository ref {name} has no object ID"))
+            })?;
+            Ok((name.clone(), target.to_owned()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(CampaignLeaseFacts {
+        state_prefix: campaign_state_ref_prefix(
+            &graph.canonical.manifest.name,
+            LOCAL_CAMPAIGN_ISSUE_NUMBER,
+        ),
+        tasks: graph
+            .canonical
+            .manifest
+            .tasks
+            .iter()
+            .map(|task| CampaignLeaseTask::new(&task.id, task.kind == "checkpoint"))
+            .collect(),
+        campaign_refs,
+        published_head: published_head.to_owned(),
+        live_nodes,
+    })
+}
+
+/// What one reconcile pass may do with an identity.
+#[derive(Debug)]
+enum CampaignPassAdmission {
+    /// Another pass holds the lease. This one admitted nothing and will
+    /// dispatch nothing.
+    Deferred { detail: String },
+    /// The identity is finished under the graph its remote carries, and the
+    /// fact was written by whichever pass got there first.
+    Complete(CampaignLapseV1),
+    /// Activation belongs to this pass, with the epoch it admitted on the way
+    /// in.
+    Open {
+        lease: Box<CampaignLeaseGuard>,
+        superseded_graph_digest: Option<String>,
+    },
+}
+
+/// Take activation for one pass, then admit whatever the authority remote now
+/// carries.
+///
+/// The order is the safety property, and it is the reverse of the one the
+/// record charges for the re-arm orphan. The lease is taken *before* any
+/// epoch moves, so two passes observing the same push cannot both bump the
+/// arm serial and dispatch the frontier twice: the second one is told the
+/// identity is leased and stands down having changed nothing. A lapsed
+/// identity never opens at all for the graph it finished, which is what makes
+/// a poll against a complete campaign free rather than merely harmless.
+fn open_campaign_pass(
+    state_dir: &Path,
+    registry: &CampaignRegistry,
+    registration: &mut CampaignRegistration,
+    graph: &CampaignGraph,
+    config_path: Option<&Path>,
+    now: DateTime<Utc>,
+) -> Result<CampaignPassAdmission> {
+    let store = campaign_lease_store(state_dir, registration);
+    let mut lease = match store.acquire(&campaign_activation(graph, registration), now) {
+        Ok(lease) => lease,
+        Err(error @ CampaignLeaseError::Held { .. }) => {
+            return Ok(CampaignPassAdmission::Deferred {
+                detail: error.to_string(),
+            })
+        }
+        Err(CampaignLeaseError::Lapsed { campaign, .. }) => {
+            let lapse = store
+                .read()?
+                .and_then(|record| record.lapse)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "campaign {campaign} lapsed without a completion fact"
+                    ))
+                })?;
+            return Ok(CampaignPassAdmission::Complete(lapse));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // Whatever this pass read before it held the lease is a snapshot from
+    // outside it. A pass that was queued at the lock while another admitted a
+    // pushed worklist would otherwise admit that same push a second time and
+    // dispatch the frontier twice, so the identity is re-read under the lease
+    // and only then compared against the remote.
+    if let Some(admitted) = registry.read_campaign(
+        &registration.code_repository,
+        &registration.worklist_pattern,
+    )? {
+        *registration = admitted;
+    }
+    let superseded_graph_digest =
+        if graph.canonical.executable_digest == registration.approved_graph_digest {
+            None
+        } else {
+            Some(readmit_campaign_epoch(
+                state_dir,
+                registry,
+                registration,
+                graph,
+                config_path,
+            )?)
+        };
+    // The lease names the epoch this pass serves, admitted or inherited.
+    lease.admit(registration.arm_serial, now)?;
+    Ok(CampaignPassAdmission::Open {
+        lease: Box::new(lease),
+        superseded_graph_digest,
+    })
+}
+
 async fn run_campaign_poll(
     socket: &Path,
     config_path: Option<&Path>,
@@ -6962,23 +7197,37 @@ async fn run_campaign_poll(
                 &registration.worklist_pattern,
                 &adapters,
             )?;
-            if graph.canonical.executable_digest != registration.approved_graph_digest {
-                let superseded = readmit_campaign_epoch(
-                    &state_dir,
-                    &registry,
-                    &mut registration,
-                    &graph,
-                    config_path,
-                )?;
-                events.push(CampaignPollEvent::readmitted(
-                    &registration.registration_id,
-                    &event_issue,
-                    &registration_path,
-                    superseded,
-                    &registration.approved_graph_digest,
-                    registration.arm_serial,
-                ));
-            }
+            let mut lease = match open_campaign_pass(
+                &state_dir,
+                &registry,
+                &mut registration,
+                &graph,
+                config_path,
+                Utc::now(),
+            )? {
+                CampaignPassAdmission::Deferred { detail } => {
+                    return Ok(CampaignPollAttempt::Deferred { detail })
+                }
+                CampaignPassAdmission::Complete(lapse) => {
+                    return Ok(CampaignPollAttempt::Complete(lapse))
+                }
+                CampaignPassAdmission::Open {
+                    lease,
+                    superseded_graph_digest,
+                } => {
+                    if let Some(superseded) = superseded_graph_digest {
+                        events.push(CampaignPollEvent::readmitted(
+                            &registration.registration_id,
+                            &event_issue,
+                            &registration_path,
+                            superseded,
+                            &registration.approved_graph_digest,
+                            registration.arm_serial,
+                        ));
+                    }
+                    *lease
+                }
+            };
             let repository_progress = repository_progress_value(&graph)?;
             let steering = read_local_steering_snapshot(&state_dir, &registration)?;
             let observation = campaign_observation(
@@ -6994,12 +7243,40 @@ async fn run_campaign_poll(
                 rpc_timeout,
             };
             let liveness_arm = if registration.last_observation.as_deref() == Some(&observation) {
-                let Some(flow_run_id) =
-                    campaign_poll_liveness_arm(host, &graph, &registration, &observation).await?
-                else {
-                    return Ok(CampaignPollAttempt::Unchanged);
-                };
-                Some(flow_run_id)
+                match campaign_poll_liveness_arm(host, &graph, &registration, &observation).await? {
+                    CampaignPassLiveness::Dispatchable(flow_run_id) => Some(flow_run_id),
+                    CampaignPassLiveness::Live { nodes } => {
+                        lease.renew(Utc::now())?;
+                        return Ok(CampaignPollAttempt::Unchanged {
+                            detail: Some(format!("{nodes} node(s) live under this lease")),
+                        });
+                    }
+                    // A pass at rest with nothing to dispatch is the only
+                    // moment completion can be decided, and the lease is
+                    // where the decision is written.
+                    CampaignPassLiveness::AtRest => {
+                        let facts = campaign_lease_facts(&graph, &repository_progress, 0)?;
+                        return match lease_disposition(&facts) {
+                            CampaignLeaseDisposition::Lapse {
+                                sha,
+                                proven_by,
+                                tasks,
+                                ..
+                            } => Ok(CampaignPollAttempt::Complete(lease.lapse(
+                                &sha,
+                                proven_by,
+                                tasks,
+                                Utc::now(),
+                            )?)),
+                            CampaignLeaseDisposition::Renew { reason } => {
+                                lease.renew(Utc::now())?;
+                                Ok(CampaignPollAttempt::Unchanged {
+                                    detail: Some(reason),
+                                })
+                            }
+                        };
+                    }
+                }
             } else {
                 None
             };
@@ -7010,6 +7287,7 @@ async fn run_campaign_poll(
                 &mut registration,
                 args.wait,
                 liveness_arm.as_deref(),
+                &mut lease,
             )
             .await?;
             registry.write(&mut registration)?;
@@ -7035,11 +7313,31 @@ async fn run_campaign_poll(
                 &registration_path,
                 CampaignPollStatus::Dispatched,
             ),
-            Ok(CampaignPollAttempt::Unchanged) => CampaignPollEvent::new(
+            Ok(CampaignPollAttempt::Unchanged { detail }) => {
+                let mut event = CampaignPollEvent::new(
+                    &registration.registration_id,
+                    &event_issue,
+                    &registration_path,
+                    CampaignPollStatus::Unchanged,
+                );
+                event.detail = detail;
+                event
+            }
+            Ok(CampaignPollAttempt::Deferred { detail }) => CampaignPollEvent::deferred(
                 &registration.registration_id,
                 &event_issue,
                 &registration_path,
-                CampaignPollStatus::Unchanged,
+                detail,
+            ),
+            // The identity is finished and the fact is written. Nothing is
+            // pruned: the registration stays armed, and the next push to its
+            // worklist reactivates it with no operator verb in between.
+            Ok(CampaignPollAttempt::Complete(lapse)) => CampaignPollEvent::complete(
+                &registration.registration_id,
+                &event_issue,
+                &registration_path,
+                &lapse.sha,
+                lapse.arm_serial,
             ),
             Err(error) => {
                 had_failures = true;
@@ -7111,6 +7409,7 @@ async fn run_campaign_status(
         registration.as_ref(),
         &mut status,
     )?;
+    attach_campaign_lease(&state_dir, registration.as_ref(), &mut status)?;
     if args.json {
         outln!("{}", serde_json::to_string(&status)?);
         return Ok(());
@@ -7326,6 +7625,7 @@ fn print_campaign_status_human(status: &Value) -> Result<()> {
         "Observation: {}",
         compact_text(status["latestObservation"].as_str().unwrap_or("none"))
     );
+    print_campaign_lease(&status["lease"])?;
     let run_count = status["flowRuns"].as_array().map_or(0, Vec::len);
     if let Some(queued_flow_run) = status["queuedFlowRunId"].as_str() {
         outln!(
@@ -7358,6 +7658,31 @@ fn print_campaign_status_human(status: &Value) -> Result<()> {
     print_run_body(status, None, "Campaign usage")
 }
 
+/// The lease line: whether this identity is live, or finished and on what.
+fn print_campaign_lease(lease: &Value) -> Result<()> {
+    let Some(state) = lease["state"].as_str() else {
+        outln!("Lease: none on this host");
+        return Ok(());
+    };
+    match lease.get("lapse") {
+        Some(lapse) => outln!(
+            "Lease: {} at {} on published head {} (proven by {})",
+            compact_text(state),
+            compact_text(lapse["lapsedAt"].as_str().unwrap_or("-")),
+            compact_text(lapse["sha"].as_str().unwrap_or("-")),
+            compact_text(lapse["provenBy"]["taskId"].as_str().unwrap_or("-")),
+        ),
+        None => outln!(
+            "Lease: {} since {}, renewed {} (arm {})",
+            compact_text(state),
+            compact_text(lease["acquiredAt"].as_str().unwrap_or("-")),
+            compact_text(lease["renewedAt"].as_str().unwrap_or("-")),
+            lease["armSerial"].as_u64().unwrap_or_default(),
+        ),
+    }
+    Ok(())
+}
+
 fn run_campaign_list(args: CampaignListArgs) -> Result<()> {
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
@@ -7377,15 +7702,33 @@ fn campaign_list_values(registry: &CampaignRegistry) -> Result<Vec<Value>> {
         .collect()
 }
 
+/// Quiescence, read from durable facts rather than observed.
+///
+/// The predicate used to be "no registration is listed", which made an
+/// operator's `disarm` the only way a campaign could ever be quiet and left
+/// liveness to be inferred from `list-units` beside it. A campaign is quiet
+/// now when its lease has lapsed: the last task went terminal under a
+/// gate-proven, published head and a pass wrote that down. The identity stays
+/// armed through it, so a push to its worklist still reactivates it.
 fn run_campaign_quiescent(args: CampaignQuiescentArgs) -> Result<()> {
     let state_dir = resolve_state_dir(args.state_dir)?;
     let registry = CampaignRegistry::open(&state_dir)?;
-    let values = campaign_list_values(&registry)?;
-    if values.is_empty() {
+    let mut live = Vec::new();
+    for (_, registration) in registry.registrations()? {
+        require_local_actor(&registration)?;
+        let lease = campaign_lease_store(&state_dir, &registration).read()?;
+        // A registration with no lease at all has never activated on this
+        // host; it cannot be called finished on the strength of an absence.
+        if lease.is_some_and(|record| record.is_lapsed()) {
+            continue;
+        }
+        live.push(registration.list_value()?);
+    }
+    if live.is_empty() {
         return Ok(());
     }
 
-    errln!("{}", serde_json::to_string(&values)?);
+    errln!("{}", serde_json::to_string(&live)?);
     Err(exit_failure(1, String::new()))
 }
 
@@ -8025,6 +8368,7 @@ fn validate_local_worklist_document(
 mod tests {
     use super::*;
     use tally_core::campaign_contract::{validate_manifest, BRIEF_SENTINEL};
+    use tally_core::campaign_lease::CampaignLeaseAcquisition;
     use tally_core::gate_budget::GateBudgetSource;
 
     fn manifest_value_for_test(tasks: Value) -> Value {
@@ -9709,9 +10053,8 @@ fi
         });
         assert_eq!(
             dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &resting,)
-                .unwrap()
-                .as_deref(),
-            Some(flow_run_id),
+                .unwrap(),
+            CampaignPassLiveness::Dispatchable(flow_run_id.to_owned()),
             "an unchanged resting campaign must wake when work is dispatchable"
         );
 
@@ -9721,9 +10064,8 @@ fi
         retryable["tasks"][0]["status"] = json!("blocked");
         assert_eq!(
             dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &retryable,)
-                .unwrap()
-                .as_deref(),
-            Some(flow_run_id),
+                .unwrap(),
+            CampaignPassLiveness::Dispatchable(flow_run_id.to_owned()),
             "a direct failure remains dispatchable until its escalation is active"
         );
 
@@ -9734,14 +10076,14 @@ fi
         assert_eq!(
             dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &live,)
                 .unwrap(),
-            None,
+            CampaignPassLiveness::Live { nodes: 1 },
             "a live pass already owns campaign progress"
         );
 
         let escalated = BTreeSet::from(["foundation".to_owned()]);
         assert_eq!(
             dispatchable_poll_liveness_arm(&graph, registration_id, &escalated, &resting).unwrap(),
-            None,
+            CampaignPassLiveness::AtRest,
             "an escalated task must not create a periodic busy-loop"
         );
 
@@ -9756,7 +10098,7 @@ fi
                 &dependency_blocked,
             )
             .unwrap(),
-            None,
+            CampaignPassLiveness::AtRest,
             "dependency-blocked work must remain at rest"
         );
 
@@ -9768,7 +10110,7 @@ fi
         assert_eq!(
             dispatchable_poll_liveness_arm(&graph, registration_id, &BTreeSet::new(), &complete,)
                 .unwrap(),
-            None,
+            CampaignPassLiveness::AtRest,
             "completed work must not create a periodic busy-loop"
         );
     }
@@ -9856,6 +10198,9 @@ fi
         config: PathBuf,
         flow: PathBuf,
         driver: PathBuf,
+        /// Whether the worklist this lane pushes ends in a chapter gate — the
+        /// checkpoint task whose proof a lapse rests on.
+        chapter_gate: bool,
     }
 
     fn readmission_git(checkout: &Path, arguments: &[&str]) {
@@ -9874,7 +10219,13 @@ fi
 
     const READMISSION_CAMPAIGN: &str = "night-readmission";
 
-    fn readmission_worklist(goal: &str, gate_runtime_max_sec: Option<u64>) -> Value {
+    const READMISSION_CHAPTER_GATE: &str = "chapter-gate-c1";
+
+    fn readmission_worklist(
+        goal: &str,
+        gate_runtime_max_sec: Option<u64>,
+        chapter_gate: bool,
+    ) -> Value {
         let mut gate = json!({
             "kind": "command",
             "id": "tests",
@@ -9886,6 +10237,31 @@ fi
                 .unwrap()
                 .insert("runtimeMaxSec".to_owned(), json!(seconds));
         }
+        let mut tasks = vec![json!({
+            "id": "foundation",
+            "kind": "implementation",
+            "title": "Build the foundation",
+            "goal": goal,
+            "deliveredBehaviors": ["The foundation exists"],
+            "readFirst": {"specSections": ["specs/night/spec.md"], "styleReferences": []},
+            "acceptanceCriteria": [{
+                "id": "green",
+                "description": "The suite passes.",
+                "argv": ["true"]
+            }],
+            "dependencies": [],
+            "conflictDomains": ["src"]
+        })];
+        if chapter_gate {
+            tasks.push(json!({
+                "id": READMISSION_CHAPTER_GATE,
+                "kind": "checkpoint",
+                "title": "Prove the chapter",
+                "dependencies": ["foundation"],
+                "argv": ["true"],
+                "runtimeMaxSec": 60
+            }));
+        }
         json!({
             "schemaVersion": 1,
             "campaign": {
@@ -9895,30 +10271,26 @@ fi
                 "agent": {},
                 "gates": [gate]
             },
-            "tasks": [{
-                "id": "foundation",
-                "kind": "implementation",
-                "title": "Build the foundation",
-                "goal": goal,
-                "deliveredBehaviors": ["The foundation exists"],
-                "readFirst": {"specSections": ["specs/night/spec.md"], "styleReferences": []},
-                "acceptanceCriteria": [{
-                    "id": "green",
-                    "description": "The suite passes.",
-                    "argv": ["true"]
-                }],
-                "dependencies": [],
-                "conflictDomains": ["src"]
-            }]
+            "tasks": tasks
         })
     }
 
     impl ReadmissionLane {
         fn open(goal: &str) -> Self {
-            Self::open_declaring(goal, None)
+            Self::open_with(goal, None, false)
         }
 
         fn open_declaring(goal: &str, gate_runtime_max_sec: Option<u64>) -> Self {
+            Self::open_with(goal, gate_runtime_max_sec, false)
+        }
+
+        /// A lane whose worklist ends in a chapter gate, which is the only
+        /// shape a campaign can ever finish in.
+        fn open_gated(goal: &str) -> Self {
+            Self::open_with(goal, None, true)
+        }
+
+        fn open_with(goal: &str, gate_runtime_max_sec: Option<u64>, chapter_gate: bool) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let checkout = temporary.path().join("checkout");
             let remote = temporary.path().join("remote.git");
@@ -9973,6 +10345,7 @@ fi
                 config,
                 flow,
                 driver,
+                chapter_gate,
             };
             lane.push_worklist_declaring(goal, gate_runtime_max_sec);
             lane
@@ -10019,13 +10392,68 @@ fi
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(
                 &path,
-                serde_json::to_vec_pretty(&readmission_worklist(goal, gate_runtime_max_sec))
-                    .unwrap(),
+                serde_json::to_vec_pretty(&readmission_worklist(
+                    goal,
+                    gate_runtime_max_sec,
+                    self.chapter_gate,
+                ))
+                .unwrap(),
             )
             .unwrap();
             readmission_git(&self.checkout, &["add", READMISSION_WORKLIST]);
             readmission_git(&self.checkout, &["commit", "--quiet", "-m", "worklist"]);
             readmission_git(&self.checkout, &["push", "--quiet", "origin", "main"]);
+        }
+
+        /// The revision the authority remote publishes on its base branch.
+        fn published_head(&self) -> String {
+            let output = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&self.checkout)
+                .args(["rev-parse", "refs/remotes/origin/main"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        /// Push one campaign-scoped durable fact, exactly as a pass's merge,
+        /// checkpoint, or publication does.
+        fn seed_campaign_ref(&self, reference: &str, object: &str) {
+            readmission_git(&self.checkout, &["fetch", "--quiet", "origin"]);
+            readmission_git(
+                &self.checkout,
+                &[
+                    "push",
+                    "--quiet",
+                    "origin",
+                    &format!("{object}:{reference}"),
+                ],
+            );
+        }
+
+        fn state_prefix(&self) -> String {
+            campaign_state_ref_prefix(READMISSION_CAMPAIGN, LOCAL_CAMPAIGN_ISSUE_NUMBER)
+        }
+
+        /// The merge receipt that makes one implementation task terminal.
+        fn seed_merge_receipt(&self, task_id: &str, revision: &str) {
+            self.seed_campaign_ref(
+                &format!("{}/merge/{task_id}", self.state_prefix()),
+                revision,
+            );
+        }
+
+        /// The chapter gate's own proof of one revision.
+        fn seed_gate_proof(&self, graph: &CampaignGraph, revision: &str) {
+            self.seed_campaign_ref(
+                &format!(
+                    "{}/checkpoint/{READMISSION_CHAPTER_GATE}-{}/{revision}",
+                    self.state_prefix(),
+                    &graph.worklist_sha256[7..]
+                ),
+                revision,
+            );
         }
 
         /// What a poll pass reads: the graph committed at the authority
@@ -10081,6 +10509,17 @@ fi
                 .unwrap();
             self.registry().write(&mut registration).unwrap();
             registration
+        }
+
+        /// Activation over this lane, taken exactly as a pass takes it.
+        fn lease(
+            &self,
+            registration: &CampaignRegistration,
+            graph: &CampaignGraph,
+        ) -> CampaignLeaseGuard {
+            campaign_lease_store(&self.state_dir, registration)
+                .acquire(&campaign_activation(graph, registration), Utc::now())
+                .unwrap()
         }
 
         fn receipt_authority(&self, graph: &CampaignGraph) -> AttemptReceiptAuthorityV1 {
@@ -10223,6 +10662,244 @@ fi
         assert!(failure.contains("durationSec"), "{failure}");
     }
 
+    /// The race the lease exists for. Two reconcile passes observe the same
+    /// pushed worklist at the same moment — the timer's and the one a
+    /// finishing pass admitted as its own successor. Exactly one may admit
+    /// that epoch and own the frontier it dispatches.
+    ///
+    /// Before the lease both passes compared the remote against the snapshot
+    /// they had each read, both bumped the arm serial, and the identity ended
+    /// two epochs on with two dispatches of one frontier in flight.
+    #[test]
+    fn lease_concurrent_passes_never_double_dispatch_one_frontier() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let first = lane.live_graph();
+        let armed = lane.arm(&first);
+        lane.push_worklist("Build the foundation and the amended edge case.");
+        let pushed = lane.live_graph();
+
+        // Both passes start from the pre-push snapshot, which is exactly what
+        // a poll holds when it reaches the identity.
+        let start = std::sync::Barrier::new(2);
+        let admissions = std::thread::scope(|scope| {
+            let passes = [0, 1].map(|_| {
+                scope.spawn(|| {
+                    let registry = lane.registry();
+                    let mut registration = armed.clone();
+                    start.wait();
+                    let admission = open_campaign_pass(
+                        &lane.state_dir,
+                        &registry,
+                        &mut registration,
+                        &pushed,
+                        Some(&lane.config),
+                        Utc::now(),
+                    )
+                    .unwrap();
+                    (admission, registration.arm_serial)
+                })
+            });
+            passes.map(|pass| pass.join().unwrap())
+        });
+
+        // Whatever order the two passes reached the lock in, the push was
+        // admitted exactly once: a deferred pass never got activation, and a
+        // pass that inherited it re-read the identity under the lease and
+        // found the epoch already admitted.
+        let admitted = admissions
+            .iter()
+            .filter(|(admission, _)| {
+                matches!(
+                    admission,
+                    CampaignPassAdmission::Open {
+                        superseded_graph_digest: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(admitted, 1, "one push, one admission: {admissions:?}");
+        for (admission, arm_serial) in &admissions {
+            match admission {
+                // A pass that holds activation serves the admitted epoch,
+                // whether it admitted it or inherited it.
+                CampaignPassAdmission::Open { .. } => assert_eq!(*arm_serial, 2),
+                // A deferred pass changed nothing at all: it still holds the
+                // snapshot it walked in with.
+                CampaignPassAdmission::Deferred { detail } => {
+                    assert_eq!(*arm_serial, 1);
+                    assert!(detail.contains("already leased"), "{detail}");
+                }
+                CampaignPassAdmission::Complete(lapse) => {
+                    panic!("nothing finished here: {lapse:?}")
+                }
+            }
+        }
+
+        // And the durable epoch counter moved once, not twice.
+        let reread = lane
+            .registry()
+            .read_campaign(READMISSION_REPOSITORY, READMISSION_WORKLIST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.arm_serial, 2);
+        assert_eq!(
+            reread.approved_graph_digest,
+            pushed.canonical.executable_digest
+        );
+
+        // The frontier is dispatched under the lease, never beside it: only a
+        // pass holding activation can produce the guard `dispatch_campaign`
+        // requires, and while it holds one nothing else can take it.
+        let store = campaign_lease_store(&lane.state_dir, &reread);
+        let activation = campaign_activation(&pushed, &reread);
+        assert!(
+            admissions
+                .iter()
+                .any(|(admission, _)| matches!(admission, CampaignPassAdmission::Open { .. })),
+            "one pass must own the frontier: {admissions:?}"
+        );
+        let contended = store.acquire(&activation, Utc::now()).unwrap_err();
+        assert!(
+            matches!(contended, CampaignLeaseError::Held { .. }),
+            "a third pass is refused while the frontier is owned: {contended}"
+        );
+        assert_eq!(store.read().unwrap().unwrap().arm_serial, 2);
+
+        // Reclamation needs no verb: the holders going away is the whole of
+        // it, whether they exited or died.
+        drop(admissions);
+        assert_eq!(
+            store
+                .acquire(&activation, Utc::now())
+                .unwrap()
+                .acquisition(),
+            CampaignLeaseAcquisition::Resumed
+        );
+    }
+
+    /// Completion is a written fact, not an observed silence: the last task
+    /// goes terminal under a gate-proven, published head, the pass lapses the
+    /// lease, and everything after that reads the fact.
+    #[test]
+    fn lease_completion_writes_the_lapse_fact_a_release_can_rely_on() {
+        let lane = ReadmissionLane::open_gated("Build the foundation as first authored.");
+        let graph = lane.live_graph();
+        let registration = lane.arm(&graph);
+        let lease = lane.lease(&registration, &graph);
+        let quiescent = || {
+            run_campaign_quiescent(CampaignQuiescentArgs {
+                state_dir: Some(lane.state_dir.clone()),
+            })
+        };
+
+        // An armed identity with unfinished work is live, and the reason the
+        // lease renews is the sentence a poll event carries.
+        let disposition = lease_disposition(
+            &campaign_lease_facts(&graph, &repository_progress_value(&graph).unwrap(), 0).unwrap(),
+        );
+        assert!(!disposition.lapses(), "{disposition:?}");
+        assert!(
+            disposition.reason().contains("foundation"),
+            "{disposition:?}"
+        );
+        assert!(quiescent().is_err(), "unfinished work is not quiescence");
+
+        // A merged frontier alone does not finish a campaign: until the
+        // chapter gate has proven the published head, the lease renews.
+        let head = lane.published_head();
+        lane.seed_merge_receipt("foundation", &head);
+        let disposition = lease_disposition(
+            &campaign_lease_facts(&graph, &repository_progress_value(&graph).unwrap(), 0).unwrap(),
+        );
+        assert!(!disposition.lapses(), "{disposition:?}");
+        assert!(
+            disposition.reason().contains(READMISSION_CHAPTER_GATE),
+            "{disposition:?}"
+        );
+
+        // With the gate's proof of that same head on the remote, the last
+        // task is terminal and the pass writes the lapse.
+        lane.seed_gate_proof(&graph, &head);
+        let facts =
+            campaign_lease_facts(&graph, &repository_progress_value(&graph).unwrap(), 0).unwrap();
+        let CampaignLeaseDisposition::Lapse {
+            sha,
+            proven_by,
+            tasks,
+            ..
+        } = lease_disposition(&facts)
+        else {
+            panic!("a proven, published frontier finishes the campaign");
+        };
+        assert_eq!(sha, head);
+        assert_eq!(proven_by.task_id, READMISSION_CHAPTER_GATE);
+        let lapse = lease.lapse(&sha, proven_by, tasks, Utc::now()).unwrap();
+        assert_eq!(lapse.sha, head);
+        assert_eq!(lapse.arm_serial, registration.arm_serial);
+        assert_eq!(lapse.graph_digest, graph.canonical.executable_digest);
+        assert_eq!(lapse.tasks, ["foundation", READMISSION_CHAPTER_GATE]);
+
+        // The fact outlives the pass that wrote it, which is the whole point:
+        // release reads it with no registration and no host in hand.
+        let record = campaign_lease_store(&lane.state_dir, &registration)
+            .read()
+            .unwrap()
+            .unwrap();
+        assert!(record.is_lapsed() && record.holder.is_none());
+        assert_eq!(record.lapse.as_ref().unwrap(), &lapse);
+        assert_eq!(record.campaign, READMISSION_CAMPAIGN);
+
+        // Quiescence is now that fact rather than an operator's disarm: the
+        // identity is still armed and still listed.
+        quiescent().unwrap();
+        assert_eq!(campaign_list_values(&lane.registry()).unwrap().len(), 1);
+
+        // And a poll against the complete campaign is a no-op by
+        // construction. It cannot take activation at all, so it admits
+        // nothing, dispatches nothing, and reports the revision that
+        // finished.
+        let mut later = registration.clone();
+        let admission = open_campaign_pass(
+            &lane.state_dir,
+            &lane.registry(),
+            &mut later,
+            &graph,
+            Some(&lane.config),
+            Utc::now(),
+        )
+        .unwrap();
+        let CampaignPassAdmission::Complete(reported) = admission else {
+            panic!("a lapsed identity admits nothing: {admission:?}");
+        };
+        assert_eq!(reported, lapse);
+
+        // Until a push re-admits the identity, which reactivates the lease
+        // with no operator verb between the two.
+        lane.push_worklist("Build the foundation and the amended edge case.");
+        let pushed = lane.live_graph();
+        let admission = open_campaign_pass(
+            &lane.state_dir,
+            &lane.registry(),
+            &mut later,
+            &pushed,
+            Some(&lane.config),
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                admission,
+                CampaignPassAdmission::Open {
+                    superseded_graph_digest: Some(_),
+                    ..
+                }
+            ),
+            "a pushed worklist reopens a lapsed identity: {admission:?}"
+        );
+        assert!(quiescent().is_err(), "a reactivated identity is live again");
+    }
+
     #[test]
     fn poll_readmission_admits_a_pushed_worklist_with_no_operator_verb() {
         let lane = ReadmissionLane::open("Build the foundation as first authored.");
@@ -10320,6 +10997,7 @@ fi
         // A pass still carrying the superseded graph is the straddle. It is
         // refused before it can enqueue anything, and the refusal is about
         // two epochs -- never about an agent that produced no commit.
+        let mut lease = lane.lease(&registration, &second);
         let refusal = dispatch_campaign(
             CampaignHost {
                 socket: &lane.temporary.path().join("absent.sock"),
@@ -10332,6 +11010,7 @@ fi
             &mut registration,
             false,
             None,
+            &mut lease,
         )
         .await
         .unwrap_err();

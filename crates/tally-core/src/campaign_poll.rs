@@ -9,12 +9,17 @@
 //! is no longer a refusal waiting for an operator verb: `forge:"local"`
 //! promises REMOTE-AUTHORITY, so a push to the armed identity's worklist is
 //! itself the arming act and the observing pass re-admits it.
+//!
+//! Schema 3 reports the campaign lease. `deferred` is a pass that found the
+//! identity already leased and dispatched nothing, and `complete` now carries
+//! the lapse — the written completion fact — instead of the registration
+//! prune that used to stand in for one.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const CAMPAIGN_POLL_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const CAMPAIGN_POLL_EVENT_SCHEMA_VERSION: u32 = 3;
 
 /// What one poll decided for one registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +32,9 @@ pub enum CampaignPollStatus {
     /// now owns attempts, so a straddling attempt stays attributable.
     Readmitted,
     Dispatched,
+    /// Another pass already holds this identity's lease. This one admitted
+    /// nothing and dispatched nothing; the holder owns the frontier.
+    Deferred,
     Complete,
     Failed,
 }
@@ -34,7 +42,11 @@ pub enum CampaignPollStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CampaignPollAction {
-    Pruned,
+    /// The lease lapsed: the last admitted task went terminal under a
+    /// gate-proven, published head and the pass wrote the completion fact.
+    /// Nothing was pruned — the identity stays armed, and a push to its
+    /// worklist reactivates it.
+    Lapsed,
 }
 
 /// A single JSON-lines record written by `tally campaign poll --once`.
@@ -56,6 +68,10 @@ pub struct CampaignPollEvent {
     /// re-admission because that is the moment attempt ownership moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arm_serial: Option<u64>,
+    /// The one revision the lapse fact names: gate-proven and published.
+    /// Present on `complete`, which is the only status that writes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -78,15 +94,23 @@ impl CampaignPollEvent {
             approved_graph_digest: None,
             live_graph_digest: None,
             arm_serial: None,
+            published_head: None,
             detail: None,
         }
     }
 
+    /// The terminal event: this identity's lease lapsed on a published head.
+    ///
+    /// The revision travels on the event because the lapse fact is the thing
+    /// a release reads, and a reader tailing the poll stream should never
+    /// have to open the lease file to learn which revision finished.
     #[must_use]
     pub fn complete(
         registration_id: impl Into<String>,
         issue_url: impl Into<String>,
         registration: impl Into<String>,
+        published_head: impl Into<String>,
+        arm_serial: u64,
     ) -> Self {
         let mut event = Self::new(
             registration_id,
@@ -94,7 +118,27 @@ impl CampaignPollEvent {
             registration,
             CampaignPollStatus::Complete,
         );
-        event.action = Some(CampaignPollAction::Pruned);
+        event.action = Some(CampaignPollAction::Lapsed);
+        event.published_head = Some(published_head.into());
+        event.arm_serial = Some(arm_serial);
+        event
+    }
+
+    /// A pass that found the identity leased by another and stood down.
+    #[must_use]
+    pub fn deferred(
+        registration_id: impl Into<String>,
+        issue_url: impl Into<String>,
+        registration: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        let mut event = Self::new(
+            registration_id,
+            issue_url,
+            registration,
+            CampaignPollStatus::Deferred,
+        );
+        event.detail = Some(detail.into());
         event
     }
 
@@ -208,6 +252,8 @@ mod tests {
             "0198f000-0000-7000-8000-000000000002",
             "https://github.com/acme/two/issues/2",
             "/state/campaigns/armed/two.json",
+            "e".repeat(40),
+            6,
         );
 
         let jsonl = [first, second]
@@ -238,8 +284,45 @@ mod tests {
             "https://github.com/acme/two/issues/2"
         );
         assert_eq!(events[1]["status"], "complete");
-        assert_eq!(events[1]["action"], "pruned");
+        assert_eq!(events[1]["action"], "lapsed");
+        assert_eq!(events[1]["publishedHead"], "e".repeat(40));
+        assert_eq!(events[1]["armSerial"], 6);
         assert!(events[1].get("detail").is_none());
+    }
+
+    /// The lease's two new reports, and the one they replaced.
+    #[test]
+    fn lease_poll_events_report_deferral_and_lapse_without_a_prune() {
+        let deferred = serde_json::to_value(CampaignPollEvent::deferred(
+            "0198f000-0000-7000-8000-000000000004",
+            "local://acme/four/specs/four.json",
+            "/state/campaigns/armed/four.json",
+            "pid 4242 holds this identity's lease",
+        ))
+        .unwrap();
+        assert_eq!(deferred["status"], "deferred");
+        assert_eq!(
+            deferred["schemaVersion"],
+            CAMPAIGN_POLL_EVENT_SCHEMA_VERSION
+        );
+        assert!(deferred.get("action").is_none());
+        assert!(deferred["detail"].as_str().unwrap().contains("4242"));
+
+        // Completion is a written fact about a revision now, so the prune
+        // that used to stand in for one must fail loudly on the wire.
+        let complete = serde_json::to_string(&CampaignPollEvent::complete(
+            "0198f000-0000-7000-8000-000000000005",
+            "local://acme/five/specs/five.json",
+            "/state/campaigns/armed/five.json",
+            "f".repeat(40),
+            2,
+        ))
+        .unwrap();
+        assert!(serde_json::from_str::<CampaignPollEvent>(&complete).is_ok());
+        assert!(serde_json::from_str::<CampaignPollEvent>(
+            &complete.replace("\"lapsed\"", "\"pruned\""),
+        )
+        .is_err());
     }
 
     #[test]
