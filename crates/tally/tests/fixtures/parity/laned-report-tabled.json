@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "side": "laned",
+  "tempdirWritable": true,
+  "devShmWritable": true,
+  "cpuParallelism": 16,
+  "failingCommandStderr": true,
+  "memoryCeiling": {
+    "imposed": {
+      "bytes": 8589934592,
+      "property": "MemoryMax"
+    }
+  }
+}

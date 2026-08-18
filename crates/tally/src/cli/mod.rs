@@ -7,6 +7,7 @@ pub(crate) mod enqueue;
 mod exit;
 mod flow;
 mod out;
+mod parity;
 mod queue;
 mod reader_state;
 mod rebuild;
@@ -106,6 +107,7 @@ use enqueue::*;
 use exit::*;
 use flow::*;
 use out::{errln, outln};
+use parity::*;
 use queue::*;
 use reader_state::*;
 use rebuild::*;
@@ -244,6 +246,8 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             Ok(())
         }
         Some(Command::AdapterSmokeCommit) => run_adapter_smoke_commit(),
+        Some(Command::ParityProbe(args)) => run_parity_probe(args),
+        Some(Command::ParityFail) => run_parity_fail(),
         Some(Command::ProducerDispatch(args)) => {
             run_producer_dispatch(opts.config, &socket, args).await
         }
