@@ -1351,6 +1351,56 @@ fn current_task_input_epochs(
         .collect()
 }
 
+/// The admitted completion identity for each projected task, when the campaign
+/// that armed this pass carries one.
+///
+/// One completion contract has exactly one author. `campaign.rs` computes the
+/// writer's tuple from the graph it admitted and hands it down here, so the
+/// revision this driver stamps into a merge trailer is the same identity
+/// `tally campaign release` recomputes from the same graph. Absent, the
+/// legacy file-derived identity below still answers.
+fn admitted_completion_revisions(value: Option<&Json>) -> Result<Option<BTreeMap<String, String>>> {
+    let Some(value) = value.filter(|value| !matches!(value, Json::Null)) else {
+        return Ok(None);
+    };
+    let revisions = value
+        .as_object()
+        .ok_or_else(|| DriverError::new("taskCompletionRevisions must be an object"))?;
+    if revisions.len() > MAX_CAMPAIGN_TASKS {
+        return Err(DriverError::new(
+            "taskCompletionRevisions exceeds 128 tasks",
+        ));
+    }
+    revisions
+        .iter()
+        .map(|(task_id, value)| {
+            if !is_task_id(task_id) {
+                return Err(DriverError::new(
+                    "taskCompletionRevisions contains an unsafe task ID",
+                ));
+            }
+            let revision = required_string(
+                Some(value),
+                &format!("taskCompletionRevisions.{task_id}"),
+                Some(71),
+            )?;
+            if !is_sha256_identity(&revision) {
+                return Err(DriverError::new(format!(
+                    "taskCompletionRevisions.{task_id} must be a lowercase SHA-256 identity"
+                )));
+            }
+            Ok((task_id.clone(), revision))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()
+        .map(Some)
+}
+
+/// The legacy completion identity: the authored task, in its authored file, in
+/// its repository.
+///
+/// This is the identity of a worklist run straight at the driver, with no
+/// campaign to admit it. A campaign-armed pass carries its admitted revisions
+/// instead, because only the admitting side can promise release the same bytes.
 fn file_task_completion_revision(
     repository: &str,
     source: &BTreeMap<String, Json>,
@@ -1382,6 +1432,7 @@ fn action_worklist(brief: &Json) -> Result<Json> {
         "worklist",
         "maxTasks",
         "maxParallel",
+        "taskCompletionRevisions",
     ];
     if brief
         .as_object()
@@ -1396,6 +1447,7 @@ fn action_worklist(brief: &Json) -> Result<Json> {
         fields.push("issueRepository");
     }
     let data = object_exact(brief, &fields, "worklist brief")?;
+    let admitted_revisions = admitted_completion_revisions(data.get("taskCompletionRevisions"))?;
     let repository = repository_name(data.get("repository"), "repository")?;
     let config = repo_config(data.get("repositoryConfig"))?;
     let (code, spec, _issue) = campaign_coordinates(data, repository.clone(), config)?;
@@ -1572,8 +1624,25 @@ fn action_worklist(brief: &Json) -> Result<Json> {
     if !same_repository(&spec, &code) {
         source.insert("repository".to_owned(), Json::from(spec.repository));
     }
+    if let Some(admitted) = &admitted_revisions {
+        let projected = tasks
+            .iter()
+            .map(|task| task_id(task).map(str::to_owned))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if admitted.keys().cloned().collect::<BTreeSet<_>>() != projected {
+            return Err(DriverError::new(
+                "taskCompletionRevisions must name exactly the projected tasks",
+            ));
+        }
+    }
     for task in &mut tasks {
-        let revision = file_task_completion_revision(&repository, &source, task)?;
+        let revision = match &admitted_revisions {
+            Some(admitted) => admitted
+                .get(task_id(task)?)
+                .expect("the admitted revision key set was checked")
+                .clone(),
+            None => file_task_completion_revision(&repository, &source, task)?,
+        };
         task.as_object_mut()
             .expect("normalized task is an object")
             .insert("revision".to_owned(), Json::from(revision));
@@ -7207,6 +7276,7 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
         "gateSet",
         "steeringHighWater",
         "taskInputHashes",
+        "taskCompletionRevisions",
         "attemptReceipts",
     ];
     if brief
@@ -7240,7 +7310,11 @@ fn action_reconcile(brief: &Json) -> Result<Json> {
             data.get(field).cloned().unwrap_or(Json::Null),
         );
     }
-    for field in ["specRepository", "issueRepository"] {
+    for field in [
+        "specRepository",
+        "issueRepository",
+        "taskCompletionRevisions",
+    ] {
         if let Some(value) = data.get(field) {
             worklist_brief.insert(field.to_owned(), value.clone());
         }
@@ -11790,7 +11864,7 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        action_ownership, action_retry, action_steer, action_worker_outcome,
+        action_ownership, action_retry, action_steer, action_worker_outcome, action_worklist,
         append_attempt_receipt, append_diagnosis_report, campaign_attempt_state,
         campaign_attempt_state_all, checkpoint_capture_note, checkpoint_ref,
         classify_worker_outcome, closed_inline_code_spans, contains_bare_exclamation_mark,
@@ -13333,6 +13407,168 @@ mod tests {
         let small = excerpt_text_window("short capture\n", CHECKPOINT_STDERR_WINDOW_CHARS);
         assert!(!small.truncated);
         assert_eq!(small.text, "short capture\n");
+    }
+
+    /// One completion contract has one author. A campaign-armed pass carries
+    /// the writer's tuple its `tally campaign arm` admitted, and that is the
+    /// identity this driver stamps into the merge trailer -- not a second hash
+    /// of the same worklist that only the driver knows how to reproduce.
+    #[test]
+    fn an_admitted_writer_tuple_replaces_the_legacy_file_completion_identity() {
+        let root = std::env::temp_dir().join(format!("tally-worklist-identity-{}", Uuid::new_v4()));
+        let origin = root.join("origin");
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&origin).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        summary_ref_test_git(
+            &origin,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+        summary_ref_test_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        summary_ref_test_git(&checkout, &["config", "user.name", "Worklist Test"]);
+        summary_ref_test_git(
+            &checkout,
+            &["config", "user.email", "worklist@example.invalid"],
+        );
+        summary_ref_test_git(
+            &checkout,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        let strings = |values: &[&str]| {
+            Json::Array(values.iter().copied().map(Json::from).collect::<Vec<_>>())
+        };
+        let worklist = Json::object([
+            ("schemaVersion", Json::Number("1".to_owned())),
+            (
+                "campaign",
+                Json::object([
+                    ("name", Json::from("fixture")),
+                    ("maxTasks", Json::Number("4".to_owned())),
+                    ("maxParallel", Json::Number("1".to_owned())),
+                    (
+                        "gates",
+                        Json::Array(vec![Json::object([
+                            ("kind", Json::from("command")),
+                            ("id", Json::from("tests")),
+                            ("preflightArgv", strings(&["true"])),
+                            ("argv", strings(&["true"])),
+                        ])]),
+                    ),
+                ]),
+            ),
+            (
+                "tasks",
+                Json::Array(vec![Json::object([
+                    ("id", Json::from("ship-feature")),
+                    ("kind", Json::from("implementation")),
+                    ("title", Json::from("Ship the fixture feature")),
+                    ("goal", Json::from("Implement the fixture surface.")),
+                    (
+                        "deliveredBehaviors",
+                        strings(&["the fixture surface exists"]),
+                    ),
+                    (
+                        "readFirst",
+                        Json::object([
+                            ("specSections", strings(&["specs/fixture.md"])),
+                            ("styleReferences", strings(&[])),
+                        ]),
+                    ),
+                    (
+                        "acceptanceCriteria",
+                        Json::Array(vec![Json::object([
+                            ("id", Json::from("green")),
+                            ("description", Json::from("The suite passes.")),
+                            ("argv", strings(&["true"])),
+                        ])]),
+                    ),
+                    ("dependencies", strings(&[])),
+                    ("conflictDomains", strings(&["crates/tally"])),
+                ])]),
+            ),
+        ]);
+        write_fixture_file(&checkout, "worklists/fixture.json", &worklist.stringify());
+        summary_ref_test_git(&checkout, &["add", "."]);
+        summary_ref_test_git(&checkout, &["commit", "--quiet", "-m", "worklist"]);
+        summary_ref_test_git(&checkout, &["push", "--quiet", "origin", "main"]);
+
+        let brief = |admitted: Option<Json>| {
+            let mut brief = Json::object([
+                ("repository", Json::from("acme/widgets")),
+                (
+                    "repositoryConfig",
+                    Json::object([
+                        (
+                            "checkout",
+                            Json::from(checkout.to_string_lossy().into_owned()),
+                        ),
+                        ("baseBranch", Json::from("main")),
+                        ("remote", Json::from("origin")),
+                        ("forge", Json::from("local")),
+                    ]),
+                ),
+                ("worklist", Json::from("worklists/fixture.json")),
+                ("maxTasks", Json::Number("4".to_owned())),
+                ("maxParallel", Json::Number("1".to_owned())),
+            ]);
+            if let Some(admitted) = admitted {
+                brief
+                    .as_object_mut()
+                    .expect("the brief is an object")
+                    .insert("taskCompletionRevisions".to_owned(), admitted);
+            }
+            brief
+        };
+        let revision_of = |projection: &Json| {
+            projection
+                .get("tasks")
+                .and_then(Json::as_array)
+                .and_then(|tasks| tasks.first())
+                .and_then(|task| task.get("revision"))
+                .and_then(Json::as_str)
+                .expect("a projected task carries a completion revision")
+                .to_owned()
+        };
+
+        // With no campaign to admit it, the legacy file-derived identity still
+        // answers, and it is nobody else's identity.
+        let legacy = revision_of(&action_worklist(&brief(None)).unwrap());
+        assert!(legacy.starts_with("sha256:"));
+
+        let admitted_revision = format!("sha256:{}", "5".repeat(64));
+        assert_ne!(legacy, admitted_revision);
+        let admitted = action_worklist(&brief(Some(Json::object([(
+            "ship-feature",
+            Json::from(admitted_revision.clone()),
+        )]))))
+        .unwrap();
+        assert_eq!(revision_of(&admitted), admitted_revision);
+
+        // The map is a contract about this exact frontier, so a name that is
+        // not on it -- or a task the campaign forgot -- is refused rather than
+        // silently half-applied.
+        let mismatched = action_worklist(&brief(Some(Json::object([
+            ("ship-feature", Json::from(admitted_revision.clone())),
+            ("ship-nothing", Json::from(admitted_revision.clone())),
+        ]))))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            mismatched.contains("taskCompletionRevisions must name exactly the projected tasks"),
+            "{mismatched}"
+        );
+        let malformed = action_worklist(&brief(Some(Json::object([(
+            "ship-feature",
+            Json::from("not-a-digest"),
+        )]))))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            malformed.contains("taskCompletionRevisions.ship-feature must be a lowercase SHA-256"),
+            "{malformed}"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     fn write_fixture_file(checkout: &Path, path: &str, body: &str) {

@@ -498,6 +498,13 @@ export const meta = {
         },
         "maxProperties": 128
       },
+      "taskCompletionRevisions": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/$defs/Sha256Identity"
+        },
+        "maxProperties": 128
+      },
       "armedManifest": {
         "anyOf": [
           {
@@ -2109,6 +2116,9 @@ function campaignInputs() {
       postFailureEvidence: args.postFailureEvidence === true,
       postFailureStderr: args.postFailureStderr === true,
       taskInputHashes: null,
+      // No campaign admitted this run, so no writer's tuple was handed down:
+      // the driver keeps its own legacy file-derived completion identity.
+      taskCompletionRevisions: null,
       // The agent block travels verbatim, policy keys included. An absent
       // diagnosis policy means the adapter's own answer, exactly as an absent
       // lane policy does; stamping one here made every adapter inherit one
@@ -2159,6 +2169,10 @@ function campaignInputs() {
     postFailureEvidence: false,
     postFailureStderr: false,
     taskInputHashes: args.taskInputHashes,
+    // The completion identity campaign.rs admitted for each task. Carrying it
+    // is what makes the merge trailer and the release oracle one contract
+    // rather than two hashes of the same work.
+    taskCompletionRevisions: args.taskCompletionRevisions,
     // Verbatim, for the reason spelled out on the pre-manifest branch above.
     agent: manifest.agent,
     steward: manifest.steward,
@@ -2924,6 +2938,10 @@ function sweepDeferral(sweepNode) {
     ...(inputs.taskInputHashes === null || inputs.taskInputHashes === undefined
       ? {}
       : { taskInputHashes: inputs.taskInputHashes }),
+    ...(inputs.taskCompletionRevisions === null ||
+    inputs.taskCompletionRevisions === undefined
+      ? {}
+      : { taskCompletionRevisions: inputs.taskCompletionRevisions }),
     attemptReceipts
   });
   const reconciliationNode = await driverNode(

@@ -68,7 +68,7 @@ const MAX_RETRY_CHARS: usize = 2_000;
 const MAX_GATE_OBSERVATION_SEC: u64 = DEFAULT_AGENT_RUNTIME_MAX_SEC;
 const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
 const LOCAL_ALLOWED_ACTOR: &str = "local";
-const RELEASE_PLAN_SCHEMA_VERSION: u32 = 1;
+const RELEASE_PLAN_SCHEMA_VERSION: u32 = 2;
 const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
 const RELEASE_ARTIFACTS_SCHEMA_VERSION: u32 = 1;
 const RELEASE_PROBE_RECEIPT_SCHEMA_VERSION: u32 = 1;
@@ -236,6 +236,14 @@ struct CampaignGraph {
     ownership_preflight_warnings: Vec<String>,
     worklist_sha256: String,
     task_input_hashes: BTreeMap<String, String>,
+    /// The writer's tuple for each task, computed once at admission.
+    ///
+    /// Carried rather than recomputed downstream for the same reason the gate
+    /// budgets are: the identity the driver stamps into a merge trailer and
+    /// the identity `release` recomputes from the same admitted graph must be
+    /// the same bytes, and the only way to promise that is to compute them
+    /// once, here.
+    task_completion_revisions: BTreeMap<String, String>,
     /// How each gate's admitted budget was arrived at, in manifest order.
     ///
     /// Carried rather than recomputed so the receipt an operator reads and the
@@ -460,12 +468,26 @@ enum ReleaseAttemptReceipt {
     GateObservation,
 }
 
+/// One durable attestation that some actor acted on one task.
+///
+/// The stamp is the whole point: a receipt that cannot say who wrote it and
+/// when witnesses nothing. Legacy schema-1 receipts carry no stamp, so they
+/// contribute no witness rather than an anonymous one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseWitnessStamp {
+    task_id: String,
+    kind: String,
+    actor: String,
+    written_at: String,
+}
+
 #[derive(Debug)]
 struct ReleaseAttemptLog {
     path: PathBuf,
     present: bool,
     bytes: Vec<u8>,
     records: Vec<ReleaseAttemptReceipt>,
+    witnesses: Vec<ReleaseWitnessStamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -487,7 +509,7 @@ struct ReleaseCommit {
     revision_values: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ReleaseCompletionOracle {
     Exact,
@@ -571,14 +593,71 @@ struct CampaignReleaseSummaryProof {
     object_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CampaignReleaseCompletionProof {
     task_id: String,
     commit: String,
     oracle: ReleaseCompletionOracle,
     #[serde(skip_serializing_if = "Option::is_none")]
     reference: Option<String>,
+}
+
+/// One row of the coverage join release renders from the durable record: one
+/// admitted task, the completion it claims, and the witnesses that carry it.
+///
+/// Every task the lapse fact names appears, witnessed or not. A coverage table
+/// that shows only what is covered is the judgment this census exists to
+/// delete, and it is the judgment a hand-authored table cannot help making.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseCoverageRow {
+    task_id: String,
+    kind: String,
+    title: String,
+    /// The completion identity claimed for this task: the writer's tuple for
+    /// an implementation task, the proven source digest for a checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim: Option<String>,
+    /// Where that claim is durable: a merge commit, or a checkpoint ref.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oracle: Option<ReleaseCompletionOracle>,
+    /// Durable attestations naming this task, in the order they were written
+    /// and across every epoch this identity served. A census counts the acts
+    /// that happened, not only the ones the current epoch would re-do.
+    witnesses: Vec<String>,
+}
+
+/// The lapse fact's own proof of the revision the campaign finished on.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseLapseProof {
+    task_id: String,
+    reference: String,
+}
+
+/// The coverage story, rendered from durable facts alone.
+///
+/// It exists only for a lapsed identity, because the lapse fact is what makes
+/// the record complete: the facts remain for release whenever, by anyone, with
+/// no live pass, no armed registration, and no operator retelling in between.
+/// `intent` is the one thing here that is not derived — the operator's own
+/// closing summary, carried verbatim when they wrote one.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignReleaseCoverage {
+    source: &'static str,
+    lapsed_at: String,
+    arm_serial: u64,
+    graph_digest: String,
+    sha: String,
+    proven_by: CampaignReleaseLapseProof,
+    rows: Vec<CampaignReleaseCoverageRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent: Option<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -608,6 +687,9 @@ struct CampaignReleasePlan {
     integration_ref: String,
     closing_summary: CampaignReleaseSummaryProof,
     completion_proofs: Vec<CampaignReleaseCompletionProof>,
+    /// Present exactly when this identity's lease has lapsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<CampaignReleaseCoverage>,
     release_notes: Vec<CampaignReleaseNote>,
     gate_proof: CampaignReleaseGateProof,
     artifacts: Vec<CampaignReleaseArtifact>,
@@ -644,7 +726,12 @@ struct CampaignReleaseStepsV1 {
 
 /// Local authority for release execution. Public release text is deliberately
 /// absent: whether a step ran is answered only by this record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The plan document and the completion proofs live here too. `planSha256`
+/// pins the bytes, but a digest is not evidence — a reader asking what this
+/// release actually claimed, and through which oracle, would otherwise have to
+/// re-render a plan against a tree that has since moved on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CampaignReleaseRecordV1 {
     schema_version: u32,
@@ -655,6 +742,11 @@ struct CampaignReleaseRecordV1 {
     version: String,
     revision: String,
     plan_sha256: String,
+    /// The rendered plan the digest above pins, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<Value>,
+    #[serde(default)]
+    completion_proofs: Vec<CampaignReleaseCompletionProof>,
     steps: CampaignReleaseStepsV1,
 }
 
@@ -883,6 +975,8 @@ fn execute_campaign_release_locked(
                 version: plan.version.clone(),
                 revision: plan.revision.clone(),
                 plan_sha256,
+                plan: Some(serde_json::to_value(plan)?),
+                completion_proofs: plan.completion_proofs.clone(),
                 steps: CampaignReleaseStepsV1::default(),
             };
             write_campaign_release_record(directory, &record_path, &record)?;
@@ -1645,7 +1739,7 @@ fn render_campaign_release_plan(
     )?;
     let integration = release_required_ref(&refs, &integration_ref, "commit")?;
     let history = release_integration_history(&registration.checkout, &integration_ref)?;
-    let revisions = release_task_revisions(&graph)?;
+    let revisions = graph_completion_revisions(&graph)?;
     let merged_commits = release_merged_commits(&graph, &revisions, &history, &refs)?;
     let source_revision = merged_commits
         .first()
@@ -1678,8 +1772,9 @@ fn render_campaign_release_plan(
     let steering = read_existing_local_steering(state_dir, &registration)?;
     let task_input_hashes = canonical_task_input_hashes(&graph)?;
     let input_epochs = current_task_input_epochs(&task_input_hashes, &steering)?;
-    let (diagnoses, retries, warnings) =
+    let (diagnoses, retries, mut warnings) =
         release_attempt_facts(&attempt_log.records, &task_ids, &input_epochs);
+    warnings.extend(release_bridge_warnings(&merged_commits));
     let merged = merged_commits
         .iter()
         .map(|merged| MergedFact {
@@ -1751,6 +1846,24 @@ fn render_campaign_release_plan(
     let campaign_summary = render_campaign_summary(&digest);
 
     let completion_proofs = release_completion_proofs(&merged_commits);
+    // Release reads the identity's own durable lease, never a registration
+    // that happens to still exist: a lapsed campaign is finished whether or
+    // not anything is armed, and the coverage below is rendered from that
+    // fact and the facts it points at.
+    let coverage = CampaignLeaseStore::new(state_dir, code_repository, worklist_pattern)
+        .read()?
+        .and_then(|lease| lease.lapse)
+        .map(|lapse| {
+            release_coverage(
+                &lapse,
+                &graph,
+                &merged_commits,
+                &checkpoints,
+                &attempt_log.witnesses,
+                Some(closing_summary.summary.body.as_str())
+                    .filter(|intent| !intent.trim().is_empty()),
+            )
+        });
     let release_notes = release_notes(&registration, &graph, &refs, &revisions, &merged_commits)?;
     let artifacts = release_artifacts(
         integration,
@@ -1786,6 +1899,7 @@ fn render_campaign_release_plan(
             object_id: closing_summary.object_id.clone(),
         },
         completion_proofs,
+        coverage,
         release_notes,
         gate_proof: CampaignReleaseGateProof {
             task_id: gate_checkpoint.task_id,
@@ -2047,7 +2161,9 @@ fn split_release_trailers(value: &str) -> Vec<String> {
     }
 }
 
-fn release_task_revisions(graph: &CanonicalCampaignGraphV1) -> Result<BTreeMap<String, String>> {
+fn graph_completion_revisions(
+    graph: &CanonicalCampaignGraphV1,
+) -> Result<BTreeMap<String, String>> {
     if graph.manifest.tasks.len() != graph.tasks.len() {
         bail!("campaign approved graph has mismatched task references and content");
     }
@@ -2217,6 +2333,141 @@ fn release_completion_proofs(
             reference: merged.bridge_ref.clone(),
         })
         .collect()
+}
+
+/// Name the legacy bridge out loud whenever it answers.
+///
+/// The bridge exists for one case: a task whose durable trailer carries an
+/// identity this graph no longer computes. That is a legacy proof, and a
+/// release that quietly accepts one reads exactly like a release that proved
+/// its completions exactly. So it says which task, which ref, and that the
+/// exact writer-tuple oracle found nothing.
+fn release_bridge_warnings(merged_commits: &[ReleaseMergedCommit]) -> Vec<String> {
+    merged_commits
+        .iter()
+        .filter(|merged| merged.oracle == ReleaseCompletionOracle::Bridge)
+        .map(|merged| {
+            let reference = merged.bridge_ref.as_deref().unwrap_or("an unnamed task ref");
+            format!(
+                "campaign task {:?} was proven by the legacy completion bridge through {reference}; the exact writer-tuple oracle found no matching {TALLY_REVISION_PREFIX} trailer",
+                merged.task_id
+            )
+        })
+        .collect()
+}
+
+/// Render the claim/task/witness join from the durable record alone.
+///
+/// The lapse fact is the spine: it names every task the finished graph
+/// carried, so the census is the campaign's own list rather than the list of
+/// tasks that happened to leave a proof behind. Everything joined onto it is
+/// equally durable — merge commits on the integration line, checkpoint refs,
+/// and the stamped attempt receipts that say who acted and when.
+fn release_coverage(
+    lapse: &CampaignLapseV1,
+    graph: &CanonicalCampaignGraphV1,
+    merged_commits: &[ReleaseMergedCommit],
+    checkpoints: &[ReleaseCheckpoint],
+    witnesses: &[ReleaseWitnessStamp],
+    intent: Option<&str>,
+) -> CampaignReleaseCoverage {
+    let admitted = graph
+        .manifest
+        .tasks
+        .iter()
+        .zip(&graph.tasks)
+        .map(|(reference, content)| (reference.id.as_str(), (reference, content)))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for task_id in &lapse.tasks {
+        let admitted_task = admitted.get(task_id.as_str());
+        let merged = merged_commits
+            .iter()
+            .find(|merged| &merged.task_id == task_id);
+        let checkpoint = checkpoints
+            .iter()
+            .find(|checkpoint| &checkpoint.task_id == task_id);
+        let (claim, proof, oracle) = match (merged, checkpoint) {
+            (Some(merged), _) => (
+                merged.commit.revision_values.first().cloned(),
+                Some(merged.commit.object_id.clone()),
+                Some(merged.oracle),
+            ),
+            (None, Some(checkpoint)) => (
+                Some(checkpoint.source_sha256.clone()),
+                Some(checkpoint.reference.clone()),
+                None,
+            ),
+            (None, None) => (None, None, None),
+        };
+        let mut task_witnesses = witnesses
+            .iter()
+            .filter(|witness| &witness.task_id == task_id)
+            .map(|witness| {
+                format!(
+                    "{} receipt written by {} at {}",
+                    witness.kind, witness.actor, witness.written_at
+                )
+            })
+            .collect::<Vec<_>>();
+        if &lapse.proven_by.task_id == task_id {
+            task_witnesses.push(format!(
+                "gate proof {} on {}",
+                lapse.proven_by.reference, lapse.sha
+            ));
+        }
+        rows.push(CampaignReleaseCoverageRow {
+            task_id: task_id.clone(),
+            kind: admitted_task
+                .map(|(reference, _)| reference.kind.clone())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            title: admitted_task
+                .map(|(_, content)| content.title.clone())
+                .unwrap_or_default(),
+            claim,
+            proof,
+            oracle,
+            witnesses: task_witnesses,
+        });
+    }
+
+    let mut warnings = Vec::new();
+    if lapse.graph_digest != graph.executable_digest {
+        warnings.push(format!(
+            "the durable lapse fact finished graph {} while this release renders graph {}",
+            lapse.graph_digest, graph.executable_digest
+        ));
+    }
+    let lapsed_ids = lapse
+        .tasks
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for task_id in admitted.keys().filter(|id| !lapsed_ids.contains(*id)) {
+        warnings.push(format!(
+            "admitted task {task_id:?} is absent from the durable lapse fact"
+        ));
+    }
+    for task_id in lapsed_ids.iter().filter(|id| !admitted.contains_key(*id)) {
+        warnings.push(format!(
+            "the durable lapse fact names task {task_id:?}, which the admitted graph does not carry"
+        ));
+    }
+
+    CampaignReleaseCoverage {
+        source: "durable-facts",
+        lapsed_at: lapse.lapsed_at.clone(),
+        arm_serial: lapse.arm_serial,
+        graph_digest: lapse.graph_digest.clone(),
+        sha: lapse.sha.clone(),
+        proven_by: CampaignReleaseLapseProof {
+            task_id: lapse.proven_by.task_id.clone(),
+            reference: lapse.proven_by.reference.clone(),
+        },
+        rows,
+        intent: intent.map(str::to_owned),
+        warnings,
+    }
 }
 
 fn release_checkpoint_refs(
@@ -2532,6 +2783,7 @@ fn read_release_attempt_log(
                 present: false,
                 bytes: Vec::new(),
                 records: Vec::new(),
+                witnesses: Vec::new(),
             })
         }
         Err(error) => {
@@ -2561,6 +2813,7 @@ fn read_release_attempt_log(
             );
         }
         let mut records = Vec::new();
+        let mut witnesses = Vec::new();
         let complete = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
         for (index, line) in complete
             .split(|byte| *byte == b'\n')
@@ -2632,13 +2885,28 @@ fn read_release_attempt_log(
                     ReleaseAttemptReceipt::Pardon { sequence, tasks }
                 }
             };
+            if let (Some(task_id), Some(actor), Some(written_at)) = (
+                object.get("taskId").and_then(Value::as_str),
+                object.get("actor").and_then(Value::as_str),
+                object.get("writtenAt").and_then(Value::as_str),
+            ) {
+                witnesses.push(ReleaseWitnessStamp {
+                    task_id: task_id.to_owned(),
+                    kind: object["kind"]
+                        .as_str()
+                        .expect("validated receipt kind is text")
+                        .to_owned(),
+                    actor: actor.to_owned(),
+                    written_at: written_at.to_owned(),
+                });
+            }
             records.push(record);
         }
-        Ok((bytes, records))
+        Ok((bytes, records, witnesses))
     })();
     let unlock = FileExt::unlock(&file)
         .with_context(|| format!("cannot unlock attempt-receipts log {}", path.display()));
-    let (bytes, records) = match (read, unlock) {
+    let (bytes, records, witnesses) = match (read, unlock) {
         (Err(error), _) => return Err(error),
         (Ok(_), Err(error)) => return Err(error),
         (Ok(value), Ok(())) => value,
@@ -2648,6 +2916,7 @@ fn read_release_attempt_log(
         present: true,
         bytes,
         records,
+        witnesses,
     })
 }
 
@@ -2958,6 +3227,30 @@ fn render_campaign_release_human(plan: &CampaignReleasePlan) -> String {
             )
         }));
     }
+    if let Some(coverage) = &plan.coverage {
+        lines.extend([
+            String::new(),
+            format!(
+                "Coverage from durable facts  lapsed {}  arm {}",
+                coverage.lapsed_at, coverage.arm_serial
+            ),
+        ]);
+        lines.extend(coverage.rows.iter().map(|row| {
+            let claim = row.claim.as_deref().unwrap_or("no durable claim");
+            let witnesses = if row.witnesses.is_empty() {
+                "unwitnessed".to_owned()
+            } else {
+                row.witnesses.join("; ")
+            };
+            format!("- {} [{}]: {claim} — {witnesses}", row.task_id, row.kind)
+        }));
+        lines.extend(
+            coverage
+                .warnings
+                .iter()
+                .map(|warning| format!("! {warning}")),
+        );
+    }
     lines.extend([String::new(), "Release notes".to_owned()]);
     if plan.release_notes.is_empty() {
         lines.push("- No implementation commits.".to_owned());
@@ -3000,6 +3293,22 @@ fn render_campaign_release_notes(plan: &CampaignReleasePlan) -> String {
                 .iter()
                 .map(|note| format!("- {}", note.header)),
         );
+    }
+    if let Some(coverage) = &plan.coverage {
+        lines.extend([String::new(), "## Coverage".to_owned(), String::new()]);
+        lines.extend(coverage.rows.iter().map(|row| {
+            format!(
+                "- `{}` ({}): {} — {}",
+                row.task_id,
+                row.kind,
+                row.claim.as_deref().unwrap_or("no durable claim"),
+                if row.witnesses.is_empty() {
+                    "unwitnessed".to_owned()
+                } else {
+                    row.witnesses.join("; ")
+                }
+            )
+        }));
     }
     lines.extend([
         String::new(),
@@ -5051,7 +5360,7 @@ fn active_local_escalated_tasks(
     graph: &CampaignGraph,
     registration: &CampaignRegistration,
 ) -> Result<BTreeSet<String>> {
-    let current_revisions = release_task_revisions(&graph.canonical)?;
+    let current_revisions = graph.task_completion_revisions.clone();
     let records = read_local_attempt_receipts(
         state_dir,
         &graph.canonical.manifest.name,
@@ -5171,7 +5480,7 @@ fn attach_campaign_status_outcomes(
         return Ok(());
     };
     let campaign = &graph.manifest.name;
-    let current_revisions = release_task_revisions(graph)?;
+    let current_revisions = graph_completion_revisions(graph)?;
     let current_epochs = if let Some(registration) = registration {
         let task_input_hashes = canonical_task_input_hashes(graph)?;
         let steering = read_existing_local_steering(state_dir, registration)?;
@@ -5928,11 +6237,13 @@ fn local_campaign_graph(
         .collect::<Vec<_>>();
     let canonical = CanonicalCampaignGraphV1::new(validated.manifest, task_content)?;
     let task_input_hashes = canonical_task_input_hashes(&canonical)?;
+    let task_completion_revisions = graph_completion_revisions(&canonical)?;
     Ok(CampaignGraph {
         canonical,
         ownership_preflight_warnings,
         worklist_sha256,
         task_input_hashes,
+        task_completion_revisions,
         gate_budgets,
     })
 }
@@ -7037,6 +7348,11 @@ async fn dispatch_campaign(
         // edits. The flow combines it with the addressed steering high-water
         // to derive the exact attempt epoch carried by new receipts.
         "taskInputHashes": &graph.task_input_hashes,
+        // Per-task completion identity: the writer's tuple this campaign
+        // admitted. The driver stamps it into the merge trailer verbatim, so
+        // release proves the same task through the exact oracle rather than
+        // through the legacy bridge.
+        "taskCompletionRevisions": &graph.task_completion_revisions,
         "steering": steering.master,
         "taskSteering": steering.tasks,
         // The pre-agent re-check reads the same append-only source. The local
@@ -9182,6 +9498,7 @@ mod tests {
     use super::*;
     use tally_core::campaign_contract::{validate_manifest, BRIEF_SENTINEL};
     use tally_core::campaign_lease::CampaignLeaseAcquisition;
+    use tally_core::campaign_publish::PublishProof;
     use tally_core::gate_budget::GateBudgetSource;
 
     fn manifest_value_for_test(tasks: Value) -> Value {
@@ -9479,6 +9796,7 @@ mod tests {
                 present: false,
                 bytes: Vec::new(),
                 records: Vec::new(),
+                witnesses: Vec::new(),
             },
         );
         let archived = artifacts
@@ -9582,7 +9900,7 @@ mod tests {
         );
         release_fixture_git(&checkout, &["commit", "--allow-empty", "-m", &valid]);
         let history = release_integration_history(&checkout, "HEAD").unwrap();
-        let revisions = release_task_revisions(&graph).unwrap();
+        let revisions = graph_completion_revisions(&graph).unwrap();
         let merged = release_merged_commits(&graph, &revisions, &history, &[]).unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].oracle, ReleaseCompletionOracle::Exact);
@@ -10002,6 +10320,7 @@ mod tests {
                 reference: "refs/tally/campaign/fixture/summary/complete".to_owned(),
                 object_id: "b".repeat(40),
             },
+            coverage: None,
             completion_proofs: vec![CampaignReleaseCompletionProof {
                 task_id: "ship-feature".to_owned(),
                 commit: revision.clone(),
@@ -10150,7 +10469,7 @@ mod tests {
         release_fixture_git(&checkout, &["commit", "-m", "chore: fixture base"]);
         let base = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
         let (graph, _) = adversarial_release_graph(&checkout);
-        let revisions = release_task_revisions(&graph).unwrap();
+        let revisions = graph_completion_revisions(&graph).unwrap();
         let legacy_revision = format!("sha256:{}", "b".repeat(64));
         assert_ne!(
             revisions.get("ship-feature"),
@@ -10360,8 +10679,288 @@ fi
             .contains("injected failure 4"));
     }
 
+    /// The unified contract, seen from the release side: a commit stamped
+    /// with the writer's tuple is proven exactly, and the bridge stays home.
     #[test]
-    fn completed_fixture_campaign_renders_a_plan_and_probes_the_full_release_lifecycle() {
+    fn an_exact_writer_tuple_match_revives_completion_without_the_bridge() {
+        let fixture = completed_release_fixture();
+        let plan = render_campaign_release_plan(
+            &fixture.state_dir,
+            RELEASE_FIXTURE_REPOSITORY,
+            RELEASE_FIXTURE_WORKLIST,
+        )
+        .unwrap();
+
+        // The trailer the fixture's integration commit carries is the writer's
+        // tuple this graph computes -- the same identity `campaign.rs` hands
+        // the driver to stamp -- so the exact oracle answers.
+        assert_eq!(
+            fixture.task_revision,
+            task_completion_revision(
+                &fixture.graph.manifest,
+                &fixture.graph.manifest.tasks[0],
+                &fixture.graph.tasks[0],
+            )
+            .unwrap()
+        );
+        assert_eq!(plan.completion_proofs.len(), 1);
+        assert_eq!(plan.completion_proofs[0].task_id, "ship-feature");
+        assert_eq!(
+            plan.completion_proofs[0].oracle,
+            ReleaseCompletionOracle::Exact
+        );
+        assert_eq!(plan.completion_proofs[0].reference, None);
+        assert!(
+            !plan
+                .digest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bridge")),
+            "an exact completion must not mention the bridge: {:?}",
+            plan.digest.warnings
+        );
+
+        // And execution persists both the proofs and the plan document, so the
+        // record answers "what did this release claim, and through which
+        // oracle" without re-rendering anything.
+        let directory = fixture.state_dir.join("release-record");
+        let calls = fixture.checkout.join("gh-calls");
+        let count = fixture.checkout.join("gh-count");
+        let fail_on = fixture.checkout.join("gh-fail-on");
+        let shim = release_recording_gh(&fixture.checkout, &calls, &count, &fail_on);
+        let config = CampaignReleaseExecutionConfig::resolve(Some(shim)).unwrap();
+        execute_campaign_release_in_directory(&directory, &plan, &config).unwrap();
+        let record: CampaignReleaseRecordV1 =
+            read_campaign_release_record(&directory.join(RELEASE_RECORD_FILE))
+                .unwrap()
+                .unwrap();
+        assert_eq!(record.completion_proofs, plan.completion_proofs);
+        assert_eq!(
+            record.plan.as_ref().unwrap(),
+            &serde_json::to_value(&plan).unwrap()
+        );
+        assert_eq!(record.plan_sha256, release_plan_sha256(&plan).unwrap());
+    }
+
+    /// The demoted bridge is still allowed to answer -- for a proof this graph
+    /// no longer computes -- but never silently.
+    #[test]
+    fn the_completion_bridge_names_itself_whenever_it_answers() {
+        let fixture = release_completion_bridge_fixture();
+        let history = release_integration_history(&fixture.checkout, "HEAD").unwrap();
+        let refs =
+            release_local_refs(&fixture.checkout, &["refs/heads/tally/".to_owned()]).unwrap();
+        let merged =
+            release_merged_commits(&fixture.graph, &fixture.revisions, &history, &refs).unwrap();
+        assert_eq!(merged[0].oracle, ReleaseCompletionOracle::Bridge);
+
+        let warnings = release_bridge_warnings(&merged);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("ship-feature")
+                && warnings[0].contains("legacy completion bridge")
+                && warnings[0].contains(&fixture.legacy_ref)
+                && warnings[0].contains(TALLY_REVISION_PREFIX),
+            "the bridge must name the task, itself, and the ref it fell back to: {}",
+            warnings[0]
+        );
+
+        // An exactly proven completion says nothing at all.
+        let exact = merged
+            .iter()
+            .map(|proof| ReleaseMergedCommit {
+                oracle: ReleaseCompletionOracle::Exact,
+                bridge_ref: None,
+                ..proof.clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(release_bridge_warnings(&exact).is_empty());
+    }
+
+    /// The release side of the lease model: once the lapse fact is written,
+    /// the coverage join is a rendering of durable facts, and no operator has
+    /// to hand-author the table it used to be read from.
+    #[test]
+    fn release_on_a_lapsed_campaign_renders_completion_coverage_from_durable_facts() {
+        let fixture = completed_release_fixture();
+        let stamped = json!({
+            "schemaVersion": ATTEMPT_RECEIPT_SCHEMA_VERSION,
+            "sequence": 2,
+            "kind": "retry",
+            "campaign": RELEASE_FIXTURE_CAMPAIGN,
+            "issueNumber": LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+            "armSerial": 1,
+            "worklistSha256": format!("sha256:{}", "c".repeat(64)),
+            "writtenAt": "2026-08-14T12:30:00Z",
+            "actor": "uid:1000",
+            "taskId": "ship-feature",
+            "attempt": 2,
+            "reason": "The fixture lane retried once.",
+            "redaction": "conservative-v2"
+        });
+        let attempt_path =
+            local_attempt_receipts_path(&fixture.state_dir, RELEASE_FIXTURE_CAMPAIGN).unwrap();
+        let mut log = fs::read_to_string(&attempt_path).unwrap();
+        log.push_str(&format!("{}\n", serde_json::to_string(&stamped).unwrap()));
+        fs::write(&attempt_path, log).unwrap();
+
+        // Nothing is armed on this path but the identity's own lease, which is
+        // what "whenever, by anyone" means.
+        let store = CampaignLeaseStore::new(
+            &fixture.state_dir,
+            RELEASE_FIXTURE_REPOSITORY,
+            RELEASE_FIXTURE_WORKLIST,
+        );
+        let uncovered = render_campaign_release_plan(
+            &fixture.state_dir,
+            RELEASE_FIXTURE_REPOSITORY,
+            RELEASE_FIXTURE_WORKLIST,
+        )
+        .unwrap();
+        assert!(
+            uncovered.coverage.is_none(),
+            "an unfinished identity has no completion fact to render coverage from"
+        );
+
+        let lapse = store
+            .acquire(
+                &CampaignActivation {
+                    campaign: RELEASE_FIXTURE_CAMPAIGN.to_owned(),
+                    repository: RELEASE_FIXTURE_REPOSITORY.to_owned(),
+                    worklist: RELEASE_FIXTURE_WORKLIST.to_owned(),
+                    arm_serial: fixture.registration.arm_serial,
+                    graph_digest: fixture.graph.executable_digest.clone(),
+                },
+                Utc::now(),
+            )
+            .unwrap()
+            .lapse(
+                &fixture.integration_tip,
+                PublishProof {
+                    task_id: "release-gate".to_owned(),
+                    reference: fixture.checkpoint_ref.clone(),
+                },
+                vec!["ship-feature".to_owned(), "release-gate".to_owned()],
+                Utc::now(),
+            )
+            .unwrap();
+
+        let plan = render_campaign_release_plan(
+            &fixture.state_dir,
+            RELEASE_FIXTURE_REPOSITORY,
+            RELEASE_FIXTURE_WORKLIST,
+        )
+        .unwrap();
+        let coverage = plan
+            .coverage
+            .as_ref()
+            .expect("a lapsed identity is covered");
+        assert_eq!(coverage.source, "durable-facts");
+        assert_eq!(coverage.sha, fixture.integration_tip);
+        assert_eq!(coverage.lapsed_at, lapse.lapsed_at);
+        assert_eq!(coverage.proven_by.reference, fixture.checkpoint_ref);
+        assert!(coverage.warnings.is_empty(), "{:?}", coverage.warnings);
+
+        // Every admitted task is a row, and every cell of it comes from a
+        // durable fact: the merge commit and its oracle, the checkpoint ref,
+        // the stamped receipt that says who acted and when.
+        let rows = coverage
+            .rows
+            .iter()
+            .map(|row| (row.task_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            rows.keys().copied().collect::<Vec<_>>(),
+            ["release-gate", "ship-feature"]
+        );
+        let implementation = rows["ship-feature"];
+        assert_eq!(implementation.kind, "implementation");
+        assert_eq!(implementation.title, "Ship the fixture feature");
+        assert_eq!(
+            implementation.claim.as_deref(),
+            Some(fixture.task_revision.as_str())
+        );
+        assert_eq!(
+            implementation.proof.as_deref(),
+            Some(fixture.integration_tip.as_str())
+        );
+        assert_eq!(implementation.oracle, Some(ReleaseCompletionOracle::Exact));
+        assert_eq!(
+            implementation.witnesses,
+            ["retry receipt written by uid:1000 at 2026-08-14T12:30:00Z"]
+        );
+        let checkpoint = rows["release-gate"];
+        assert_eq!(checkpoint.kind, "checkpoint");
+        assert_eq!(
+            checkpoint.claim.as_deref(),
+            Some(fixture.source_sha256.as_str())
+        );
+        assert_eq!(
+            checkpoint.proof.as_deref(),
+            Some(fixture.checkpoint_ref.as_str())
+        );
+        assert_eq!(
+            checkpoint.witnesses,
+            [format!(
+                "gate proof {} on {}",
+                fixture.checkpoint_ref, fixture.integration_tip
+            )]
+        );
+
+        // The operator's own summary is carried verbatim beside the derived
+        // rows -- and it is not where any of them came from: this fixture's
+        // summary is three words and no table.
+        let summary_body = format!(
+            "{COMPLETE_SUMMARY_MARKER_PREFIX}{} -->\n\n### Campaign complete\n",
+            fixture.source_sha256
+        );
+        assert_eq!(coverage.intent.as_deref(), Some(summary_body.as_str()));
+        assert!(
+            !summary_body.contains("ship-feature"),
+            "the fixture's operator text must not be the source of the coverage rows"
+        );
+
+        let human = render_campaign_release_human(&plan);
+        assert!(
+            human.contains("Coverage from durable facts")
+                && human.contains("- ship-feature [implementation]:")
+                && human.contains("retry receipt written by uid:1000"),
+            "{human}"
+        );
+        assert!(
+            render_campaign_release_notes(&plan).contains("## Coverage"),
+            "the published notes carry the rendered join"
+        );
+    }
+
+    /// The one identity every release fixture below arms.
+    const RELEASE_FIXTURE_CAMPAIGN: &str = "fixture-release";
+    const RELEASE_FIXTURE_REGISTRATION: &str = "0198a62b-41ee-7000-8000-000000000777";
+    const RELEASE_FIXTURE_WORKLIST: &str = "specs/release.json";
+    const RELEASE_FIXTURE_REPOSITORY: &str = "acme/widgets";
+
+    /// One campaign that finished: merged lane, gate-proven integration tip,
+    /// durable checkpoint and summary refs, and a stamped attempt receipt.
+    struct CompletedReleaseFixture {
+        _temporary: tempfile::TempDir,
+        checkout: PathBuf,
+        state_dir: PathBuf,
+        graph: CanonicalCampaignGraphV1,
+        registration: CampaignRegistration,
+        source_revision: String,
+        task_revision: String,
+        task_branch: String,
+        source_commit: String,
+        integration_branch: String,
+        integration_tip: String,
+        source_sha256: String,
+        checkpoint_ref: String,
+        complete_ref: String,
+        legacy_complete_ref: String,
+        archive_ref: String,
+    }
+
+    fn completed_release_fixture() -> CompletedReleaseFixture {
         let temporary = tempfile::tempdir().unwrap();
         let checkout = temporary.path().join("repository");
         let state_dir = temporary.path().join("state");
@@ -10377,10 +10976,10 @@ fi
         release_fixture_git(&checkout, &["commit", "-m", "chore: fixture base"]);
         let source_revision = release_fixture_git(&checkout, &["rev-parse", "HEAD"]);
 
-        let campaign = "fixture-release";
-        let registration_id = "0198a62b-41ee-7000-8000-000000000777";
-        let worklist = "specs/release.json";
-        let repository = "acme/widgets";
+        let campaign = RELEASE_FIXTURE_CAMPAIGN;
+        let registration_id = RELEASE_FIXTURE_REGISTRATION;
+        let worklist = RELEASE_FIXTURE_WORKLIST;
+        let repository = RELEASE_FIXTURE_REPOSITORY;
         let manifest = admit_manifest_value(json!({
             "schemaVersion": 1,
             "name": campaign,
@@ -10556,6 +11155,45 @@ fi
             ),
         )
         .unwrap();
+
+        CompletedReleaseFixture {
+            _temporary: temporary,
+            checkout,
+            state_dir,
+            graph,
+            registration,
+            source_revision,
+            task_revision,
+            task_branch,
+            source_commit,
+            integration_branch,
+            integration_tip,
+            source_sha256,
+            checkpoint_ref,
+            complete_ref,
+            legacy_complete_ref,
+            archive_ref,
+        }
+    }
+
+    #[test]
+    fn completed_fixture_campaign_renders_a_plan_and_probes_the_full_release_lifecycle() {
+        let fixture = completed_release_fixture();
+        let checkout = fixture.checkout.clone();
+        let state_dir = fixture.state_dir.clone();
+        let registration_id = RELEASE_FIXTURE_REGISTRATION;
+        let worklist = RELEASE_FIXTURE_WORKLIST;
+        let repository = RELEASE_FIXTURE_REPOSITORY;
+        let temporary = &fixture._temporary;
+        let source_revision = fixture.source_revision.clone();
+        let task_branch = fixture.task_branch.clone();
+        let source_commit = fixture.source_commit.clone();
+        let integration_branch = fixture.integration_branch.clone();
+        let integration_tip = fixture.integration_tip.clone();
+        let checkpoint_ref = fixture.checkpoint_ref.clone();
+        let complete_ref = fixture.complete_ref.clone();
+        let legacy_complete_ref = fixture.legacy_complete_ref.clone();
+        let archive_ref = fixture.archive_ref.clone();
 
         let before = release_fixture_fingerprint(&[&state_dir, &checkout]);
         let plan = render_campaign_release_plan(&state_dir, repository, worklist).unwrap();
@@ -11783,7 +12421,7 @@ fi
         let lane = ReadmissionLane::open("Build the foundation as first authored.");
         let graph = lane.live_graph();
         let registration = lane.arm(&graph);
-        let revisions = release_task_revisions(&graph.canonical).unwrap();
+        let revisions = graph_completion_revisions(&graph.canonical).unwrap();
         let unanswered =
             current_task_input_epochs(&graph.task_input_hashes, &CampaignSteering::default())
                 .unwrap();
@@ -11977,6 +12615,43 @@ fi
     /// Completion is a written fact, not an observed silence: the last task
     /// goes terminal under a gate-proven, published head, the pass lapses the
     /// lease, and everything after that reads the fact.
+    /// The seam the unified contract rests on: what an armed campaign hands
+    /// the driver to stamp is the writer's tuple, task for task, and not the
+    /// attempt-epoch input hash beside it.
+    #[test]
+    fn an_armed_graph_hands_down_the_completion_identity_release_recomputes() {
+        let lane = ReadmissionLane::open_gated("Build the foundation as first authored.");
+        let graph = lane.live_graph();
+        let expected = graph
+            .canonical
+            .manifest
+            .tasks
+            .iter()
+            .zip(&graph.canonical.tasks)
+            .map(|(reference, content)| {
+                (
+                    reference.id.clone(),
+                    task_completion_revision(&graph.canonical.manifest, reference, content)
+                        .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(graph.task_completion_revisions, expected);
+        assert_eq!(
+            graph.task_completion_revisions.keys().collect::<Vec<_>>(),
+            graph.task_input_hashes.keys().collect::<Vec<_>>(),
+            "both maps cover the admitted frontier"
+        );
+        assert!(
+            graph
+                .task_completion_revisions
+                .iter()
+                .all(|(task_id, revision)| graph.task_input_hashes[task_id] != *revision),
+            "the completion identity and the attempt epoch input are different contracts"
+        );
+    }
+
     #[test]
     fn lease_completion_writes_the_lapse_fact_a_release_can_rely_on() {
         let lane = ReadmissionLane::open_gated("Build the foundation as first authored.");
@@ -12321,11 +12996,13 @@ fi
         )
         .unwrap();
         let task_input_hashes = canonical_task_input_hashes(&canonical).unwrap();
+        let task_completion_revisions = graph_completion_revisions(&canonical).unwrap();
         CampaignGraph {
             canonical,
             ownership_preflight_warnings: Vec::new(),
             worklist_sha256: format!("sha256:{}", "a".repeat(64)),
             task_input_hashes,
+            task_completion_revisions,
             gate_budgets: Vec::new(),
         }
     }
