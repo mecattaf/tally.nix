@@ -183,6 +183,8 @@ pub(super) enum CampaignCommand {
     Arm(CampaignArmArgs),
     /// Append human steering to an armed campaign's local ordered log.
     Steer(CampaignSteerArgs),
+    /// Read the typed doubt this campaign is holding for an operator.
+    Inbox(CampaignInboxArgs),
     /// Render or execute the release represented by a completed campaign.
     Release(CampaignReleaseArgs),
     /// Reconcile changed armed campaigns into fresh bounded flow passes.
@@ -229,6 +231,22 @@ pub(super) struct CampaignSteerArgs {
     )]
     pub(super) message_file: Option<PathBuf>,
     /// Durable registration root; defaults beneath tally state.
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignInboxArgs {
+    /// Code repository coordinate of an existing armed campaign.
+    #[arg(value_name = "OWNER/REPO")]
+    pub(super) code_repository: String,
+    /// Committed worklist pattern identifying the campaign.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist_pattern: String,
+    /// Emit the complete machine-readable inbox projection.
+    #[arg(long)]
+    pub(super) json: bool,
+    /// Durable registration and attempt-receipt root; defaults beneath tally state.
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }
