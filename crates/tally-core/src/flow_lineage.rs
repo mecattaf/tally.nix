@@ -68,6 +68,23 @@ fn lookup_key(value: &str) -> String {
     canonical_flow_run_id(value).unwrap_or_else(|_| value.to_owned())
 }
 
+/// A stored identifier must already be canonical.
+///
+/// Every append goes through [`canonical_flow_run_id`], so a non-canonical
+/// rendering in the ledger cannot have been written by this build. It is
+/// refused rather than indexed under its own spelling, because that spelling
+/// answers no lookup the runner makes: the rollover would read as absent and
+/// resurrect a run an operator durably retired.
+fn stored_canonical(field: &str, value: &str) -> Result<(), String> {
+    match canonical_flow_run_id(value) {
+        Ok(canonical) if canonical == value => Ok(()),
+        Ok(_) => Err(format!(
+            "{field} is not the canonical hyphenated lowercase UUID rendering"
+        )),
+        Err(_) => Err(format!("{field} is not a UUID")),
+    }
+}
+
 /// Why a run was abandoned in favour of a successor.
 ///
 /// Closed on purpose. The whole point of recording a reason is that a generic
@@ -136,9 +153,8 @@ impl FlowSupersedeRecord {
                 "schemaVersion must be the integer {FLOW_LINEAGE_SCHEMA_VERSION}"
             ));
         }
-        Uuid::parse_str(&self.flow_run_id).map_err(|_| "flowRunId is not a UUID".to_owned())?;
-        Uuid::parse_str(&self.successor_flow_run_id)
-            .map_err(|_| "successorFlowRunId is not a UUID".to_owned())?;
+        stored_canonical("flowRunId", &self.flow_run_id)?;
+        stored_canonical("successorFlowRunId", &self.successor_flow_run_id)?;
         if self.flow_run_id == self.successor_flow_run_id {
             return Err("successorFlowRunId must differ from flowRunId".to_owned());
         }
@@ -309,13 +325,7 @@ impl FlowLineage {
         Ok(lineage)
     }
 
-    fn insert(&mut self, mut record: FlowSupersedeRecord) -> Result<(), String> {
-        // Read-side canonicalization absorbs a record written before run IDs
-        // were canonicalized on the way in, so a pre-repair ledger entry in an
-        // upper-case or unhyphenated rendering still answers the lookup the
-        // runner actually makes.
-        record.flow_run_id = lookup_key(&record.flow_run_id);
-        record.successor_flow_run_id = lookup_key(&record.successor_flow_run_id);
+    fn insert(&mut self, record: FlowSupersedeRecord) -> Result<(), String> {
         if let Some(existing) = self.by_predecessor.get(&record.flow_run_id) {
             return Err(format!(
                 "flow run {} is already superseded by {}",
@@ -848,12 +858,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_repair_ledger_entry_is_absorbed_on_read() {
+    fn a_non_canonical_stored_rendering_is_refused_rather_than_silently_missed() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(FLOW_LINEAGE_FILE);
-        // Exactly what the merged-but-unrepaired build could write: the
-        // caller's own upper-case spelling stored verbatim.
-        let legacy = FlowSupersedeRecord {
+        // No writer produces this: it is a hand-repaired line typed in the
+        // caller's own upper-case spelling. Indexing it under that spelling
+        // would answer no lookup, so the read says so instead.
+        let smuggled = FlowSupersedeRecord {
             schema_version: FLOW_LINEAGE_SCHEMA_VERSION,
             flow_run_id: "00000000-0000-4000-8000-0000000000A1".to_owned(),
             successor_flow_run_id: "00000000-0000-4000-8000-0000000000B2".to_owned(),
@@ -865,22 +876,15 @@ mod tests {
         };
         std::fs::write(
             &path,
-            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+            format!("{}\n", serde_json::to_string(&smuggled).unwrap()),
         )
         .unwrap();
 
-        let lineage = FlowLineage::read(&path).unwrap();
-        let view = lineage.view(A);
-        assert!(view.superseded, "the runner's rendering must still match");
-        assert_eq!(view.superseded_by.unwrap().successor_flow_run_id, B);
-        assert_eq!(view.chain, vec![A.to_owned(), B.to_owned()]);
-        // It is one rollover, so re-recording it is a reuse rather than a
-        // conflict against a successor that looks unclaimed.
-        assert_eq!(
-            record_supersede(&path, A, B, SupersedeReason::GenerationChange, &pins())
-                .unwrap()
-                .disposition,
-            SupersedeDisposition::Reused
+        let error = FlowLineage::read(&path).unwrap_err();
+        assert!(
+            matches!(&error, FlowLineageError::Malformed { reason, .. }
+                if reason.contains("canonical")),
+            "{error}"
         );
     }
 
