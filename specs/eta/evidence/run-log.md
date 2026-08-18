@@ -280,3 +280,55 @@ freshly proves the full ladder over the NEW head, so C1/C2 re-passing
 here subsumes most of C3's risk; cost is wall-clock only. Worth a
 ruling at the sitting on whether checkpoint receipts should survive
 re-arm when the proven head is an ancestor of the current base.
+
+## Chapter 4 CLOSED — C3 green, machine-published, campaign complete. 2026-08-18 ~13:10 UTC
+
+All four chapter-4 lanes merged (4 merges in 5 attempts; the one
+retry was the auto-diagnosed parity lane). The checkpoint chain
+re-witnessed C1 (one flaky red, machine-recovered, findings above),
+C2, and C3 green over head e091b46a — fleet gate PASS, final bar
+24/24 at every witness. **The first machine fast-forward publish in
+the record**: the machinery rebased the four lane commits
+content-disjointly over the supervisor's run-log commits and
+fast-forwarded main to exactly the proven sha — proven head ==
+published sha e091b46a, no operator verb, the cherry-pick ritual's
+grave now witnessed. The campaign reached complete with 25/25 done
+and the lease lapsed into the durable completion fact (X6's first
+full lifecycle). Supervisor discipline learned mid-chapter: run-log
+pushes to main re-key the observation and extend the checkpoint
+grind — ledger commits batch to campaign-quiescent windows from now
+on. Deployed contract shakedown verdict: X1 (machine publish), X2
+(re-admission — exercised by every observation change), X5 (receipt
+budgets, floor case), X6 (lease lifecycle), and the role-aware
+diagnosis steward all carried live fire; the inbox saw no traffic
+(nothing escalated — every failure self-resolved).
+
+Pin-bump 3: dotfiles pin b54ea267 → ab10ac91 (published head + the
+run-log commit; code-identical to the proven e091b46a).
+
+Pin-bump 3 flash, first attempt FAILED — two lessons, one new P3 item:
+(1) the supervisor repeated the recorded pipefail sin (nixos-rebuild
+piped to tail masked exit 1; the run-log's own 08-17 lesson — retyped
+here as penance and re-learned); (2) the real failure was the KNOWN
+lease test-isolation race surviving its chapter-3 repair:
+lease_concurrent_passes_never_double_dispatch_one_frontier panicked on
+another test's Held lease for scope night-readmission-6
+(campaign.rs:11971) inside the package build's cargo test — the
+the-inbox lane's unique-scope fix was incomplete; two tests still
+contend under sandbox parallelism. Flaky, not deterministic: the same
+code passed the cargo-tests gate and three fleet-gate runs today.
+Retried once with the cause named (E6 satisfied); the complete
+per-test unique-scope repair is QUEUED UNDER P3 beside the #440
+launch-cwd flake — the flaky-test class now has two members.
+
+Flash retry SUCCEEDED (exit 0, pipefail-verified). Post-flash
+checklist executed: fleet-deploy inactive, both timers stopped, daemon
+restarted on 5rd83q51...-tally-0.1.0. Seam verification, all green:
+`tally --version` → "tally 0.1.0 (rev ab10ac91...)" — the deployed
+binary names its own pin for the first time (D1); adapter smoke
+claude-code PASS with commit probe verified; and the FIRST LIVE
+baseline-parity probe returned verdict PARITY — bare and laned agents
+identical on tempdirWritable, devShmWritable, cpuParallelism=32,
+failingCommandStderr, memoryCeiling=absent; zero contained, zero
+undocumented divergences. The §2.6 law is a measured property of the
+deployed host. Chapter 4 seam closed; chapter 5 next (P1–P4).
