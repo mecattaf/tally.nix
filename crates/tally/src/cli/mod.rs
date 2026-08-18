@@ -6,6 +6,7 @@ mod daemon;
 pub(crate) mod enqueue;
 mod exit;
 mod flow;
+mod judge_replay;
 mod out;
 mod parity;
 mod queue;
@@ -106,6 +107,7 @@ use daemon::*;
 use enqueue::*;
 use exit::*;
 use flow::*;
+use judge_replay::*;
 use out::{errln, outln};
 use parity::*;
 use queue::*;
@@ -343,6 +345,9 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             run_rebuild(&socket, opts.config.as_deref(), rpc_timeout, args).await
         }
         Some(Command::LintHistory(args)) => run_lint_history(args),
+        Some(Command::JudgeReplay { command }) => {
+            run_judge_replay(opts.config.as_deref(), command).await
+        }
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::History { command }) => run_history(command),
         Some(Command::Attest { command }) => run_attest(command),

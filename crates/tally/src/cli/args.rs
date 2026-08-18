@@ -65,6 +65,13 @@ pub(super) enum Command {
     Rebuild(RebuildArgs),
     /// Validate every commit in a Git revision range against tally's commit grammar.
     LintHistory(LintHistoryArgs),
+    /// The judge-tier corpus replay harness: assemble the journaled diagnosis
+    /// corpus from the durable record, replay it against a candidate adapter,
+    /// and render the disagreement (ETA.md §8.5).
+    JudgeReplay {
+        #[command(subcommand)]
+        command: JudgeReplayCommand,
+    },
     Witness {
         #[command(subcommand)]
         command: WitnessCommand,
@@ -118,6 +125,58 @@ pub(super) struct RebuildArgs {
     /// attestation ledgers; defaults to the XDG data directory.
     #[arg(long, value_name = "PATH")]
     pub(super) data_dir: Option<PathBuf>,
+}
+
+/// The two halves of the harness, kept as separate verbs because they are
+/// separate acts with separate costs: assembly reads only durable local state
+/// and is free, while a run dispatches every case to a model and is the spend
+/// the §8.5 decision is bought with. Nothing chains them.
+#[derive(Debug, Subcommand)]
+pub(super) enum JudgeReplayCommand {
+    /// Walk the durable record and emit a corpus of {brief, recorded-verdict}
+    /// pairs, reporting what was found and what was unrecoverable.
+    Assemble(JudgeReplayAssembleArgs),
+    /// Replay an assembled corpus against a candidate adapter and write the
+    /// byte-stable disagreement table.
+    Run(JudgeReplayRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct JudgeReplayAssembleArgs {
+    /// Campaign whose recorded diagnoses join the corpus. Repeat the flag to
+    /// sweep several campaigns into one corpus.
+    #[arg(long = "campaign", value_name = "NAME", required = true)]
+    pub(super) campaigns: Vec<String>,
+    /// Content-addressed brief archive holding the dispatched diagnosis briefs;
+    /// defaults to `<data-dir>/briefs`.
+    #[arg(long, value_name = "PATH")]
+    pub(super) briefs: Option<PathBuf>,
+    /// Directory holding one attempt-receipt log per campaign; defaults to
+    /// `<state-dir>/campaigns/attempt-receipts`.
+    #[arg(long, value_name = "PATH")]
+    pub(super) receipts_root: Option<PathBuf>,
+    /// Corpus directory to write. It must not already hold entries.
+    #[arg(long, value_name = "PATH")]
+    pub(super) out: PathBuf,
+    /// Print the corpus manifest instead of the human summary.
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct JudgeReplayRunArgs {
+    /// Corpus directory written by `judge-replay assemble`.
+    #[arg(long, value_name = "PATH")]
+    pub(super) corpus: PathBuf,
+    /// Candidate adapter name, resolved in the host catalog.
+    #[arg(long, value_name = "NAME")]
+    pub(super) candidate: String,
+    /// File the disagreement table is written to. It is also printed.
+    #[arg(long, value_name = "PATH")]
+    pub(super) out: PathBuf,
+    /// Wall-clock budget for one candidate dispatch.
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_CANDIDATE_TIMEOUT_SEC)]
+    pub(super) timeout_sec: u64,
 }
 
 #[derive(Debug, Args)]
