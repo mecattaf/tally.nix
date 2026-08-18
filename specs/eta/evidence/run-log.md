@@ -239,3 +239,6 @@ first reconciled pass.
 |---|---|---|---|
 | 13 | 08-18 06:46–07:46 | product-split attempt 1 — MERGED first try | integration 1ea314e5; agent ~50 min; whole node chain exit 0; steward commitlint fallback correctly replaced a non-conforming lane-tip subject with the task-id template |
 | 14 | 08-18 07:47–09:15 | worklist-scaffold attempt 1 — MERGED first try | integration 2c41af34; node chain clean end to end; the scaffold verb and its bare-repo no-spec-plane property landed under the receipt-derived gate budgets' first live run |
+| 15 | 08-18 ~08:50 | baseline-parity-probe attempt 1 — ownership refusal | agent left uncommitted changes (dirty-worktree finish violation, the known class); refused before touching the base, exit=1 named exactly |
+| 16 | 08-18 ~08:52 | AUTO-DIAGNOSIS — first live cycle of the role-aware shim | verdict retry, outcome-first diagnosis correctly distinguishing no-commit from boundary-breach; schema-valid on the first real dispatch; zero supervisor involvement — the failure→diagnosis→retry loop closed autonomously for the first time in the campaign's history |
+| 17 | 08-18 08:55–09:38 | baseline-parity-probe attempt 2 — MERGED | integration 64576e92; steered by the auto-diagnosis; lane-tip conventional subject accepted by commitlint directly |
