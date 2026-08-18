@@ -72,7 +72,7 @@ assertions.
 | `queue` | Enqueue, continue, retry, cancel, pause/resume, drain, and await. | RPC result JSON. |
 | `producer` | Preview and exercise configured GitHub producers. | Diagnostic/admission JSON. |
 | `adapter` | Execute a minimal live adapter diagnostic. | Smoke result JSON. |
-| `campaign` | Project, arm, poll, or inspect forge-native campaigns. | Projection, admission, or registry JSON. |
+| `campaign` | Scaffold, arm, steer, poll, or inspect local and forge-native campaigns. | Scaffold, admission, or registry JSON. |
 | `witness` | Verify/compare chains, verify authorship, or append an advisory observation. | Text or JSON. |
 | `attest` | Run a child through the advisory execution-attestation wrapper. | Child output; child's exit. |
 | `lease` | Acquire, release, or inspect an explicit reservation. | Lease JSON. |
@@ -90,6 +90,26 @@ implementation-private, and not part of this CLI contract.
 
 ## Local worklist campaigns
 
+Write a minimal admissible worklist for a new campaign identity:
+
+```console
+$ tally campaign scaffold IDENTITY
+$ tally campaign scaffold IDENTITY --path some/other/worklist.json
+```
+
+The identity must be a safe path component: it becomes the campaign name, the
+default file `silent-factory-worklists/IDENTITY.json`, and — reduced to the
+stricter lowercase-and-hyphen task-id form — the id of the one example task.
+The verb runs inside the checkout that will arm it, reads `OWNER/REPO` from
+that checkout's `origin` remote when it spells one, rehearses the rendered
+bytes through the same validation `arm` performs, and refuses to overwrite an
+existing file. `--path` may not contain `..` and must land inside the checkout.
+Every value the author must replace is spelled `EDIT-ME`; the printed handoff
+names the fields worth checking and the exact `arm` line. Stdout is one compact
+JSON object — `worklist`, `pattern`, `campaign`, `taskId`, `armArgv` — followed
+by that human handoff. See [A small worklist, end to
+end](../flows/small-worklist.md) for the whole lifecycle.
+
 Register the committed worklist on a repository's remote base branch as the
 campaign authority:
 
@@ -97,7 +117,10 @@ campaign authority:
 $ tally campaign arm OWNER/REPO PATH/TO/WORKLIST.json [--wait]
 $ tally campaign arm OWNER/REPO PATH/TO/WORKLIST.json \
     --checkout /srv/repository --base-branch main --remote origin
-$ tally campaign resume OWNER/REPO PATH/TO/WORKLIST.json --reason TEXT
+$ tally campaign steer OWNER/REPO PATH/TO/WORKLIST.json --message TEXT
+$ tally campaign inbox OWNER/REPO PATH/TO/WORKLIST.json [--json]
+$ tally campaign status OWNER/REPO PATH/TO/WORKLIST.json [--json]
+$ tally campaign release OWNER/REPO PATH/TO/WORKLIST.json --plan
 $ tally campaign disarm OWNER/REPO PATH/TO/WORKLIST.json
 ```
 
@@ -105,8 +128,8 @@ $ tally campaign disarm OWNER/REPO PATH/TO/WORKLIST.json
 default to `main` and `origin`. Arm fetches that remote and reads the single
 regular file matching the worklist pattern from the fetched base tree. Dirty
 working-tree bytes are never campaign authority. The registration records the
-canonical checkout and Git coordinates, so resume and poll never recover them
-from a rendered campaign declaration.
+canonical checkout and Git coordinates, so re-admission and poll never recover
+them from a rendered campaign declaration.
 
 The schema-version-1 worklist may carry a closed top-level `campaign` object.
 It owns the campaign name, task/parallelism limits, merge method, runtime
@@ -114,6 +137,11 @@ limits, agent role, optional steward role, and the required non-empty gate
 list. Agent and steward names resolve through the host adapter catalog; the
 host does not declare per-campaign policy or a campaign mutex. The runner uses
 the reserved capacity-1 `campaign/OWNER/REPO` mutex.
+
+After the first arm, a worklist push to the identity's authority remote is
+itself the arming act: the poll scan below validates the pushed graph, then
+admits it as a fresh reconcile epoch with no operator verb in between. Arming
+again is the same epoch flip with a human in it.
 
 `--no-enqueue` validates and registers without admitting the initial pass.
 Packaged installs default the flow and driver to

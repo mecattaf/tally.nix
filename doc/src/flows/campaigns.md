@@ -1,7 +1,14 @@
 # Campaigns
 
-Tally has two campaign weights:
+Tally has three campaign weights:
 
+- **Local worklist campaigns are one committed JSON file.** `tally campaign
+  scaffold IDENTITY` writes a minimal admissible worklist, and `tally campaign
+  arm OWNER/REPO WORKLIST` registers it against the checkout's own remote base
+  branch. No forge issue graph, no spec corpus, and no module declaration is
+  involved, and every later amendment is a push. [A small worklist, end to
+  end](small-worklist.md) walks that lifecycle on an ordinary repository; the
+  rest of this page is the reference behind it.
 - **Ad-hoc campaigns are forge-native.** One GitHub master issue contains the
   campaign configuration and ordered DAG. Its native sub-issues contain the
   exact per-task briefs. `tally campaign arm ISSUE-URL` registers that durable
@@ -11,7 +18,7 @@ Tally has two campaign weights:
   the right surface when the same label, mention, repository policy, and
   worklist discovery should be estate configuration.
 
-Both modes use the same shipped, bounded, stateless `spec-build` reconciler.
+All three use the same shipped, bounded, stateless `spec-build` reconciler.
 Marked merged pull requests and automated checkpoint refs are durable
 completion facts, and tally witnesses every observation and gate.
 
@@ -1384,7 +1391,12 @@ authority for uncommitted worklist bytes. It accepts schema version 1:
 
 Every node has an explicit `kind` discriminator. An `implementation` node
 requires `id`, `kind`, `title`, `goal`, `deliveredBehaviors`, `readFirst`,
-`acceptanceCriteria`, and `dependencies`. `conflictDomains` may be omitted only
+`acceptanceCriteria`, and `dependencies`. `readFirst.specSections` must be a
+non-empty list of strings, and that is the whole requirement: nothing resolves
+those strings against the filesystem, so a repository with no `specs/` tree
+names whatever its lane should read first — a design note, a README section, a
+neighbouring source file. The example above cites a spec corpus because that is
+the genre it illustrates, not because campaigns need one. `conflictDomains` may be omitted only
 while `maxParallel = 1`; every implementation node must provide a non-empty
 array when parallelism is enabled. Entries are normalized relative file or
 directory paths without `..`. Equal paths and ancestor/descendant paths overlap,
@@ -2313,6 +2325,11 @@ therefore a fresh forge event ID.
 
 ## Starting recurring automation
 
+This is the heaviest of the three weights, and everything below is what
+*recurring estate configuration* costs. None of it is a precondition for
+running a campaign: a local worklist campaign needs none of these steps, and a
+repository with no spec corpus at all is a supported campaign target.
+
 The complete operational sequence is:
 
 1. Freeze and commit the spec corpus, including its schema-versioned task
@@ -2327,5 +2344,8 @@ The complete operational sequence is:
 That is the recurring activation path: no per-repository flow script, dispatch
 wrapper, producer block, or extra serialization service. For a one-night or
 otherwise ad-hoc buildout, stop before steps 3–6: project the worklist and run
-`tally campaign arm` instead. Promoting a repeated ad-hoc campaign into this
+`tally campaign arm` instead. For ordinary work on a repository that has no
+spec plane, drop to the local worklist weight — [scaffold, arm, push,
+release](small-worklist.md) — which needs neither the corpus of step 1 nor the
+forge and module surface of steps 3–4. Promoting a repeated campaign into this
 declarative surface is an explicit change of weight class.

@@ -49,7 +49,13 @@ evidence. tally earns its extra machinery only when admission, cross-workload
 fairness, remote re-adoption, semantic gates, deduplication, or independently
 verifiable history matter.
 
-The next three pages take the shortest path to a witnessed
+There are two ways in. [Install tally](getting-started/install.md) deploys the
+complete Home Manager surface — pools, producers, meters, declarative flows —
+and the pages after it take the shortest path to a witnessed
 [job](getting-started/first-job.md) and a witnessed
-[flow](getting-started/first-flow.md). The [Concepts](concepts/jobs-and-admission.md)
-section then explains each mechanism in isolation.
+[flow](getting-started/first-flow.md). [Install tally as a
+product](getting-started/product.md) is the single-machine path: a
+profile-installed CLI and a fleet-free daemon, for running campaigns on your
+own repositories without deploying anything to anyone. The
+[Concepts](concepts/jobs-and-admission.md) section then explains each mechanism
+in isolation.
