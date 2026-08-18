@@ -667,6 +667,12 @@ struct DaemonHandler {
     execution_cancel: broadcast::Sender<Uuid>,
     fatal: mpsc::UnboundedSender<DaemonError>,
     post_ack_tasks: Rc<RefCell<Vec<JoinHandle<()>>>>,
+    /// Jobs whose terminal acknowledgement has been sent but whose post-ack
+    /// enrichment has not yet installed the facts a continuation reads (#440).
+    ///
+    /// Each entry is the sender a waiter subscribes to; the entry is removed
+    /// and signalled when the enrichment task ends, however it ends.
+    settling_completions: Rc<RefCell<HashMap<Uuid, watch::Sender<bool>>>>,
     ingress_sweep: Rc<Mutex<()>>,
     tally_socket: String,
     brief_root: PathBuf,

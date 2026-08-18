@@ -4417,6 +4417,103 @@ mod tests {
             .await;
     }
 
+    /// #440's flake, killed at its cause rather than waited out.
+    ///
+    /// The `launch-cwd-ordinary-completion` bar case enqueues with `--wait`
+    /// and continues the instant the wait returns. The terminal
+    /// acknowledgement is deliberately independent of the post-ack scrape --
+    /// `run.rs` releases waiters after the witness fsync and nothing else --
+    /// so the continuation could reach the row before the session pointer was
+    /// installed and be refused with "has no scraped session reference". It
+    /// was: once at the Phase-0 bootstrap gate, green on rerun, which is the
+    /// signature of a race and not of a defect the case can see.
+    ///
+    /// This drives the losing side of that race with no timing in it at all.
+    /// `finish_job` returns with the enrichment task spawned and not yet
+    /// polled, so the continuation below is admitted at exactly the moment
+    /// the old code lost -- every time, not intermittently. Nothing here
+    /// sleeps, drains, or observes the enrichment: the continuation's own
+    /// wait on the settled completion is the whole mechanism under test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_continuation_admitted_at_the_terminal_ack_reads_the_scraped_session() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let launched_in = temp.path().join("continued-session-home");
+                fs::create_dir(&launched_in).unwrap();
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"raced-session\"}'\n",
+                );
+                let config = cwd_keyed_config(&program);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths, settings(), executor)
+                        .await
+                        .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial work"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let finished = await_positive_progress(
+                    "raced continuation source completion",
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap();
+
+                // The terminal acknowledgement. A `--wait` returns here.
+                daemon.finish_job(finished).await.unwrap();
+
+                let continued = await_positive_progress(
+                    "continuation admitted at the terminal acknowledgement",
+                    daemon
+                        .handler
+                        .continue_job_as_client(Some(json!({
+                            "resumeFrom": task_uuid,
+                            "argv": ["review"],
+                        }))),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the continuation lost the race to its own scrape: {error:?}")
+                });
+                assert!(
+                    continued["task_uuid"].is_string(),
+                    "a continuation admits a new row: {continued}"
+                );
+
+                // And it continues *that* session: the pointer the scrape
+                // installed, not an empty one the admission tolerated.
+                let observed = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .query_rows
+                    .get(&task_uuid.parse::<Uuid>().unwrap())
+                    .and_then(|fact| fact.session_ref.clone());
+                assert_eq!(observed.as_deref(), Some("raced-session"));
+            })
+            .await;
+    }
+
     /// #425 (F2). "This row declared no working directory" and "nothing
     /// recorded where this session was launched" are different facts, and only
     /// the second is a reason to refuse.

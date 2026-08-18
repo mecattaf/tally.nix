@@ -484,12 +484,38 @@ impl DaemonHandler {
         });
     }
 
+    /// Wait for the continued job's post-ack enrichment to settle (#440).
+    ///
+    /// A `--wait` returns on the terminal acknowledgement, which is
+    /// deliberately independent of the scrape that installs the session
+    /// pointer, so `queue continue` on the task that just finished used to
+    /// race it and lose — reported as "has no scraped session reference",
+    /// intermittently, in the bar case that flaked at the Phase-0 bootstrap
+    /// gate. The wait is on the enrichment task's own end, not on a duration,
+    /// and it costs nothing for a job whose enrichment already finished or
+    /// never had one.
+    ///
+    /// Taken before the context write lock, because the enrichment this waits
+    /// on takes that same lock to install what it scraped.
+    async fn settle_continued_job(&self, presented: &str) {
+        let pending = {
+            let context = self.context.read().await;
+            context.aliases.get(presented).copied()
+        };
+        if let Some(job_id) = pending {
+            self.await_completion_settled(job_id).await;
+        }
+    }
+
     async fn admit_payload(
         &self,
         mut payload: EnqueuePayload,
         ingress_id: Option<String>,
         caller: CallerIdentity,
     ) -> Result<Value, WireError> {
+        if let Some(resume_from) = payload.resume_from.clone() {
+            self.settle_continued_job(&resume_from).await;
+        }
         // Tree and SQLite measurement stay on the periodic blocking sampler,
         // but the cheap statvfs guard must be current for every admission.
         let storage = self.refresh_storage_for_intake();

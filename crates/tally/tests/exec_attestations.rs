@@ -11,18 +11,29 @@ use tally_core::witness::{
     WitnessLedger, GENESIS_PREV_HASH,
 };
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
+
+use isolated_host::{Isolated, IsolatedHost};
+
 const FIRST: &str = "00000000-0000-4000-8000-000000000061";
 const SECOND: &str = "00000000-0000-4000-8000-000000000062";
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
-fn tally() -> Command {
+/// Every `tally` this file spawns, bound to the caller's private host.
+///
+/// The host is the caller's rather than this frame's because the command is
+/// returned unspawned: a host created here would be torn down while the
+/// builder still named its directories.
+fn tally(host: &IsolatedHost) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
-    command.args(["--config", EMPTY_CONFIG]);
+    command.isolated(host).args(["--config", EMPTY_CONFIG]);
     command
 }
 
 fn run_attested(ledger: &Path, task_uuid: &str, artifact: &Path, payload_hash: &str) -> Output {
-    tally()
+    let host = IsolatedHost::new();
+    tally(&host)
         .args([
             "attest",
             "exec",
@@ -89,7 +100,8 @@ fn append_canon(ledger: &mut WitnessLedger, task_uuid: &str, artifact: &Path, pa
 }
 
 fn compare(canon: &Path, attestations: &Path) -> Output {
-    tally()
+    let host = IsolatedHost::new();
+    tally(&host)
         .args([
             "witness",
             "compare",
@@ -207,8 +219,9 @@ fn attestation_append_failure_never_changes_child_exit_propagation() {
     fs::write(&blocker, "block").unwrap();
     let ledger = blocker.join("exec-attestations.jsonl");
 
+    let host = IsolatedHost::new();
     for expected in [0, 23] {
-        let output = tally()
+        let output = tally(&host)
             .args([
                 "attest",
                 "exec",
@@ -239,7 +252,8 @@ fn attestation_append_failure_never_changes_child_exit_propagation() {
 fn wrapper_maps_a_signalled_child_to_128_plus_signal() {
     let temp = tempfile::tempdir().unwrap();
     let ledger = temp.path().join("exec-attestations.jsonl");
-    let output = tally()
+    let host = IsolatedHost::new();
+    let output = tally(&host)
         .args([
             "attest",
             "exec",

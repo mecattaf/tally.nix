@@ -670,6 +670,10 @@ impl Daemon {
                     .auto_bounded_requeue
                 && job.row.attempt < self.handler.settings.recovery_policy.max_attempts;
             if !auto_requeue {
+                // The pending mark goes up before the waiters are released,
+                // not after: a continuation admitted the instant a `--wait`
+                // returns must find something to wait on (#440).
+                self.handler.begin_completion_settle(finished.job_id);
                 context.barriers.complete_job(&stable, result.value());
             }
             // Terminal: the job leaves the live map (#395). Everything below

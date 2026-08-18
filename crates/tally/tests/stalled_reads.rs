@@ -38,8 +38,12 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, LocalSet};
 
+use isolated_host::{Isolated, IsolatedHost};
+
 #[path = "support/configured_tally.rs"]
 mod configured_tally;
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
 #[path = "support/shell_program.rs"]
 mod shell_program;
 
@@ -205,16 +209,15 @@ async fn start_daemon(paths: &DaemonPaths, config: Config) -> RunningDaemon {
 
 async fn run_tally(config: &Path, socket: &Path, args: &[&str]) -> std::process::Output {
     let state_home = config.parent().unwrap().join("xdg-state");
+    let host = IsolatedHost::new();
     Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(config)
         .arg("--socket")
         .arg(socket)
         .args(args)
         .env("XDG_STATE_HOME", &state_home)
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
-        .env_remove("TALLY_RPC_TIMEOUT_SEC")
         .output()
         .await
         .unwrap()

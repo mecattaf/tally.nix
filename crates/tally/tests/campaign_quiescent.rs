@@ -7,17 +7,26 @@ use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV4, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
+
+use isolated_host::{Isolated, IsolatedHost};
+
 const WORKLIST: &str = "specs/night/tasks.json";
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 fn quiescent(state_dir: &Path, absent_socket: &Path) -> Output {
+    // The private host outlives the spawn, which is the whole of its job here:
+    // the verb runs to completion before this frame returns.
+    let host = IsolatedHost::new();
     Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .args(["campaign", "quiescent", "--state-dir"])
         .arg(state_dir)
+        // Named after the guard bound its own: this verb is about what a
+        // campaign does when no daemon answers.
         .env("TALLY_SOCKET", absent_socket)
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .unwrap()
 }

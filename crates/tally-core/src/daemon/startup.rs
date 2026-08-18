@@ -484,6 +484,7 @@ impl Daemon {
             execution_cancel,
             fatal: fatal_tx,
             post_ack_tasks,
+            settling_completions: Rc::new(RefCell::new(HashMap::new())),
             ingress_sweep: Rc::new(Mutex::new(())),
             tally_socket,
             brief_root: paths.data_dir.clone(),
