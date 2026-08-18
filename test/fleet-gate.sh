@@ -317,7 +317,16 @@ gate_local_repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 
 mkdir -p "$state_dir/transcripts"
 chmod 0700 "$state_dir" "$state_dir/transcripts"
-transcript="$state_dir/transcripts/$gate_sha.log"
+# Red evidence outlives the green re-run that follows it. A transcript named
+# by the audited SHA alone is overwritten by the next run on that same head:
+# witnessed at the eta C1 re-witness (2026-08-18, specs/eta/evidence/run-log.md),
+# where the transcript holding the original failing check was replaced by the
+# re-run that went green, and the only copy of the failure was gone. The run
+# stamp is UTC seconds plus this shell's PID, so two runs of one head -- even
+# two started in the same second -- write two files, and the PASS/FAIL line
+# below names the exact one this run wrote.
+gate_run_stamp="$(date --utc '+%Y%m%dT%H%M%SZ')-$$"
+transcript="$state_dir/transcripts/$gate_sha-$gate_run_stamp.log"
 gate_root="$(mktemp -d "${TMPDIR:-/tmp}/tally-fleet-gate.XXXXXX")"
 chmod 0700 "$gate_root"
 worktree="$gate_root/worktree"

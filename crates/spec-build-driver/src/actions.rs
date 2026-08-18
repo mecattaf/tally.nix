@@ -15,7 +15,7 @@ use tally_core::attempt_receipts::{
     ATTEMPT_RECEIPT_AUTHORITY_FILE, ATTEMPT_RECEIPT_MACHINE_ACTOR, ATTEMPT_RECEIPT_SCHEMA_VERSION,
     LEGACY_ATTEMPT_RECEIPT_SCHEMA_VERSION, MAX_TASK_LIFETIME_ATTEMPTS,
 };
-use tally_core::campaign_contract::task_input_epoch;
+use tally_core::campaign_contract::{task_input_epoch, DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC};
 use tally_core::campaign_folds::{
     campaign_digest as fold_campaign_digest, render_campaign_summary, stable_publish_branch,
     stage_scoped_summary_ref, CampaignReconciliation,
@@ -1115,7 +1115,11 @@ fn validate_worklist_campaign(
             "worklist.campaign.stewardArgv requires a steward adapter",
         ));
     }
-    let default_steward_runtime = Json::Number("120".to_owned());
+    // The arm CLI's ruled default for the silence, read rather than retyped:
+    // the steward's only dispatch is the diagnosis node, and the sizing that
+    // number carries is a ruling, not a numeral this validator may drift from.
+    let default_steward_runtime =
+        Json::Number(DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC.to_string());
     campaign_u64(
         campaign
             .get("stewardRuntimeMaxSec")
@@ -2795,6 +2799,110 @@ fn transient_steering_result(retry: &Json) -> Json {
     ])
 }
 
+/// The judge that never answered, as the flow named it.
+///
+/// A steward-bound diagnosis node can exit without projecting a result: its
+/// unit budget expires mid model call, its harness crashes, its answer comes
+/// back empty. Witnessed at the eta C1 re-witness (2026-08-18,
+/// `specs/eta/evidence/run-log.md`), where the missing projection surfaced as
+/// a `result-schema-mismatch` flow error and killed the whole pass.
+///
+/// The class is kin to [`LaneOutcome`]'s adapter-terminal: it is settled
+/// without consulting a judge, because there was no judge. Nothing was
+/// established about the work, so no retry may be dispatched on its
+/// authority; the diagnosis position -- no diagnosis means stop and tell the
+/// operator -- makes the only correct verdict `blocked`, and the receipt this
+/// composes is the operator's inbox entry.
+struct DiagnosisUnavailable {
+    /// The failure class the flow read off the dead node, in the machinery's
+    /// own vocabulary (`result-schema-mismatch`, `result-projection-timeout`).
+    code: String,
+    /// The node's own detail, bounded by the flow before it travelled.
+    detail: String,
+}
+
+impl DiagnosisUnavailable {
+    /// The receipt text. Composed rather than quoted -- no model wrote a
+    /// sentence here, so the machinery writes one -- and carrying the same
+    /// literal gate evidence the public grammar requires of a judge's own
+    /// diagnosis, so the operator reads one shape whoever authored it.
+    fn diagnosis(&self, task_id: &str, gate_evidence: Option<&Json>) -> String {
+        let (gate_id, path) = gate_evidence_requirements(gate_evidence);
+        let mut note = format!(
+            "Recorded a diagnosis-unavailable outcome: the steward node for task {task_id} \
+             ended without projecting a diagnosis ({}), so nothing judged this failure and \
+             no retry may be dispatched on a judgment nobody made.",
+            self.code
+        );
+        if let Some(gate_id) = gate_id {
+            note.push_str(&format!(
+                " Failing check id: {}.",
+                python_single_quoted(&gate_id)
+            ));
+        }
+        if let Some(path) = path {
+            note.push_str(&format!(
+                " Offending path: {}.",
+                python_single_quoted(&path)
+            ));
+        }
+        let detail = collapse_whitespace(&self.detail);
+        let detail = take_chars(&detail, 2_000);
+        let detail = trim_end_punctuation(&detail);
+        let detail = replace_bare_exclamation_marks(detail, ".");
+        if !detail.is_empty() {
+            note.push_str(&format!(" Node detail: {detail}."));
+        }
+        bound_public_diagnosis(&note)
+    }
+}
+
+/// Read the flow's typed statement that its judge died.
+///
+/// Absent and null are admissible and mean the ordinary path: this pass has a
+/// diagnosis, and the judge wrote it.
+fn diagnosis_unavailable(value: Option<&Json>) -> Result<Option<DiagnosisUnavailable>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let object = object_complete(value, &["code", "detail"], "diagnosisUnavailable")?;
+    let code = required_string(object.get("code"), "diagnosisUnavailable.code", Some(64))?;
+    if !Regex::new(r"^[a-z][a-z0-9:._-]{0,63}$")
+        .expect("static machine class regex")
+        .is_match(&code)
+    {
+        return Err(DriverError::new(
+            "diagnosisUnavailable.code is not a safe machine class name",
+        ));
+    }
+    let detail = required_text(
+        object.get("detail"),
+        "diagnosisUnavailable.detail",
+        MAX_DIAGNOSIS_CHARS,
+    )?;
+    Ok(Some(DiagnosisUnavailable { code, detail }))
+}
+
+/// The diagnosis text this steer records, whoever authored it.
+///
+/// The judge's own answer when there was one, and the machinery's composed
+/// account when the judge died. Both then travel the identical redaction,
+/// bounding and public-grammar path below: a receipt an operator reads must
+/// not need to know which of the two it is looking at to be legible.
+fn steer_diagnosis(
+    data: &BTreeMap<String, Json>,
+    unavailable: Option<&DiagnosisUnavailable>,
+    task_id: &str,
+) -> Result<String> {
+    match unavailable {
+        Some(unavailable) => Ok(unavailable.diagnosis(task_id, data.get("gateEvidence"))),
+        None => required_text(data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS),
+    }
+}
+
 fn action_steer(brief: &Json) -> Result<Json> {
     let data = object_exact(
         brief,
@@ -2808,6 +2916,7 @@ fn action_steer(brief: &Json) -> Result<Json> {
             "stage",
             "attempt",
             "diagnosis",
+            "diagnosisUnavailable",
             "verdict",
             "proposal",
             "attemptReceipts",
@@ -2848,6 +2957,12 @@ fn action_steer(brief: &Json) -> Result<Json> {
             "taskKind must equal implementation or checkpoint",
         ));
     }
+    let unavailable = diagnosis_unavailable(data.get("diagnosisUnavailable"))?;
+    if unavailable.is_some() && !matches!(data.get("diagnosis"), None | Some(Json::Null)) {
+        return Err(DriverError::new(
+            "a diagnosis-unavailable steer carries no diagnosis: the judge never answered",
+        ));
+    }
     let requested_verdict =
         DiagnosisVerdict::parse(data.get("verdict"), "verdict")?.unwrap_or(if attempt == 2 {
             DiagnosisVerdict::Blocked
@@ -2855,6 +2970,11 @@ fn action_steer(brief: &Json) -> Result<Json> {
             DiagnosisVerdict::Retry
         });
     let (proposal, proposal_redacted) = public_diagnosis_proposal(data.get("proposal"))?;
+    if proposal.is_some() && unavailable.is_some() {
+        return Err(DriverError::new(
+            "a diagnosis-unavailable steer carries no proposal: the judge never answered",
+        ));
+    }
     if proposal.is_some() && requested_verdict != DiagnosisVerdict::Blocked {
         return Err(DriverError::new(
             "proposal is allowed only with a blocked diagnosis verdict",
@@ -2897,11 +3017,15 @@ fn action_steer(brief: &Json) -> Result<Json> {
     let adapter_terminal = lane_outcome
         .as_ref()
         .is_some_and(LaneOutcome::is_adapter_terminal);
+    // A judge that never answered settles the verdict the same way an adapter
+    // that stated its own wall does: no judgment slot is needed, because there
+    // is no judgment to weigh.
     let mut verdict = if breach
         || task_kind == "checkpoint"
         || attempt == 2
         || transient_budget_exhausted
         || adapter_terminal
+        || unavailable.is_some()
     {
         DiagnosisVerdict::Blocked
     } else {
@@ -2931,7 +3055,7 @@ fn action_steer(brief: &Json) -> Result<Json> {
         } else {
             (String::new(), false)
         };
-        let diagnosis = required_text(data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS)?;
+        let diagnosis = steer_diagnosis(data, unavailable.as_ref(), &task_id)?;
         let (diagnosis, redacted_diagnosis) = redact_public_text(&diagnosis);
         let diagnosis = bound_public_diagnosis(&diagnosis);
         let diagnosis = validated_diagnosis(&diagnosis, data.get("gateEvidence"));
@@ -3004,7 +3128,7 @@ fn action_steer(brief: &Json) -> Result<Json> {
     } else {
         (String::new(), false)
     };
-    let diagnosis = required_text(data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS)?;
+    let diagnosis = steer_diagnosis(data, unavailable.as_ref(), &task_id)?;
     let (diagnosis, redacted) = redact_public_text(&diagnosis);
     let diagnosis = bound_public_diagnosis(&diagnosis);
     let diagnosis = validated_diagnosis(&diagnosis, data.get("gateEvidence"));

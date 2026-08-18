@@ -25,7 +25,27 @@ pub const DEFAULT_AGENT_RUNTIME_MAX_SEC: u64 = 14_400;
 pub const DEFAULT_RUNNER_POOL: &str = "campaign";
 pub const DEFAULT_AGENT_PRIORITY: &str = "low";
 pub const DEFAULT_STEWARD_FINAL_MESSAGE_PATTERN: &str = "^TALLY_FINAL_MESSAGE=(.*)$";
-pub const DEFAULT_STEWARD_RUNTIME_MAX_SEC: u64 = 120;
+/// The steward's dispatch budget, which is the diagnosis role's budget.
+///
+/// Ruled at 1,800 seconds after the eta C1 re-witness (2026-08-18,
+/// `specs/eta/evidence/run-log.md`): the checkpoint's diagnosis node spent 2.4
+/// seconds of CPU across two minutes of wall clock waiting on one model call,
+/// hit the 120-second limit this constant used to hold, and projected nothing.
+/// That 120 was sized for a narration subprocess that no longer dispatches --
+/// publication narrates from the lane tip and falls back to a deterministic
+/// template, so a tight budget there costs nothing -- while the only steward
+/// dispatch left is the diagnosis node, whose brief carries a failing task's
+/// gate outputs, diff, task brief and prior diagnoses, and whose answer is one
+/// model call on whatever model the host catalog binds.
+///
+/// Sizing: a checkpoint-scale brief on a slow model is minutes of wall clock
+/// that are almost entirely wait, so the budget is an order of magnitude above
+/// the wall the incident measured, and still an order of magnitude under the
+/// lane budget (`DEFAULT_AGENT_RUNTIME_MAX_SEC`) -- a steward that hangs
+/// forever dies inside the pass that dispatched it instead of holding the
+/// campaign. A campaign that wants a tighter budget for a fast local judge
+/// says so in its worklist; this is the number for the silence.
+pub const DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC: u64 = 1_800;
 pub const MAX_AGENT_MODEL_CHARS: usize = 128;
 pub const MAX_STEWARD_ENV_ENTRIES: usize = 64;
 pub const MAX_STEWARD_ENV_VALUE_CHARS: usize = 4096;
@@ -959,7 +979,7 @@ fn default_steward_final_message_pattern() -> String {
 }
 
 const fn default_steward_runtime_max_sec() -> Option<u64> {
-    Some(DEFAULT_STEWARD_RUNTIME_MAX_SEC)
+    Some(DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC)
 }
 
 const fn default_gate_runtime_max_sec() -> u64 {
@@ -1233,7 +1253,7 @@ mod tests {
         );
         assert_eq!(
             steward.runtime_max_sec,
-            Some(DEFAULT_STEWARD_RUNTIME_MAX_SEC)
+            Some(DEFAULT_STEWARD_DIAGNOSIS_RUNTIME_MAX_SEC)
         );
     }
 
