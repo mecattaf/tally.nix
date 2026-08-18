@@ -242,3 +242,16 @@ first reconciled pass.
 | 15 | 08-18 ~08:50 | baseline-parity-probe attempt 1 — ownership refusal | agent left uncommitted changes (dirty-worktree finish violation, the known class); refused before touching the base, exit=1 named exactly |
 | 16 | 08-18 ~08:52 | AUTO-DIAGNOSIS — first live cycle of the role-aware shim | verdict retry, outcome-first diagnosis correctly distinguishing no-commit from boundary-breach; schema-valid on the first real dispatch; zero supervisor involvement — the failure→diagnosis→retry loop closed autonomously for the first time in the campaign's history |
 | 17 | 08-18 08:55–09:38 | baseline-parity-probe attempt 2 — MERGED | integration 64576e92; steered by the auto-diagnosis; lane-tip conventional subject accepted by commitlint directly |
+| 18 | 08-18 09:39–10:15 | product-docs attempt 1 — MERGED first try | integration c8e7ea5d; all four chapter-4 implementation lanes done, 4 merges in 5 attempts |
+
+Machinery observation for the C3 sitting: after the re-arm, the
+reconciler honored durable done-ness for the twenty implementation
+tasks but is RE-RUNNING the checkpoint tasks (chapter-gate-c1 started
+10:19 UTC on the chapter-4 integration head) — checkpoint proofs are
+receipt-lineage-scoped where implementation done-ness is
+tree-derivable. Defensible semantics (a checkpoint witnessed against
+an older head says nothing about the current one) and each re-run
+freshly proves the full ladder over the NEW head, so C1/C2 re-passing
+here subsumes most of C3's risk; cost is wall-clock only. Worth a
+ruling at the sitting on whether checkpoint receipts should survive
+re-arm when the proven head is an ancestor of the current base.
