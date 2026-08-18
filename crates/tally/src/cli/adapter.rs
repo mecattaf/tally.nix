@@ -19,7 +19,7 @@ const CAPTURE_PROJECTION_POLL: Duration = Duration::from_millis(100);
 /// witness-emitted PASS were reported as failures because a `query.job` read
 /// timed out during a daemon stall (#431). A timed-out read is never rendered
 /// as adapter failure.
-const VERDICT_UNAVAILABLE_EXIT: i32 = 5;
+pub(super) const VERDICT_UNAVAILABLE_EXIT: i32 = 5;
 const DEFAULT_SMOKE_PROMPT: &str = "Reply with the single word ok.";
 pub(super) const COMMIT_PROBE_FILE: &str = "tally-commit-probe.txt";
 pub(super) const COMMIT_PROBE_MESSAGE: &str = "tally commit probe";
@@ -65,14 +65,14 @@ impl SmokeVerdict {
 /// Both deadline variants count: a per-call deadline and the reconnect window
 /// used while re-arming a wait describe the same fact from the client's side —
 /// no reply arrived — and a stalled daemon can produce either.
-fn is_rpc_timeout(error: &WireIoError) -> bool {
+pub(super) fn is_rpc_timeout(error: &WireIoError) -> bool {
     matches!(
         error,
         WireIoError::DeadlineExceeded { .. } | WireIoError::RearmDeadlineExceeded { .. }
     )
 }
 
-fn verdict_unavailable(detail: String) -> anyhow::Error {
+pub(super) fn verdict_unavailable(detail: String) -> anyhow::Error {
     exit_failure(VERDICT_UNAVAILABLE_EXIT, detail)
 }
 
@@ -85,6 +85,9 @@ pub(super) async fn run_adapter(
     match command {
         AdapterCommand::Smoke(args) => {
             run_adapter_smoke(socket, config_path, rpc_timeout, args).await
+        }
+        AdapterCommand::Parity(args) => {
+            run_adapter_parity(socket, config_path, rpc_timeout, args).await
         }
     }
 }
@@ -573,7 +576,7 @@ impl CommitProbe {
     }
 }
 
-fn git(root: &Path, argv: &[&str]) -> Result<String> {
+pub(super) fn git(root: &Path, argv: &[&str]) -> Result<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -615,7 +618,7 @@ fn resolve_smoke_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
     })
 }
 
-fn resolve_smoke_pool(
+pub(super) fn resolve_smoke_pool(
     adapter: &str,
     requested: Option<&str>,
     pools: &BTreeMap<String, tally_core::config::PoolConfig>,
@@ -646,7 +649,7 @@ fn resolve_smoke_pool(
     )))
 }
 
-fn configured_names<'a>(names: impl Iterator<Item = &'a String>) -> String {
+pub(super) fn configured_names<'a>(names: impl Iterator<Item = &'a String>) -> String {
     let names = names.map(String::as_str).collect::<Vec<_>>();
     if names.is_empty() {
         "<none>".to_owned()

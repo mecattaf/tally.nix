@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "note": "Fixture table for the baseline-parity tests. It carries the one ruling shape the law admits -- a named capability, the ruling that narrows it, and the source the ruling is written in -- so the gate can be exercised without the committed table having to assert a containment that does not stand.",
+  "rulings": [
+    {
+      "capability": "memoryCeiling",
+      "ruling": "The job cgroup carries a memory ceiling the terminal does not, accepted as a deliberate containment of runaway compilation.",
+      "citation": "specs/substrate/evidence/vestige-sweep.md V-1 (fixture citation: this ruling was NOT taken; chapter 1 deleted the cap)"
+    }
+  ]
+}

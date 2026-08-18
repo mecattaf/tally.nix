@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "side": "laned",
+  "tempdirWritable": true,
+  "devShmWritable": false,
+  "cpuParallelism": 16,
+  "failingCommandStderr": true,
+  "memoryCeiling": "absent"
+}

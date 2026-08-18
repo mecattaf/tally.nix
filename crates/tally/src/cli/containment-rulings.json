@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 1,
+  "note": "Baseline parity (AUG15-SESSION-FINDINGS.md section 2.6, restated as this chapter's standing authority in specs/eta/evidence/sitting-c2.md): whatever an agent can do bare in a terminal -- write temp files, use /dev/shm, compile at full parallelism, see its own error output -- it must be able to do inside a lane; every deliberate gap is a documented containment ruling with a named justification, or it is a defect. Each entry below names one capability the lane deliberately narrows, the ruling that narrowed it, and the source that carries the ruling. The list is empty on purpose: chapter 1 deleted the two convicted gaps -- the unauthored 8 GiB job MemoryMax (specs/substrate/evidence/vestige-sweep.md V-1) and the read-only diagnosis sandbox (V-2) -- and nothing has been ruled back since. An empty table is the strongest position the law admits, and it is what makes the probe red for the next unauthored constraint: adding a row is how a containment becomes lawful, and until the row exists the divergence is a defect that names itself.",
+  "rulings": []
+}

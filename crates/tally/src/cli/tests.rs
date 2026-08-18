@@ -577,6 +577,102 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
 }
 
 #[test]
+fn adapter_parity_cli_shape_and_its_hidden_probe_verbs_are_stable() {
+    let defaults = Opts::try_parse_from(["tally", "adapter", "parity"]).unwrap();
+    assert!(matches!(
+        defaults.command,
+        Some(Command::Adapter {
+            command: AdapterCommand::Parity(AdapterParityArgs {
+                adapter,
+                pool: None,
+                state_dir: None,
+                probe_root: None,
+            })
+        }) if adapter == "shell"
+    ));
+
+    let overridden = Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "parity",
+        "--adapter",
+        "codex",
+        "--pool",
+        "build",
+        "--state-dir",
+        "/var/lib/tally/state",
+    ])
+    .unwrap();
+    assert!(matches!(
+        overridden.command,
+        Some(Command::Adapter {
+            command: AdapterCommand::Parity(AdapterParityArgs {
+                adapter,
+                pool: Some(pool),
+                state_dir: Some(state_dir),
+                probe_root: None,
+            })
+        }) if adapter == "codex"
+            && pool == "build"
+            && state_dir == Path::new("/var/lib/tally/state")
+    ));
+
+    // The site derivation has one home: naming both a state directory and a
+    // probe root would leave `tally gc` sweeping one of them and the probe
+    // writing the other.
+    assert!(Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "parity",
+        "--state-dir",
+        "/var/lib/tally/state",
+        "--probe-root",
+        "/var/lib/tally/state/adapter-smoke",
+    ])
+    .is_err());
+
+    // Both halves run the same hidden probe; the side is explicit on the wire
+    // rather than inferred from which process spawned it.
+    let laned = Opts::try_parse_from([
+        "tally",
+        "__parity-probe",
+        "--side",
+        "laned",
+        "--out",
+        "/tmp/parity-report.json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        laned.command,
+        Some(Command::ParityProbe(ParityProbeArgs {
+            side: ProbeSide::Laned,
+            out: Some(out),
+        })) if out == Path::new("/tmp/parity-report.json")
+    ));
+    assert!(matches!(
+        Opts::try_parse_from(["tally", "__parity-probe"])
+            .unwrap()
+            .command,
+        Some(Command::ParityProbe(ParityProbeArgs {
+            side: ProbeSide::Bare,
+            out: None,
+        }))
+    ));
+    assert!(matches!(
+        Opts::try_parse_from(["tally", "__parity-fail"])
+            .unwrap()
+            .command,
+        Some(Command::ParityFail)
+    ));
+
+    // Machinery, not surface: an operator asks for the comparison and never
+    // for one half of it.
+    let help = Opts::command().render_long_help().to_string();
+    assert!(!help.contains("__parity-probe"));
+    assert!(!help.contains("__parity-fail"));
+}
+
+#[test]
 fn hidden_exit_recorder_command_parses() {
     let options = Opts::try_parse_from([
         "tally",

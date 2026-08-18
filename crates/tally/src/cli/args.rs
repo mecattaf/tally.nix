@@ -36,6 +36,16 @@ pub(super) enum Command {
     AdapterSmokeShell,
     #[command(name = "__adapter-smoke-commit", hide = true)]
     AdapterSmokeCommit,
+    /// The one capability probe `adapter parity` runs on both sides. Hidden
+    /// because it is machinery: an operator asks for the comparison, never for
+    /// one half of it.
+    #[command(name = PARITY_PROBE_VERB, hide = true)]
+    ParityProbe(ParityProbeArgs),
+    /// Fails on purpose, writing one known line to stderr. The probe's
+    /// "can this process see its own error output?" observation is this verb
+    /// coming back readable.
+    #[command(name = PARITY_FAIL_VERB, hide = true)]
+    ParityFail,
     #[command(name = "__producer-dispatch", hide = true)]
     ProducerDispatch(ProducerDispatchArgs),
     Gc(GcArgs),
@@ -395,6 +405,46 @@ pub(super) struct CampaignDisarmArgs {
 pub(super) enum AdapterCommand {
     /// Execute one minimal job through the configured adapter and daemon.
     Smoke(AdapterSmokeArgs),
+    /// Run one typed capability probe bare and again as a real job unit, and
+    /// put every divergence to the committed containment-rulings table.
+    Parity(AdapterParityArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct AdapterParityArgs {
+    /// Adapter the laned half is dispatched through. The probe argv must be
+    /// executed literally, so this is only meaningful for an adapter that runs
+    /// a command rather than reading a prompt.
+    #[arg(long, default_value = "shell", value_name = "NAME")]
+    pub(super) adapter: String,
+    /// Admission pool; inferred only when a conventional lane is configured.
+    #[arg(long)]
+    pub(super) pool: Option<String>,
+    /// State directory the probe site derives from; defaults to the XDG state
+    /// directory. The site is minted under the same `adapter-smoke/` root and
+    /// `probe-` prefix the commit probe uses, so `tally gc --state-dir <same
+    /// path>` reaps a site a failed probe retained as evidence.
+    #[arg(long, value_name = "PATH", conflicts_with = "probe_root")]
+    pub(super) state_dir: Option<PathBuf>,
+    /// Directory the probe site is created under; defaults to `adapter-smoke/`
+    /// below the state directory. Never the system temporary directory: a
+    /// hardened adapter's transient unit gets a private /tmp it cannot chdir
+    /// into, which would read as a parity defect and be a harness fault.
+    #[arg(long, value_name = "PATH")]
+    pub(super) probe_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct ParityProbeArgs {
+    /// Which side this run is. Carried into the report so a pair that is not
+    /// one bare and one laned observation is refused rather than compared.
+    #[arg(long, value_enum, default_value_t = ProbeSide::Bare)]
+    pub(super) side: ProbeSide,
+    /// Additionally write the report here. The laned half writes into its
+    /// declared workspace so the comparison never depends on the adapter
+    /// scrape configuration it is measuring.
+    #[arg(long, value_name = "PATH")]
+    pub(super) out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
