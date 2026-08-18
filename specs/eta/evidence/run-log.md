@@ -238,3 +238,4 @@ first reconciled pass.
 | # | when (UTC) | what | outcome |
 |---|---|---|---|
 | 13 | 08-18 06:46–07:46 | product-split attempt 1 — MERGED first try | integration 1ea314e5; agent ~50 min; whole node chain exit 0; steward commitlint fallback correctly replaced a non-conforming lane-tip subject with the task-id template |
+| 14 | 08-18 07:47–09:15 | worklist-scaffold attempt 1 — MERGED first try | integration 2c41af34; node chain clean end to end; the scaffold verb and its bare-repo no-spec-plane property landed under the receipt-derived gate budgets' first live run |
