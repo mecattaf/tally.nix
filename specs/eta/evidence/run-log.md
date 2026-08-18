@@ -244,6 +244,31 @@ first reconciled pass.
 | 17 | 08-18 08:55–09:38 | baseline-parity-probe attempt 2 — MERGED | integration 64576e92; steered by the auto-diagnosis; lane-tip conventional subject accepted by commitlint directly |
 | 18 | 08-18 09:39–10:15 | product-docs attempt 1 — MERGED first try | integration c8e7ea5d; all four chapter-4 implementation lanes done, 4 merges in 5 attempts |
 
+## C1 re-witness: one flaky red, machine-recovered; three findings (08-18 ~11:30–12:00 UTC)
+
+The C1 re-witness failed once — `fleet gate: FAIL e091b46a` — then the
+next poll pass re-ran it green (final bar 24/24) with no supervisor
+verb; C2's re-witness followed. The campaign's first RED checkpoint
+recovered autonomously. Findings for the C3 sitting, none blocking:
+
+1. **Red transcript evidence is clobbered.** Fleet-gate transcripts key
+   by head sha; the green re-run overwrote the red run's transcript, so
+   the failing check's identity is unrecoverable (coredump timeline
+   suggests the crash-injection test genre, `release_execute_crash_child`
+   — deliberate SIGABRT cores, likely #440-class flake, unproven).
+   A red transcript should be preserved, not overwritten.
+2. **A steward diagnosis timeout kills its pass.** diagnose-chapter-gate-c1
+   hit the 120s steward node budget (2.4s CPU / 2min wall — model
+   latency on a checkpoint-sized brief), and the projection timeout
+   surfaced as FlowResultError result-schema-mismatch, failing the
+   WHOLE pass — V-16's class one seam over: an envelope-less steward
+   death should be a typed diagnosis-unavailable outcome (blocked
+   escalation), never a flow crash. The 120s budget itself needs a
+   ruled, larger number for diagnosis-role dispatches.
+3. **Post-flaky-red conduct was correct end to end:** checkpoint-record
+   wrote the red fact, cleanup ran, the next pass re-dispatched, and
+   the re-run proved the same head. Wall-clock cost only.
+
 Machinery observation for the C3 sitting: after the re-arm, the
 reconciler honored durable done-ness for the twenty implementation
 tasks but is RE-RUNNING the checkpoint tasks (chapter-gate-c1 started
