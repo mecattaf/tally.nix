@@ -803,13 +803,23 @@ pub fn task_input_epoch(
     Ok(format!("sha256:{:x}", Sha256::digest(bytes.as_bytes())))
 }
 
-/// Revision identity for one task's durable completion proof.
+/// Revision identity for one task's durable completion proof: the writer's
+/// tuple, and nothing else.
 ///
 /// The campaign's full executable digest remains the admission boundary, but
 /// it is intentionally too broad for completion: adding an unrelated task or
-/// editing another brief must not invalidate every merged pull request. This
-/// contract includes the task itself plus the global execution policy that can
-/// change whether its proof is valid, and excludes scheduler/capacity fields.
+/// editing another brief must not invalidate every merged pull request. What
+/// is left is what the writer authored — the campaign this worklist names, the
+/// task's own reference, and its admitted content.
+///
+/// Execution policy is deliberately absent. Gates, agent, steward, and merge
+/// method decide how a task is attempted and how its lane lands; they say
+/// nothing about what was asked for, so an edit to any of them is a policy
+/// edit and not new work. Keying completion on them made every such edit
+/// re-key delivered work, which killed the exact-match oracle and left a
+/// heuristic bridge answering in its place. The repository block leaves for
+/// the same reason at one remove: a checkout path, remote, or forge is where
+/// the machine runs, never what the writer asked for.
 pub fn task_completion_revision(
     manifest: &CampaignManifest,
     reference: &CampaignTaskReference,
@@ -817,26 +827,16 @@ pub fn task_completion_revision(
 ) -> Result<String, CampaignContractError> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct CompletionPolicy<'a> {
+    struct WriterTuple<'a> {
         contract_version: u32,
         campaign: &'a str,
-        repository: &'a CampaignRepository,
-        merge_method: &'a str,
-        agent: &'a CampaignAgent,
-        steward: &'a Option<CampaignSteward>,
-        gates: &'a [CampaignGate],
         task: &'a CampaignTaskReference,
         content: &'a CanonicalCampaignTaskV1,
     }
 
-    let bytes = canonical_json(CompletionPolicy {
+    let bytes = canonical_json(WriterTuple {
         contract_version: 1,
         campaign: &manifest.name,
-        repository: &manifest.repository,
-        merge_method: &manifest.merge_method,
-        agent: &manifest.agent,
-        steward: &manifest.steward,
-        gates: &manifest.gates,
         task: reference,
         content,
     })?;
@@ -1077,24 +1077,75 @@ mod tests {
             revision,
             "the completed task's admitted issue content remains revision-bearing"
         );
+    }
 
-        let mut global_policy_changed = manifest.clone();
-        global_policy_changed.gates.push(CampaignGate::Command {
+    /// The E1 contract, stated as the case that used to fail: policy is not
+    /// work. Each edit below is one an operator makes mid-campaign — a gate
+    /// added, the agent retuned, a steward attached, the merge method
+    /// switched — and none of them is an instruction to the task that already
+    /// landed.
+    #[test]
+    fn a_policy_only_change_never_re_keys_a_task_completion_identity() {
+        let manifest: CampaignManifest = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "name": "fixture",
+            "repository": {"checkout": "/srv/fixture", "forge": "github"},
+            "mergeMethod": "squash",
+            "agent": {},
+            "gates": [],
+            "tasks": [{
+                "id": "build",
+                "kind": "implementation",
+                "issue": 8,
+                "dependencies": [],
+                "conflictDomains": ["src/build"]
+            }]
+        }))
+        .unwrap();
+        let content = CanonicalCampaignTaskV1 {
+            number: 8,
+            title: "Build the feature".to_owned(),
+            body: "Implement the admitted feature.".to_owned(),
+        };
+        let revision = task_completion_revision(&manifest, &manifest.tasks[0], &content).unwrap();
+
+        let mut gates_changed = manifest.clone();
+        gates_changed.gates.push(CampaignGate::Command {
             id: "tests".to_owned(),
             preflight_argv: vec!["true".to_owned()],
             argv: vec!["true".to_owned()],
             runtime_max_sec: 60,
         });
-        assert_ne!(
-            task_completion_revision(
-                &global_policy_changed,
-                &global_policy_changed.tasks[0],
-                &content,
-            )
-            .unwrap(),
-            revision,
-            "global execution policy changes must invalidate prior task proof"
-        );
+        let mut agent_changed = manifest.clone();
+        agent_changed.agent.model = Some("a-larger-model".to_owned());
+        agent_changed.agent.runtime_max_sec = Some(60);
+        let mut steward_changed = manifest.clone();
+        steward_changed.steward = Some(CampaignSteward {
+            adapter: "codex".to_owned(),
+            argv: vec!["true".to_owned()],
+            env: BTreeMap::new(),
+            final_message_pattern: default_steward_final_message_pattern(),
+            runtime_max_sec: default_steward_runtime_max_sec(),
+        });
+        let mut merge_method_changed = manifest.clone();
+        merge_method_changed.merge_method = "merge".to_owned();
+        let mut repository_changed = manifest.clone();
+        repository_changed.repository.checkout = PathBuf::from("/srv/moved-fixture");
+        repository_changed.repository.remote = "mirror".to_owned();
+
+        for (policy, edited) in [
+            ("a gate added", gates_changed),
+            ("the agent retuned", agent_changed),
+            ("a steward attached", steward_changed),
+            ("the merge method switched", merge_method_changed),
+            ("the checkout moved", repository_changed),
+        ] {
+            assert_eq!(
+                task_completion_revision(&edited, &edited.tasks[0], &content).unwrap(),
+                revision,
+                "{policy} is execution policy, not new work, and must not re-key completion"
+            );
+        }
     }
 
     #[test]

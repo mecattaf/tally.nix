@@ -473,6 +473,9 @@ pub struct SpecBuildFlowArgs {
     #[serde(default)]
     #[schemars(!default, extend("maxProperties" = 128))]
     task_input_hashes: Optional<BTreeMap<String, Sha256Identity>>,
+    #[serde(default)]
+    #[schemars(!default, extend("maxProperties" = 128))]
+    task_completion_revisions: Optional<BTreeMap<String, Sha256Identity>>,
     armed_manifest: Option<CanonicalCampaignManifest>,
     #[serde(default)]
     #[schemars(!default)]
