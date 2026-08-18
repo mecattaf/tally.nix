@@ -83,6 +83,15 @@ pub struct CampaignAgent {
     pub model: Option<String>,
 }
 
+/// A gate's merge criterion and the wall clock it runs under.
+///
+/// An admitted gate always carries a resolved `runtimeMaxSec`, the way an
+/// admitted manifest carries a resolved pool and merge method. The number is
+/// not authored there: a worklist gate may omit its budget entirely, and the
+/// arm CLI resolves the omission against that gate's own receipts before this
+/// contract ever sees it (`gate_budget::resolve_gate_budget`, vestige-sweep
+/// V-6). The default below is reachable only by the pre-worklist
+/// `admit_manifest_value` compatibility callers, and dies with them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum CampaignGate {
@@ -107,6 +116,18 @@ impl CampaignGate {
     pub fn id(&self) -> &str {
         match self {
             Self::Command { id, .. } | Self::ForbidPaths { id, .. } => id,
+        }
+    }
+
+    /// The resolved budget this gate runs under.
+    pub const fn runtime_max_sec(&self) -> u64 {
+        match self {
+            Self::Command {
+                runtime_max_sec, ..
+            }
+            | Self::ForbidPaths {
+                runtime_max_sec, ..
+            } => *runtime_max_sec,
         }
     }
 

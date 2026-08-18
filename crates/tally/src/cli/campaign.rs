@@ -37,6 +37,7 @@ use tally_core::campaign_registry::{
     CampaignRegistration, CampaignRegistrationV4, CampaignRegistry, REGISTRY_SCHEMA_VERSION,
 };
 use tally_core::config::{PoolConfig, ResourceKind};
+use tally_core::gate_budget::{resolve_gate_budget, GateBudget, GATE_BUDGET_UNOBSERVED_SEC};
 use tally_core::lease::{is_campaign_pool_name, CAMPAIGN_POOL_PREFIX};
 
 const COMPLETION_TRAILER_PREFIXES: [&str; 2] = ["Tally-Task:", "Tally-Revision:"];
@@ -52,6 +53,13 @@ const ATTEMPT_RECEIPTS_FILE: &str = "attempt-receipts-v1.jsonl";
 const MAX_ATTEMPT_RECEIPTS_LOG_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_RETRY_CHARS: usize = 2_000;
+/// The longest firing a gate-observation receipt may claim, in seconds.
+///
+/// A gate cannot have run longer than the campaign budget that supervised it,
+/// and `DEFAULT_AGENT_RUNTIME_MAX_SEC` (four hours) is the largest such budget
+/// this contract ships. The bound exists so one corrupt duration cannot derive
+/// an unbounded budget for every later pass.
+const MAX_GATE_OBSERVATION_SEC: u64 = DEFAULT_AGENT_RUNTIME_MAX_SEC;
 const LOCAL_CAMPAIGN_ISSUE_NUMBER: u64 = 1;
 const LOCAL_ALLOWED_ACTOR: &str = "local";
 const RELEASE_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -113,6 +121,75 @@ struct CommittedLocalWorklist {
     source_sha256: String,
 }
 
+/// A gate exactly as a worklist may author it.
+///
+/// The only difference from the admitted `CampaignGate` is the one that matters
+/// here: `runtimeMaxSec` is optional, and its absence is a statement rather than
+/// an omission to be papered over. It says the gate's own receipts decide.
+/// Nothing downstream ever sees this type; `resolve_worklist_gate_budgets`
+/// turns it into an admitted gate carrying a resolved number.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum WorklistGate {
+    #[serde(rename = "command", rename_all = "camelCase")]
+    Command {
+        id: String,
+        preflight_argv: Vec<String>,
+        argv: Vec<String>,
+        #[serde(default)]
+        runtime_max_sec: Option<u64>,
+    },
+    #[serde(rename = "forbidPaths", rename_all = "camelCase")]
+    ForbidPaths {
+        id: String,
+        forbid_paths: Vec<String>,
+        #[serde(default)]
+        runtime_max_sec: Option<u64>,
+    },
+}
+
+impl WorklistGate {
+    fn id(&self) -> &str {
+        match self {
+            Self::Command { id, .. } | Self::ForbidPaths { id, .. } => id,
+        }
+    }
+
+    const fn declared_runtime_max_sec(&self) -> Option<u64> {
+        match self {
+            Self::Command {
+                runtime_max_sec, ..
+            }
+            | Self::ForbidPaths {
+                runtime_max_sec, ..
+            } => *runtime_max_sec,
+        }
+    }
+
+    fn resolved(&self, runtime_max_sec: u64) -> CampaignGate {
+        match self {
+            Self::Command {
+                id,
+                preflight_argv,
+                argv,
+                ..
+            } => CampaignGate::Command {
+                id: id.clone(),
+                preflight_argv: preflight_argv.clone(),
+                argv: argv.clone(),
+                runtime_max_sec,
+            },
+            Self::ForbidPaths {
+                id, forbid_paths, ..
+            } => CampaignGate::ForbidPaths {
+                id: id.clone(),
+                forbid_paths: forbid_paths.clone(),
+                runtime_max_sec,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct WorklistCampaignPolicy {
@@ -137,7 +214,7 @@ struct WorklistCampaignPolicy {
     #[serde(default = "default_worklist_steward_runtime_max_sec")]
     steward_runtime_max_sec: u64,
     #[serde(default)]
-    gates: Vec<CampaignGate>,
+    gates: Vec<WorklistGate>,
 }
 
 struct CheckpointBrief<'a> {
@@ -153,6 +230,11 @@ struct CampaignGraph {
     ownership_preflight_warnings: Vec<String>,
     worklist_sha256: String,
     task_input_hashes: BTreeMap<String, String>,
+    /// How each gate's admitted budget was arrived at, in manifest order.
+    ///
+    /// Carried rather than recomputed so the receipt an operator reads and the
+    /// number the graph admitted cannot disagree.
+    gate_budgets: Vec<GateBudget>,
 }
 
 const fn default_worklist_max_tasks() -> usize {
@@ -301,6 +383,15 @@ enum LocalAttemptReceiptV1 {
     Pardon {
         tasks: Option<BTreeSet<String>>,
     },
+    /// One recorded firing of one gate id, in seconds.
+    ///
+    /// This is the evidence an absent `runtimeMaxSec` derives from. It is
+    /// deliberately campaign-scoped and gate-scoped and carries no task: a gate
+    /// costs what it costs regardless of which lane provoked it.
+    GateObservation {
+        gate_id: String,
+        duration_sec: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +439,9 @@ enum ReleaseAttemptReceipt {
         sequence: u64,
         tasks: Option<BTreeSet<String>>,
     },
+    /// Gate cost evidence. It is read at admission to derive gate budgets and
+    /// projects nothing into a release: no task claims it.
+    GateObservation,
 }
 
 #[derive(Debug)]
@@ -2504,6 +2598,9 @@ fn read_release_attempt_log(
                 },
                 LocalAttemptReceiptV1::WorkerOutcome(_) => ReleaseAttemptReceipt::WorkerOutcome,
                 LocalAttemptReceiptV1::Escalation => ReleaseAttemptReceipt::Escalation,
+                LocalAttemptReceiptV1::GateObservation { .. } => {
+                    ReleaseAttemptReceipt::GateObservation
+                }
                 LocalAttemptReceiptV1::Pardon { tasks } => {
                     ReleaseAttemptReceipt::Pardon { sequence, tasks }
                 }
@@ -2587,7 +2684,8 @@ fn release_attempt_facts(
             ReleaseAttemptReceipt::Diagnosis { .. }
             | ReleaseAttemptReceipt::Retry { .. }
             | ReleaseAttemptReceipt::WorkerOutcome
-            | ReleaseAttemptReceipt::Escalation => {}
+            | ReleaseAttemptReceipt::Escalation
+            | ReleaseAttemptReceipt::GateObservation => {}
         }
     }
     (diagnoses, retries, warnings)
@@ -3023,7 +3121,13 @@ fn require_local_actor(registration: &CampaignRegistration) -> Result<()> {
     Ok(())
 }
 
-fn arm_receipt(result: &Value, warnings: &[String]) -> Value {
+/// The receipt an arm prints, including the one under `--no-enqueue`.
+///
+/// `--no-enqueue` is the admission rehearsal: it registers and validates and
+/// dispatches nothing, so this object is the only place an operator can read
+/// which budget each gate will bind before a pass runs under it. Every gate
+/// appears, declared and derived alike, with the sentence that produced it.
+fn arm_receipt(result: &Value, warnings: &[String], gate_budgets: &[GateBudget]) -> Value {
     let mut value = if result.is_object() {
         result.clone()
     } else {
@@ -3036,6 +3140,7 @@ fn arm_receipt(result: &Value, warnings: &[String]) -> Value {
         .unwrap_or_default();
     combined.extend(warnings.iter().map(|warning| json!(warning)));
     object.insert("warnings".to_owned(), Value::Array(combined));
+    object.insert("gateBudgets".to_owned(), json!(gate_budgets));
     value
 }
 
@@ -3964,6 +4069,7 @@ fn validate_local_attempt_receipt(
             "reason",
         ]),
         "escalation" => fields(&["body"]),
+        "gate-observation" => fields(&["gateId", "durationSec"]),
         "pardon" => {
             let (required, mut allowed) = fields(&["tasks"]);
             allowed.extend(["reason", "actor", "nonce"]);
@@ -4198,6 +4304,27 @@ fn validate_local_attempt_receipt(
             )?;
             Ok(LocalAttemptReceiptV1::Escalation)
         }
+        "gate-observation" => {
+            let gate_id = object
+                .get("gateId")
+                .and_then(Value::as_str)
+                .filter(|gate_id| safe_component(gate_id) && gate_id.chars().count() <= 80)
+                .ok_or_else(|| invalid(format!("{context}.gateId is unsafe")))?
+                .to_owned();
+            let duration_sec = object
+                .get("durationSec")
+                .and_then(Value::as_u64)
+                .filter(|seconds| *seconds <= MAX_GATE_OBSERVATION_SEC)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{context}.durationSec must be an integer of at most {MAX_GATE_OBSERVATION_SEC} seconds"
+                    ))
+                })?;
+            Ok(LocalAttemptReceiptV1::GateObservation {
+                gate_id,
+                duration_sec,
+            })
+        }
         "pardon" => {
             let tasks = match object.get("tasks") {
                 Some(Value::Null) => None,
@@ -4337,6 +4464,69 @@ fn read_local_attempt_receipts(
     }
 }
 
+/// Every recorded firing this campaign's receipts hold, grouped by gate id.
+///
+/// A gate id with no record is absent from the map, which is what tells the
+/// derivation that the gate has never fired. Receipts are campaign-scoped, so
+/// this is the campaign's own history and nobody else's.
+fn recorded_gate_observations(
+    state_dir: &Path,
+    campaign: &str,
+) -> Result<BTreeMap<String, Vec<u64>>> {
+    let records = read_local_attempt_receipts(state_dir, campaign, LOCAL_CAMPAIGN_ISSUE_NUMBER)?;
+    let mut observations = BTreeMap::<String, Vec<u64>>::new();
+    for record in &records {
+        if let LocalAttemptReceiptV1::GateObservation {
+            gate_id,
+            duration_sec,
+        } = record
+        {
+            observations
+                .entry(gate_id.clone())
+                .or_default()
+                .push(*duration_sec);
+        }
+    }
+    Ok(observations)
+}
+
+/// Bind every authored gate to the budget it will actually run under.
+///
+/// A declared budget passes through untouched — the declared number IS the
+/// budget, the same permanence `maxParallel` carries. A silent budget is
+/// resolved here, once, from this campaign's own receipts, and the resolved
+/// number is what the admitted contract carries: an admitted gate never leaves
+/// this seam holding a guess, and the flow never has to invent one.
+///
+/// The resolved number is part of the executable graph, so it is covered by the
+/// executable digest and by every task input hash. That is deliberate. A gate
+/// budget is global execution policy; when it moves, the proof taken under the
+/// old wall clock is stale, and the contract already says so
+/// (`task_input_hash` folds `manifest.gates` for exactly this reason).
+fn resolve_worklist_gate_budgets(
+    gates: &[WorklistGate],
+    observations: &BTreeMap<String, Vec<u64>>,
+) -> (Vec<CampaignGate>, Vec<GateBudget>) {
+    let budgets = gates
+        .iter()
+        .map(|gate| {
+            resolve_gate_budget(
+                gate.id(),
+                gate.declared_runtime_max_sec(),
+                observations
+                    .get(gate.id())
+                    .map_or(&[][..], |durations| durations.as_slice()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let resolved = gates
+        .iter()
+        .zip(&budgets)
+        .map(|(gate, budget)| gate.resolved(budget.runtime_max_sec))
+        .collect();
+    (resolved, budgets)
+}
+
 fn active_escalated_tasks_from_receipts(
     records: &[LocalAttemptReceiptV1],
     current_revisions: &BTreeMap<String, String>,
@@ -4409,6 +4599,7 @@ fn active_escalated_tasks_from_receipts(
                     });
                 }
             }
+            LocalAttemptReceiptV1::GateObservation { .. } => {}
             LocalAttemptReceiptV1::Pardon { tasks: None, .. } => {
                 diagnoses.clear();
                 authority_requests.clear();
@@ -4492,7 +4683,8 @@ fn active_worker_outcomes_from_receipts(
             LocalAttemptReceiptV1::Diagnosis { .. }
             | LocalAttemptReceiptV1::Retry { .. }
             | LocalAttemptReceiptV1::WorkerOutcome(_)
-            | LocalAttemptReceiptV1::Escalation => {}
+            | LocalAttemptReceiptV1::Escalation
+            | LocalAttemptReceiptV1::GateObservation { .. } => {}
         }
     }
     outcomes
@@ -4943,7 +5135,21 @@ fn parse_worklist_campaign_policy(
             "worklist.campaign.stewardArgv must contain non-empty strings without control characters",
         ));
     }
-    validate_gates(&policy.gates)
+    // Shape only: ids, argv, and patterns are judged here, and a declared
+    // budget of zero is still refused. A silent budget stands in as the
+    // never-fired floor for the length of this check and is resolved for real
+    // against receipts once the campaign name is known.
+    let shaped = policy
+        .gates
+        .iter()
+        .map(|gate| {
+            gate.resolved(
+                gate.declared_runtime_max_sec()
+                    .unwrap_or(GATE_BUDGET_UNOBSERVED_SEC),
+            )
+        })
+        .collect::<Vec<_>>();
+    validate_gates(&shaped)
         .map_err(|error| invalid(format!("worklist.campaign.gates are invalid: {error}")))?;
     Ok(policy)
 }
@@ -5006,11 +5212,12 @@ fn resolve_worklist_steward(
 }
 
 fn manifest_config_from_worklist(
+    state_dir: &Path,
     committed: &CommittedLocalWorklist,
     repository: &CampaignRepository,
     code_repository: &str,
     adapters: &BTreeMap<String, AdapterConfig>,
-) -> Result<Value> {
+) -> Result<(Value, Vec<GateBudget>)> {
     let policy = parse_worklist_campaign_policy(&committed.document, &committed.source_path)?;
     let Some(adapter) = adapters.get(&policy.agent.adapter) else {
         return Err(invalid(format!(
@@ -5021,21 +5228,29 @@ fn manifest_config_from_worklist(
     let pool = format!("campaign/{code_repository}");
     debug_assert!(is_campaign_pool_name(&pool));
     let steward = resolve_worklist_steward(&policy, adapters)?;
-    Ok(json!({
-        "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
-        "name": policy.name.expect("campaign name was defaulted above"),
-        "repository": repository,
-        "maxTasks": policy.max_tasks,
-        "maxParallel": policy.max_parallel,
-        "driverRuntimeMaxSec": policy.driver_runtime_max_sec,
-        "runtimeMaxSec": policy.runtime_max_sec,
-        "pool": pool,
-        "mergeMethod": policy.merge_method,
-        "agent": resolve_worklist_agent_policies(policy.agent, adapter),
-        "steward": steward,
-        "gates": policy.gates,
-        "tasks": [],
-    }))
+    let name = policy.name.expect("campaign name was defaulted above");
+    let (gates, gate_budgets) = resolve_worklist_gate_budgets(
+        &policy.gates,
+        &recorded_gate_observations(state_dir, &name)?,
+    );
+    Ok((
+        json!({
+            "schemaVersion": CAMPAIGN_SCHEMA_VERSION,
+            "name": name,
+            "repository": repository,
+            "maxTasks": policy.max_tasks,
+            "maxParallel": policy.max_parallel,
+            "driverRuntimeMaxSec": policy.driver_runtime_max_sec,
+            "runtimeMaxSec": policy.runtime_max_sec,
+            "pool": pool,
+            "mergeMethod": policy.merge_method,
+            "agent": resolve_worklist_agent_policies(policy.agent, adapter),
+            "steward": steward,
+            "gates": gates,
+            "tasks": [],
+        }),
+        gate_budgets,
+    ))
 }
 
 /// Bind the worklist's policy silence to the selected adapter's own answer.
@@ -5191,26 +5406,33 @@ fn committed_local_worklist(
 }
 
 fn local_campaign_graph_from_worklist(
+    state_dir: &Path,
     repository: CampaignRepository,
     code_repository: &str,
     worklist_pattern: &str,
     adapters: &BTreeMap<String, AdapterConfig>,
 ) -> Result<CampaignGraph> {
     let committed = committed_local_worklist(&repository, worklist_pattern)?;
-    let manifest_config =
-        manifest_config_from_worklist(&committed, &repository, code_repository, adapters)?;
+    let (manifest_config, gate_budgets) = manifest_config_from_worklist(
+        state_dir,
+        &committed,
+        &repository,
+        code_repository,
+        adapters,
+    )?;
     let validated = validate_local_worklist_document(&committed.document, &manifest_config)?;
     if validated.manifest.repository.forge != "local" {
         return Err(invalid(
             "the local worklist arm path requires campaign.repository.forge=local",
         ));
     }
-    local_campaign_graph(validated, committed.source_sha256)
+    local_campaign_graph(validated, committed.source_sha256, gate_budgets)
 }
 
 fn local_campaign_graph(
     validated: ValidatedWorklist,
     worklist_sha256: String,
+    gate_budgets: Vec<GateBudget>,
 ) -> Result<CampaignGraph> {
     if validated.tasks.len() != validated.manifest.tasks.len() {
         return Err(invalid(
@@ -5235,6 +5457,7 @@ fn local_campaign_graph(
         ownership_preflight_warnings,
         worklist_sha256,
         task_input_hashes,
+        gate_budgets,
     })
 }
 
@@ -6550,6 +6773,7 @@ async fn run_campaign_arm(
         "driver",
     )?;
     let graph = local_campaign_graph_from_worklist(
+        &state_dir,
         repository,
         &code_repository,
         &worklist_pattern,
@@ -6625,7 +6849,7 @@ async fn run_campaign_arm(
         });
         outln!(
             "{}",
-            serde_json::to_string(&arm_receipt(&receipt, &arm_warnings))?
+            serde_json::to_string(&arm_receipt(&receipt, &arm_warnings, &graph.gate_budgets))?
         );
         return Ok(());
     }
@@ -6647,7 +6871,7 @@ async fn run_campaign_arm(
     registry.write(&mut registration)?;
     outln!(
         "{}",
-        serde_json::to_string(&arm_receipt(&result, &arm_warnings))?
+        serde_json::to_string(&arm_receipt(&result, &arm_warnings, &graph.gate_budgets))?
     );
     if args.wait {
         let code = waited_exit_code(&result);
@@ -6732,6 +6956,7 @@ async fn run_campaign_poll(
             require_local_actor(&registration)?;
             let repository = campaign_repository_from_registration(&registration);
             let graph = local_campaign_graph_from_worklist(
+                &state_dir,
                 repository,
                 &registration.code_repository,
                 &registration.worklist_pattern,
@@ -7800,6 +8025,7 @@ fn validate_local_worklist_document(
 mod tests {
     use super::*;
     use tally_core::campaign_contract::{validate_manifest, BRIEF_SENTINEL};
+    use tally_core::gate_budget::GateBudgetSource;
 
     fn manifest_value_for_test(tasks: Value) -> Value {
         json!({
@@ -9255,7 +9481,7 @@ fi
     #[test]
     fn arm_receipt_has_no_counter_clearing_surface() {
         let warnings = vec!["ownership warning".to_owned()];
-        let receipt = arm_receipt(&json!({"status": "armed"}), &warnings);
+        let receipt = arm_receipt(&json!({"status": "armed"}), &warnings, &[]);
         assert!(!receipt.as_object().unwrap().contains_key("autoPardons"));
         assert_eq!(receipt["warnings"], json!(warnings));
     }
@@ -9646,20 +9872,28 @@ fi
         );
     }
 
-    fn readmission_worklist(goal: &str) -> Value {
+    const READMISSION_CAMPAIGN: &str = "night-readmission";
+
+    fn readmission_worklist(goal: &str, gate_runtime_max_sec: Option<u64>) -> Value {
+        let mut gate = json!({
+            "kind": "command",
+            "id": "tests",
+            "preflightArgv": ["true"],
+            "argv": ["true"]
+        });
+        if let Some(seconds) = gate_runtime_max_sec {
+            gate.as_object_mut()
+                .unwrap()
+                .insert("runtimeMaxSec".to_owned(), json!(seconds));
+        }
         json!({
             "schemaVersion": 1,
             "campaign": {
-                "name": "night-readmission",
+                "name": READMISSION_CAMPAIGN,
                 "maxTasks": 4,
                 "maxParallel": 1,
                 "agent": {},
-                "gates": [{
-                    "kind": "command",
-                    "id": "tests",
-                    "preflightArgv": ["true"],
-                    "argv": ["true"]
-                }]
+                "gates": [gate]
             },
             "tasks": [{
                 "id": "foundation",
@@ -9681,6 +9915,10 @@ fi
 
     impl ReadmissionLane {
         fn open(goal: &str) -> Self {
+            Self::open_declaring(goal, None)
+        }
+
+        fn open_declaring(goal: &str, gate_runtime_max_sec: Option<u64>) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let checkout = temporary.path().join("checkout");
             let remote = temporary.path().join("remote.git");
@@ -9736,18 +9974,53 @@ fi
                 flow,
                 driver,
             };
-            lane.push_worklist(goal);
+            lane.push_worklist_declaring(goal, gate_runtime_max_sec);
             lane
+        }
+
+        /// Append one recorded firing of a gate id to this identity's own
+        /// attempt-receipts log — the evidence a silent budget derives from.
+        fn seed_gate_observation(&self, gate_id: &str, duration_sec: u64) {
+            let path = local_attempt_receipts_path(&self.state_dir, READMISSION_CAMPAIGN).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let sequence = fs::read_to_string(&path)
+                .map(|text| text.lines().count())
+                .unwrap_or_default()
+                + 1;
+            let record = json!({
+                "schemaVersion": ATTEMPT_RECEIPT_SCHEMA_VERSION,
+                "sequence": sequence,
+                "kind": "gate-observation",
+                "campaign": READMISSION_CAMPAIGN,
+                "issueNumber": LOCAL_CAMPAIGN_ISSUE_NUMBER.to_string(),
+                "armSerial": 1,
+                "worklistSha256": format!("sha256:{}", "b".repeat(64)),
+                "writtenAt": "2026-08-17T12:00:00Z",
+                "actor": "spec-build-driver",
+                "gateId": gate_id,
+                "durationSec": duration_sec,
+            });
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{record}").unwrap();
         }
 
         /// The arming act itself: an amended worklist committed and pushed to
         /// the identity's authority remote, with no tally verb involved.
         fn push_worklist(&self, goal: &str) {
+            self.push_worklist_declaring(goal, None);
+        }
+
+        fn push_worklist_declaring(&self, goal: &str, gate_runtime_max_sec: Option<u64>) {
             let path = self.checkout.join(READMISSION_WORKLIST);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(
                 &path,
-                serde_json::to_vec_pretty(&readmission_worklist(goal)).unwrap(),
+                serde_json::to_vec_pretty(&readmission_worklist(goal, gate_runtime_max_sec))
+                    .unwrap(),
             )
             .unwrap();
             readmission_git(&self.checkout, &["add", READMISSION_WORKLIST]);
@@ -9758,7 +10031,12 @@ fi
         /// What a poll pass reads: the graph committed at the authority
         /// remote's base branch, never the working tree beside it.
         fn live_graph(&self) -> CampaignGraph {
+            self.live_graph_result().unwrap()
+        }
+
+        fn live_graph_result(&self) -> Result<CampaignGraph> {
             local_campaign_graph_from_worklist(
+                &self.state_dir,
                 CampaignRepository {
                     checkout: self.checkout.clone(),
                     base_branch: "main".to_owned(),
@@ -9769,7 +10047,6 @@ fi
                 READMISSION_WORKLIST,
                 &load_client_config(Some(&self.config)).unwrap().adapters,
             )
-            .unwrap()
         }
 
         fn registry(&self) -> CampaignRegistry {
@@ -9814,6 +10091,136 @@ fi
             .unwrap();
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
         }
+    }
+
+    /// The red one: a worklist that declares no gate budget used to be handed
+    /// 900 by a serde default nobody measured. It now gets the never-fired
+    /// floor until the gate fires, and its own receipts after that.
+    #[test]
+    fn gate_budget_derives_from_seeded_receipts_when_the_worklist_is_silent() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+
+        let unobserved = lane.live_graph();
+        assert_eq!(
+            unobserved.canonical.manifest.gates[0].runtime_max_sec(),
+            GATE_BUDGET_UNOBSERVED_SEC,
+            "a gate with no recorded firing binds the stated floor, not a guess"
+        );
+        let [floor_budget] = unobserved.gate_budgets.as_slice() else {
+            panic!("one gate, one budget: {:?}", unobserved.gate_budgets);
+        };
+        assert_eq!(floor_budget.source, GateBudgetSource::Unobserved);
+        assert_eq!(floor_budget.observations, 0);
+
+        lane.seed_gate_observation("tests", 310);
+        lane.seed_gate_observation("tests", 620);
+        lane.seed_gate_observation("other-gate", 4_000);
+
+        let derived = lane.live_graph();
+        assert_eq!(
+            derived.canonical.manifest.gates[0].runtime_max_sec(),
+            1_240,
+            "the budget is this gate's own high water times the stated slack"
+        );
+        let [budget] = derived.gate_budgets.as_slice() else {
+            panic!("one gate, one budget: {:?}", derived.gate_budgets);
+        };
+        assert_eq!(budget.gate_id, "tests");
+        assert_eq!(budget.source, GateBudgetSource::Derived);
+        assert_eq!(
+            budget.observations, 2,
+            "another gate id's firings are not this gate's evidence"
+        );
+        assert_eq!(budget.observed_high_water_sec, Some(620));
+
+        // The derivation is readable in the rehearsal an operator runs before
+        // any pass: `campaign arm --no-enqueue` prints exactly this object.
+        let receipt = arm_receipt(
+            &json!({"status": "armed", "enqueued": false}),
+            &[],
+            &derived.gate_budgets,
+        );
+        let rendered = receipt["gateBudgets"][0]["derivation"]
+            .as_str()
+            .expect("the rehearsal must carry a derivation sentence")
+            .to_owned();
+        assert!(
+            rendered.contains("gate tests")
+                && rendered.contains("1240s")
+                && rendered.contains("high water 620s")
+                && rendered.contains("2 receipt observation(s)"),
+            "the rehearsal must say which budget binds and why: {rendered}"
+        );
+        assert_eq!(receipt["gateBudgets"][0]["runtimeMaxSec"], 1_240);
+
+        assert_ne!(
+            derived.canonical.executable_digest, unobserved.canonical.executable_digest,
+            "a gate budget is global execution policy; moving it is a new epoch, \
+             not a silent re-pricing of proof already taken"
+        );
+    }
+
+    /// The permanence half: a declared number is the budget, and no amount of
+    /// receipt evidence revises it.
+    #[test]
+    fn gate_budget_declared_by_the_worklist_is_honored_verbatim() {
+        let lane =
+            ReadmissionLane::open_declaring("Build the foundation as first authored.", Some(45));
+        lane.seed_gate_observation("tests", 620);
+        lane.seed_gate_observation("tests", 3_000);
+
+        let graph = lane.live_graph();
+        assert_eq!(
+            graph.canonical.manifest.gates[0].runtime_max_sec(),
+            45,
+            "the declared number IS the budget"
+        );
+        let [budget] = graph.gate_budgets.as_slice() else {
+            panic!("one gate, one budget: {:?}", graph.gate_budgets);
+        };
+        assert_eq!(budget.source, GateBudgetSource::Declared);
+        assert_eq!(budget.runtime_max_sec, 45);
+        assert_eq!(
+            budget.observed_high_water_sec,
+            Some(3_000),
+            "the receipts stay visible to the operator even when they do not bind"
+        );
+        assert!(
+            budget.derivation.contains("honored verbatim"),
+            "{}",
+            budget.derivation
+        );
+    }
+
+    /// A declared zero is still a refusal, and a corrupt duration cannot buy an
+    /// unbounded budget for every later pass.
+    #[test]
+    fn gate_budget_declarations_and_observations_stay_bounded() {
+        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        lane.push_worklist_declaring("Build the foundation as first authored.", Some(0));
+        let failure = local_campaign_graph_from_worklist(
+            &lane.state_dir,
+            CampaignRepository {
+                checkout: lane.checkout.clone(),
+                base_branch: "main".to_owned(),
+                remote: "origin".to_owned(),
+                forge: "local".to_owned(),
+            },
+            READMISSION_REPOSITORY,
+            READMISSION_WORKLIST,
+            &load_client_config(Some(&lane.config)).unwrap().adapters,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            failure.contains("runtimeMaxSec must be positive"),
+            "{failure}"
+        );
+
+        lane.push_worklist("Build the foundation as first authored.");
+        lane.seed_gate_observation("tests", MAX_GATE_OBSERVATION_SEC + 1);
+        let failure = lane.live_graph_result().unwrap_err().to_string();
+        assert!(failure.contains("durationSec"), "{failure}");
     }
 
     #[test]
@@ -10044,6 +10451,7 @@ fi
             ownership_preflight_warnings: Vec::new(),
             worklist_sha256: format!("sha256:{}", "a".repeat(64)),
             task_input_hashes,
+            gate_budgets: Vec::new(),
         }
     }
 
@@ -10164,9 +10572,15 @@ fi
             ("codex".to_owned(), AdapterConfig::default()),
             ("narrator".to_owned(), narrator),
         ]);
-        let config =
-            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
-                .unwrap();
+        let receipts = tempfile::tempdir().unwrap();
+        let (config, _) = manifest_config_from_worklist(
+            receipts.path(),
+            &committed,
+            &repository,
+            "acme/widgets",
+            &adapters,
+        )
+        .unwrap();
         assert_eq!(config["steward"]["argv"], json!(["narrator", "--json"]));
         assert_eq!(
             config["steward"]["env"]["NARRATOR_ENDPOINT"],
@@ -10176,10 +10590,15 @@ fi
         assert_eq!(config["steward"]["runtimeMaxSec"], 120);
 
         adapters.get_mut("narrator").unwrap().hardening = AdapterHardening::Strict;
-        let failure =
-            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
-                .unwrap_err()
-                .to_string();
+        let failure = manifest_config_from_worklist(
+            receipts.path(),
+            &committed,
+            &repository,
+            "acme/widgets",
+            &adapters,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(failure.contains("direct narration subprocess"), "{failure}");
 
         adapters.get_mut("narrator").unwrap().hardening = AdapterHardening::None;
@@ -10190,10 +10609,15 @@ fi
             .get_mut("finalMessage")
             .unwrap()
             .stream = ScrapeStream::Stderr;
-        let failure =
-            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
-                .unwrap_err()
-                .to_string();
+        let failure = manifest_config_from_worklist(
+            receipts.path(),
+            &committed,
+            &repository,
+            "acme/widgets",
+            &adapters,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(failure.contains("non-empty stdout regex"), "{failure}");
     }
 
@@ -10234,9 +10658,15 @@ fi
         // An adapter that declares nothing answers silence with silence: the
         // manifest carries no policy name it could not render.
         let silent_catalog = BTreeMap::from([("codex".to_owned(), codex_shaped_adapter(&[]))]);
-        let config =
-            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &silent_catalog)
-                .unwrap();
+        let receipts = tempfile::tempdir().unwrap();
+        let (config, _) = manifest_config_from_worklist(
+            receipts.path(),
+            &committed,
+            &repository,
+            "acme/widgets",
+            &silent_catalog,
+        )
+        .unwrap();
         assert_eq!(config["agent"]["approvalPolicy"], Value::Null);
         assert_eq!(config["agent"]["sandboxPolicy"], Value::Null);
         assert_eq!(config["agent"]["diagnosisSandboxPolicy"], Value::Null);
@@ -10260,9 +10690,14 @@ fi
             declaring.extra_config.insert(key.to_owned(), json!(policy));
         }
         let catalog = BTreeMap::from([("codex".to_owned(), declaring)]);
-        let config =
-            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &catalog)
-                .unwrap();
+        let (config, _) = manifest_config_from_worklist(
+            receipts.path(),
+            &committed,
+            &repository,
+            "acme/widgets",
+            &catalog,
+        )
+        .unwrap();
         assert_eq!(config["agent"]["approvalPolicy"], "never");
         assert_eq!(config["agent"]["sandboxPolicy"], "danger-full-access");
         assert_eq!(config["agent"]["diagnosisSandboxPolicy"], "workspace-write");
@@ -10409,9 +10844,15 @@ fi
         let committed = committed_local_worklist(&repository, "specs/*/epsilon.json").unwrap();
         assert_eq!(committed.document, document);
         assert_eq!(committed.source_path, "specs/night/epsilon.json");
-        let manifest_config =
-            manifest_config_from_worklist(&committed, &repository, "acme/widgets", &adapters)
-                .unwrap();
+        let receipts = tempfile::tempdir().unwrap();
+        let (manifest_config, gate_budgets) = manifest_config_from_worklist(
+            receipts.path(),
+            &committed,
+            &repository,
+            "acme/widgets",
+            &adapters,
+        )
+        .unwrap();
         let validated =
             validate_local_worklist_document(&committed.document, &manifest_config).unwrap();
         assert_eq!(validated.manifest.name, "epsilon");
@@ -10428,7 +10869,8 @@ fi
                 .collect::<Vec<_>>(),
             [1, 2]
         );
-        let graph = local_campaign_graph(validated, committed.source_sha256.clone()).unwrap();
+        let graph =
+            local_campaign_graph(validated, committed.source_sha256.clone(), gate_budgets).unwrap();
         assert!(graph.canonical.tasks[0]
             .body
             .contains("Build the local foundation in src/lib.rs."));
@@ -10449,6 +10891,7 @@ fi
         let receipt = arm_receipt(
             &json!({"status": "armed"}),
             &graph.ownership_preflight_warnings,
+            &[],
         );
         assert_eq!(
             receipt["warnings"],
@@ -10458,6 +10901,7 @@ fi
         let mut forge_field = document.clone();
         forge_field["campaign"]["label"] = json!("must-not-be-accepted");
         let failure = manifest_config_from_worklist(
+            receipts.path(),
             &CommittedLocalWorklist {
                 document: forge_field,
                 source_path: committed.source_path.clone(),
@@ -10474,6 +10918,7 @@ fi
         let mut unknown_agent = document.clone();
         unknown_agent["campaign"]["agent"]["adapter"] = json!("missing");
         let failure = manifest_config_from_worklist(
+            receipts.path(),
             &CommittedLocalWorklist {
                 document: unknown_agent,
                 source_path: committed.source_path,
@@ -10497,6 +10942,7 @@ fi
         run_git(&checkout, &["commit", "--quiet", "-m", "edit gate"]);
         run_git(&checkout, &["push", "--quiet", "origin", "main"]);
         let revised_graph = local_campaign_graph_from_worklist(
+            receipts.path(),
             repository,
             "acme/widgets",
             "specs/*/epsilon.json",
