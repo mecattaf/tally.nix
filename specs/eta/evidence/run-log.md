@@ -212,3 +212,29 @@ the diagnosis role with its fixed commit-narration schema
 role-aware steward shim in dotfiles/home/tally.nix — queued for the
 chapter-4 sitting. Buildout stands at chapters 1–3 of 5; stopped here
 per operator instruction.
+
+## Chapter 4 armed — sitting C2, 2026-08-18 06:46 UTC
+
+Adapter claude-code host-default per the operator's chapter-4 ruling
+(2026-08-18). The carried shim finding is CLOSED before arming: the
+role-aware steward shim deployed (dotfiles de49728b; mechanism — job
+units have no stdin, diagnosis briefs arrive as the TALLY_BRIEF file;
+the stdin-only shim answered narration schema from an empty read),
+smoke-proven against a synthetic brief. Sitting e41edb96 appends the
+chapter-4 tasks and retires the four template-gate runtimeMaxSec
+guesses per gate-budgets-from-receipts' own schedule; the admission
+rehearsal rendered the derivation legibly — all four gates on the
+never-fired 3600s floor, because the re-arm opened a fresh receipt
+lineage (zero observations); driver-suite gains headroom (900→3600),
+nothing tightens. Registry was empty post-disarm, so re-entry used the
+arm verb once; poll timer restarted — push-to-re-admit carries
+amendments from here. Rehearsal note: `campaign status` refuses with
+"invalid campaign task table" while the registration has no reconciled
+pass (lastObservation null) — machinery finding if it survives the
+first reconciled pass.
+
+### Chapter 4 lane ledger (claude-code, unmetered rail)
+
+| # | when (UTC) | what | outcome |
+|---|---|---|---|
+| 13 | 08-18 06:46–07:46 | product-split attempt 1 — MERGED first try | integration 1ea314e5; agent ~50 min; whole node chain exit 0; steward commitlint fallback correctly replaced a non-conforming lane-tip subject with the task-id template |
