@@ -11785,7 +11785,23 @@ fi
 
     const READMISSION_REPOSITORY: &str = "acme/widgets";
 
-    /// A scope number no other lane in this process holds.
+    /// The prefix every lane identity in this module carries, written once so
+    /// no two lanes can be told apart by a literal somebody retyped.
+    const READMISSION_CAMPAIGN_PREFIX: &str = "night-readmission-";
+
+    /// The longest scope a lane identity can carry.
+    ///
+    /// A campaign name is a safe path component bounded at 80 bytes
+    /// (`campaign_contract`'s `safe_component`), and the prefix above spends
+    /// eighteen of them.
+    const READMISSION_SCOPE_MAX: usize = 80 - READMISSION_CAMPAIGN_PREFIX.len();
+
+    /// How much of the opening test's name a scope keeps before the digest
+    /// that makes it unique takes over.
+    const READMISSION_SCOPE_STEM_MAX: usize = READMISSION_SCOPE_MAX - 1 - 8;
+
+    /// A campaign identity no other lane in this process can name, derived
+    /// from the test that opened it.
     ///
     /// A campaign identity is what names durable state: the lease directory
     /// is `sha256(repository, worklist)`, the receipts log and the state ref
@@ -11794,12 +11810,73 @@ fi
     /// two of them apart is that each happens to have rooted its state
     /// somewhere else — an isolation the tests never state and a single
     /// shared root would silently remove, with `cargo test` running the lanes
-    /// concurrently. Giving each lane its own identity says it instead:
-    /// nothing a lane writes can alias what another lane wrote, wherever
-    /// either of them roots its state.
-    fn readmission_scope() -> u64 {
-        static SCOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    /// concurrently.
+    ///
+    /// A counter said only "not the same as the last one", and left *which*
+    /// lane got which number to the scheduler: the name in a failure was a
+    /// number that meant a different test on every run, and one missed call
+    /// site aliased two live lanes. The opening test's own name says it
+    /// outright — two tests cannot share a name, because the compiler will
+    /// not compile a module that declares one twice — so a collision is not
+    /// a discipline a later lane has to keep.
+    macro_rules! readmission_scope {
+        () => {{
+            // A test-local item, named so its type path ends at the test.
+            fn scope() {}
+            readmission_scope_from(std::any::type_name_of_val(&scope))
+        }};
+    }
+
+    /// Derive one lane's scope from the type path of its test-local probe and
+    /// claim it.
+    ///
+    /// The stem is the test's own name, so a failure names the test that
+    /// produced it; the digest is of the whole name, so the truncation the
+    /// 80-byte bound forces cannot make two long test names one scope.
+    fn readmission_scope_from(probe_type_name: &str) -> String {
+        let path = probe_type_name
+            .strip_suffix("::scope")
+            .unwrap_or_else(|| panic!("scope probe is not this module's: {probe_type_name:?}"));
+        // An `async` test's body is a closure of the test, so the path can end
+        // in one or more `{{closure}}` segments; the test is the first segment
+        // that is not one.
+        let test = path
+            .rsplit("::")
+            .find(|segment| !segment.starts_with("{{"))
+            .unwrap_or_default();
+        assert!(
+            !test.is_empty()
+                && test.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                }),
+            "readmission_scope! belongs in a test function, whose name is the \
+             identity: {path:?}"
+        );
+        let digest = format!("{:x}", Sha256::digest(test.as_bytes()));
+        let stem = &test[..test.len().min(READMISSION_SCOPE_STEM_MAX)];
+        let scope = format!("{}-{}", stem.replace('_', "-"), &digest[..8]);
+        assert!(
+            readmission_scope_is_fresh(&scope),
+            "lane scope {scope:?} was claimed twice: one test opened two lanes \
+             under one identity, which is the aliasing this derivation exists to \
+             make impossible"
+        );
+        scope
+    }
+
+    /// Record a scope as claimed, answering whether it was new.
+    ///
+    /// The registry is the second half of the proof. Derivation makes two
+    /// *tests* unable to collide; this makes one test unable to collide with
+    /// itself, and turns what used to surface as another lane's `Held` lease
+    /// into a refusal at the moment the second lane is opened.
+    fn readmission_scope_is_fresh(scope: &str) -> bool {
+        static CLAIMED: std::sync::Mutex<BTreeSet<String>> =
+            std::sync::Mutex::new(BTreeSet::new());
+        CLAIMED
+            .lock()
+            .expect("readmission scope registry lock poisoned")
+            .insert(scope.to_owned())
     }
 
     /// One armed identity whose authority remote is a real bare repository,
@@ -11892,22 +11969,28 @@ fi
     }
 
     impl ReadmissionLane {
-        fn open(goal: &str) -> Self {
-            Self::open_with(goal, None, false)
+        fn open(scope: String, goal: &str) -> Self {
+            Self::open_with(scope, goal, None, false)
         }
 
-        fn open_declaring(goal: &str, gate_runtime_max_sec: Option<u64>) -> Self {
-            Self::open_with(goal, gate_runtime_max_sec, false)
+        fn open_declaring(scope: String, goal: &str, gate_runtime_max_sec: Option<u64>) -> Self {
+            Self::open_with(scope, goal, gate_runtime_max_sec, false)
         }
 
         /// A lane whose worklist ends in a chapter gate, which is the only
         /// shape a campaign can ever finish in.
-        fn open_gated(goal: &str) -> Self {
-            Self::open_with(goal, None, true)
+        fn open_gated(scope: String, goal: &str) -> Self {
+            Self::open_with(scope, goal, None, true)
         }
 
-        fn open_with(goal: &str, gate_runtime_max_sec: Option<u64>, chapter_gate: bool) -> Self {
-            let scope = readmission_scope();
+        /// `scope` is always `readmission_scope!()` at the call: the identity
+        /// is the opening test's, and nothing here can invent one.
+        fn open_with(
+            scope: String,
+            goal: &str,
+            gate_runtime_max_sec: Option<u64>,
+            chapter_gate: bool,
+        ) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let checkout = temporary.path().join("checkout");
             let remote = temporary.path().join("remote.git");
@@ -11962,7 +12045,7 @@ fi
                 config,
                 flow,
                 driver,
-                campaign: format!("night-readmission-{scope}"),
+                campaign: format!("{READMISSION_CAMPAIGN_PREFIX}{scope}"),
                 worklist: format!("specs/night/tasks-{scope}.json"),
                 chapter_gate,
             };
@@ -12171,12 +12254,79 @@ fi
         }
     }
 
+    /// The lease race's structural cure, stated as a property (ext2's
+    /// flaky-test class).
+    ///
+    /// `lease_concurrent_passes_never_double_dispatch_one_frontier` panicked
+    /// on a `Held` lease for scope `night-readmission-6` after the counter
+    /// was supposed to have made lane identities unique: the counter promised
+    /// only "different from the last one", so which lane held which number
+    /// was the scheduler's to decide and the failure named a scope that meant
+    /// a different test on every run. The two facts that replace it are here:
+    /// a lane's identity is the opening test's own name, and a second claim
+    /// of one identity is refused where it happens rather than surfacing much
+    /// later as somebody else's contended lease.
+    #[test]
+    fn lease_scopes_are_isolation_keyed_by_the_test_name() {
+        // The stem is the test's name; the suffix is a digest of the whole of
+        // it. Two tests, two identities, with nothing shared to schedule.
+        let one = readmission_scope_from("tally::cli::campaign::tests::a_lease_test::scope");
+        let two = readmission_scope_from("tally::cli::campaign::tests::another_lease_test::scope");
+        assert!(one.starts_with("a-lease-test-"), "{one}");
+        assert_ne!(one, two);
+
+        // The 80-byte campaign-name bound truncates the stem, and the digest
+        // is what keeps truncation from merging two lanes into one identity.
+        let shared_stem = "a".repeat(READMISSION_SCOPE_STEM_MAX + 4);
+        let long = readmission_scope_from(&format!("tests::{shared_stem}_alpha::scope"));
+        let longer = readmission_scope_from(&format!("tests::{shared_stem}_beta::scope"));
+        assert_ne!(long, longer, "truncation must not merge two lanes");
+        for scope in [&one, &two, &long, &longer] {
+            let campaign = format!("{READMISSION_CAMPAIGN_PREFIX}{scope}");
+            assert!(campaign.len() <= 80, "unusable campaign name: {campaign}");
+        }
+
+        // Claiming is what makes it a guard: one test opening two lanes under
+        // one name is refused at the second lane, not raced into the first
+        // lane's durable state.
+        assert!(
+            !readmission_scope_is_fresh(&one),
+            "a claimed scope must never be handed out twice"
+        );
+
+        // And the derived identity is the one every durable artifact is named
+        // for — the receipts log and the state-ref prefix through the
+        // campaign name, the lease directory through the worklist path.
+        let lane = ReadmissionLane::open(
+            readmission_scope!(),
+            "Build the foundation as first authored.",
+        );
+        let derived = "lease-scopes-are-isolation-keyed-by-the-test-name-";
+        assert!(
+            lane.campaign
+                .starts_with(&format!("{READMISSION_CAMPAIGN_PREFIX}{derived}")),
+            "{}",
+            lane.campaign
+        );
+        assert!(
+            lane.worklist
+                .starts_with(&format!("specs/night/tasks-{derived}")),
+            "{}",
+            lane.worklist
+        );
+        assert!(!readmission_scope_is_fresh(
+            lane.campaign
+                .strip_prefix(READMISSION_CAMPAIGN_PREFIX)
+                .expect("the campaign name carries this module's prefix")
+        ));
+    }
+
     /// The red one: a worklist that declares no gate budget used to be handed
     /// 900 by a serde default nobody measured. It now gets the never-fired
     /// floor until the gate fires, and its own receipts after that.
     #[test]
     fn gate_budget_derives_from_seeded_receipts_when_the_worklist_is_silent() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
 
         let unobserved = lane.live_graph();
         assert_eq!(
@@ -12243,7 +12393,7 @@ fi
     #[test]
     fn gate_budget_declared_by_the_worklist_is_honored_verbatim() {
         let lane =
-            ReadmissionLane::open_declaring("Build the foundation as first authored.", Some(45));
+            ReadmissionLane::open_declaring(readmission_scope!(), "Build the foundation as first authored.", Some(45));
         lane.seed_gate_observation("tests", 620);
         lane.seed_gate_observation("tests", 3_000);
 
@@ -12274,7 +12424,7 @@ fi
     /// unbounded budget for every later pass.
     #[test]
     fn gate_budget_declarations_and_observations_stay_bounded() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
         lane.push_worklist_declaring("Build the foundation as first authored.", Some(0));
         let failure = local_campaign_graph_from_worklist(
             &lane.state_dir,
@@ -12308,7 +12458,7 @@ fi
     /// with no supervising session grepping anything.
     #[test]
     fn inbox_blocked_escalation_lands_as_one_structured_entry() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
         let graph = lane.live_graph();
         let mut registration = lane.arm(&graph);
         let epoch =
@@ -12418,7 +12568,7 @@ fi
     /// current and the task is free to run again.
     #[test]
     fn inbox_answer_becomes_steering_that_refreshes_the_task_budget() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
         let graph = lane.live_graph();
         let registration = lane.arm(&graph);
         let revisions = graph_completion_revisions(&graph.canonical).unwrap();
@@ -12506,7 +12656,7 @@ fi
     /// two epochs on with two dispatches of one frontier in flight.
     #[test]
     fn lease_concurrent_passes_never_double_dispatch_one_frontier() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
         let first = lane.live_graph();
         let armed = lane.arm(&first);
         lane.push_worklist("Build the foundation and the amended edge case.");
@@ -12620,7 +12770,7 @@ fi
     /// attempt-epoch input hash beside it.
     #[test]
     fn an_armed_graph_hands_down_the_completion_identity_release_recomputes() {
-        let lane = ReadmissionLane::open_gated("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open_gated(readmission_scope!(), "Build the foundation as first authored.");
         let graph = lane.live_graph();
         let expected = graph
             .canonical
@@ -12654,7 +12804,7 @@ fi
 
     #[test]
     fn lease_completion_writes_the_lapse_fact_a_release_can_rely_on() {
-        let lane = ReadmissionLane::open_gated("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open_gated(readmission_scope!(), "Build the foundation as first authored.");
         let graph = lane.live_graph();
         let registration = lane.arm(&graph);
         let lease = lane.lease(&registration, &graph);
@@ -12773,7 +12923,7 @@ fi
 
     #[test]
     fn poll_readmission_admits_a_pushed_worklist_with_no_operator_verb() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
         let first = lane.live_graph();
         let mut registration = lane.arm(&first);
         let registry = lane.registry();
@@ -12837,7 +12987,7 @@ fi
 
     #[tokio::test]
     async fn poll_readmission_refuses_a_straddling_attempt_as_a_digest_mismatch() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
         let first = lane.live_graph();
         let mut registration = lane.arm(&first);
         let registry = lane.registry();
@@ -12942,7 +13092,7 @@ fi
 
     #[test]
     fn poll_readmission_refuses_a_push_this_host_cannot_serve_without_losing_the_epoch() {
-        let lane = ReadmissionLane::open("Build the foundation as first authored.");
+        let lane = ReadmissionLane::open(readmission_scope!(), "Build the foundation as first authored.");
         let first = lane.live_graph();
         let mut registration = lane.arm(&first);
         let registry = lane.registry();

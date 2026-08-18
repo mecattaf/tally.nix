@@ -30,6 +30,41 @@ fn publish_completion_enrichment(job: &Job) {
     });
 }
 
+/// One job's post-ack enrichment, held for as long as it is still in flight.
+///
+/// #440. The terminal acknowledgement is deliberately independent of the
+/// scrape (`run.rs`: waiters become runnable after the witness fsync and
+/// nothing else), so a `--wait` returns before the session pointer the
+/// completion scraped is installed. That is right for the ack and wrong for
+/// the one caller who needs the scraped fact — a continuation of the job that
+/// just finished — which used to lose the race by however long the scrape
+/// took and report "has no scraped session reference".
+///
+/// The guard turns the interval into something a reader can wait on. It is
+/// dropped on every path out of the enrichment task, including the error
+/// returns, so a waiter is never left holding a promise nobody will keep.
+pub(super) struct CompletionSettleGuard {
+    settling: Rc<RefCell<HashMap<Uuid, watch::Sender<bool>>>>,
+    job_id: Uuid,
+}
+
+impl CompletionSettleGuard {
+    fn take(settling: &Rc<RefCell<HashMap<Uuid, watch::Sender<bool>>>>, job_id: Uuid) -> Self {
+        Self {
+            settling: Rc::clone(settling),
+            job_id,
+        }
+    }
+}
+
+impl Drop for CompletionSettleGuard {
+    fn drop(&mut self) {
+        if let Some(settled) = self.settling.borrow_mut().remove(&self.job_id) {
+            let _ = settled.send(true);
+        }
+    }
+}
+
 pub(super) struct TerminalWork {
     pub(super) job: Job,
     pub(super) result: JobResult,
@@ -44,7 +79,50 @@ pub(super) struct PreparedExecution {
 }
 
 impl DaemonHandler {
+    /// Declare that this job's post-ack enrichment is pending (#440).
+    ///
+    /// Called from inside the same critical section that releases the job's
+    /// waiters, before the ack can reach anyone: a continuation admitted the
+    /// instant a `--wait` returns has to find the pending mark already there,
+    /// or waiting on it proves nothing.
+    ///
+    /// Idempotent, because the forced-terminal paths reach
+    /// [`Self::complete_terminal_post_ack`] without passing through the
+    /// ordinary one.
+    pub(super) fn begin_completion_settle(&self, job_id: Uuid) {
+        self.settling_completions
+            .borrow_mut()
+            .entry(job_id)
+            .or_insert_with(|| watch::channel(false).0);
+    }
+
+    /// Wait until this job's post-ack enrichment has ended.
+    ///
+    /// Returns at once for a job with nothing in flight, which is every job
+    /// whose enrichment already finished and every job that never had one.
+    /// The wait is on the enrichment's own completion, so there is no ordering
+    /// here for a sleep to approximate.
+    pub(super) async fn await_completion_settled(&self, job_id: Uuid) {
+        let Some(mut settled) = self
+            .settling_completions
+            .borrow()
+            .get(&job_id)
+            .map(watch::Sender::subscribe)
+        else {
+            return;
+        };
+        while !*settled.borrow_and_update() {
+            // An enrichment task that died with its sender un-signalled drops
+            // it, and a dropped sender is the same answer: nothing further is
+            // coming for this job.
+            if settled.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub(super) fn complete_terminal_post_ack(&self, work: TerminalWork) {
+        self.begin_completion_settle(work.job.job_id);
         self.revoke_job_token(&work.job);
         for check in &work.evidence_checks {
             self.emit_post_ack(evidence_event(&work.job, check));
@@ -88,7 +166,9 @@ impl DaemonHandler {
             // `crate::occupancy`'s doc makes ("the config ceiling still
             // needs checking, because it depends on nothing scraped").
             let handler = self.clone();
+            let settle = CompletionSettleGuard::take(&self.settling_completions, job.job_id);
             let task = tokio::task::spawn_local(async move {
+                let _settle = settle;
                 let mut job = job;
                 job.row.context_window = {
                     let context = handler.context.read().await;
@@ -119,7 +199,9 @@ impl DaemonHandler {
             return;
         }
         let handler = self.clone();
+        let settle = CompletionSettleGuard::take(&self.settling_completions, job.job_id);
         let task = tokio::task::spawn_local(async move {
+            let _settle = settle;
             let (adapters, state_dir, pools) = {
                 let context = handler.context.read().await;
                 (

@@ -11,8 +11,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
 #[path = "support/shell_program.rs"]
 mod shell_program;
+
+use isolated_host::{Isolated, IsolatedHost};
 
 const FORGE_TASK_T01: &str = "0198f000-0000-7000-8000-000000000042/t01";
 const FORGE_TASK_T02: &str = "0198f000-0000-7000-8000-000000000042/t02";
@@ -822,14 +826,16 @@ async fn run_tally_with_identity(
     job_id: Option<&str>,
     job_token: Option<&str>,
 ) -> std::process::Output {
+    // The guard scrubs the ambient job identity; a case that wants one names
+    // it below, which is the only way this file's children get one.
+    let host = IsolatedHost::new();
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
     command
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(socket)
-        .args(args)
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN");
+        .args(args);
     if let Some(job_id) = job_id {
         command.env("TALLY_JOB_ID", job_id);
     }
@@ -1918,13 +1924,13 @@ async fn a_human_query_whose_reader_hangs_up_exits_without_a_panic() {
                 let _ = serve_connection(stream, FloodQueryHandler).await;
             });
 
+            let host = IsolatedHost::new();
             let mut child = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .isolated(&host)
                 .args(["--config", EMPTY_CONFIG])
                 .arg("--socket")
                 .arg(&socket)
                 .args(["query", "run", "00000000-0000-4000-8000-000000000262"])
-                .env_remove("TALLY_JOB_ID")
-                .env_remove("TALLY_JOB_TOKEN")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -1975,15 +1981,14 @@ async fn tally_writing_into_a_closed_pipe(
 ) -> std::process::Output {
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
+    let host = IsolatedHost::new();
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
-    command.args(["--config", EMPTY_CONFIG]);
+    command.isolated(&host).args(["--config", EMPTY_CONFIG]);
     if let Some(socket) = socket {
         command.arg("--socket").arg(socket);
     }
     command
         .args(args)
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
         .stdout(Stdio::from(writer))
         .stderr(Stdio::piped())
         .spawn()
@@ -2199,7 +2204,9 @@ async fn a_closed_stream_never_panics_the_help_or_the_error_printer() {
     // daemon unreachable), never the panic's 101 and never a silent 0.
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
+    let host = IsolatedHost::new();
     let unreachable = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(&absent)
@@ -2229,7 +2236,9 @@ async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
         let attestations = attestations.clone();
         let name = name.to_owned();
         async move {
+            let host = IsolatedHost::new();
             Command::new(env!("CARGO_BIN_EXE_tally"))
+                .isolated(&host)
                 .args(["--config", EMPTY_CONFIG])
                 .args(["witness", "verify"])
                 .arg(fixtures.join(name))
@@ -2549,7 +2558,9 @@ async fn a_walked_window_whose_reader_hangs_up_exits_quietly_without_notices() {
                 let _ = serve_connection(stream, handler).await;
             });
 
+            let host = IsolatedHost::new();
             let mut child = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .isolated(&host)
                 .args(["--config", EMPTY_CONFIG])
                 .arg("--socket")
                 .arg(&socket)
@@ -2559,8 +2570,6 @@ async fn a_walked_window_whose_reader_hangs_up_exits_quietly_without_notices() {
                     "--flow-run",
                     "00000000-0000-4000-8000-000000000045",
                 ])
-                .env_remove("TALLY_JOB_ID")
-                .env_remove("TALLY_JOB_TOKEN")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()

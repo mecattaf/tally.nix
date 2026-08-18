@@ -11,6 +11,11 @@ use tally_core::config::{
     Config, FlowRegistration, PoolConfig, PoolPredicate, ResourceKind, WindowedConsumptionPredicate,
 };
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
+
+use isolated_host::{Isolated, IsolatedHost};
+
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 fn fixture(name: &str) -> PathBuf {
@@ -106,7 +111,9 @@ fn serve_empty_flow_history(
 
 #[test]
 fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
+    let host = IsolatedHost::new();
     let valid = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .args(["flow", "check"])
         .arg(fixture("valid.js"))
@@ -127,6 +134,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     let args_path = temp.path().join("flow-args.json");
     fs::write(&args_path, br#"{"task":"from-path"}"#).unwrap();
     let from_path = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .args(["flow", "check"])
         .arg(fixture("valid.js"))
@@ -144,6 +152,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     let relative_link = temp.path().join("args-link.json");
     std::os::unix::fs::symlink(&args_path, &relative_link).unwrap();
     let from_relative_link = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .current_dir(temp.path())
         .args(["flow", "check"])
@@ -159,6 +168,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     );
 
     let drv = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .args(["flow", "check"])
         .arg(fixture("valid-drv.js"))
@@ -179,6 +189,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
         ("bad-args-schema.js", "args-schema-invalid"),
     ] {
         let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+            .isolated(&host)
             .args(["--config", EMPTY_CONFIG])
             .args(["flow", "check"])
             .arg(fixture(name))
@@ -197,7 +208,9 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
 
 #[test]
 fn flow_render_cli_is_static_mermaid_with_check_level_failures() {
+    let host = IsolatedHost::new();
     let rendered = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .args(["flow", "render"])
         .arg(fixture("valid-drv.js"))
@@ -217,6 +230,7 @@ fn flow_render_cli_is_static_mermaid_with_check_level_failures() {
     );
 
     let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .args(["flow", "render"])
         .arg(fixture("banned-global.js"))
@@ -231,6 +245,7 @@ fn flow_render_cli_is_static_mermaid_with_check_level_failures() {
 
 #[test]
 fn flow_check_cli_rejects_configured_windowed_consumption_pools() {
+    let host = IsolatedHost::new();
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.json");
     let mut config = Config::default();
@@ -248,6 +263,7 @@ fn flow_check_cli_rejects_configured_windowed_consumption_pools() {
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
 
     let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(&config_path)
         .args(["flow", "check"])
@@ -264,6 +280,7 @@ fn flow_check_cli_rejects_configured_windowed_consumption_pools() {
 
 #[test]
 fn flow_run_rejects_a_registered_workload_mutex_without_an_admitted_parent() {
+    let host = IsolatedHost::new();
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.json");
     let script = fixture("valid.js");
@@ -286,6 +303,7 @@ fn flow_run_rejects_a_registered_workload_mutex_without_an_admitted_parent() {
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(&config_path)
         .arg("--socket")
@@ -302,8 +320,6 @@ fn flow_run_rejects_a_registered_workload_mutex_without_an_admitted_parent() {
             "--catalog",
         ])
         .arg(fixture("catalog.json"))
-        .env_remove("TALLY_TASK_UUID")
-        .env_remove("TALLY_JOB_ID")
         .output()
         .unwrap();
 
@@ -322,6 +338,7 @@ fn flow_run_rejects_a_registered_workload_mutex_without_an_admitted_parent() {
 
 #[test]
 fn flow_run_allows_a_registered_flow_without_a_workload_mutex() {
+    let host = IsolatedHost::new();
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.json");
     let socket = temp.path().join("tally.sock");
@@ -338,6 +355,7 @@ fn flow_run_allows_a_registered_flow_without_a_workload_mutex() {
     let server = serve_empty_flow_history(&socket, None);
 
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(&config_path)
         .arg("--socket")
@@ -354,8 +372,6 @@ fn flow_run_allows_a_registered_flow_without_a_workload_mutex() {
             "--catalog",
         ])
         .arg(fixture("catalog.json"))
-        .env_remove("TALLY_TASK_UUID")
-        .env_remove("TALLY_JOB_ID")
         .output()
         .unwrap();
     server.join().unwrap();
@@ -369,6 +385,7 @@ fn flow_run_allows_a_registered_flow_without_a_workload_mutex() {
 
 #[test]
 fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
+    let host = IsolatedHost::new();
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path());
     let socket = temp.path().join("tally.sock");
@@ -381,6 +398,7 @@ fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
     fs::write(&args_path, prepared.canonical()).unwrap();
     let server = serve_empty_flow_history(&socket, Some("00000000-0000-4000-8000-000000000048"));
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(&config)
         .arg("--socket")
@@ -422,6 +440,7 @@ fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
     );
 
     let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(&config)
         .args(["flow", "run"])
@@ -439,11 +458,13 @@ fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
 
 #[test]
 fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event() {
+    let host = IsolatedHost::new();
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path());
     let socket = temp.path().join("tally.sock");
     let server = serve_empty_flow_history(&socket, None);
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(&config)
         .arg("--socket")
@@ -458,9 +479,6 @@ fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event
             "--flow-run-id",
             "00000000-0000-4000-8000-000000000049",
         ])
-        .env_remove("TALLY_TASK_UUID")
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .unwrap();
     server.join().unwrap();
@@ -479,12 +497,14 @@ fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event
 
 #[test]
 fn flow_run_with_a_missing_explicit_config_names_it_before_connecting() {
+    let host = IsolatedHost::new();
     let temp = tempfile::tempdir().unwrap();
     let config_home = temp.path().join("empty-config-home");
     fs::create_dir_all(&config_home).unwrap();
     let expected = config_home.join("tally/config.json");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .arg("--config")
         .arg(&expected)
         .arg("--socket")
@@ -503,9 +523,6 @@ fn flow_run_with_a_missing_explicit_config_names_it_before_connecting() {
         .arg(fixture("catalog.json"))
         .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("HOME")
-        .env_remove("TALLY_TASK_UUID")
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .unwrap();
 

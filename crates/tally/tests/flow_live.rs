@@ -35,10 +35,14 @@ use tokio::task::JoinHandle;
 
 #[path = "support/configured_tally.rs"]
 mod configured_tally;
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
 #[path = "support/shell_program.rs"]
 mod shell_program;
 #[path = "support/timeout_scale.rs"]
 mod timeout_scale;
+
+use isolated_host::{Isolated, IsolatedHost};
 
 use timeout_scale::{effective_scale, scaled, TIMEOUT_SCALE_ENV};
 
@@ -689,8 +693,13 @@ fn runner(
     args: &str,
     max_nodes: u32,
 ) -> Command {
+    // The runner is *built* here and spawned by the caller, so its private
+    // host is rooted in the case's own temporary tree rather than in a frame
+    // that ends before the child starts.
+    let host = IsolatedHost::under(config_path.parent().unwrap().join("isolated-host"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
     command
+        .isolated(&host)
         .arg("--config")
         .arg(config_path)
         .arg("--socket")
@@ -703,9 +712,6 @@ fn runner(
         .arg(max_nodes.to_string())
         .arg("--flow-run-id")
         .arg(flow_run_id)
-        .env_remove("TALLY_TASK_UUID")
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -1255,7 +1261,10 @@ async fn fs5_live_acceptance_matrix() {
             // The generation boundary: a durable rollover from the terminal old
             // run to a fresh successor, recorded once and safe to repeat.
             let supersede = || {
+                let host =
+                    IsolatedHost::under(temp.path().join("isolated-host-supersede"));
                 Command::new(env!("CARGO_BIN_EXE_tally"))
+                    .isolated(&host)
                     .arg("--config")
                     .arg(&config_path)
                     .arg("--socket")
@@ -1338,7 +1347,9 @@ async fn fs5_live_acceptance_matrix() {
             );
 
             // Both query surfaces answer the generation question unambiguously.
+            let lineage_host = IsolatedHost::new();
             let lineage = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .isolated(&lineage_host)
                 .arg("--config")
                 .arg(&config_path)
                 .arg("--socket")
@@ -2206,7 +2217,9 @@ async fn retry_cancellation_cap_and_partial_failure_are_live_end_to_end() {
             .spawn()
             .unwrap();
             wait_for_flow_state(&client, CANCELLED_RUN, 1, "running").await;
+            let cancel_host = IsolatedHost::new();
             let cancel_output = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .isolated(&cancel_host)
                 .arg("--config")
                 .arg(&config_path)
                 .arg("--socket")

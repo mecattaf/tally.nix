@@ -26,10 +26,14 @@ use tokio::task::LocalSet;
 
 #[path = "support/configured_tally.rs"]
 mod configured_tally;
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
 #[path = "support/live.rs"]
 mod live_support;
 #[path = "support/shell_program.rs"]
 mod shell_program;
+
+use isolated_host::{Isolated, IsolatedHost};
 
 const BASH: &str = "/run/current-system/sw/bin/bash";
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
@@ -155,9 +159,11 @@ async fn enqueue_wait_rearms_after_restart_and_observes_terminal_verdict() {
         write.write_all(&terminal).await.unwrap();
     });
 
+    let host = IsolatedHost::new();
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new(env!("CARGO_BIN_EXE_tally"))
+            .isolated(&host)
             .args(["--config", EMPTY_CONFIG])
             .arg("--socket")
             .arg(&socket)
@@ -215,9 +221,11 @@ async fn await_job_exits_unreachable_after_rearm_window_is_exhausted() {
         fs::remove_file(removed_socket).unwrap();
     });
 
+    let host = IsolatedHost::new();
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new(env!("CARGO_BIN_EXE_tally"))
+            .isolated(&host)
             .args(["--config", EMPTY_CONFIG])
             .arg("--socket")
             .arg(&socket)

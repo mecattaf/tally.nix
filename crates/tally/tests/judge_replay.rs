@@ -16,6 +16,11 @@ use std::process::{Command, Output};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
+
+use isolated_host::{Isolated, IsolatedHost};
+
 const CANDIDATE: &str = "fixture-judge";
 const FIXTURE_CANDIDATE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -382,8 +387,10 @@ impl DurableRecord {
     }
 
     fn assemble(&self, campaigns: &[&str], out: &Path) -> Output {
+        let host = IsolatedHost::new();
         let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
         command
+            .isolated(&host)
             .args(["--config", self.config.to_str().unwrap()])
             .args(["judge-replay", "assemble"]);
         for campaign in campaigns {
@@ -403,7 +410,9 @@ impl DurableRecord {
     }
 
     fn replay_as(&self, candidate: &str, corpus: &Path, out: &Path) -> Output {
+        let host = IsolatedHost::new();
         Command::new(env!("CARGO_BIN_EXE_tally"))
+            .isolated(&host)
             .args(["--config", self.config.to_str().unwrap()])
             .args(["judge-replay", "run"])
             .args(["--corpus", corpus.to_str().unwrap()])

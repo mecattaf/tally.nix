@@ -3,10 +3,16 @@ use std::process::Command;
 
 use serde_json::Value;
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
+
+use isolated_host::{Isolated, IsolatedHost};
+
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
 #[test]
 fn lint_history_reports_each_commit_and_fails_a_poisoned_range() {
+    let host = IsolatedHost::new();
     let temporary = tempfile::tempdir().unwrap();
     let repository = temporary.path();
     git(repository, &["init", "-b", "main"]);
@@ -36,6 +42,7 @@ fn lint_history_reports_each_commit_and_fails_a_poisoned_range() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .current_dir(repository)
         .args(["lint-history", "HEAD", "--scope", "crates/tally"])
@@ -56,6 +63,7 @@ fn lint_history_reports_each_commit_and_fails_a_poisoned_range() {
     );
 
     let valid = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .current_dir(repository)
         .args(["lint-history", &first, "--scopes", "crates/tally"])

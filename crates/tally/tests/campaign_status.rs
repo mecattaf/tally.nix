@@ -15,6 +15,11 @@ use tally_core::wire::{serve_connection, RpcHandler};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
+
+use isolated_host::{Isolated, IsolatedHost};
+
 const ISSUE_URL: &str = "local://acme/widgets/specs/night/tasks.json";
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 const CODE_REPOSITORY: &str = "acme/widgets";
@@ -362,13 +367,15 @@ impl RpcHandler for FirstQueuedCampaignStatusHandler {
 }
 
 async fn run_tally(socket: &Path, args: &[&str]) -> std::process::Output {
+    // The verb runs to completion inside this frame, so the private host only
+    // has to outlive the call.
+    let host = IsolatedHost::new();
     Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(socket)
         .args(args)
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .await
         .unwrap()

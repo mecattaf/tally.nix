@@ -16,6 +16,11 @@ use std::process::Output;
 
 use tokio::process::Command;
 
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
+
+use isolated_host::{Isolated, IsolatedHost};
+
 const FLOW_RUN: &str = "00000000-0000-4000-8000-000000000abc";
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 const VALID_LEDGER: &str = concat!(
@@ -33,14 +38,18 @@ async fn invocation(
     data_dir: Option<&Path>,
     args: &[&str],
 ) -> Output {
+    // Every case here is *about* the host locations, so the guard binds them
+    // first and the case then aims the ones it is proving. What the guard
+    // removes is the possibility of a variable this file never mentions --
+    // `XDG_STATE_HOME`, the socket -- resolving to the operator's.
+    let host = IsolatedHost::new();
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
     command
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .args(args)
         .env("HOME", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN");
+        .env_remove("XDG_CONFIG_HOME");
     match xdg_data_home {
         Some(xdg) => command.env("XDG_DATA_HOME", xdg),
         None => command.env_remove("XDG_DATA_HOME"),

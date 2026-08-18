@@ -20,8 +20,12 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, LocalSet};
 
+use isolated_host::{Isolated, IsolatedHost};
+
 #[path = "support/configured_tally.rs"]
 mod configured_tally;
+#[path = "support/isolated_host.rs"]
+mod isolated_host;
 
 const EMPTY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/empty-config.json");
 
@@ -108,15 +112,16 @@ async fn start_daemon(paths: &DaemonPaths) -> RunningDaemon {
 }
 
 async fn enqueue(socket: &Path, args: &[&str]) -> std::process::Output {
+    // A one-shot verb: the private host only has to outlive this frame.
+    let host = IsolatedHost::new();
     Command::new(env!("CARGO_BIN_EXE_tally"))
+        .isolated(&host)
         .args(["--config", EMPTY_CONFIG])
         .arg("--socket")
         .arg(socket)
         .arg("queue")
         .arg("enqueue")
         .args(args)
-        .env_remove("TALLY_JOB_ID")
-        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .await
         .unwrap()
