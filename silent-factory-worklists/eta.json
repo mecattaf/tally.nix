@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "campaign": {
     "name": "eta",
-    "maxTasks": 40,
+    "maxTasks": 32,
     "maxParallel": 1,
     "steward": "narrator",
     "agent": {
