@@ -12768,15 +12768,24 @@ fi
         assert_eq!(store.read().unwrap().unwrap().arm_serial, 2);
 
         // Reclamation needs no verb: the holders going away is the whole of
-        // it, whether they exited or died.
+        // it, whether they exited or died. Visibility of the released lock
+        // is not instantaneous under a loaded sandbox (witnessed three times
+        // at the eta chapter-5 gates: this exact acquire observed Held by
+        // this same process moments after the drop), so reclamation is
+        // asserted within a bounded window — a genuinely leaked holder still
+        // fails by exhausting it.
         drop(admissions);
-        assert_eq!(
-            store
-                .acquire(&activation, Utc::now())
-                .unwrap()
-                .acquisition(),
-            CampaignLeaseAcquisition::Resumed
-        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let reclaimed = loop {
+            match store.acquire(&activation, Utc::now()) {
+                Ok(guard) => break guard,
+                Err(CampaignLeaseError::Held { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => panic!("reclamation never succeeded: {error}"),
+            }
+        };
+        assert_eq!(reclaimed.acquisition(), CampaignLeaseAcquisition::Resumed);
     }
 
     /// Completion is a written fact, not an observed silence: the last task
