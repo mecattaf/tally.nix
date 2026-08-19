@@ -341,6 +341,52 @@ refreshes comment-sweep's budget as designed. E6 held: every retry
 this chapter carries a named cause and the cause is one recorded
 class.
 
+## Chapter 5 CLOSED — P4 green, machine-published, pin-bump 4 deployed. eta ENDS. 2026-08-19
+
+All six chapter-5 lanes merged (five first-try; comment-sweep took two
+attempts, its first refused by the lease flake). The night's full arc,
+compressed: the C4 publish withheld legibly (non-disjoint path — the
+sitting's doc-pointer edit vs a lane's doc update; resolved by
+reverting the cosmetic hunk); TWO re-entry wedges found and recorded
+(a base-only fix cannot re-admit — poll keys on worklist digest alone;
+and a completed campaign's summary correctly refuses contradiction by
+a fresh epoch — both escaped by one honest amendment); the lease
+flake's TRUE mechanism finally caught via the newly-preserved red
+transcript — not scope collision but the reclamation assertion
+assuming instantaneous lock-release visibility under loaded
+release-mode sandboxes — fixed by supervisor commit on the integration
+line (bounded-window retry that still bites on a real leak), which the
+gate promptly refused once for rustfmt (the supervisor held to the
+lane bar; formatted and amended). Then C1–C4 re-witnessed green over
+a51b339c and the machine fast-forwarded main to it: proven == published.
+Pin-bump 4 flashed; the deployed binary answers
+"tally 0.1.0 (rev a51b339c...)"; smoke PASS, parity PARITY, zero
+undocumented divergences.
+
+**Completion-fact postscript, the migration defect (recorded, post-eta
+backlog):** under the newly deployed writer-tuple contract, done-ness
+rests on durable facts alone — the old tree-derivation path is gone
+and the legacy bridge does not revive pre-migration facts — so
+re-arming the pre-migration eta registration dispatched a chapter-1
+lane afresh (stopped within minutes, nothing merged, nothing
+published). eta is therefore closed WITHOUT a lease-lapse fact: its
+exit stands on the P4 witness, the machine-publish receipt, and the
+deployed pin — the charter's own criterion ("eta ends at P4 green").
+The campaign is disarmed terminally. First post-eta item: the
+completion-fact migration bridge for pre-contract campaigns.
+
+**P2 seam verdict (§8.5, on the numbers):** tally judge-replay
+assemble swept epsilon-extension + eta and recovered ONE decision-grade
+case against sixteen honestly-named unrecoverables
+(judge-corpus-assembly.json, this directory): epsilon's receipts
+predate the typed verdict field; eta's briefs largely lack recorded
+verdicts because steward timeouts ate them — the defect fixed and
+deployed TODAY. n=1 supports no tier decision. §8.5 stays open,
+deferred to a replay over the corpus the repaired machinery will now
+actually accumulate, once a small-tier adapter is configured (window
+resets 08-22 13:34 UTC). The harness, the corpus, and the run are one
+command from that day.
+
 Flash retry SUCCEEDED (exit 0, pipefail-verified). Post-flash
 checklist executed: fleet-deploy inactive, both timers stopped, daemon
 restarted on 5rd83q51...-tally-0.1.0. Seam verification, all green:

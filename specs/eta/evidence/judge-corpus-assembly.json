@@ -1,0 +1,151 @@
+{
+  "schemaVersion": 1,
+  "campaigns": [
+    "epsilon-extension",
+    "eta"
+  ],
+  "found": 1,
+  "unrecoverable": 16,
+  "cases": [
+    {
+      "id": "eta+1+baseline-parity-probe+attempt-1",
+      "campaign": "eta",
+      "issueNumber": "1",
+      "taskId": "baseline-parity-probe",
+      "attempt": 1,
+      "briefSha256": "sha256:1b1b9c8937664435b5fb7bf3caeba1ba27e16b24cdf1712fab62a5700dd68910",
+      "recordedVerdict": "retry"
+    }
+  ],
+  "unrecoverableCases": [
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "authoring-doctrine-skills",
+      "attempt": 1,
+      "reason": "ambiguous-brief",
+      "detail": "4 retained briefs carry this task and attempt; the record cannot say which one produced the recorded verdict"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "chapter-gate",
+      "attempt": 1,
+      "reason": "ambiguous-brief",
+      "detail": "2 retained briefs carry this task and attempt; the record cannot say which one produced the recorded verdict"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "chapter-gate",
+      "attempt": 2,
+      "reason": "recorded-verdict-absent",
+      "detail": "the receipt predates the typed verdict field, so it records prose and no decision"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "epoch-scoped-budgets",
+      "attempt": 1,
+      "reason": "ambiguous-brief",
+      "detail": "3 retained briefs carry this task and attempt; the record cannot say which one produced the recorded verdict"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "epoch-scoped-budgets",
+      "attempt": 2,
+      "reason": "recorded-verdict-absent",
+      "detail": "the receipt predates the typed verdict field, so it records prose and no decision"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "fleet-gate-cheap-first",
+      "attempt": 1,
+      "reason": "recorded-verdict-absent",
+      "detail": "the receipt predates the typed verdict field, so it records prose and no decision"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "receipt-authority-stamp",
+      "attempt": 1,
+      "reason": "ambiguous-brief",
+      "detail": "3 retained briefs carry this task and attempt; the record cannot say which one produced the recorded verdict"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "receipt-authority-stamp",
+      "attempt": 2,
+      "reason": "recorded-verdict-absent",
+      "detail": "the receipt predates the typed verdict field, so it records prose and no decision"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "subject-adoption-narrator-retire",
+      "attempt": 1,
+      "reason": "recorded-verdict-absent",
+      "detail": "the receipt predates the typed verdict field, so it records prose and no decision"
+    },
+    {
+      "campaign": "epsilon-extension",
+      "issueNumber": "1",
+      "taskId": "subject-adoption-narrator-retire",
+      "attempt": 2,
+      "reason": "recorded-verdict-absent",
+      "detail": "the receipt predates the typed verdict field, so it records prose and no decision"
+    },
+    {
+      "campaign": "eta",
+      "issueNumber": "1",
+      "taskId": "chapter-gate-c1",
+      "attempt": 1,
+      "reason": "ambiguous-brief",
+      "detail": "4 retained briefs carry this task and attempt; the record cannot say which one produced the recorded verdict"
+    },
+    {
+      "campaign": "eta",
+      "issueNumber": "1",
+      "taskId": "chapter-gate-c2",
+      "attempt": 1,
+      "reason": "verdict-not-recorded",
+      "detail": "a diagnosis brief was retained but no receipt records a verdict for it"
+    },
+    {
+      "campaign": "eta",
+      "issueNumber": "1",
+      "taskId": "comment-sweep",
+      "attempt": 1,
+      "reason": "verdict-not-recorded",
+      "detail": "a diagnosis brief was retained but no receipt records a verdict for it"
+    },
+    {
+      "campaign": "eta",
+      "issueNumber": "1",
+      "taskId": "completion-unification",
+      "attempt": 1,
+      "reason": "verdict-not-recorded",
+      "detail": "a diagnosis brief was retained but no receipt records a verdict for it"
+    },
+    {
+      "campaign": "eta",
+      "issueNumber": "1",
+      "taskId": "specs-deny-list",
+      "attempt": 1,
+      "reason": "verdict-not-recorded",
+      "detail": "a diagnosis brief was retained but no receipt records a verdict for it"
+    },
+    {
+      "campaign": "eta",
+      "issueNumber": "1",
+      "taskId": "the-inbox",
+      "attempt": 1,
+      "reason": "verdict-not-recorded",
+      "detail": "a diagnosis brief was retained but no receipt records a verdict for it"
+    }
+  ],
+  "warnings": []
+}
